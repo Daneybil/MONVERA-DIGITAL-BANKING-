@@ -1,0 +1,6 @@
+{
+  "name": "MONVERA",
+  "description": "MONVERA (MV Banking / MVB) is a premium digital banking platform with customer accounts, ledger accounting, instant MV-to-MV transfers, term investments, card controls, and private administration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
