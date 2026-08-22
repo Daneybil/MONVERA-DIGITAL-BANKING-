@@ -25,6 +25,8 @@ import { BusinessBankingView } from './components/dashboard/BusinessBankingView'
 import { AdminDashboard } from './components/admin/AdminDashboard';
 
 import { AuthModals } from './components/auth/AuthModals';
+import { LoginPage } from './components/auth/LoginPage';
+import { SignUpPage } from './components/auth/SignUpPage';
 import { SendMoneyModal } from './components/dashboard/SendMoneyModal';
 import { ReceiveMoneyModal } from './components/dashboard/ReceiveMoneyModal';
 import { DepositModal } from './components/dashboard/DepositModal';
@@ -32,6 +34,30 @@ import { WithdrawModal } from './components/dashboard/WithdrawModal';
 
 const AppContent: React.FC = () => {
   const { currentView, currentUser, setCurrentView } = useAuth();
+
+  // Dedicated Monvera Bank Login Page
+  if (currentView === 'login') {
+    return (
+      <LoginPage
+        onSwitchToSignUp={() => {
+          setCurrentView('signup');
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }}
+      />
+    );
+  }
+
+  // Dedicated Monvera Bank Sign-Up Page
+  if (currentView === 'signup') {
+    return (
+      <SignUpPage
+        onSwitchToLogin={() => {
+          setCurrentView('login');
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }}
+      />
+    );
+  }
 
   // Dedicated Monvera Bank Offers Page
   if (currentView === 'offers') {

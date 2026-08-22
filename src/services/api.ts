@@ -58,16 +58,87 @@ export const api = {
   },
 
   async register(data: {
+    id?: string;
+    uid?: string;
     firstName: string;
     lastName: string;
     email: string;
     phone?: string;
     dateOfBirth?: string;
     country?: string;
+    maritalStatus?: string;
+    address?: string;
+    taxId?: string;
+    password?: string;
     isBusiness?: boolean;
     businessName?: string;
+    permanentAccountNumber?: string;
   }): Promise<{ success: boolean; user?: UserProfile; balanceMetrics?: BalanceMetrics; error?: string }> {
     const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  async changePassword(data: {
+    userId: string;
+    currentPassword?: string;
+    newPassword: string;
+  }): Promise<{ success: boolean; error?: string; message?: string }> {
+    const res = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  async resetPassword(data: {
+    emailOrAccount: string;
+  }): Promise<{ success: boolean; error?: string; message?: string }> {
+    const res = await fetch('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  async updateAvatar(data: {
+    userId: string;
+    avatarUrl: string;
+  }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
+    const res = await fetch('/api/auth/update-avatar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  async submitKyc(data: {
+    userId: string;
+    documentType: string;
+    documentNumber: string;
+    country: string;
+    proofOfAddress?: string;
+    autoApprove?: boolean;
+  }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
+    const res = await fetch('/api/kyc/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  async approveKyc(data: {
+    userId: string;
+    adminId?: string;
+  }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
+    const res = await fetch('/api/kyc/approve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -211,6 +282,31 @@ export const api = {
 
   async getCards(userId: string): Promise<{ cards: CardItem[] }> {
     const res = await fetch(`/api/cards?userId=${encodeURIComponent(userId)}`);
+    return res.json();
+  },
+
+  async createCard(data: {
+    userId: string;
+    cardHolderName?: string;
+    phone?: string;
+    cardType?: 'PHYSICAL' | 'VIRTUAL';
+    cardTier?: string;
+    brand?: 'VISA' | 'MASTERCARD';
+    spendingLimitMonthly?: number;
+    spendingLimitDaily?: number;
+    colorScheme?: string;
+  }): Promise<{
+    success: boolean;
+    card?: CardItem;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    error?: string;
+  }> {
+    const res = await fetch('/api/cards/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
     return res.json();
   },
 

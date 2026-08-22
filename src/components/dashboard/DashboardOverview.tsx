@@ -27,6 +27,8 @@ import {
   FileText,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
+import { KycBanner } from '../kyc/KycBanner';
+import { KycVerificationModal } from '../kyc/KycVerificationModal';
 
 export const DashboardOverview: React.FC = () => {
   const { currentUser, balanceMetrics, openModal, setCurrentView } = useAuth();
@@ -34,6 +36,7 @@ export const DashboardOverview: React.FC = () => {
   const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
   const [hideBalances, setHideBalances] = useState<boolean>(false);
   const [copiedAcc, setCopiedAcc] = useState<boolean>(false);
+  const [isKycModalOpen, setIsKycModalOpen] = useState<boolean>(false);
 
   useEffect(() => {
     async function loadTx() {
@@ -59,6 +62,16 @@ export const DashboardOverview: React.FC = () => {
     navigator.clipboard.writeText(currentUser.permanentAccountNumber);
     setCopiedAcc(true);
     setTimeout(() => setCopiedAcc(false), 2000);
+  };
+
+  const isVerified = currentUser?.kycStatus === 'verified';
+
+  const handleProtectedAction = (action: () => void) => {
+    if (!isVerified) {
+      setIsKycModalOpen(true);
+    } else {
+      action();
+    }
   };
 
   const checkingAcc = balanceMetrics.accounts?.find((a) => a.type === 'CHECKING');
@@ -94,6 +107,9 @@ export const DashboardOverview: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* KYC Verification Callout Banner (Appears automatically for unverified/pending accounts) */}
+      <KycBanner />
 
       {/* --- HERO BALANCE CARD (EXPANDED LENGTH & BOLD HIGH-CONTRAST TYPOGRAPHY) --- */}
       <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-7 sm:p-10 lg:p-12 text-white shadow-2xl border-4 border-slate-800">
@@ -163,90 +179,155 @@ export const DashboardOverview: React.FC = () => {
 
       {/* --- MAIN DASHBOARD ACTIONS (LARGE, SMART & PROFESSIONAL BUTTONS) --- */}
       <div className="space-y-4">
-        <div className="text-base font-black uppercase tracking-wider text-slate-950">Quick Banking Actions</div>
+        <div className="flex items-center justify-between">
+          <div className="text-base font-black uppercase tracking-wider text-slate-950">Quick Banking Actions</div>
+          {!isVerified && (
+            <button
+              onClick={() => setIsKycModalOpen(true)}
+              className="inline-flex items-center gap-1.5 text-xs font-black text-amber-800 bg-amber-100 hover:bg-amber-200 border border-amber-300 px-3 py-1 rounded-full cursor-pointer transition-colors"
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Actions Locked — Click to Verify</span>
+            </button>
+          )}
+        </div>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
           
           <button
             id="action-btn-deposit"
-            onClick={() => openModal('deposit')}
-            className="p-5 sm:p-6 rounded-3xl bg-white hover:bg-emerald-50/90 border-2 border-slate-300 hover:border-emerald-600 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer"
+            onClick={() => handleProtectedAction(() => openModal('deposit'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-emerald-50/90 border-slate-300 hover:border-emerald-600'
+            }`}
           >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
             <div className="w-14 h-14 rounded-2xl bg-emerald-100 text-emerald-800 flex items-center justify-center group-hover:scale-110 group-hover:bg-emerald-600 group-hover:text-white transition-all shadow-sm">
               <Plus className="w-7 h-7 stroke-[3]" />
             </div>
             <div>
               <span className="text-base font-black text-slate-950 block">Deposit</span>
-              <span className="text-xs text-slate-700 font-bold block">Add Funds</span>
+              <span className="text-xs text-slate-700 font-bold block">{!isVerified ? 'Locked (Verify)' : 'Add Funds'}</span>
             </div>
           </button>
 
           <button
             id="action-btn-send"
-            onClick={() => openModal('send')}
-            className="p-5 sm:p-6 rounded-3xl bg-white hover:bg-emerald-50/90 border-2 border-slate-300 hover:border-emerald-600 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer"
+            onClick={() => handleProtectedAction(() => openModal('send'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-emerald-50/90 border-slate-300 hover:border-emerald-600'
+            }`}
           >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
             <div className="w-14 h-14 rounded-2xl bg-slate-950 text-emerald-400 flex items-center justify-center group-hover:scale-110 group-hover:bg-emerald-600 group-hover:text-white transition-all shadow-sm">
               <Send className="w-6 h-6 stroke-[3]" />
             </div>
             <div>
               <span className="text-base font-black text-slate-950 block">Send Money</span>
-              <span className="text-xs text-slate-700 font-bold block">Transfer Funds</span>
+              <span className="text-xs text-slate-700 font-bold block">{!isVerified ? 'Locked (Verify)' : 'Transfer Funds'}</span>
             </div>
           </button>
 
           <button
             id="action-btn-receive"
-            onClick={() => openModal('receive')}
-            className="p-5 sm:p-6 rounded-3xl bg-white hover:bg-slate-50 border-2 border-slate-300 hover:border-slate-500 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer"
+            onClick={() => handleProtectedAction(() => openModal('receive'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-slate-50 border-slate-300 hover:border-slate-500'
+            }`}
           >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
             <div className="w-14 h-14 rounded-2xl bg-slate-100 text-slate-900 flex items-center justify-center group-hover:scale-110 group-hover:bg-slate-950 group-hover:text-white transition-all shadow-sm">
               <QrCode className="w-6 h-6 stroke-[3]" />
             </div>
             <div>
               <span className="text-base font-black text-slate-950 block">Receive</span>
-              <span className="text-xs text-slate-700 font-bold block">QR / Details</span>
+              <span className="text-xs text-slate-700 font-bold block">{!isVerified ? 'Locked (Verify)' : 'QR / Details'}</span>
             </div>
           </button>
 
           <button
             id="action-btn-withdraw"
-            onClick={() => openModal('withdraw')}
-            className="p-5 sm:p-6 rounded-3xl bg-white hover:bg-slate-50 border-2 border-slate-300 hover:border-slate-500 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer"
+            onClick={() => handleProtectedAction(() => openModal('withdraw'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-slate-50 border-slate-300 hover:border-slate-500'
+            }`}
           >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
             <div className="w-14 h-14 rounded-2xl bg-slate-100 text-slate-900 flex items-center justify-center group-hover:scale-110 group-hover:bg-slate-950 group-hover:text-white transition-all shadow-sm">
               <Landmark className="w-6 h-6 stroke-[3]" />
             </div>
             <div>
               <span className="text-base font-black text-slate-950 block">Withdraw</span>
-              <span className="text-xs text-slate-700 font-bold block">ACH / Wire / Card</span>
+              <span className="text-xs text-slate-700 font-bold block">{!isVerified ? 'Locked (Verify)' : 'ACH / Wire / Card'}</span>
             </div>
           </button>
 
           <button
             id="action-btn-invest"
-            onClick={() => setCurrentView('investments')}
-            className="p-5 sm:p-6 rounded-3xl bg-white hover:bg-emerald-50/90 border-2 border-slate-300 hover:border-emerald-600 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer"
+            onClick={() => handleProtectedAction(() => setCurrentView('investments'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-emerald-50/90 border-slate-300 hover:border-emerald-600'
+            }`}
           >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
             <div className="w-14 h-14 rounded-2xl bg-emerald-950 text-emerald-400 flex items-center justify-center group-hover:scale-110 group-hover:bg-emerald-600 group-hover:text-white transition-all shadow-sm">
               <TrendingUp className="w-6 h-6 stroke-[3]" />
             </div>
             <div>
               <span className="text-base font-black text-slate-950 block">Invest (4.50%)</span>
-              <span className="text-xs text-emerald-800 font-black block">60-360D Term</span>
+              <span className="text-xs text-emerald-800 font-black block">{!isVerified ? 'Locked (Verify)' : '60-360D Term'}</span>
             </div>
           </button>
 
           <button
             id="action-btn-cards"
-            onClick={() => setCurrentView('cards')}
-            className="p-5 sm:p-6 rounded-3xl bg-white hover:bg-slate-50 border-2 border-slate-300 hover:border-slate-500 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer"
+            onClick={() => handleProtectedAction(() => setCurrentView('cards'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-slate-50 border-slate-300 hover:border-slate-500'
+            }`}
           >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
             <div className="w-14 h-14 rounded-2xl bg-slate-950 text-white flex items-center justify-center group-hover:scale-110 group-hover:bg-slate-800 transition-all shadow-sm">
               <CreditCard className="w-6 h-6 stroke-[3]" />
             </div>
             <div>
               <span className="text-base font-black text-slate-950 block">Cards</span>
-              <span className="text-xs text-slate-700 font-bold block">Manage Debit</span>
+              <span className="text-xs text-slate-700 font-bold block">{!isVerified ? 'Locked (Verify)' : 'Manage Debit'}</span>
             </div>
           </button>
 
@@ -350,7 +431,7 @@ export const DashboardOverview: React.FC = () => {
                   Active Sovereign Terms (60-360D)
                 </div>
                 <p className="text-xs text-slate-800 font-medium mt-1">
-                  Fixed sovereign term contracts generating guaranteed 4.50% APY daily yields until maturity.
+                  Fixed sovereign term contracts generating guaranteed 4.50% fixed daily interest (credited every 24 hours) until maturity.
                 </p>
               </div>
             </div>
@@ -523,6 +604,12 @@ export const DashboardOverview: React.FC = () => {
           onClose={() => setSelectedTx(null)}
         />
       )}
+
+      {/* KYC Verification Modal */}
+      <KycVerificationModal
+        isOpen={isKycModalOpen}
+        onClose={() => setIsKycModalOpen(false)}
+      />
 
     </div>
   );

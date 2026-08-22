@@ -1,5 +1,6 @@
 export type UserRole = 'customer' | 'business' | 'admin' | 'super_admin';
 export type UserStatus = 'active' | 'frozen' | 'pending_verification';
+export type KycStatus = 'unverified' | 'pending' | 'verified';
 
 export interface UserProfile {
   id: string;
@@ -18,6 +19,15 @@ export interface UserProfile {
   twoFactorEnabled: boolean;
   createdAt: string;
   businessName?: string;
+  maritalStatus?: string;
+  taxId?: string;
+  kycStatus?: KycStatus;
+  kycDocumentType?: string;
+  kycDocumentNumber?: string;
+  kycSubmittedAt?: string;
+  kycVerifiedAt?: string;
+  emailVerified?: boolean;
+  dailyTransactionLimit?: number;
 }
 
 export type AccountType = 'CHECKING' | 'SAVINGS' | 'INVESTMENT' | 'BUSINESS';
@@ -119,12 +129,14 @@ export interface CardItem {
   id: string;
   userId: string;
   cardHolderName: string;
+  cardNumber: string; // Complete 16-digit number formatted: "4654 8291 3049 5985"
   maskedNumber: string; // e.g. "•••• •••• •••• 8829"
   fullNumberMasked: string; // e.g. "4921 •••• •••• 8829"
   expiryDate: string;
   cvvMasked: string;
   cardType: 'VIRTUAL' | 'PHYSICAL';
-  cardTier: 'Obsidian World Elite' | 'Titanium Business' | 'Sapphire Debit';
+  cardTier: string;
+  brand?: 'VISA' | 'MASTERCARD';
   status: 'ACTIVE' | 'FROZEN' | 'CANCELLED';
   spendingLimitDaily: number;
   spendingLimitMonthly: number;
@@ -133,7 +145,7 @@ export interface CardItem {
   onlineEnabled: boolean;
   atmEnabled: boolean;
   contactlessEnabled: boolean;
-  colorScheme: 'obsidian' | 'titanium' | 'emerald';
+  colorScheme: 'obsidian' | 'titanium' | 'emerald' | 'sapphire' | 'gold' | string;
 }
 
 export interface NotificationReply {

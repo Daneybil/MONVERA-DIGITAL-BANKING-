@@ -1,0 +1,102 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Customer banking profile with personal details, KYC status, and permanent account information",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user"
+        },
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user"
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Customer's full legal name"
+        },
+        "firstName": {
+          "type": "string",
+          "description": "Customer's first name"
+        },
+        "lastName": {
+          "type": "string",
+          "description": "Customer's last name"
+        },
+        "email": {
+          "type": "string",
+          "description": "Verified email address"
+        },
+        "phone": {
+          "type": "string",
+          "description": "Customer contact phone number"
+        },
+        "country": {
+          "type": "string",
+          "description": "Customer country of residence"
+        },
+        "dateOfBirth": {
+          "type": "string",
+          "description": "Date of birth (YYYY-MM-DD)"
+        },
+        "age": {
+          "type": "string",
+          "description": "Calculated or stated age"
+        },
+        "maritalStatus": {
+          "type": "string",
+          "description": "Marital status"
+        },
+        "address": {
+          "type": "string",
+          "description": "Residential street address"
+        },
+        "permanentAccountNumber": {
+          "type": "string",
+          "description": "10-digit unique Monvera Account Number"
+        },
+        "username": {
+          "type": "string",
+          "description": "Customer handle for transfers"
+        },
+        "role": {
+          "type": "string",
+          "description": "Access role (customer, business, admin, super_admin)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Account status (active, frozen, pending_verification)"
+        },
+        "kycStatus": {
+          "type": "string",
+          "description": "KYC compliance state (unverified, pending, verified)"
+        },
+        "membershipTier": {
+          "type": "string",
+          "description": "Banking tier (Standard, Premier, Private Wealth, Business Platinum)"
+        },
+        "twoFactorEnabled": {
+          "type": "boolean",
+          "description": "Whether 2FA is enabled"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Account registration timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last profile update timestamp"
+        }
+      },
+      "required": ["id", "email", "firstName", "lastName", "kycStatus"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Customer profiles keyed strictly by authenticated Firebase UID"
+    }
+  }
+}

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import officeHeroImage from '../../assets/images/monvera_office_hero_1787152640128.jpg';
-import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, CheckCircle2, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star } from 'lucide-react';
+import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, CheckCircle2, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star, Lock } from 'lucide-react';
 
 export const HeroSection: React.FC = () => {
   const { currentUser, setCurrentView, openModal } = useAuth();
@@ -10,18 +10,14 @@ export const HeroSection: React.FC = () => {
 
   const handleGetStartedClick = () => {
     setGetStartedClicked(true);
-    if (currentUser) {
-      setCurrentView(currentUser.role === 'super_admin' ? 'admin' : 'dashboard');
-    } else {
-      openModal('auth_register');
-    }
+    openModal('auth_prompt');
   };
 
-  const handleDashboardClick = () => {
+  const handleLoginClick = () => {
     if (currentUser) {
       setCurrentView(currentUser.role === 'super_admin' ? 'admin' : 'dashboard');
     } else {
-      setCurrentView('dashboard');
+      openModal('auth_login');
     }
   };
 
@@ -86,28 +82,18 @@ export const HeroSection: React.FC = () => {
 
         {/* Compact Centered 3D Action Buttons (Short & Centered) */}
         <div className="pt-2 w-full flex flex-col items-center justify-center mx-auto text-center">
-          <div className="grid grid-cols-2 gap-3 max-w-sm sm:max-w-md w-full mx-auto justify-items-center">
-            {/* 3D Button 1: Get Started / Get Started Now */}
+          <div className="grid grid-cols-2 sm:grid-cols-2 gap-3 max-w-sm sm:max-w-md w-full mx-auto justify-items-center">
+            {/* 3D Button 1: Get Started */}
             <button
               id="hero-get-started-btn"
               onClick={handleGetStartedClick}
               className="w-full max-w-[190px] inline-flex items-center justify-center gap-2 px-3 sm:px-4 py-3 text-xs sm:text-sm font-extrabold text-white bg-gradient-to-b from-slate-850 via-slate-900 to-black hover:from-slate-800 hover:to-slate-950 rounded-xl border border-slate-700 border-b-[4px] border-b-slate-950 shadow-md active:translate-y-1 active:border-b-[1px] active:shadow-2xs transition-all cursor-pointer select-none"
             >
-              <span>{getStartedClicked ? 'Get Started Now' : 'Get Started'}</span>
+              <span>Get Started</span>
               <ArrowRight className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
             </button>
 
-            {/* 3D Button 2: Monvera Dashboard */}
-            <button
-              id="hero-dashboard-btn"
-              onClick={handleDashboardClick}
-              className="w-full max-w-[190px] inline-flex items-center justify-center gap-2 px-3 sm:px-4 py-3 text-xs sm:text-sm font-extrabold text-white bg-gradient-to-b from-emerald-500 via-emerald-600 to-emerald-700 hover:from-emerald-400 hover:to-emerald-600 rounded-xl border border-emerald-400 border-b-[4px] border-b-emerald-950 shadow-md active:translate-y-1 active:border-b-[1px] active:shadow-2xs transition-all cursor-pointer select-none"
-            >
-              <LayoutDashboard className="w-3.5 h-3.5 text-white shrink-0" />
-              <span>Monvera Dashboard</span>
-            </button>
-
-            {/* 3D Button 3: Monvera Bank Offers */}
+            {/* 3D Button 2: Monvera Bank Offers */}
             <button
               id="hero-bank-offers-btn"
               onClick={handleBankOffersClick}
@@ -117,7 +103,7 @@ export const HeroSection: React.FC = () => {
               <span>Monvera Bank Offers</span>
             </button>
 
-            {/* 3D Button 4: Monvera Investment Center */}
+            {/* 3D Button 3: Monvera Investment Center */}
             <button
               id="hero-investment-center-btn"
               onClick={handleInvestmentCenterClick}
@@ -126,17 +112,15 @@ export const HeroSection: React.FC = () => {
               <TrendingUp className="w-3.5 h-3.5 text-blue-200 shrink-0" />
               <span>Investment Center</span>
             </button>
-          </div>
 
-          {/* 3D Button 5: How Monvera Bank Works (Centered directly below) */}
-          <div className="pt-3 w-full flex justify-center">
+            {/* 3D Button 4: How Monvera Bank Works */}
             <button
               id="hero-how-it-works-btn"
               onClick={handleHowItWorksClick}
-              className="inline-flex items-center justify-center gap-2 px-5 py-3 text-xs sm:text-sm font-extrabold text-white bg-gradient-to-b from-amber-600 via-amber-700 to-amber-800 hover:from-amber-500 hover:to-amber-700 rounded-xl border border-amber-400 border-b-[4px] border-b-amber-950 shadow-md active:translate-y-1 active:border-b-[1px] active:shadow-2xs transition-all cursor-pointer select-none"
+              className="w-full max-w-[190px] inline-flex items-center justify-center gap-2 px-3 sm:px-4 py-3 text-xs sm:text-sm font-extrabold text-white bg-gradient-to-b from-amber-600 via-amber-700 to-amber-800 hover:from-amber-500 hover:to-amber-700 rounded-xl border border-amber-400 border-b-[4px] border-b-amber-950 shadow-md active:translate-y-1 active:border-b-[1px] active:shadow-2xs transition-all cursor-pointer select-none"
             >
               <HelpCircle className="w-3.5 h-3.5 text-amber-200 shrink-0" />
-              <span>How Monvera Bank Works</span>
+              <span>How It Works</span>
             </button>
           </div>
         </div>

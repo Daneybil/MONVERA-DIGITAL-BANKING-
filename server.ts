@@ -7,7 +7,8 @@ import { UserProfile, InvestmentTermDays } from './src/types';
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -65,16 +66,30 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
 });
 
 app.post('/api/auth/register', (req: Request, res: Response) => {
-  const { firstName, lastName, email, phone, dateOfBirth, country, isBusiness, businessName, username } = req.body;
+  const { id, uid, firstName, lastName, email, phone, dateOfBirth, country, isBusiness, businessName, username, maritalStatus, address, permanentAccountNumber: requestedAccNum } = req.body;
 
   if (!firstName || !lastName || !email) {
     return res.status(400).json({ error: 'First name, last name, and valid email are required.' });
   }
 
-  // Check if email already registered
-  const existing = Array.from(db.users.values()).find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
-  if (existing) {
-    return res.status(400).json({ error: 'An account with this email address already exists.' });
+  const userId = uid || id || `usr_${Date.now().toString(36)}`;
+
+  // If user already exists by ID, return existing user and balance metrics
+  if (db.users.has(userId)) {
+    const existingUser = db.users.get(userId)!;
+    const balanceMetrics = db.getUserBalanceMetrics(existingUser.id);
+    return res.json({ success: true, user: existingUser, balanceMetrics });
+  }
+
+  // Check if email already registered under another ID
+  const existingByEmail = Array.from(db.users.values()).find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
+  if (existingByEmail && existingByEmail.id !== userId) {
+    // If it was another user ID, update ID to Firebase UID
+    db.users.delete(existingByEmail.id);
+    existingByEmail.id = userId;
+    db.users.set(userId, existingByEmail);
+    const balanceMetrics = db.getUserBalanceMetrics(userId);
+    return res.json({ success: true, user: existingByEmail, balanceMetrics });
   }
 
   // Generate unique username if not provided
@@ -83,18 +98,19 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   
   let finalUsername = generatedUsername;
   let counter = 1;
-  while (Array.from(db.users.values()).some((u) => u.username.toLowerCase() === finalUsername.toLowerCase())) {
+  while (Array.from(db.users.values()).some((u) => u.id !== userId && u.username.toLowerCase() === finalUsername.toLowerCase())) {
     finalUsername = `${generatedUsername}${counter}`;
     counter++;
   }
 
   // Generate unique 10-digit permanent Monvera Account Number (starts with 10)
-  let permanentAccountNumber = '';
-  do {
-    permanentAccountNumber = `10${Math.floor(10000000 + Math.random() * 90000000)}`;
-  } while (Array.from(db.users.values()).some((u) => u.permanentAccountNumber === permanentAccountNumber));
+  let permanentAccountNumber = requestedAccNum || '';
+  if (!permanentAccountNumber) {
+    do {
+      permanentAccountNumber = `10${Math.floor(10000000 + Math.random() * 90000000)}`;
+    } while (Array.from(db.users.values()).some((u) => u.id !== userId && u.permanentAccountNumber === permanentAccountNumber));
+  }
 
-  const userId = `usr_${Date.now().toString(36)}`;
   const newUser: UserProfile = {
     id: userId,
     username: finalUsername,
@@ -105,16 +121,25 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
     permanentAccountNumber,
     dateOfBirth,
     country: country || 'United States',
+    maritalStatus: maritalStatus || req.body.maritalStatus,
+    taxId: req.body.taxId,
     avatarUrl: `https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80`,
     status: 'active',
     role: isBusiness ? 'business' : 'customer',
     membershipTier: isBusiness ? 'Business Platinum' : 'Premier',
-    twoFactorEnabled: true,
+    twoFactorEnabled: false,
     createdAt: new Date().toISOString(),
     businessName: isBusiness ? businessName || `${firstName}'s Enterprise` : undefined,
+    kycStatus: 'unverified',
+    dailyTransactionLimit: 1000000,
   };
 
   db.users.set(userId, newUser);
+  if (req.body.password) {
+    db.userPasswords.set(userId, req.body.password);
+  } else {
+    db.userPasswords.set(userId, 'Password123!');
+  }
 
   // Initialize checking, savings, investment accounts
   const chkId = `acc_chk_${userId}`;
@@ -169,29 +194,6 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
     nickname: 'Monvera Capital Portfolio',
   });
 
-  // Issue virtual debit card
-  const cardId = `crd_${userId}_01`;
-  db.cards.set(cardId, {
-    id: cardId,
-    userId,
-    cardHolderName: `${firstName.toUpperCase()} ${lastName.toUpperCase()}`,
-    maskedNumber: '•••• •••• •••• ' + Math.floor(1000 + Math.random() * 9000),
-    fullNumberMasked: '4921 •••• •••• ' + Math.floor(1000 + Math.random() * 9000),
-    expiryDate: '09/29',
-    cvvMasked: '•••',
-    cardType: 'PHYSICAL',
-    cardTier: 'Obsidian World Elite',
-    status: 'ACTIVE',
-    spendingLimitDaily: 10000,
-    spendingLimitMonthly: 50000,
-    currentDailySpend: 0,
-    internationalEnabled: true,
-    onlineEnabled: true,
-    atmEnabled: true,
-    contactlessEnabled: true,
-    colorScheme: 'obsidian',
-  });
-
   // Welcome notification
   db.notifications.push({
     id: `notif_welcome_${userId}`,
@@ -206,6 +208,92 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
 
   const balanceMetrics = db.getUserBalanceMetrics(userId);
   res.json({ success: true, user: newUser, balanceMetrics });
+});
+
+// Change Password Endpoint
+app.post('/api/auth/change-password', (req: Request, res: Response) => {
+  const { userId, currentPassword, newPassword } = req.body;
+  if (!userId || !newPassword) {
+    return res.status(400).json({ error: 'User ID and new password are required.' });
+  }
+
+  const result = db.changePassword({ userId, currentPassword, newPassword });
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json({ success: true, message: result.message });
+});
+
+// Password Reset / Recovery Endpoint
+app.post('/api/auth/reset-password', (req: Request, res: Response) => {
+  const { emailOrAccount } = req.body;
+  if (!emailOrAccount) {
+    return res.status(400).json({ error: 'Email or Account Number is required.' });
+  }
+
+  const result = db.resetPassword(emailOrAccount);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json({ success: true, message: result.message });
+});
+
+// Update Profile Avatar Endpoint
+app.post('/api/auth/update-avatar', (req: Request, res: Response) => {
+  const { userId, avatarUrl } = req.body;
+  if (!userId || !avatarUrl) {
+    return res.status(400).json({ error: 'User ID and avatar URL are required.' });
+  }
+
+  const user = db.users.get(userId);
+  if (!user) {
+    return res.status(404).json({ error: 'User account not found.' });
+  }
+
+  user.avatarUrl = avatarUrl;
+  db.users.set(userId, user);
+
+  res.json({ success: true, user });
+});
+
+// KYC Submit Verification Endpoint
+app.post('/api/kyc/submit', (req: Request, res: Response) => {
+  const { userId, documentType, documentNumber, country, proofOfAddress, autoApprove } = req.body;
+  if (!userId || !documentType || !documentNumber) {
+    return res.status(400).json({ error: 'User ID, document type, and document number are required.' });
+  }
+
+  const result = db.submitKyc({
+    userId,
+    documentType,
+    documentNumber,
+    country,
+    proofOfAddress,
+    autoApprove: autoApprove !== false,
+  });
+
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json({ success: true, user: result.user });
+});
+
+// KYC Admin Approve Endpoint
+app.post('/api/kyc/approve', (req: Request, res: Response) => {
+  const { userId, adminId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'Customer ID is required.' });
+  }
+
+  const result = db.approveKyc(userId, adminId);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json({ success: true, user: result.user });
 });
 
 // --- ACCOUNT & BALANCE METRICS ---
@@ -506,6 +594,35 @@ app.get('/api/cards', (req: Request, res: Response) => {
 
   const userCards = Array.from(db.cards.values()).filter((c) => c.userId === userId);
   res.json({ cards: userCards });
+});
+
+app.post('/api/cards/create', (req: Request, res: Response) => {
+  const { userId, cardHolderName, phone, cardType, cardTier, brand, spendingLimitMonthly, spendingLimitDaily, colorScheme } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  const result = db.createCard({
+    userId,
+    cardHolderName,
+    phone,
+    cardType,
+    cardTier,
+    brand,
+    spendingLimitMonthly: spendingLimitMonthly ? Number(spendingLimitMonthly) : 20000,
+    spendingLimitDaily: spendingLimitDaily ? Number(spendingLimitDaily) : 20000,
+    colorScheme,
+  });
+
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  const balanceMetrics = db.getUserBalanceMetrics(userId);
+  res.json({
+    success: true,
+    card: result.card,
+    transaction: result.transaction,
+    balanceMetrics,
+  });
 });
 
 app.post('/api/cards/:id/toggle-freeze', (req: Request, res: Response) => {

@@ -2,11 +2,13 @@ import React, { useState } from 'react';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { useAuth } from '../../context/AuthContext';
 import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, UserCheck, Lock } from 'lucide-react';
+import { KycVerificationModal } from '../kyc/KycVerificationModal';
 
 export const PublicNavbar: React.FC = () => {
   const { currentUser, setCurrentView, openModal, availableUsers, switchUser } = useAuth();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [demoDropdownOpen, setDemoDropdownOpen] = useState(false);
+  const [isKycModalOpen, setIsKycModalOpen] = useState(false);
 
   const navLinks = [
     { label: 'Personal', target: 'personal' },
@@ -128,40 +130,14 @@ export const PublicNavbar: React.FC = () => {
             )}
           </div>
 
-          {currentUser ? (
-            <button
-              id="enter-banking-portal-btn"
-              onClick={() => {
-                if (currentUser.role === 'super_admin' || currentUser.role === 'admin') {
-                  setCurrentView('admin');
-                } else {
-                  setCurrentView('dashboard');
-                }
-              }}
-              className="inline-flex items-center gap-2.5 px-6 py-2.5 text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98]"
-            >
-              <span className="tracking-tight">{currentUser.role === 'super_admin' ? 'Admin Portal' : 'Open Dashboard'}</span>
-              <ArrowRight className="w-4 h-4 text-emerald-400" />
-            </button>
-          ) : (
-            <>
-              <button
-                id="login-btn-header"
-                onClick={() => openModal('auth_login')}
-                className="px-4 py-2.5 text-sm font-bold text-slate-800 hover:text-slate-950 transition-colors"
-              >
-                Log In
-              </button>
-              <button
-                id="open-account-btn-header"
-                onClick={() => openModal('auth_register')}
-                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-xl shadow-md border border-slate-700 transition-all active:scale-[0.98]"
-              >
-                <span>Open Account</span>
-                <ArrowRight className="w-4 h-4 text-emerald-400" />
-              </button>
-            </>
-          )}
+          <button
+            id="get-started-btn-header"
+            onClick={() => openModal('auth_prompt')}
+            className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98] cursor-pointer"
+          >
+            <span>Get Started</span>
+            <ArrowRight className="w-4 h-4 text-emerald-400" />
+          </button>
         </div>
 
         {/* Mobile Menu Trigger */}
@@ -192,42 +168,25 @@ export const PublicNavbar: React.FC = () => {
           </div>
 
           <div className="pt-4 border-t border-slate-200 space-y-2">
-            {currentUser ? (
-              <button
-                onClick={() => {
-                  setMobileMenuOpen(false);
-                  setCurrentView(currentUser.role === 'super_admin' ? 'admin' : 'dashboard');
-                }}
-                className="w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold text-white bg-slate-900 rounded-xl"
-              >
-                <span>Go to Banking Dashboard</span>
-                <ArrowRight className="w-4 h-4 text-emerald-400" />
-              </button>
-            ) : (
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => {
-                    setMobileMenuOpen(false);
-                    openModal('auth_login');
-                  }}
-                  className="py-3 text-center text-sm font-semibold text-slate-800 bg-slate-100 rounded-xl"
-                >
-                  Log In
-                </button>
-                <button
-                  onClick={() => {
-                    setMobileMenuOpen(false);
-                    openModal('auth_register');
-                  }}
-                  className="py-3 text-center text-sm font-semibold text-white bg-emerald-600 rounded-xl"
-                >
-                  Open Account
-                </button>
-              </div>
-            )}
+            <button
+              onClick={() => {
+                setMobileMenuOpen(false);
+                openModal('auth_prompt');
+              }}
+              className="w-full py-3.5 text-center text-sm font-extrabold text-white bg-slate-950 rounded-xl shadow-md flex items-center justify-center gap-2"
+            >
+              <span>Get Started</span>
+              <ArrowRight className="w-4 h-4 text-emerald-400" />
+            </button>
           </div>
         </div>
       )}
+
+      {/* KYC Verification Modal */}
+      <KycVerificationModal
+        isOpen={isKycModalOpen}
+        onClose={() => setIsKycModalOpen(false)}
+      />
     </header>
   );
 };
