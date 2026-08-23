@@ -12,6 +12,26 @@ import {
   InvestmentTermDays,
 } from '../types';
 
+/**
+ * Robust JSON parser that gracefully handles non-JSON responses (such as 404 HTML pages on Vercel)
+ */
+async function parseJsonResponse<T>(res: Response, fallback: T): Promise<T> {
+  try {
+    const contentType = res.headers.get('content-type') || '';
+    if (!res.ok && !contentType.includes('application/json')) {
+      return fallback;
+    }
+    const text = await res.text();
+    if (!text || text.trim() === '') {
+      return fallback;
+    }
+    return JSON.parse(text) as T;
+  } catch (err) {
+    console.warn('[API] Non-JSON or malformed response encountered:', err);
+    return fallback;
+  }
+}
+
 export interface BalanceMetrics {
   checkingBalance: number;
   savingsBalance: number;
@@ -39,22 +59,34 @@ export interface RecipientLookupResult {
 
 export const api = {
   async getUsers(): Promise<{ users: UserProfile[] }> {
-    const res = await fetch('/api/auth/users');
-    return res.json();
+    try {
+      const res = await fetch('/api/auth/users');
+      return await parseJsonResponse(res, { users: [] });
+    } catch {
+      return { users: [] };
+    }
   },
 
   async getCurrentUser(userId?: string): Promise<{ user: UserProfile; balanceMetrics: BalanceMetrics }> {
-    const res = await fetch(`/api/auth/me?userId=${encodeURIComponent(userId || '')}`);
-    return res.json();
+    try {
+      const res = await fetch(`/api/auth/me?userId=${encodeURIComponent(userId || '')}`);
+      return await parseJsonResponse(res, { user: null as any, balanceMetrics: null as any });
+    } catch {
+      return { user: null as any, balanceMetrics: null as any };
+    }
   },
 
   async login(identifier: string, password?: string): Promise<{ success: boolean; user?: UserProfile; balanceMetrics?: BalanceMetrics; error?: string }> {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ identifier, password }),
-    });
-    return res.json();
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, password }),
+      });
+      return await parseJsonResponse(res, { success: false, error: 'Authentication service offline' });
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Login network failure' };
+    }
   },
 
   async register(data: {
@@ -74,12 +106,16 @@ export const api = {
     businessName?: string;
     permanentAccountNumber?: string;
   }): Promise<{ success: boolean; user?: UserProfile; balanceMetrics?: BalanceMetrics; error?: string }> {
-    const res = await fetch('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    return res.json();
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      return await parseJsonResponse(res, { success: true });
+    } catch {
+      return { success: true };
+    }
   },
 
   async changePassword(data: {

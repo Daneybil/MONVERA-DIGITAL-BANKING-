@@ -17,8 +17,11 @@ import {
   Copy,
   Check,
   AtSign,
+  QrCode,
+  Camera,
 } from 'lucide-react';
 import { Transaction } from '../../types';
+import { QrScannerModal } from './QrScannerModal';
 
 export const SendMoneyModal: React.FC = () => {
   const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications } = useAuth();
@@ -30,6 +33,7 @@ export const SendMoneyModal: React.FC = () => {
   const [memo, setMemo] = useState('');
   const [category, setCategory] = useState<Transaction['category']>('Transfers');
   const [securityPin, setSecurityPin] = useState('8829');
+  const [isQrScannerOpen, setIsQrScannerOpen] = useState(false);
 
   // Lookup state
   const [isLookingUp, setIsLookingUp] = useState(false);
@@ -163,13 +167,14 @@ export const SendMoneyModal: React.FC = () => {
   ].filter((c) => c.acc !== currentUser.permanentAccountNumber);
 
   return (
-    <div
-      id="send-money-modal-backdrop"
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-200"
-      onClick={(e) => {
-        if (e.target === e.currentTarget && step !== 'PROCESSING') closeModal();
-      }}
-    >
+    <>
+      <div
+        id="send-money-modal-backdrop"
+        className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-200"
+        onClick={(e) => {
+          if (e.target === e.currentTarget && step !== 'PROCESSING') closeModal();
+        }}
+      >
       <div
         id="send-money-modal-container"
         className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl border-2 border-slate-200 overflow-hidden relative max-h-[94vh] flex flex-col"
@@ -217,44 +222,68 @@ export const SendMoneyModal: React.FC = () => {
                     e.g. <strong className="text-emerald-700">@marcus</strong> or <strong className="text-slate-800">1088492015</strong>
                   </span>
                 </div>
-                <div className="relative">
-                  <div className="absolute left-4 top-3.5 text-slate-400">
-                    <AtSign className="w-5 h-5" />
-                  </div>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Enter @username or 10-digit account number"
-                    value={recipientInput}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setRecipientInput(val);
-                      handleLookup(val);
-                    }}
-                    className="w-full pl-11 pr-24 py-3.5 text-base font-mono font-bold tracking-wider rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white"
-                  />
-                  {isLookingUp ? (
-                    <div className="absolute right-4 top-3.5 text-xs text-emerald-600 animate-pulse font-mono font-bold">
-                      Verifying...
+                
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <div className="absolute left-4 top-3.5 text-slate-400">
+                      <AtSign className="w-5 h-5" />
                     </div>
-                  ) : (
-                    recipientInput.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => handleLookup(recipientInput)}
-                        className="absolute right-2.5 top-2 px-3 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-colors"
-                      >
-                        Verify
-                      </button>
-                    )
-                  )}
+                    <input
+                      type="text"
+                      required
+                      placeholder="Enter @username or 10-digit account number"
+                      value={recipientInput}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setRecipientInput(val);
+                        handleLookup(val);
+                      }}
+                      className="w-full pl-11 pr-24 py-3.5 text-base font-mono font-bold tracking-wider rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white"
+                    />
+                    {isLookingUp ? (
+                      <div className="absolute right-4 top-3.5 text-xs text-emerald-600 animate-pulse font-mono font-bold">
+                        Verifying...
+                      </div>
+                    ) : (
+                      recipientInput.trim() && (
+                        <button
+                          type="button"
+                          onClick={() => handleLookup(recipientInput)}
+                          className="absolute right-2.5 top-2 px-3 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-colors cursor-pointer"
+                        >
+                          Verify
+                        </button>
+                      )
+                    )}
+                  </div>
+
+                  {/* QR Scan Button */}
+                  <button
+                    type="button"
+                    onClick={() => setIsQrScannerOpen(true)}
+                    className="py-3.5 px-4 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border-2 border-emerald-400 text-emerald-950 font-black text-xs flex items-center gap-1.5 shadow-xs transition-all cursor-pointer flex-shrink-0"
+                    title="Scan Recipient QR Code"
+                  >
+                    <Camera className="w-4 h-4 text-emerald-800" />
+                    <span className="hidden sm:inline">Scan QR</span>
+                  </button>
                 </div>
 
                 {/* Quick Directory Contacts */}
                 <div className="pt-1">
-                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
-                    Quick Transfer Suggestions
-                  </span>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                      Quick Transfer Suggestions
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setIsQrScannerOpen(true)}
+                      className="text-[11px] font-bold text-emerald-700 hover:text-emerald-900 flex items-center gap-1 cursor-pointer"
+                    >
+                      <QrCode className="w-3.5 h-3.5" />
+                      <span>Scan QR Code</span>
+                    </button>
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     {quickContacts.map((contact) => (
                       <button
@@ -493,5 +522,16 @@ export const SendMoneyModal: React.FC = () => {
         </div>
       </div>
     </div>
+
+    {/* Recipient QR Scanner Modal */}
+    <QrScannerModal
+      isOpen={isQrScannerOpen}
+      onClose={() => setIsQrScannerOpen(false)}
+      onScanSuccess={(scanned) => {
+        setRecipientInput(scanned.identifier);
+        handleLookup(scanned.identifier);
+      }}
+    />
+  </>
   );
 };

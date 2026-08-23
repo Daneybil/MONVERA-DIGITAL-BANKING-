@@ -30,6 +30,7 @@ import {
 } from 'lucide-react';
 import { InvestmentReceiptModal } from './InvestmentReceiptModal';
 import { InvestmentShareModal } from './InvestmentShareModal';
+import { InvestmentAccrualModal } from './InvestmentAccrualModal';
 
 const SUPPORTED_TERMS: { termDays: InvestmentTermDays; dailyRate: number; planName: string; minAmount: number }[] = [
   { termDays: 60, dailyRate: 4.5, planName: 'Monvera 60-Day Term Plan', minAmount: 100 },
@@ -55,9 +56,20 @@ export const InvestmentsView: React.FC = () => {
   const [isFastForwarding, setIsFastForwarding] = useState<string | null>(null);
   const [earlyWithdrawalNotice, setEarlyWithdrawalNotice] = useState<string | null>(null);
 
-  // Receipt & Share Modals
+  // Receipt, Share & Accrual Schedule Modals
   const [receiptInv, setReceiptInv] = useState<InvestmentPlan | null>(null);
   const [shareInv, setShareInv] = useState<InvestmentPlan | null>(null);
+  const [accrualModalInv, setAccrualModalInv] = useState<InvestmentPlan | null>(null);
+
+  // Live 1-Second Real-Time Ticker for 24h cycle countdown
+  const [currentTime, setCurrentTime] = useState<number>(Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   // History Filters & Search
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -87,10 +99,16 @@ export const InvestmentsView: React.FC = () => {
   const expectedReturn = Number((dailyInterest * activePlan.termDays).toFixed(2));
   const totalAtMaturity = Number((principalNum + expectedReturn).toFixed(2));
 
-  // Compute active investments stats
+  // Compute active investments stats and live accrued profits
   const activeInvestments = investments.filter((i) => i.status === 'ACTIVE');
   const totalDailyAccrual = activeInvestments.reduce((acc, curr) => acc + curr.amount * 0.045, 0);
   const totalProjectedAccrual = activeInvestments.reduce((acc, curr) => acc + curr.expectedYield, 0);
+
+  const totalAccruedProfitLive = activeInvestments.reduce((acc, inv) => {
+    const elapsed = Math.max(0, currentTime - new Date(inv.startDate).getTime());
+    const cycles = Math.min(inv.termDays, Math.floor(elapsed / (24 * 60 * 60 * 1000)));
+    return acc + cycles * (inv.amount * 0.045);
+  }, 0);
 
   const handleCreateInvestment = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -262,28 +280,36 @@ export const InvestmentsView: React.FC = () => {
             </div>
 
             {/* Quick Metrics Sub-Box */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5 bg-slate-950/80 p-4 sm:p-5 rounded-2xl border-2 border-slate-700 font-mono">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-950/80 p-4 sm:p-5 rounded-2xl border-2 border-slate-700 font-mono">
               <div className="space-y-0.5">
                 <span className="text-[11px] uppercase text-slate-400 font-bold block">
                   Active Contracts
                 </span>
-                <span className="text-xl sm:text-2xl font-black text-white">
+                <span className="text-lg sm:text-xl font-black text-white">
                   {activeInvestments.length} {activeInvestments.length === 1 ? 'Plan' : 'Plans'}
+                </span>
+              </div>
+              <div className="space-y-0.5">
+                <span className="text-[11px] uppercase text-emerald-400 font-bold block">
+                  Accrued Profit So Far
+                </span>
+                <span className="text-lg sm:text-xl font-black text-emerald-400">
+                  +${totalAccruedProfitLive.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                 </span>
               </div>
               <div className="space-y-0.5">
                 <span className="text-[11px] uppercase text-slate-400 font-bold block">
                   Daily Yield (24h)
                 </span>
-                <span className="text-xl sm:text-2xl font-black text-emerald-400">
+                <span className="text-lg sm:text-xl font-black text-emerald-400">
                   +${totalDailyAccrual.toLocaleString('en-US', { minimumFractionDigits: 2 })}/d
                 </span>
               </div>
-              <div className="col-span-2 sm:col-span-1 space-y-0.5 border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-800">
+              <div className="space-y-0.5">
                 <span className="text-[11px] uppercase text-slate-400 font-bold block">
                   Projected Profits
                 </span>
-                <span className="text-xl sm:text-2xl font-black text-emerald-400">
+                <span className="text-lg sm:text-xl font-black text-emerald-400">
                   +${totalProjectedAccrual.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                 </span>
               </div>
@@ -647,20 +673,36 @@ export const InvestmentsView: React.FC = () => {
 
               const startDateObj = new Date(inv.startDate);
               const maturityDateObj = new Date(inv.maturityDate);
+              const startDateMs = startDateObj.getTime();
+              const maturityDateMs = maturityDateObj.getTime();
 
-              // Calculate time progress
-              const totalDurationMs = maturityDateObj.getTime() - startDateObj.getTime();
-              const elapsedMs = Math.max(0, Date.now() - startDateObj.getTime());
+              // Calculate time progress and 24-hour cycles
+              const totalDurationMs = maturityDateMs - startDateMs;
+              const elapsedMs = Math.max(0, currentTime - startDateMs);
+              const dayLengthMs = 24 * 60 * 60 * 1000;
+              const totalDays = inv.termDays;
+              const completedCycles = Math.min(totalDays, Math.floor(elapsedMs / dayLengthMs));
+              const accruedProfit = Number((completedCycles * invDaily).toFixed(2));
+              const currentRunningValue = Number((inv.amount + accruedProfit).toFixed(2));
+
+              const nextPayoutMs = startDateMs + (completedCycles + 1) * dayLengthMs;
+              const msToNext = Math.max(0, nextPayoutMs - currentTime);
+              const hoursToNext = Math.floor(msToNext / (1000 * 60 * 60));
+              const minsToNext = Math.floor((msToNext % (1000 * 60 * 60)) / (1000 * 60));
+              const secsToNext = Math.floor((msToNext % (1000 * 60)) / 1000);
+              const countdownStr = `${String(hoursToNext).padStart(2, '0')}:${String(minsToNext).padStart(2, '0')}:${String(secsToNext).padStart(2, '0')}`;
+
               const progressPercent = isActive
                 ? Math.min(100, Math.round((elapsedMs / totalDurationMs) * 100))
                 : 100;
               const daysRemaining = isActive
-                ? Math.max(0, Math.ceil((maturityDateObj.getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
+                ? Math.max(0, totalDays - completedCycles)
                 : 0;
 
               return (
                 <div
                   key={inv.id}
+                  id={`investment-card-${inv.id}`}
                   className={`p-6 sm:p-7 rounded-3xl border-2 transition-all space-y-5 shadow-xl flex flex-col justify-between ${
                     isActive
                       ? 'bg-white border-emerald-500 shadow-emerald-950/10'
@@ -668,26 +710,110 @@ export const InvestmentsView: React.FC = () => {
                   }`}
                 >
                   <div className="space-y-4">
-                    <div className="flex items-center justify-between">
+                    {/* Status and 24h Yield Badges */}
+                    <div className="flex items-center justify-between gap-2">
                       <span
-                        className={`text-xs font-mono uppercase font-black px-3 py-1 rounded-xl border-2 ${
+                        className={`inline-flex items-center gap-2 text-xs font-mono uppercase font-black px-3 py-1.5 rounded-xl border-2 ${
                           isActive
                             ? 'bg-emerald-100 text-emerald-950 border-emerald-500'
                             : 'bg-slate-200 text-slate-800 border-slate-400'
                         }`}
                       >
-                        {isActive ? 'LOCKED & EARNING' : 'MATURED & SETTLED'}
+                        {isActive && (
+                          <span className="relative flex h-2.5 w-2.5">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-600"></span>
+                          </span>
+                        )}
+                        <span>{isActive ? 'LOCKED & EARNING' : 'MATURED & SETTLED'}</span>
                       </span>
-                      <span className="text-xs font-mono font-black text-emerald-950 bg-emerald-200 border-2 border-emerald-400 px-2.5 py-1 rounded-xl">
-                        4.50% / 24h
+                      <span className="text-xs font-mono font-black text-emerald-950 bg-emerald-200 border-2 border-emerald-400 px-3 py-1.5 rounded-xl">
+                        +4.50% / 24 Hours
                       </span>
                     </div>
 
                     <div>
-                      <h3 className="font-black text-slate-950 text-xl">{inv.planName}</h3>
+                      <h3 className="font-black text-slate-950 text-xl tracking-tight">{inv.planName}</h3>
                       <span className="text-xs text-slate-500 font-mono font-bold block mt-0.5">
-                        Ref: #{inv.id.slice(-8).toUpperCase()}
+                        Contract Ref: #{inv.id.slice(-8).toUpperCase()}
                       </span>
+                    </div>
+
+                    {/* Prominent 3D 24-Hour Live Countdown Box */}
+                    {isActive ? (
+                      <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 border-2 border-emerald-500 text-white font-mono shadow-lg space-y-2.5">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-black text-emerald-400 flex items-center gap-1.5 uppercase tracking-wider">
+                            <Clock className="w-3.5 h-3.5 animate-spin" style={{ animationDuration: '8s' }} />
+                            <span>Next 4.50% Profit Payout</span>
+                          </span>
+                          <span className="px-2 py-0.5 rounded-md bg-emerald-900/80 text-emerald-300 border border-emerald-500/50 font-black text-[11px]">
+                            +${invDaily.toFixed(2)}
+                          </span>
+                        </div>
+
+                        {/* Large Bold Digital Ticker */}
+                        <div className="flex items-center justify-center gap-2 bg-slate-950/80 py-2.5 px-3 rounded-xl border border-slate-700">
+                          <div className="text-center">
+                            <span className="text-xl sm:text-2xl font-black text-white tracking-wider block">
+                              {String(hoursToNext).padStart(2, '0')}
+                            </span>
+                            <span className="text-[9px] uppercase font-black text-slate-400">Hours</span>
+                          </div>
+                          <span className="text-xl sm:text-2xl font-black text-emerald-400 -mt-2">:</span>
+                          <div className="text-center">
+                            <span className="text-xl sm:text-2xl font-black text-white tracking-wider block">
+                              {String(minsToNext).padStart(2, '0')}
+                            </span>
+                            <span className="text-[9px] uppercase font-black text-slate-400">Mins</span>
+                          </div>
+                          <span className="text-xl sm:text-2xl font-black text-emerald-400 -mt-2">:</span>
+                          <div className="text-center">
+                            <span className="text-xl sm:text-2xl font-black text-emerald-400 tracking-wider block animate-pulse">
+                              {String(secsToNext).padStart(2, '0')}
+                            </span>
+                            <span className="text-[9px] uppercase font-black text-emerald-400">Secs</span>
+                          </div>
+                        </div>
+
+                        <p className="text-[11px] text-slate-300 font-extrabold text-center">
+                          Auto-credited every 24 hours • Cycle {completedCycles + 1} of {totalDays}
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="p-3.5 rounded-2xl bg-slate-100 border-2 border-slate-300 font-mono text-center space-y-1">
+                        <span className="text-xs uppercase font-black text-slate-600 flex items-center justify-center gap-1.5">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                          <span>All {totalDays} Cycles Distributed</span>
+                        </span>
+                        <span className="text-sm font-black text-slate-900 block">
+                          Full 4.5% Profit Settled to Checking
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Accrued Profit & Current Running Value Box */}
+                    <div className="p-3.5 rounded-2xl bg-emerald-50 border-2 border-emerald-300 font-mono space-y-2">
+                      <div className="flex items-center justify-between text-xs font-black">
+                        <span className="text-slate-700">Accrued Profit So Far:</span>
+                        <span className="text-emerald-700 font-black text-sm">
+                          +${accruedProfit.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between text-xs font-black">
+                        <span className="text-slate-700">Current Portfolio Value:</span>
+                        <span className="text-slate-950 font-black text-sm">
+                          ${currentRunningValue.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[11px] font-bold text-slate-600 pt-1 border-t border-emerald-200">
+                        <span>Daily Distribution Status:</span>
+                        <span className="font-black text-emerald-950">
+                          {completedCycles} of {totalDays} Days Credited
+                        </span>
+                      </div>
                     </div>
 
                     {/* Accurate Timestamps: Deposit Time & Expiry Time */}
@@ -729,10 +855,10 @@ export const InvestmentsView: React.FC = () => {
                       {/* Progress Bar */}
                       <div className="pt-1.5 space-y-1">
                         <div className="flex justify-between text-[11px] font-black text-slate-600">
-                          <span>{isActive ? `${daysRemaining} days left` : 'Completed'}</span>
+                          <span>{isActive ? `${daysRemaining} days remaining` : 'Completed'}</span>
                           <span>{progressPercent}% Elapsed</span>
                         </div>
-                        <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
+                        <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
                           <div
                             className="h-full bg-emerald-500 rounded-full transition-all duration-300"
                             style={{ width: `${progressPercent}%` }}
@@ -748,11 +874,11 @@ export const InvestmentsView: React.FC = () => {
                         <span className="font-black text-slate-950">${inv.amount.toLocaleString()}</span>
                       </div>
                       <div className="flex justify-between text-slate-700">
-                        <span>Daily Profit (24h):</span>
+                        <span>Daily Profit (24h Rate):</span>
                         <span className="font-black text-emerald-700">+${invDaily.toLocaleString('en-US', { minimumFractionDigits: 2 })}/day</span>
                       </div>
                       <div className="flex justify-between text-slate-700">
-                        <span>Total Term Earnings:</span>
+                        <span>Total Term Guaranteed Earnings:</span>
                         <span className="font-black text-emerald-700">+${inv.expectedYield.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
                       </div>
                       <div className="flex justify-between text-slate-900 pt-2 border-t border-slate-200">
@@ -767,6 +893,15 @@ export const InvestmentsView: React.FC = () => {
                   {/* Actions Bar */}
                   <div className="pt-4 space-y-2.5 border-t-2 border-slate-100">
                     
+                    {/* View 24h Profit Accrual Schedule Button */}
+                    <button
+                      onClick={() => setAccrualModalInv(inv)}
+                      className="w-full py-2.5 px-3 rounded-xl text-xs font-black text-emerald-950 bg-emerald-100 hover:bg-emerald-200 border-2 border-emerald-500 transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+                    >
+                      <Layers className="w-4 h-4 text-emerald-700" />
+                      <span>View 24h Profit Schedule ({completedCycles} of {totalDays} Credited)</span>
+                    </button>
+
                     {/* Certificate & Share Buttons */}
                     <div className="grid grid-cols-2 gap-2">
                       <button
@@ -779,7 +914,7 @@ export const InvestmentsView: React.FC = () => {
 
                       <button
                         onClick={() => setShareInv(inv)}
-                        className="py-2 px-3 rounded-xl text-xs font-black text-emerald-950 bg-emerald-100 hover:bg-emerald-200 border border-emerald-400 transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                        className="py-2 px-3 rounded-xl text-xs font-black text-emerald-950 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
                       >
                         <Share2 className="w-3.5 h-3.5 text-emerald-700" />
                         <span>Share Plan</span>
@@ -836,6 +971,15 @@ export const InvestmentsView: React.FC = () => {
           investment={shareInv}
           user={currentUser}
           onClose={() => setShareInv(null)}
+        />
+      )}
+
+      {/* 24-Hour Profit Accrual & Daily Distribution Schedule Modal */}
+      {accrualModalInv && (
+        <InvestmentAccrualModal
+          investment={accrualModalInv}
+          currentTime={currentTime}
+          onClose={() => setAccrualModalInv(null)}
         />
       )}
 

@@ -497,10 +497,15 @@ export class MonveraDatabase {
       }
     }
 
-    // Active term investments sum
+    // Active term investments sum & dynamic 24h profit accrual
     const activeInvestments = Array.from(this.investments.values()).filter(
       (i) => i.userId === userId && i.status === 'ACTIVE'
     );
+    for (const inv of activeInvestments) {
+      const elapsedMs = Math.max(0, Date.now() - new Date(inv.startDate).getTime());
+      const completedDays = Math.min(inv.termDays, Math.floor(elapsedMs / (24 * 60 * 60 * 1000)));
+      inv.totalAccruedEarnings = Number((completedDays * (inv.amount * 0.045)).toFixed(2));
+    }
     const totalActiveInvestmentsAmount = activeInvestments.reduce((sum, i) => sum + i.amount, 0);
     const totalAccruedEarnings = activeInvestments.reduce((sum, i) => sum + i.totalAccruedEarnings, 0);
 
