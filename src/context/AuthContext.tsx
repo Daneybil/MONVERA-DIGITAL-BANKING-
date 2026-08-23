@@ -120,15 +120,80 @@ function getFirebaseErrorMessage(err: any): string {
   return 'An unexpected authentication error occurred. Please try again.';
 }
 
+// Check if the current URL path or hash matches private admin access
+const checkIsAdminPath = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  try {
+    const rawPath = window.location.pathname.toLowerCase().replace(/\/+$/, '').trim();
+    const hash = window.location.hash.toLowerCase().replace(/^#\/?/, '').trim();
+    const search = window.location.search.toLowerCase();
+
+    return (
+      rawPath === '/monveramv' ||
+      rawPath === '/monvera-mv' ||
+      rawPath === '/monvera_mv' ||
+      rawPath === '/monvera/mv' ||
+      hash === 'monveramv' ||
+      hash === 'monvera-mv' ||
+      hash === 'monvera_mv' ||
+      hash === '/monveramv' ||
+      search.includes('admin=monveramv') ||
+      search.includes('monveramv')
+    );
+  } catch {
+    return false;
+  }
+};
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [balanceMetrics, setBalanceMetrics] = useState<BalanceMetrics | null>(null);
   const [availableUsers, setAvailableUsers] = useState<UserProfile[]>([]);
-  const [currentView, setCurrentView] = useState<AppView>('home');
+  const [currentView, setCurrentViewState] = useState<AppView>(() => {
+    return checkIsAdminPath() ? 'admin' : 'home';
+  });
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState<number>(Date.now());
   const [activeModal, setActiveModal] = useState<'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null>(null);
+
+  const setCurrentView = useCallback((view: AppView) => {
+    setCurrentViewState(view);
+    try {
+      if (typeof window !== 'undefined') {
+        if (view === 'admin') {
+          if (window.location.pathname.toLowerCase() !== '/monveramv') {
+            window.history.pushState(null, '', '/MonveraMV');
+          }
+        } else if (checkIsAdminPath()) {
+          window.history.pushState(null, '', '/');
+        }
+      }
+    } catch {
+      // Safe fallback for restricted iframe contexts
+    }
+  }, []);
+
+  // Listen to browser URL changes (e.g. user manually typing /MonveraMV or pressing back/forward)
+  useEffect(() => {
+    const handleUrlChange = () => {
+      if (checkIsAdminPath()) {
+        setCurrentViewState('admin');
+      }
+    };
+
+    window.addEventListener('popstate', handleUrlChange);
+    window.addEventListener('hashchange', handleUrlChange);
+
+    if (checkIsAdminPath()) {
+      setCurrentViewState('admin');
+    }
+
+    return () => {
+      window.removeEventListener('popstate', handleUrlChange);
+      window.removeEventListener('hashchange', handleUrlChange);
+    };
+  }, []);
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -389,13 +454,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           dateOfBirth: finalUser.dateOfBirth,
           maritalStatus: finalUser.maritalStatus,
           permanentAccountNumber: finalUser.permanentAccountNumber,
+          kycStatus: finalUser.kycStatus,
+          kycDocumentType: finalUser.kycDocumentType,
+          kycDocumentNumber: finalUser.kycDocumentNumber,
+          kycVerifiedAt: finalUser.kycVerifiedAt,
           password: cleanPassword,
         }).catch(() => ({ success: true, user: finalUser, balanceMetrics: null })),
         api.getNotifications(uid).catch(() => ({ notifications: [] }))
       ]);
 
       if (backendSync?.user) {
-        setCurrentUser({ ...backendSync.user, avatarUrl: persistedAvatar });
+        const mergedUser: UserProfile = {
+          ...backendSync.user,
+          ...userProfile, // Firestore is the single source of truth for customer profile & KYC status
+          avatarUrl: persistedAvatar,
+        };
+        setCurrentUser(mergedUser);
       }
 
       if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts) {

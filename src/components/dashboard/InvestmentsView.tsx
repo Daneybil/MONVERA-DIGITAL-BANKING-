@@ -13,7 +13,6 @@ import {
   ArrowRight,
   Sparkles,
   Lock,
-  FastForward,
   Layers,
   HelpCircle,
   Info,
@@ -53,7 +52,6 @@ export const InvestmentsView: React.FC = () => {
   const [principalAmount, setPrincipalAmount] = useState<string>('1000');
   const [isCreating, setIsCreating] = useState<boolean>(false);
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [isFastForwarding, setIsFastForwarding] = useState<string | null>(null);
   const [earlyWithdrawalNotice, setEarlyWithdrawalNotice] = useState<string | null>(null);
 
   // Receipt, Share & Accrual Schedule Modals
@@ -165,33 +163,6 @@ export const InvestmentsView: React.FC = () => {
       });
     } finally {
       setIsCreating(false);
-    }
-  };
-
-  const handleFastForwardMaturity = async (invId: string) => {
-    setIsFastForwarding(invId);
-    try {
-      const res = await api.matureInvestment(invId);
-      if (res.success) {
-        setFeedbackMsg({
-          type: 'success',
-          text: `Term investment matured! Principal and full 4.50% daily interest returned to your Checking Account.`,
-        });
-        const invRes = await api.getInvestments(currentUser.id);
-        if (invRes.investments) setInvestments(invRes.investments);
-        await refreshBalance();
-        await refreshNotifications();
-        confetti({
-          particleCount: 100,
-          spread: 80,
-          origin: { y: 0.5 },
-          colors: ['#10b981', '#34d399', '#fbbf24'],
-        });
-      }
-    } catch (err) {
-      setFeedbackMsg({ type: 'error', text: 'Failed to mature investment.' });
-    } finally {
-      setIsFastForwarding(null);
     }
   };
 
@@ -667,7 +638,6 @@ export const InvestmentsView: React.FC = () => {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {filteredInvestments.map((inv) => {
-              const isFast = isFastForwarding === inv.id;
               const isActive = inv.status === 'ACTIVE';
               const invDaily = Number((inv.amount * 0.045).toFixed(2));
 
@@ -922,31 +892,17 @@ export const InvestmentsView: React.FC = () => {
                     </div>
 
                     {isActive && (
-                      <>
-                        {/* Early Withdrawal Information Trigger Button */}
-                        <button
-                          onClick={() =>
-                            setEarlyWithdrawalNotice(
-                              `This ${inv.termDays}-Day Term Investment is locked until ${maturityDateObj.toLocaleDateString()} at ${maturityDateObj.toLocaleTimeString()}. Fixed term contracts cannot be withdrawn prior to maturity. Once the term concludes, your full principal ($${inv.amount.toLocaleString()}) and all 4.5% daily interest ($${inv.expectedYield.toLocaleString()}) will automatically be available for instant withdrawal.`
-                            )
-                          }
-                          className="w-full py-2.5 px-3 rounded-xl text-xs font-black text-amber-900 bg-amber-100 hover:bg-amber-200 border-2 border-amber-400 transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
-                        >
-                          <Lock className="w-4 h-4 text-amber-700" />
-                          <span>Withdrawal Status: Locked Until Maturity</span>
-                        </button>
-
-                        {/* Simulator Button */}
-                        <button
-                          onClick={() => handleFastForwardMaturity(inv.id)}
-                          disabled={isFast}
-                          className="w-full py-2 px-3 rounded-xl text-xs font-black text-slate-700 bg-slate-100 hover:bg-slate-200 transition-colors flex items-center justify-center gap-1.5 border border-slate-300 cursor-pointer shadow-xs"
-                          title="Simulate maturity date arrival and immediate ledger settlement"
-                        >
-                          <FastForward className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>{isFast ? 'Settling Funds...' : 'Simulate Maturity Payout (Test)'}</span>
-                        </button>
-                      </>
+                      <button
+                        onClick={() =>
+                          setEarlyWithdrawalNotice(
+                            `This ${inv.termDays}-Day Term Investment is locked until ${maturityDateObj.toLocaleDateString()} at ${maturityDateObj.toLocaleTimeString()}. Fixed term contracts cannot be withdrawn prior to maturity. Once the term concludes, your full principal ($${inv.amount.toLocaleString()}) and all 4.5% daily interest ($${inv.expectedYield.toLocaleString()}) will automatically be available for instant withdrawal.`
+                          )
+                        }
+                        className="w-full py-3 px-3.5 rounded-xl text-xs font-black text-amber-950 bg-amber-100 hover:bg-amber-200 border-2 border-amber-400 transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                      >
+                        <Lock className="w-4 h-4 text-amber-800" />
+                        <span>Withdrawal Status: Locked Until Maturity</span>
+                      </button>
                     )}
                   </div>
                 </div>

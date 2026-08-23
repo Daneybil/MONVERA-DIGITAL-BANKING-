@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import officeHeroImage from '../../assets/images/monvera_office_hero_1787152640128.jpg';
+import luxuryCardholderImage from '../../assets/images/monvera_luxury_cardholder_1787487721200.jpg';
 import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, CheckCircle2, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star, Lock } from 'lucide-react';
 
 export const HeroSection: React.FC = () => {
@@ -37,9 +38,9 @@ export const HeroSection: React.FC = () => {
   };
 
   return (
-    <section className="relative overflow-hidden bg-gradient-to-b from-white via-slate-50/60 to-slate-100/40 pt-20 pb-20 lg:pt-28 lg:pb-28">
-      {/* Subtle Background Radial Atmosphere */}
-      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full max-w-7xl h-96 bg-gradient-to-tr from-amber-100/30 via-slate-100/30 to-emerald-100/20 blur-3xl pointer-events-none" />
+    <section className="relative overflow-hidden bg-[#FAF7F2] pt-20 pb-20 lg:pt-28 lg:pb-28 border-b border-amber-900/10">
+      {/* Subtle Background Warm Milk Radial Atmosphere */}
+      <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full max-w-7xl h-96 bg-gradient-to-tr from-amber-200/25 via-orange-100/20 to-emerald-100/15 blur-3xl pointer-events-none" />
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 relative text-center space-y-10">
         
@@ -165,10 +166,10 @@ export const HeroSection: React.FC = () => {
               </span>
             </div>
 
-            {/* Lineup of Robust, Authentic Profile Icons of People who Reviewed */}
+            {/* Lineup of Profile Icons of People who Reviewed - Overlapping Stack Design */}
             <div className="flex flex-col items-center justify-center gap-4 pt-1 w-full max-w-full px-2">
-              {/* Profile Avatars: Responsive Wrap & Fully Visible Edges on Mobile */}
-              <div className="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 p-2 max-w-xl mx-auto">
+              {/* Profile Avatars Touching & Overlapping Each Other */}
+              <div className="flex items-center justify-center -space-x-3 sm:-space-x-3.5 p-2 max-w-xl mx-auto overflow-x-auto py-3">
                 {[
                   { name: 'Sarah Jenkins, Portfolio Lead', src: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80' },
                   { name: 'David Chen, Managing Director', src: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80' },
@@ -188,7 +189,7 @@ export const HeroSection: React.FC = () => {
                   <div
                     key={idx}
                     title={user.name}
-                    className="relative flex-shrink-0 w-9 h-9 sm:w-11 sm:h-11 rounded-full border-2 border-white ring-2 ring-emerald-500/40 shadow-md transition-all duration-200 hover:scale-125 hover:z-30 hover:ring-emerald-600 cursor-pointer"
+                    className="relative flex-shrink-0 w-10 h-10 sm:w-12 sm:h-12 rounded-full border-[3px] border-[#FAF7F2] ring-1 ring-slate-300 shadow-md transition-all duration-200 hover:scale-130 hover:z-40 hover:ring-2 hover:ring-emerald-500 cursor-pointer"
                   >
                     <img
                       src={user.src}
@@ -199,8 +200,8 @@ export const HeroSection: React.FC = () => {
                   </div>
                 ))}
                 
-                {/* Additional Counter Badge */}
-                <div className="relative flex-shrink-0 inline-flex items-center justify-center w-9 h-9 sm:w-11 sm:h-11 rounded-full bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 text-white font-mono text-[11px] sm:text-xs font-black border-2 border-white ring-2 ring-emerald-500 shadow-md">
+                {/* Additional Counter Badge Overlapping on the Stack */}
+                <div className="relative flex-shrink-0 inline-flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 text-white font-mono text-[11px] sm:text-xs font-black border-[3px] border-[#FAF7F2] ring-1 ring-slate-300 shadow-md">
                   +2.4M
                 </div>
               </div>
@@ -210,6 +211,26 @@ export const HeroSection: React.FC = () => {
                 <span>Trusted by</span>
                 <span className="text-emerald-700 font-black text-base sm:text-lg">2,400,000+</span>
                 <span>depositors globally</span>
+              </div>
+
+              {/* Bold Rectangular Monvera Luxury Cardholder Image Placed Underneath Depositors Badge */}
+              <div className="w-full max-w-5xl mx-auto mt-6 rounded-2xl sm:rounded-3xl overflow-hidden shadow-2xl border-2 border-slate-800/40 bg-slate-950 relative group transition-all duration-300 hover:shadow-slate-950/30">
+                <img
+                  src={luxuryCardholderImage}
+                  alt="Monvera Executive Cardholder & Premium Banking"
+                  className="w-full h-72 sm:h-96 md:h-[440px] object-cover transition-transform duration-700 group-hover:scale-102"
+                  referrerPolicy="no-referrer"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-slate-950/85 via-slate-950/20 to-transparent pointer-events-none" />
+                <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between pointer-events-none">
+                  <span className="text-xs sm:text-sm uppercase font-mono tracking-widest text-amber-400 font-extrabold bg-slate-950/95 backdrop-blur-xs px-4 py-2 rounded-xl border border-amber-500/50 shadow-md flex items-center gap-2">
+                    <CreditCard className="w-4 h-4 text-amber-400" />
+                    <span>MONVERA ELITE CARDHOLDER & WEALTH SUITE</span>
+                  </span>
+                  <span className="text-xs sm:text-sm font-mono font-bold text-emerald-300 bg-slate-900/95 px-3.5 py-2 rounded-xl border border-emerald-500/50 shadow-md">
+                    WORLDWIDE ACCEPTANCE
+                  </span>
+                </div>
               </div>
             </div>
           </div>

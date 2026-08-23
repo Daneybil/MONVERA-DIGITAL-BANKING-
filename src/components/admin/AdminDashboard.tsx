@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { firestoreSync } from '../../services/firestoreSync';
 import {
   UserProfile,
   Transaction,
@@ -144,6 +145,29 @@ export const AdminDashboard: React.FC = () => {
       });
       if (res.success) {
         await loadAllAdminData();
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleApproveKyc = async (userId: string) => {
+    try {
+      const res = await api.approveKyc({
+        userId,
+        adminId: currentUser?.id || 'usr_admin',
+      });
+      if (res.success && res.user) {
+        // Persist verified status to Firestore
+        await firestoreSync.saveUserProfile(userId, res.user);
+        await loadAllAdminData();
+        await refreshNotifications();
+        confetti({
+          particleCount: 50,
+          spread: 60,
+          origin: { y: 0.7 },
+          colors: ['#0284c7', '#10b981'],
+        });
       }
     } catch (err) {
       console.error(err);
@@ -354,8 +378,9 @@ export const AdminDashboard: React.FC = () => {
               <tr>
                 <th className="p-3.5">Customer</th>
                 <th className="p-3.5">Permanent Account</th>
-                <th className="p-3.5">Tier</th>
-                <th className="p-3.5">Status</th>
+                <th className="p-3.5">Country & ID</th>
+                <th className="p-3.5">KYC Status</th>
+                <th className="p-3.5">Account Status</th>
                 <th className="p-3.5 text-right">Actions</th>
               </tr>
             </thead>
@@ -367,7 +392,25 @@ export const AdminDashboard: React.FC = () => {
                     <div className="text-[10px] text-slate-500">{u.email}</div>
                   </td>
                   <td className="p-3.5 text-slate-700">{u.permanentAccountNumber}</td>
-                  <td className="p-3.5 text-emerald-700 font-sans font-bold">{u.membershipTier}</td>
+                  <td className="p-3.5 font-sans">
+                    <div className="text-slate-900 font-semibold">{u.country || 'Nigeria'}</div>
+                    <div className="text-[10px] text-slate-500 font-mono">
+                      {u.kycDocumentType ? `${u.kycDocumentType}: ${u.kycDocumentNumber || 'Submitted'}` : 'No ID'}
+                    </div>
+                  </td>
+                  <td className="p-3.5 font-sans">
+                    <span
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                        u.kycStatus === 'verified'
+                          ? 'bg-sky-100 text-sky-950 border border-sky-300'
+                          : u.kycStatus === 'pending'
+                          ? 'bg-amber-100 text-amber-950 border border-amber-300'
+                          : 'bg-slate-100 text-slate-700 border border-slate-300'
+                      }`}
+                    >
+                      {u.kycStatus === 'verified' ? '✓ Verified' : u.kycStatus === 'pending' ? '⧗ Under Review' : 'Unverified'}
+                    </span>
+                  </td>
                   <td className="p-3.5 font-sans">
                     <span
                       className={`px-2 py-0.5 rounded text-[10px] font-bold ${
@@ -379,7 +422,16 @@ export const AdminDashboard: React.FC = () => {
                       {u.status}
                     </span>
                   </td>
-                  <td className="p-3.5 text-right font-sans">
+                  <td className="p-3.5 text-right font-sans space-x-1.5">
+                    {u.kycStatus !== 'verified' && (
+                      <button
+                        onClick={() => handleApproveKyc(u.id)}
+                        className="px-2.5 py-1 text-xs font-bold rounded-lg bg-sky-600 hover:bg-sky-700 text-white transition-colors cursor-pointer"
+                        title="Approve Customer KYC"
+                      >
+                        Approve KYC
+                      </button>
+                    )}
                     <button
                       onClick={() => handleToggleFreezeUser(u.id)}
                       className={`px-3 py-1 text-xs font-bold rounded-lg transition-colors ${
@@ -395,6 +447,106 @@ export const AdminDashboard: React.FC = () => {
               ))}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      {/* --- KYC ONBOARDING & COMPLIANCE BOARD --- */}
+      <div className="space-y-4">
+        <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+          <Shield className="w-5 h-5 text-sky-600" />
+          <span>KYC Compliance & Verification Queue</span>
+        </h3>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {customers
+            .filter((u) => u.kycStatus === 'pending' || u.kycDocumentType || u.kycDocumentNumber)
+            .map((u) => (
+              <div
+                key={`kyc-card-${u.id}`}
+                className="p-5 rounded-2xl bg-white border-2 border-slate-200 shadow-xs space-y-3"
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="font-bold text-slate-900 text-sm">
+                      {u.firstName} {u.lastName}
+                    </h4>
+                    <p className="text-xs text-slate-500 font-mono">
+                      Acct: {u.permanentAccountNumber} • {u.country || 'Nigeria'}
+                    </p>
+                  </div>
+                  <span
+                    className={`px-2.5 py-0.5 rounded-md text-xs font-black ${
+                      u.kycStatus === 'verified'
+                        ? 'bg-sky-100 text-sky-950 border border-sky-300'
+                        : 'bg-amber-100 text-amber-950 border border-amber-300'
+                    }`}
+                  >
+                    {u.kycStatus === 'verified' ? 'Verified' : 'Under Review'}
+                  </span>
+                </div>
+
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs font-mono space-y-1">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">ID Type:</span>
+                    <span className="font-bold text-slate-900">{u.kycDocumentType || 'Passport'}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">ID Code / No:</span>
+                    <span className="font-bold text-slate-900">{u.kycDocumentNumber || 'N/A'}</span>
+                  </div>
+                  {u.kycSsn && (
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">US SSN:</span>
+                      <span className="font-bold text-sky-800">{u.kycSsn}</span>
+                    </div>
+                  )}
+                  {u.kycStreetAddress && (
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Address:</span>
+                      <span className="font-medium text-slate-900 truncate max-w-[200px]">{u.kycStreetAddress}</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Previews if images exist */}
+                {(u.kycDocumentImage || u.kycLiveSelfieImage) && (
+                  <div className="flex items-center gap-2 pt-1">
+                    {u.kycDocumentImage && (
+                      <div className="w-16 h-12 rounded-lg border border-slate-300 overflow-hidden bg-slate-100 shrink-0">
+                        <img
+                          src={u.kycDocumentImage}
+                          alt="Document"
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                    )}
+                    {u.kycLiveSelfieImage && (
+                      <div className="w-12 h-12 rounded-full border border-slate-300 overflow-hidden bg-slate-100 shrink-0">
+                        <img
+                          src={u.kycLiveSelfieImage}
+                          alt="Live Selfie"
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                    )}
+                    <span className="text-[11px] text-slate-500 font-semibold">
+                      Document & Live Biometric Captured
+                    </span>
+                  </div>
+                )}
+
+                {u.kycStatus !== 'verified' && (
+                  <button
+                    type="button"
+                    onClick={() => handleApproveKyc(u.id)}
+                    className="w-full py-2 px-3 rounded-xl bg-slate-950 hover:bg-slate-900 text-white text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Approve & Issue $1,000,000 Daily Limit</span>
+                  </button>
+                )}
+              </div>
+            ))}
         </div>
       </div>
 

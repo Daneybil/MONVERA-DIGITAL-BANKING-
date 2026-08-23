@@ -29,7 +29,7 @@ export const InvestmentTermPreview: React.FC = () => {
   const expectedMaturityValue = Number((investAmount + expectedYield).toFixed(2));
 
   return (
-    <section id="investments" className="py-20 lg:py-28 bg-slate-950 text-white relative overflow-hidden">
+    <section id="investments" className="py-20 lg:py-28 bg-[#182130] text-white relative overflow-hidden border-t border-slate-700/60">
       {/* Visual background accents */}
       <div className="absolute top-0 right-0 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
       <div className="absolute bottom-0 left-0 w-96 h-96 bg-blue-500/10 rounded-full blur-3xl pointer-events-none" />
@@ -37,7 +37,7 @@ export const InvestmentTermPreview: React.FC = () => {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 relative">
         
         <div className="text-center max-w-3xl mx-auto space-y-4 mb-16">
-          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-xl bg-emerald-950 text-emerald-300 border-2 border-emerald-500 text-sm font-black tracking-wide">
+          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-xl bg-emerald-950/90 text-emerald-300 border-2 border-emerald-500 text-sm font-black tracking-wide">
             <ShieldCheck className="w-5 h-5 text-emerald-400" />
             <span>Investment Treasury Guaranteed</span>
           </div>
@@ -52,8 +52,8 @@ export const InvestmentTermPreview: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           
           {/* Left Column: Term Selector Buttons & Amount Slider */}
-          <div className="lg:col-span-7 bg-slate-900 rounded-3xl p-6 sm:p-8 border-2 border-slate-700 shadow-2xl space-y-7">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-700 pb-4 gap-2">
+          <div className="lg:col-span-7 bg-[#1f2c40] rounded-3xl p-6 sm:p-8 border-2 border-slate-700/80 shadow-2xl space-y-7">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-700/80 pb-4 gap-2">
               <div>
                 <h3 className="text-2xl sm:text-3xl font-black text-white">Select Investment Duration</h3>
                 <p className="text-base text-slate-200 font-bold mt-1">Choose between 60 days to 360 days (Min $100)</p>
@@ -122,7 +122,7 @@ export const InvestmentTermPreview: React.FC = () => {
           </div>
 
           {/* Right Column: Calculated Yield Summary Card */}
-          <div className="lg:col-span-5 bg-gradient-to-b from-slate-900 to-slate-950 rounded-3xl p-6 sm:p-8 border-2 border-emerald-500 shadow-2xl space-y-6">
+          <div className="lg:col-span-5 bg-gradient-to-b from-[#1f2c40] to-[#16202e] rounded-3xl p-6 sm:p-8 border-2 border-emerald-500 shadow-2xl space-y-6">
             <div className="space-y-1">
               <span className="text-xs font-mono uppercase tracking-widest text-emerald-400 block font-black">
                 Fixed Interest Breakdown

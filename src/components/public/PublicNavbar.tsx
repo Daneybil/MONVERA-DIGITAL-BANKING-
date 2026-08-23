@@ -48,7 +48,7 @@ export const PublicNavbar: React.FC = () => {
   };
 
   return (
-    <header id="monvera-public-navbar" className="sticky top-0 z-50 bg-white/95 backdrop-blur-md border-b border-slate-200/90 shadow-2xs">
+    <header id="monvera-public-navbar" className="sticky top-0 z-50 bg-[#FAF7F2]/95 backdrop-blur-md border-b border-amber-900/10 shadow-2xs">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between">
         {/* Monvera Brand */}
         <div

@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { firestoreSync } from '../../services/firestoreSync';
 import {
   User,
   ShieldCheck,
@@ -394,7 +395,19 @@ export const ProfileView: React.FC = () => {
       });
 
       if (res.success && res.user) {
-        updateUser(res.user);
+        const approvedUser = {
+          ...currentUser,
+          ...res.user,
+          kycStatus: 'verified' as const,
+          kycDocumentType: `${documentType} (${selectedJurisdiction === 'US' ? 'United States' : issuingCountry})`,
+          kycDocumentNumber: cleanDocNum,
+          kycCountry: selectedJurisdiction === 'US' ? 'United States' : issuingCountry,
+          kycSsn: selectedJurisdiction === 'US' ? ssnNumber : undefined,
+          kycVerifiedAt: new Date().toISOString(),
+          dailyTransactionLimit: 1000000,
+        };
+        updateUser(approvedUser);
+        await firestoreSync.saveUserProfile(currentUser.id, approvedUser);
         setKycSuccessMsg(
           'Identity verification accepted and approved! Your Royal Blue Verified Badge is now active, granting permanent regulatory clearance and full $1,000,000 daily transaction limits.'
         );
@@ -581,7 +594,7 @@ export const ProfileView: React.FC = () => {
             <div className="flex flex-wrap items-center justify-center md:justify-start gap-3">
               <h3 className="text-2xl sm:text-3xl font-extrabold text-slate-900 flex items-center gap-2">
                 <span>{currentUser.firstName} {currentUser.lastName}</span>
-                {isEmailVerified && <BlueVerifiedBadge className="w-6 h-6" />}
+                {isVerified && <BlueVerifiedBadge className="w-6 h-6" />}
               </h3>
               
               {/* Email Verification Status Badge */}
@@ -847,7 +860,7 @@ export const ProfileView: React.FC = () => {
       {/* Grid: Email Verification, Password Management & KYC Verification */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         
-        {/* Card 1: Email Verification (Firebase Auth System) */}
+        {/* Card 1: Email Verification */}
         <div className="p-6 sm:p-8 rounded-3xl bg-white border-2 border-slate-200 shadow-sm space-y-6">
           <div className="flex items-center justify-between pb-3 border-b-2 border-slate-100">
             <div className="flex items-center gap-3">
@@ -856,7 +869,7 @@ export const ProfileView: React.FC = () => {
               </div>
               <div>
                 <h3 className="font-extrabold text-lg text-slate-900">Email Verification</h3>
-                <p className="text-xs font-semibold text-slate-600">Firebase Authentication</p>
+                <p className="text-xs font-semibold text-slate-600">Email Verification</p>
               </div>
             </div>
 
@@ -874,7 +887,7 @@ export const ProfileView: React.FC = () => {
           </div>
 
           <p className="text-sm font-semibold text-slate-800 leading-relaxed">
-            Confirms that the customer owns the registered email address and protects account access with Firebase Authentication.
+            Confirms that the customer owns the registered email address and protects account access with secure email verification.
           </p>
 
           <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-2">
@@ -943,7 +956,7 @@ export const ProfileView: React.FC = () => {
               <div className="p-4 rounded-2xl bg-sky-50 border border-sky-200 text-sky-950 flex items-center gap-3">
                 <BlueVerifiedBadge className="w-5 h-5 shrink-0" />
                 <span className="text-xs font-bold leading-relaxed">
-                  Your registered email address is verified with Firebase Authentication.
+                  Your registered email address is verified and active.
                 </span>
               </div>
             )}

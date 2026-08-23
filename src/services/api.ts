@@ -105,6 +105,10 @@ export const api = {
     isBusiness?: boolean;
     businessName?: string;
     permanentAccountNumber?: string;
+    kycStatus?: 'unverified' | 'pending' | 'verified';
+    kycDocumentType?: string;
+    kycDocumentNumber?: string;
+    kycVerifiedAt?: string;
   }): Promise<{ success: boolean; user?: UserProfile; balanceMetrics?: BalanceMetrics; error?: string }> {
     try {
       const res = await fetch('/api/auth/register', {
@@ -156,11 +160,19 @@ export const api = {
 
   async submitKyc(data: {
     userId: string;
+    firstName?: string;
+    lastName?: string;
+    country: string;
     documentType: string;
     documentNumber: string;
-    country: string;
+    documentImage?: string;
+    liveSelfieImage?: string;
+    streetAddress?: string;
     proofOfAddress?: string;
+    proofOfAddressImage?: string;
+    ssn?: string;
     autoApprove?: boolean;
+    reviewDurationMinutes?: number;
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
     const res = await fetch('/api/kyc/submit', {
       method: 'POST',
@@ -245,11 +257,14 @@ export const api = {
   async createWithdrawal(data: {
     userId: string;
     amount: number;
-    destinationType: 'ACH_BANK' | 'FEDWIRE' | 'CARD' | 'CRYPTO';
+    destinationType: 'ACH_BANK' | 'CARD' | 'CRYPTO';
     destinationLabel: string;
     accountOrIban: string;
     sourceAccountType?: 'CHECKING' | 'SAVINGS';
     routingNumber?: string;
+    cardBrand?: 'VISA' | 'MASTERCARD';
+    cryptoAsset?: 'USDT' | 'BNB';
+    cryptoNetwork?: string;
   }): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
     const res = await fetch('/api/withdrawals/create', {
       method: 'POST',

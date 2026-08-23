@@ -22,10 +22,19 @@ export interface UserProfile {
   maritalStatus?: string;
   taxId?: string;
   kycStatus?: KycStatus;
+  kycFirstName?: string;
+  kycLastName?: string;
+  kycCountry?: string;
   kycDocumentType?: string;
   kycDocumentNumber?: string;
+  kycDocumentImage?: string;
+  kycLiveSelfieImage?: string;
+  kycStreetAddress?: string;
+  kycProofOfAddressImage?: string;
+  kycSsn?: string;
   kycSubmittedAt?: string;
   kycVerifiedAt?: string;
+  kycReviewDurationMinutes?: number;
   emailVerified?: boolean;
   dailyTransactionLimit?: number;
 }

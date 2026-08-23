@@ -77,6 +77,10 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   // If user already exists by ID, return existing user and balance metrics
   if (db.users.has(userId)) {
     const existingUser = db.users.get(userId)!;
+    if (req.body.kycStatus) existingUser.kycStatus = req.body.kycStatus;
+    if (req.body.kycDocumentType) existingUser.kycDocumentType = req.body.kycDocumentType;
+    if (req.body.kycDocumentNumber) existingUser.kycDocumentNumber = req.body.kycDocumentNumber;
+    if (req.body.kycVerifiedAt) existingUser.kycVerifiedAt = req.body.kycVerifiedAt;
     const balanceMetrics = db.getUserBalanceMetrics(existingUser.id);
     return res.json({ success: true, user: existingUser, balanceMetrics });
   }
@@ -260,18 +264,42 @@ app.post('/api/auth/update-avatar', (req: Request, res: Response) => {
 
 // KYC Submit Verification Endpoint
 app.post('/api/kyc/submit', (req: Request, res: Response) => {
-  const { userId, documentType, documentNumber, country, proofOfAddress, autoApprove } = req.body;
+  const {
+    userId,
+    firstName,
+    lastName,
+    documentType,
+    documentNumber,
+    documentImage,
+    liveSelfieImage,
+    streetAddress,
+    country,
+    proofOfAddress,
+    proofOfAddressImage,
+    ssn,
+    autoApprove,
+    reviewDurationMinutes,
+  } = req.body;
+
   if (!userId || !documentType || !documentNumber) {
     return res.status(400).json({ error: 'User ID, document type, and document number are required.' });
   }
 
   const result = db.submitKyc({
     userId,
+    firstName,
+    lastName,
     documentType,
     documentNumber,
+    documentImage,
+    liveSelfieImage,
+    streetAddress,
     country,
     proofOfAddress,
+    proofOfAddressImage,
+    ssn,
     autoApprove: autoApprove !== false,
+    reviewDurationMinutes: reviewDurationMinutes || 10,
   });
 
   if (!result.success) {
@@ -442,7 +470,18 @@ app.post('/api/deposits/create', (req: Request, res: Response) => {
 
 // --- WITHDRAWALS ---
 app.post('/api/withdrawals/create', (req: Request, res: Response) => {
-  const { userId, amount, destinationType, destinationLabel, accountOrIban, sourceAccountType } = req.body;
+  const {
+    userId,
+    amount,
+    destinationType,
+    destinationLabel,
+    accountOrIban,
+    sourceAccountType,
+    routingNumber,
+    cardBrand,
+    cryptoAsset,
+    cryptoNetwork,
+  } = req.body;
 
   if (!userId || !amount || !destinationLabel || !accountOrIban) {
     return res.status(400).json({ error: 'Missing required withdrawal details.' });
@@ -455,6 +494,10 @@ app.post('/api/withdrawals/create', (req: Request, res: Response) => {
     destinationLabel,
     accountOrIban,
     sourceAccountType: sourceAccountType || 'CHECKING',
+    routingNumber,
+    cardBrand,
+    cryptoAsset,
+    cryptoNetwork,
   });
 
   if (!result.success) {

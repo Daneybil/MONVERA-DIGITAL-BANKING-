@@ -798,13 +798,17 @@ export class MonveraDatabase {
     destinationLabel: string;
     accountOrIban: string;
     sourceAccountType?: 'CHECKING' | 'SAVINGS';
+    routingNumber?: string;
+    cardBrand?: 'VISA' | 'MASTERCARD';
+    cryptoAsset?: 'USDT' | 'BNB';
+    cryptoNetwork?: string;
   }): { success: boolean; transaction?: Transaction; error?: string } {
     const user = this.users.get(params.userId);
     if (!user) return { success: false, error: 'Customer account not found.' };
     if (params.amount <= 0) return { success: false, error: 'Withdrawal amount must be greater than $0.00.' };
 
     const metrics = this.getUserBalanceMetrics(user.id);
-    const fee = params.destinationType === 'FEDWIRE' ? 15.0 : 0.0;
+    const fee = 0.0; // All withdrawals are 100% free and instant
     const totalRequired = params.amount + fee;
 
     const sourceType = params.sourceAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
@@ -816,9 +820,14 @@ export class MonveraDatabase {
         success: false,
         error: `Insufficient balance in your ${sourceAccName} ($${sourceBal.toLocaleString('en-US', {
           minimumFractionDigits: 2,
-        })}). Required: $${totalRequired.toFixed(2)} (including $${fee.toFixed(2)} fee). Note: Active investment capital is locked until maturity.`,
+        })}). Required: $${totalRequired.toFixed(2)}. Note: Active investment capital is locked until maturity.`,
       };
     }
+
+    const cleanAccountDisplay =
+      params.destinationType === 'CRYPTO'
+        ? `${params.accountOrIban.slice(0, 6)}...${params.accountOrIban.slice(-4)}`
+        : `•••• ${params.accountOrIban.replace(/\s+/g, '').slice(-4)}`;
 
     const sourceAccountId = sourceType === 'SAVINGS' ? `acc_sav_${user.id}` : `acc_chk_${user.id}`;
     const tx = this.recordLedgerTransaction({
@@ -827,25 +836,29 @@ export class MonveraDatabase {
       fee,
       userId: user.id,
       senderAccountId: sourceAccountId,
-      description: `Withdrawal from ${sourceAccName} to ${params.destinationLabel} (•••• ${params.accountOrIban.slice(-4)})`,
+      description: `Withdrawal from ${sourceAccName} to ${params.destinationLabel} (${cleanAccountDisplay})`,
       category: 'Withdrawals',
       status: 'COMPLETED',
-      paymentProviderRef: `WTH-CLEAR-${Date.now().toString(36).toUpperCase()}`,
+      paymentProviderRef: `WTH-INSTANT-${Date.now().toString(36).toUpperCase()}`,
       metadata: {
         destinationType: params.destinationType,
         destinationLabel: params.destinationLabel,
-        accountOrIbanMasked: `•••• ${params.accountOrIban.slice(-4)}`,
+        accountOrIbanMasked: cleanAccountDisplay,
         sourceAccountType: sourceType,
+        routingNumber: params.routingNumber,
+        cardBrand: params.cardBrand,
+        cryptoAsset: params.cryptoAsset,
+        cryptoNetwork: params.cryptoNetwork || (params.destinationType === 'CRYPTO' ? 'Binance Smart Chain (BEP-20)' : undefined),
       },
     });
 
     this.notifications.unshift({
       id: `notif_${Date.now()}_wth`,
       userId: user.id,
-      title: 'Withdrawal Dispatched',
+      title: 'Withdrawal Dispatched Instantly',
       message: `-$${params.amount.toLocaleString('en-US', {
         minimumFractionDigits: 2,
-      })} has been dispatched from your ${sourceAccName} to ${params.destinationLabel}.`,
+      })} has been debited from your ${sourceAccName} and sent to ${params.destinationLabel} (${cleanAccountDisplay}).`,
       type: 'TRANSACTION',
       severity: 'info',
       read: false,
@@ -1457,11 +1470,19 @@ export class MonveraDatabase {
   // --- KYC Submission & Verification Engine ---
   public submitKyc(params: {
     userId: string;
+    firstName?: string;
+    lastName?: string;
     documentType: string;
     documentNumber: string;
+    documentImage?: string;
+    liveSelfieImage?: string;
+    streetAddress?: string;
     country: string;
     proofOfAddress?: string;
+    proofOfAddressImage?: string;
+    ssn?: string;
     autoApprove?: boolean;
+    reviewDurationMinutes?: number;
   }): { success: boolean; user?: UserProfile; error?: string } {
     const user = this.users.get(params.userId);
     if (!user) return { success: false, error: 'User account not found.' };
@@ -1471,39 +1492,78 @@ export class MonveraDatabase {
     }
 
     const now = new Date().toISOString();
+    if (params.firstName) user.firstName = params.firstName;
+    if (params.lastName) user.lastName = params.lastName;
+    user.kycFirstName = params.firstName || user.firstName;
+    user.kycLastName = params.lastName || user.lastName;
     user.kycDocumentType = params.documentType;
     user.kycDocumentNumber = params.documentNumber.trim();
+    user.kycCountry = params.country || user.country;
     user.country = params.country || user.country;
+    if (params.documentImage) user.kycDocumentImage = params.documentImage;
+    if (params.liveSelfieImage) user.kycLiveSelfieImage = params.liveSelfieImage;
+    if (params.streetAddress) user.kycStreetAddress = params.streetAddress;
+    if (params.proofOfAddressImage) user.kycProofOfAddressImage = params.proofOfAddressImage;
+    if (params.ssn) user.kycSsn = params.ssn;
     user.kycSubmittedAt = now;
+    user.kycReviewDurationMinutes = params.reviewDurationMinutes || 10;
 
-    // If autoApprove is requested (or standard submission), approve verification
-    user.kycStatus = 'verified';
-    user.kycVerifiedAt = now;
-    user.dailyTransactionLimit = 1000000;
+    const isAutoApproved = params.autoApprove !== false;
+    if (isAutoApproved) {
+      user.kycStatus = 'verified';
+      user.kycVerifiedAt = now;
+      user.dailyTransactionLimit = 1000000;
 
-    this.notifications.unshift({
-      id: `notif_kyc_${Date.now()}`,
-      userId: user.id,
-      title: 'KYC Identity Verification Approved',
-      message: `Your ${params.documentType} (${params.documentNumber}) has been verified and approved. Your verified badge is now active with your $1,000,000 daily transaction limit.`,
-      type: 'SECURITY',
-      severity: 'success',
-      read: false,
-      createdAt: now,
-    });
+      this.notifications.unshift({
+        id: `notif_kyc_${Date.now()}`,
+        userId: user.id,
+        title: 'KYC Identity Verification Approved',
+        message: `Your ${params.documentType} (${params.documentNumber}) has been verified and approved. Your verified badge is now active with your $1,000,000 daily transaction limit.`,
+        type: 'SECURITY',
+        severity: 'success',
+        read: false,
+        createdAt: now,
+      });
 
-    this.auditLogs.unshift({
-      id: `aud_${Date.now()}_kyc`,
-      adminId: 'usr_admin',
-      adminName: 'Monvera Automated Compliance Engine',
-      action: 'KYC_DOCUMENTS_VERIFIED',
-      targetUserId: user.id,
-      targetAccountNumber: user.permanentAccountNumber,
-      reason: `Automated FinCEN verification of ${params.documentType}`,
-      timestamp: now,
-      ipAddress: '127.0.0.1 (Compliance Node)',
-      result: 'SUCCESS',
-    });
+      this.auditLogs.unshift({
+        id: `aud_${Date.now()}_kyc`,
+        adminId: 'usr_admin',
+        adminName: 'Monvera Automated Compliance Engine',
+        action: 'KYC_DOCUMENTS_VERIFIED',
+        targetUserId: user.id,
+        targetAccountNumber: user.permanentAccountNumber,
+        reason: `Automated FinCEN verification of ${params.documentType} (${params.country || 'Global'})`,
+        timestamp: now,
+        ipAddress: '127.0.0.1 (Compliance Node)',
+        result: 'SUCCESS',
+      });
+    } else {
+      user.kycStatus = 'pending';
+
+      this.notifications.unshift({
+        id: `notif_kyc_sub_${Date.now()}`,
+        userId: user.id,
+        title: 'KYC Verification Submitted',
+        message: `Your ${params.documentType} and address documents have been submitted for compliance verification (5–10 min turnaround).`,
+        type: 'SECURITY',
+        severity: 'info',
+        read: false,
+        createdAt: now,
+      });
+
+      this.auditLogs.unshift({
+        id: `aud_${Date.now()}_kyc_sub`,
+        adminId: 'system',
+        adminName: 'Monvera Security Ingestion',
+        action: 'KYC_SUBMITTED_FOR_REVIEW',
+        targetUserId: user.id,
+        targetAccountNumber: user.permanentAccountNumber,
+        reason: `Submitted ${params.documentType} (${params.country || 'Global'}) for 5-10 min verification`,
+        timestamp: now,
+        ipAddress: '127.0.0.1',
+        result: 'SUCCESS',
+      });
+    }
 
     return { success: true, user };
   }
