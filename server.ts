@@ -344,11 +344,14 @@ app.get('/api/accounts/lookup', (req: Request, res: Response) => {
 
   const cleanInput = rawInput.trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
   
-  // Look up by permanent account number OR username
+  // Look up by permanent account number, username, email, ID, or full name
   const recipient = Array.from(db.users.values()).find(
     (u) =>
-      u.permanentAccountNumber.replace(/[-\s]/g, '') === cleanInput ||
-      (u.username && u.username.toLowerCase() === cleanInput)
+      u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanInput ||
+      (u.username && u.username.toLowerCase() === cleanInput) ||
+      (u.email && u.email.toLowerCase() === cleanInput) ||
+      (u.id && u.id.toLowerCase() === cleanInput) ||
+      `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanInput
   );
 
   if (!recipient) {
@@ -390,8 +393,11 @@ app.post('/api/transfers/monvera', (req: Request, res: Response) => {
   const cleanTarget = rawTarget.toString().trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
   const recipient = Array.from(db.users.values()).find(
     (u) =>
-      u.permanentAccountNumber.replace(/[-\s]/g, '') === cleanTarget ||
-      (u.username && u.username.toLowerCase() === cleanTarget)
+      u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget ||
+      (u.username && u.username.toLowerCase() === cleanTarget) ||
+      (u.email && u.email.toLowerCase() === cleanTarget) ||
+      (u.id && u.id.toLowerCase() === cleanTarget) ||
+      `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanTarget
   );
 
   if (!recipient) {

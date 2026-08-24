@@ -65,30 +65,27 @@ export const SendMoneyModal: React.FC = () => {
       return;
     }
 
-    const clean = trimmed.replace(/^@/, '').replace(/[-\s]/g, '');
-    const is10Digits = /^\d{10}$/.test(clean);
-    const isUsername = clean.length >= 3 && !/^\d+$/.test(clean);
-
-    if (is10Digits || isUsername || trimmed.startsWith('@')) {
-      setIsLookingUp(true);
-      setErrorMessage(null);
-      try {
-        const res = await api.lookupRecipient(trimmed, currentUser.id);
-        if (res.valid) {
-          setLookupResult(res);
-          setErrorMessage(null);
-        } else {
-          setLookupResult(null);
-          setErrorMessage(res.error || 'Recipient not found.');
-        }
-      } catch (err: any) {
-        setLookupResult(null);
-        setErrorMessage('Failed to verify recipient account or username.');
-      } finally {
-        setIsLookingUp(false);
-      }
-    } else {
+    if (trimmed.length < 2) {
       setLookupResult(null);
+      return;
+    }
+
+    setIsLookingUp(true);
+    setErrorMessage(null);
+    try {
+      const res = await api.lookupRecipient(trimmed, currentUser.id);
+      if (res.valid) {
+        setLookupResult(res);
+        setErrorMessage(null);
+      } else {
+        setLookupResult(null);
+        setErrorMessage(res.error || 'Recipient not found.');
+      }
+    } catch (err: any) {
+      setLookupResult(null);
+      setErrorMessage('Failed to verify recipient account or username.');
+    } finally {
+      setIsLookingUp(false);
     }
   };
 

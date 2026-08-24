@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import officeHeroImage from '../../assets/images/monvera_office_hero_1787152640128.jpg';
-import luxuryCardholderImage from '../../assets/images/monvera_luxury_cardholder_1787487721200.jpg';
+import dualCardsLamborghiniImage from '../../assets/images/monvera_cards_lambo_wide_1787576194809.jpg';
 import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, CheckCircle2, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star, Lock } from 'lucide-react';
 
 export const HeroSection: React.FC = () => {
@@ -213,22 +213,22 @@ export const HeroSection: React.FC = () => {
                 <span>depositors globally</span>
               </div>
 
-              {/* Bold Rectangular Monvera Luxury Cardholder Image Placed Underneath Depositors Badge */}
-              <div className="w-full max-w-5xl mx-auto mt-6 rounded-2xl sm:rounded-3xl overflow-hidden shadow-2xl border-2 border-slate-800/40 bg-slate-950 relative group transition-all duration-300 hover:shadow-slate-950/30">
+              {/* Bold Wide Rectangular Monvera Dual Cards Luxury Showcase Touching Edges */}
+              <div className="w-full max-w-6xl mx-auto mt-6 rounded-2xl sm:rounded-3xl overflow-hidden shadow-2xl border-2 border-slate-800/60 bg-slate-950 relative group transition-all duration-300 hover:shadow-slate-950/40">
                 <img
-                  src={luxuryCardholderImage}
-                  alt="Monvera Executive Cardholder & Premium Banking"
-                  className="w-full h-72 sm:h-96 md:h-[440px] object-cover transition-transform duration-700 group-hover:scale-102"
+                  src={dualCardsLamborghiniImage}
+                  alt="Monvera Visa Debit & Mastercard Credit Cards - Luxury Lifestyle"
+                  className="w-full aspect-[16/9] sm:aspect-[21/9] md:aspect-[16/8] lg:h-[500px] object-cover transition-transform duration-700 group-hover:scale-102"
                   referrerPolicy="no-referrer"
                 />
-                <div className="absolute inset-0 bg-gradient-to-t from-slate-950/85 via-slate-950/20 to-transparent pointer-events-none" />
-                <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between pointer-events-none">
-                  <span className="text-xs sm:text-sm uppercase font-mono tracking-widest text-amber-400 font-extrabold bg-slate-950/95 backdrop-blur-xs px-4 py-2 rounded-xl border border-amber-500/50 shadow-md flex items-center gap-2">
-                    <CreditCard className="w-4 h-4 text-amber-400" />
-                    <span>MONVERA ELITE CARDHOLDER & WEALTH SUITE</span>
+                <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/15 to-transparent pointer-events-none" />
+                <div className="absolute bottom-4 sm:bottom-6 left-4 sm:left-6 right-4 sm:right-6 flex flex-col sm:flex-row items-center justify-between gap-3 pointer-events-none">
+                  <span className="text-xs sm:text-sm uppercase font-mono tracking-widest text-amber-300 font-black bg-slate-950/95 backdrop-blur-xs px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl border border-amber-500/60 shadow-xl flex items-center gap-2.5">
+                    <CreditCard className="w-4 h-4 sm:w-5 sm:h-5 text-amber-400" />
+                    <span>MONVERA VISA DEBIT &amp; MASTERCARD CREDIT</span>
                   </span>
-                  <span className="text-xs sm:text-sm font-mono font-bold text-emerald-300 bg-slate-900/95 px-3.5 py-2 rounded-xl border border-emerald-500/50 shadow-md">
-                    WORLDWIDE ACCEPTANCE
+                  <span className="text-xs sm:text-sm font-mono font-black text-emerald-300 bg-slate-900/95 px-4 sm:px-5 py-2 sm:py-2.5 rounded-xl border border-emerald-500/60 shadow-xl">
+                    WORLDWIDE ACCEPTANCE &amp; GLOBAL ACCESS
                   </span>
                 </div>
               </div>

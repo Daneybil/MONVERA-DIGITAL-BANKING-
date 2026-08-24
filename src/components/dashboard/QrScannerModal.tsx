@@ -1,5 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { X, Camera, Upload, QrCode, AlertCircle, CheckCircle2, RefreshCw, Zap, Sparkles } from 'lucide-react';
+import jsQR from 'jsqr';
 
 interface QrScannerModalProps {
   isOpen: boolean;
@@ -17,6 +18,112 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+
+  // Stop Camera Stream & Scanner loop
+  const stopCamera = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    setIsCameraActive(false);
+  }, []);
+
+  // Process raw decoded QR text/payload
+  const handlePayloadDetected = useCallback((rawText: string) => {
+    try {
+      const trimmed = rawText.trim();
+
+      // Check if JSON format (Monvera Standard QR)
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        const parsed = JSON.parse(trimmed);
+        const username = parsed.username ? String(parsed.username).replace(/^@/, '').trim() : undefined;
+        const accountNumber = parsed.accountNumber || parsed.account ? String(parsed.accountNumber || parsed.account).replace(/[-\s]/g, '').trim() : undefined;
+        const identifier = username ? `@${username}` : (accountNumber || '');
+        if (identifier) {
+          stopCamera();
+          onScanSuccess({
+            identifier,
+            name: parsed.name,
+            username,
+            accountNumber,
+          });
+          onClose();
+          return;
+        }
+      }
+
+      // Check if Monvera URI scheme (monvera://pay?username=...&account=...)
+      if (trimmed.startsWith('monvera://')) {
+        const url = new URL(trimmed.replace('monvera://', 'https://monvera.internal/'));
+        const username = url.searchParams.get('username')?.replace(/^@/, '');
+        const account = (url.searchParams.get('account') || url.searchParams.get('accountNumber'))?.replace(/[-\s]/g, '');
+        const name = url.searchParams.get('name') ? decodeURIComponent(url.searchParams.get('name')!) : undefined;
+
+        const identifier = username ? `@${username}` : (account || '');
+        if (identifier) {
+          stopCamera();
+          onScanSuccess({
+            identifier,
+            name,
+            username: username || undefined,
+            accountNumber: account || undefined,
+          });
+          onClose();
+          return;
+        }
+      }
+
+      // Raw username or account number string format
+      const clean = trimmed.replace(/^@/, '').trim();
+      const isAcc = /^\d{6,14}$/.test(clean.replace(/[-\s]/g, ''));
+      stopCamera();
+      onScanSuccess({
+        identifier: isAcc ? clean.replace(/[-\s]/g, '') : `@${clean}`,
+        username: !isAcc ? clean : undefined,
+        accountNumber: isAcc ? clean.replace(/[-\s]/g, '') : undefined,
+      });
+      onClose();
+    } catch (err) {
+      console.error('Failed to parse QR payload:', err);
+      stopCamera();
+      onScanSuccess({ identifier: rawText.trim() });
+      onClose();
+    }
+  }, [stopCamera, onScanSuccess, onClose]);
+
+  // Live video frame QR scanner loop
+  const scanVideoFrame = useCallback(() => {
+    if (!videoRef.current || videoRef.current.readyState < 2) {
+      animationFrameRef.current = requestAnimationFrame(scanVideoFrame);
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    if (ctx && canvas.width > 0 && canvas.height > 0) {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {
+        inversionAttempts: 'attemptBoth',
+      });
+
+      if (code && code.data) {
+        handlePayloadDetected(code.data);
+        return;
+      }
+    }
+
+    animationFrameRef.current = requestAnimationFrame(scanVideoFrame);
+  }, [handlePayloadDetected]);
 
   // Start Camera Stream
   const startCamera = async () => {
@@ -29,26 +136,19 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play();
+          videoRef.current.setAttribute('playsinline', 'true');
+          await videoRef.current.play();
         }
         setIsCameraActive(true);
+        animationFrameRef.current = requestAnimationFrame(scanVideoFrame);
       } else {
-        setCameraError('Camera access is not supported in this browser or iframe. You can upload a QR image or select a quick contact below.');
+        setCameraError('Camera access is not supported in this browser environment. You can upload a QR image or select a quick contact below.');
       }
     } catch (err: any) {
       console.warn('Camera stream error:', err);
-      setCameraError('Unable to access camera (camera permission denied or not available). Please use QR file upload or choose a quick contact below.');
+      setCameraError('Camera permission denied or camera device unavailable. Please use the Upload Image tab to upload your QR screenshot or choose a contact below.');
       setIsCameraActive(false);
     }
-  };
-
-  // Stop Camera Stream
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    setIsCameraActive(false);
   };
 
   useEffect(() => {
@@ -60,83 +160,34 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
     return () => {
       stopCamera();
     };
-  }, [isOpen, activeTab]);
+  }, [isOpen, activeTab, stopCamera]);
 
   if (!isOpen) return null;
 
-  // Process raw decoded QR text/payload
-  const handlePayloadDetected = (rawText: string) => {
-    try {
-      const trimmed = rawText.trim();
-
-      // Check if JSON format
-      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-        const parsed = JSON.parse(trimmed);
-        const identifier = parsed.username ? `@${parsed.username.replace(/^@/, '')}` : (parsed.accountNumber || parsed.account || '');
-        if (identifier) {
-          stopCamera();
-          onScanSuccess({
-            identifier,
-            name: parsed.name,
-            username: parsed.username ? parsed.username.replace(/^@/, '') : undefined,
-            accountNumber: parsed.accountNumber || parsed.account,
-          });
-          onClose();
-          return;
-        }
-      }
-
-      // Check if Monvera URI scheme
-      if (trimmed.startsWith('monvera://')) {
-        const url = new URL(trimmed.replace('monvera://', 'https://monvera.internal/'));
-        const username = url.searchParams.get('username');
-        const account = url.searchParams.get('account') || url.searchParams.get('accountNumber');
-        const name = url.searchParams.get('name') ? decodeURIComponent(url.searchParams.get('name')!) : undefined;
-
-        const identifier = username ? `@${username.replace(/^@/, '')}` : (account || '');
-        if (identifier) {
-          stopCamera();
-          onScanSuccess({
-            identifier,
-            name,
-            username: username ? username.replace(/^@/, '') : undefined,
-            accountNumber: account || undefined,
-          });
-          onClose();
-          return;
-        }
-      }
-
-      // Raw username or account number format
-      const clean = trimmed.replace(/^@/, '');
-      stopCamera();
-      onScanSuccess({
-        identifier: trimmed.startsWith('@') ? trimmed : (/^\d{10}$/.test(clean) ? clean : `@${clean}`),
-      });
-      onClose();
-    } catch (err) {
-      console.error('Failed to parse QR payload:', err);
-      // Fallback
-      stopCamera();
-      onScanSuccess({ identifier: rawText.trim() });
-      onClose();
-    }
-  };
-
-  // Simulated Instant Scan from Camera Frame or Test Button
+  // Instant Manual Frame Capture Scan
   const handleCaptureFrame = () => {
-    // When user captures in camera view, trigger scan simulation
-    handlePayloadDetected(
-      JSON.stringify({
-        app: 'monvera',
-        username: 'sophia',
-        name: 'Sophia Chen',
-        accountNumber: '1093847294',
-      })
-    );
+    if (videoRef.current && videoRef.current.videoWidth > 0) {
+      const video = videoRef.current;
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, {
+          inversionAttempts: 'attemptBoth',
+        });
+        if (code && code.data) {
+          handlePayloadDetected(code.data);
+          return;
+        }
+      }
+    }
+    setCameraError('No QR code detected in the current camera frame. Please align the QR code inside the viewfinder box.');
   };
 
-  // Upload QR Image handler
+  // Real Upload QR Image handler using jsQR
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -144,32 +195,72 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
     setIsProcessingUpload(true);
     setUploadError(null);
 
-    // Read image and simulate detection
     const reader = new FileReader();
     reader.onload = (event) => {
       const img = new Image();
       img.onload = () => {
-        setIsProcessingUpload(false);
-        // Default detected payload from uploaded image
-        handlePayloadDetected(
-          JSON.stringify({
-            app: 'monvera',
-            username: 'marcus',
-            name: 'Marcus Sterling',
-            accountNumber: '1088492015',
-          })
-        );
+        try {
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          if (!ctx) {
+            setIsProcessingUpload(false);
+            setUploadError('Failed to initialize image processing canvas.');
+            return;
+          }
+
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          
+          // 1. Try standard and inverted scans with jsQR
+          let code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'attemptBoth',
+          });
+
+          // 2. If not detected on raw image, try contrast/scaled normalization
+          if (!code && (canvas.width > 1200 || canvas.height > 1200)) {
+            const scaledCanvas = document.createElement('canvas');
+            const scale = Math.min(1000 / canvas.width, 1000 / canvas.height);
+            scaledCanvas.width = Math.round(canvas.width * scale);
+            scaledCanvas.height = Math.round(canvas.height * scale);
+            const scaledCtx = scaledCanvas.getContext('2d', { willReadFrequently: true });
+            if (scaledCtx) {
+              scaledCtx.drawImage(img, 0, 0, scaledCanvas.width, scaledCanvas.height);
+              const scaledImageData = scaledCtx.getImageData(0, 0, scaledCanvas.width, scaledCanvas.height);
+              code = jsQR(scaledImageData.data, scaledImageData.width, scaledImageData.height, {
+                inversionAttempts: 'attemptBoth',
+              });
+            }
+          }
+
+          setIsProcessingUpload(false);
+
+          if (code && code.data) {
+            handlePayloadDetected(code.data);
+          } else {
+            setUploadError('No valid QR code was detected in the uploaded image. Please ensure the QR code is clear, unobstructed, and not cropped.');
+          }
+        } catch (err: any) {
+          setIsProcessingUpload(false);
+          setUploadError(`Failed to decode QR code from image: ${err?.message || 'Unknown error'}`);
+        }
       };
       img.onerror = () => {
         setIsProcessingUpload(false);
-        setUploadError('Unable to read the image file. Please upload a clear QR code image.');
+        setUploadError('Unable to read the image file. Please upload a clear PNG or JPEG image.');
       };
       img.src = event.target?.result as string;
+    };
+    reader.onerror = () => {
+      setIsProcessingUpload(false);
+      setUploadError('Failed to read file from disk.');
     };
     reader.readAsDataURL(file);
   };
 
-  // Quick scan directory presets for instantaneous testing
+  // Quick scan directory presets for fallback
   const quickPresets = [
     {
       name: 'Marcus Sterling',
@@ -217,7 +308,7 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
             </div>
             <div>
               <h3 className="text-lg font-black text-slate-950">Scan Recipient QR Code</h3>
-              <p className="text-xs text-slate-500 font-semibold">Instantly load recipient credentials</p>
+              <p className="text-xs text-slate-500 font-semibold">Decodes Monvera QR accurately in real-time</p>
             </div>
           </div>
           <button
@@ -284,16 +375,16 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
                   <div className="flex items-start gap-2.5">
                     <AlertCircle className="w-5 h-5 text-amber-700 flex-shrink-0 mt-0.5" />
                     <div>
-                      <h4 className="text-xs font-black uppercase tracking-wider">Camera Unavailable in Preview</h4>
+                      <h4 className="text-xs font-black uppercase tracking-wider">Camera Mode Notice</h4>
                       <p className="text-xs text-amber-800 font-medium mt-1">{cameraError}</p>
                     </div>
                   </div>
                   <button
                     type="button"
-                    onClick={() => setActiveTab('quick')}
+                    onClick={() => setActiveTab('upload')}
                     className="w-full py-2.5 px-3 rounded-xl bg-amber-900 text-white font-black text-xs hover:bg-amber-950 transition-colors shadow-xs"
                   >
-                    Select From Monvera Directory QR
+                    Switch to Upload Image
                   </button>
                 </div>
               ) : (
@@ -320,7 +411,7 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
                     </div>
                   </div>
 
-                  {/* Simulated Scanner Tap trigger */}
+                  {/* Scan Frame trigger */}
                   <div className="absolute bottom-4 left-4 right-4 z-10 text-center">
                     <button
                       type="button"
@@ -360,16 +451,16 @@ export const QrScannerModal: React.FC<QrScannerModalProps> = ({ isOpen, onClose,
                 </div>
                 <div>
                   <h4 className="text-sm font-black text-slate-900">Upload or Drop QR Code Image</h4>
-                  <p className="text-xs text-slate-500 mt-1">PNG, JPG, or WebP screenshot containing Monvera QR</p>
+                  <p className="text-xs text-slate-500 mt-1">PNG, JPG, or WebP screenshot containing recipient QR</p>
                 </div>
                 <span className="inline-block py-2 px-4 rounded-xl bg-slate-900 text-white font-bold text-xs shadow-xs group-hover:bg-emerald-700 transition-colors">
-                  {isProcessingUpload ? 'Analyzing QR...' : 'Choose File'}
+                  {isProcessingUpload ? 'Decoding QR Code...' : 'Choose QR Image File'}
                 </span>
               </div>
 
               {uploadError && (
-                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-bold flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-bold flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
                   <span>{uploadError}</span>
                 </div>
               )}
