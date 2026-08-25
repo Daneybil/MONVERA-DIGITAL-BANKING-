@@ -57,15 +57,18 @@ export const SendMoneyModal: React.FC = () => {
   if (activeModal !== 'send' || !currentUser) return null;
 
   // Real-time lookup for either 10-digit account number OR username
-  const handleLookup = async (inputVal: string) => {
+  const handleLookup = async (
+    inputVal: string,
+    hint?: { name?: string; username?: string; accountNumber?: string }
+  ) => {
     const trimmed = inputVal.trim();
-    if (!trimmed) {
+    if (!trimmed && !hint?.accountNumber && !hint?.username) {
       setLookupResult(null);
       setErrorMessage(null);
       return;
     }
 
-    if (trimmed.length < 2) {
+    if (trimmed.length < 2 && !hint?.accountNumber && !hint?.username) {
       setLookupResult(null);
       return;
     }
@@ -73,7 +76,7 @@ export const SendMoneyModal: React.FC = () => {
     setIsLookingUp(true);
     setErrorMessage(null);
     try {
-      const res = await api.lookupRecipient(trimmed, currentUser.id);
+      const res = await api.lookupRecipient(trimmed, currentUser.id, hint);
       if (res.valid) {
         setLookupResult(res);
         setErrorMessage(null);
@@ -526,7 +529,7 @@ export const SendMoneyModal: React.FC = () => {
       onClose={() => setIsQrScannerOpen(false)}
       onScanSuccess={(scanned) => {
         setRecipientInput(scanned.identifier);
-        handleLookup(scanned.identifier);
+        handleLookup(scanned.identifier, scanned);
       }}
     />
   </>

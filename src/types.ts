@@ -1,6 +1,23 @@
 export type UserRole = 'customer' | 'business' | 'admin' | 'super_admin';
 export type UserStatus = 'active' | 'frozen' | 'pending_verification';
-export type KycStatus = 'unverified' | 'pending' | 'verified';
+export type KycStatus = 'unverified' | 'pending' | 'action_required' | 'partially_approved' | 'verified' | 'rejected';
+
+export type KycItemReviewStatus = 'pending' | 'approved' | 'rejected';
+
+export interface KycItemReview {
+  status: KycItemReviewStatus;
+  rejectionReason?: string;
+  reason?: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
+}
+
+export interface KycItemReviews {
+  identity?: KycItemReview;
+  proofOfAddress?: KycItemReview;
+  liveness?: KycItemReview;
+  ssn?: KycItemReview;
+}
 
 export interface UserProfile {
   id: string;
@@ -22,18 +39,27 @@ export interface UserProfile {
   maritalStatus?: string;
   taxId?: string;
   kycStatus?: KycStatus;
+  kycFullName?: string;
   kycFirstName?: string;
   kycLastName?: string;
   kycCountry?: string;
+  kycPhone?: string;
+  kycEmail?: string;
+  kycDateOfBirth?: string;
   kycDocumentType?: string;
   kycDocumentNumber?: string;
-  kycDocumentImage?: string;
-  kycLiveSelfieImage?: string;
-  kycStreetAddress?: string;
-  kycProofOfAddressImage?: string;
-  kycSsn?: string;
+  kycDocumentImage?: string; // Front image or single doc image
+  kycDocumentBackImage?: string; // Back image where applicable (Driver's License, National ID)
+  kycLiveSelfieImage?: string; // Liveness / Selfie
+  kycStreetAddress?: string; // Residential street address
+  kycProofOfAddressType?: string; // e.g. "Bank Statement", "Utility Bill", etc.
+  kycProofOfAddressImage?: string; // Proof of address document
+  kycSsn?: string; // SSN number
+  kycSsnImage?: string; // Optional SSN document image
   kycSubmittedAt?: string;
   kycVerifiedAt?: string;
+  kycRejectionReason?: string;
+  kycItemReviews?: KycItemReviews;
   kycReviewDurationMinutes?: number;
   emailVerified?: boolean;
   dailyTransactionLimit?: number;
@@ -159,11 +185,14 @@ export interface CardItem {
 
 export interface NotificationReply {
   id: string;
-  sender: 'user' | 'support';
+  sender: 'user' | 'support' | 'ADMIN' | 'COMPLIANCE' | 'SUPPORT_REP' | string;
+  senderRole?: 'ADMIN' | 'COMPLIANCE' | 'SUPPORT_REP' | 'USER' | 'CUSTOMER';
+  senderId?: string;
   senderName: string;
   senderAvatar?: string;
   message: string;
-  createdAt: string;
+  createdAt?: string;
+  timestamp?: string;
 }
 
 export interface NotificationItem {
@@ -172,7 +201,7 @@ export interface NotificationItem {
   title: string;
   message: string;
   type: 'TRANSACTION' | 'SECURITY' | 'INVESTMENT' | 'SYSTEM' | 'SUPPORT';
-  severity: 'info' | 'success' | 'warning' | 'support';
+  severity: 'info' | 'success' | 'warning' | 'support' | 'error';
   read: boolean;
   createdAt: string;
   referenceId?: string;
@@ -180,6 +209,7 @@ export interface NotificationItem {
   supportRepName?: string;
   supportRepRole?: string;
   supportRepAvatar?: string;
+  supportStatus?: 'OPEN' | 'IN_PROGRESS' | 'RESOLVED' | 'CLOSED' | string;
   replies?: NotificationReply[];
 }
 

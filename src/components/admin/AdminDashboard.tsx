@@ -7,8 +7,8 @@ import {
   Transaction,
   AdminAuditLog,
   AdminSystemOverview,
+  TransactionStatus,
 } from '../../types';
-import confetti from 'canvas-confetti';
 import {
   Shield,
   Coins,
@@ -25,546 +25,568 @@ import {
   Search,
   Zap,
   Building,
+  ArrowDownLeft,
+  ArrowUpRight,
+  ShieldCheck,
+  Bell,
+  FileText,
+  Clock,
+  Sparkles,
+  MessageSquare,
 } from 'lucide-react';
+import { AdminOverviewView } from './AdminOverviewView';
+import { AdminCustomersView } from './AdminCustomersView';
+import { AdminKycView } from './AdminKycView';
+import { AdminSupportView } from './AdminSupportView';
+import { AdminTransactionsView } from './AdminTransactionsView';
+import { AdminDepositsView } from './AdminDepositsView';
+import { AdminWithdrawalsView } from './AdminWithdrawalsView';
+import { AdminTransfersView } from './AdminTransfersView';
+import { AdminDemoFundsView } from './AdminDemoFundsView';
+import { AdminNotificationsView } from './AdminNotificationsView';
+import { AdminAuditLogView } from './AdminAuditLogView';
+import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 
 export const AdminDashboard: React.FC = () => {
   const { currentUser, refreshBalance, refreshNotifications } = useAuth();
-  
+
+  const [activeTab, setActiveTab] = useState<string>('overview');
   const [metrics, setMetrics] = useState<AdminSystemOverview | null>(null);
   const [customers, setCustomers] = useState<(UserProfile & { balanceMetrics?: any })[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [supportTickets, setSupportTickets] = useState<any[]>([]);
   const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
+  const [selectedCustomer, setSelectedCustomer] = useState<(UserProfile & { balanceMetrics?: any }) | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
 
-  // Funding tool state
-  const [targetUserId, setTargetUserId] = useState<string>('usr_eleanor');
-  const [fundAmount, setFundAmount] = useState<string>('50000');
-  const [fundReason, setFundReason] = useState<string>('Development and Test Liquidity Provision');
-  const [isFunding, setIsFunding] = useState<boolean>(false);
-  const [fundFeedback, setFundFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  // Helper to merge Firestore users and server customers seamlessly without duplicate accounts
+  const mergeCustomers = (
+    firestoreUsers: (UserProfile & { balanceMetrics?: any })[],
+    serverUsers: (UserProfile & { balanceMetrics?: any })[],
+    loggedInUser?: UserProfile | null
+  ): (UserProfile & { balanceMetrics?: any })[] => {
+    const userMap = new Map<string, UserProfile & { balanceMetrics?: any }>();
+    const seenEmails = new Set<string>();
+    const seenAccountNums = new Set<string>();
 
-  // Pool top-up state
-  const [topUpAmount, setTopUpAmount] = useState<string>('500000000');
-  const [isToppingUp, setIsToppingUp] = useState<boolean>(false);
+    // 1. First add real users from Firestore (authoritative source of real registrations)
+    for (const fsUser of firestoreUsers) {
+      const emailKey = (fsUser.email || '').toLowerCase().trim();
+      const accKey = (fsUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
 
-  // User search
-  const [userSearch, setUserSearch] = useState<string>('');
+      // Locate if server already computed balance metrics for this UID or email
+      const matchedServer = serverUsers.find(
+        (s) =>
+          s.id === fsUser.id ||
+          (s.email && s.email.toLowerCase().trim() === emailKey) ||
+          (s.permanentAccountNumber && s.permanentAccountNumber.replace(/[-\s]/g, '') === accKey)
+      );
 
-  useEffect(() => {
-    loadAllAdminData();
-  }, []);
+      const defaultMetrics = {
+        checkingBalance: 0,
+        savingsBalance: 0,
+        investedBalance: 0,
+        totalBalance: 0,
+        availableBalance: 0,
+        accruedEarnings: 0,
+        pendingBalance: 0,
+      };
+
+      const finalUser: UserProfile & { balanceMetrics?: any } = {
+        ...fsUser,
+        balanceMetrics: fsUser.balanceMetrics || matchedServer?.balanceMetrics || defaultMetrics,
+      };
+
+      userMap.set(fsUser.id, finalUser);
+      if (emailKey) seenEmails.add(emailKey);
+      if (accKey) seenAccountNums.add(accKey);
+    }
+
+    // 2. Include logged in user if not already present
+    if (loggedInUser && loggedInUser.id) {
+      const loggedEmail = (loggedInUser.email || '').toLowerCase().trim();
+      const loggedAcc = (loggedInUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+
+      if (!userMap.has(loggedInUser.id) && !seenEmails.has(loggedEmail)) {
+        userMap.set(loggedInUser.id, {
+          ...loggedInUser,
+          balanceMetrics: (loggedInUser as any).balanceMetrics || {
+            checkingBalance: 25000.0,
+            savingsBalance: 50000.0,
+            investedBalance: 15000.0,
+            totalBalance: 90000.0,
+            availableBalance: 75000.0,
+            accruedEarnings: 800.0,
+            pendingBalance: 0,
+          },
+        });
+        if (loggedEmail) seenEmails.add(loggedEmail);
+        if (loggedAcc) seenAccountNums.add(loggedAcc);
+      }
+    }
+
+    // 3. Include seed/server accounts if not duplicating real accounts
+    for (const sUser of serverUsers) {
+      const emailKey = (sUser.email || '').toLowerCase().trim();
+      const accKey = (sUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+
+      if (!userMap.has(sUser.id) && !seenEmails.has(emailKey) && !seenAccountNums.has(accKey)) {
+        userMap.set(sUser.id, sUser);
+        if (emailKey) seenEmails.add(emailKey);
+        if (accKey) seenAccountNums.add(accKey);
+      }
+    }
+
+    return Array.from(userMap.values());
+  };
 
   const loadAllAdminData = async () => {
+    setIsLoading(true);
     try {
-      const [overviewRes, custRes, txRes, logsRes] = await Promise.all([
+      const [overviewRes, custRes, txRes, logsRes, firestoreUsers, tickets] = await Promise.all([
         api.getAdminOverview(),
         api.getAdminCustomers(),
         api.getTransactions(),
         api.getAdminAuditLogs(),
+        firestoreSync.getAllUsersWithBalances(),
+        firestoreSync.getAllSupportTickets(),
       ]);
 
-      if (overviewRes) setMetrics(overviewRes);
-      if (custRes.customers) {
-        setCustomers(custRes.customers);
-        if (custRes.customers.length > 0 && !targetUserId) {
-          setTargetUserId(custRes.customers[0].id);
-        }
-      }
-      if (txRes.transactions) setTransactions(txRes.transactions);
-      if (logsRes.auditLogs) setAuditLogs(logsRes.auditLogs);
-    } catch (err) {
-      console.error(err);
-    }
-  };
+      const merged = mergeCustomers(firestoreUsers || [], custRes.customers || [], currentUser);
+      setCustomers(merged);
+      setSupportTickets(tickets || []);
 
-  const handleIssueFunding = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const amount = parseFloat(fundAmount);
-    if (isNaN(amount) || amount <= 0) {
-      setFundFeedback({ type: 'error', text: 'Please enter a valid funding amount.' });
-      return;
-    }
-
-    setIsFunding(true);
-    setFundFeedback(null);
-
-    try {
-      const res = await api.issueAdminDevFunding({
-        adminId: currentUser?.id || 'usr_admin',
-        targetUserId,
-        amount,
-        reason: fundReason,
-      });
-
-      if (res.success) {
-        setFundFeedback({
-          type: 'success',
-          text: `Issued $${amount.toLocaleString()} in Dev Liquidity. Target user checking balance credited and ledger double-entry recorded.`,
-        });
-        await loadAllAdminData();
-        await refreshBalance();
-        await refreshNotifications();
-        confetti({
-          particleCount: 80,
-          spread: 70,
-          origin: { y: 0.6 },
-          colors: ['#f59e0b', '#10b981', '#0f172a'],
+      if (overviewRes) {
+        setMetrics({
+          ...overviewRes,
+          totalCustomers: merged.length,
+          activeAccounts: merged.length * 3,
         });
       } else {
-        setFundFeedback({ type: 'error', text: res.error || 'Failed to issue funding.' });
+        setMetrics({
+          totalCustomers: merged.length,
+          activeAccounts: merged.length * 3,
+          totalPlatformDeposits: 0,
+          totalPlatformWithdrawals: 0,
+          totalPlatformTransfers: 0,
+          totalPlatformInvestments: 0,
+          pendingTransactionsCount: 0,
+          failedTransactionsCount: 0,
+          devFundingPoolBalance: 1000000000,
+          systemReserveRatio: 100,
+          activeNodesCount: 8,
+        });
       }
+
+      if (txRes.transactions) setTransactions(txRes.transactions);
+      if (logsRes.auditLogs) setAuditLogs(logsRes.auditLogs);
+      setLastRefreshed(new Date());
     } catch (err) {
-      setFundFeedback({ type: 'error', text: 'Error executing admin funding ledger operation.' });
+      console.error('Failed to load admin data:', err);
     } finally {
-      setIsFunding(false);
+      setIsLoading(false);
     }
   };
 
-  const handleTopUpPool = async () => {
-    setIsToppingUp(true);
-    try {
-      const res = await api.topUpDevFundingPool({
-        adminId: currentUser?.id || 'usr_admin',
-        amount: parseFloat(topUpAmount),
-        reason: 'Authorized Reserve Capital Injection',
-      });
-      if (res.success) {
-        await loadAllAdminData();
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsToppingUp(false);
-    }
-  };
+  // Initial load and real-time subscription to newly registered users in Firestore
+  useEffect(() => {
+    loadAllAdminData();
 
-  const handleToggleFreezeUser = async (userId: string) => {
+    // Subscribe to Firestore users with balances collection so new signups appear automatically
+    const unsubscribeUsers = firestoreSync.subscribeToUsersWithBalances((firestoreUsers) => {
+      if (firestoreUsers && firestoreUsers.length > 0) {
+        setCustomers((prevCustomers) => {
+          const merged = mergeCustomers(firestoreUsers, prevCustomers, currentUser);
+          setMetrics((prevMetrics) =>
+            prevMetrics
+              ? {
+                  ...prevMetrics,
+                  totalCustomers: merged.length,
+                  activeAccounts: merged.length * 3,
+                }
+              : null
+          );
+          return merged;
+        });
+      }
+    });
+
+    // Subscribe to Support Tickets
+    const unsubscribeTickets = firestoreSync.subscribeToSupportTickets((liveTickets) => {
+      if (liveTickets) {
+        setSupportTickets(liveTickets);
+      }
+    });
+
+    return () => {
+      if (unsubscribeUsers) unsubscribeUsers();
+      if (unsubscribeTickets) unsubscribeTickets();
+    };
+  }, []);
+
+  const handleToggleFreezeUser = async (userId: string, reason: string) => {
     try {
       const res = await api.toggleCustomerStatus(userId, {
         adminId: currentUser?.id,
-        reason: 'Administrative compliance audit',
+        reason: reason || 'Administrative compliance audit',
       });
       if (res.success) {
         await loadAllAdminData();
+        await refreshNotifications();
       }
     } catch (err) {
-      console.error(err);
+      console.error('Error toggling customer freeze status:', err);
     }
   };
 
   const handleApproveKyc = async (userId: string) => {
     try {
-      const res = await api.approveKyc({
-        userId,
-        adminId: currentUser?.id || 'usr_admin',
-      });
+      const res = await api.adminApproveKyc(userId, currentUser?.id || 'usr_admin');
       if (res.success && res.user) {
-        // Persist verified status to Firestore
         await firestoreSync.saveUserProfile(userId, res.user);
         await loadAllAdminData();
         await refreshNotifications();
-        confetti({
-          particleCount: 50,
-          spread: 60,
-          origin: { y: 0.7 },
-          colors: ['#0284c7', '#10b981'],
-        });
       }
     } catch (err) {
-      console.error(err);
+      console.error('Error approving KYC:', err);
     }
   };
 
-  const filteredUsers = customers.filter((u) =>
-    `${u.firstName} ${u.lastName} ${u.email} ${u.permanentAccountNumber}`
-      .toLowerCase()
-      .includes(userSearch.toLowerCase())
-  );
+  const handleRejectKyc = async (userId: string, reason: string) => {
+    try {
+      const res = await api.adminRejectKyc(userId, reason, currentUser?.id || 'usr_admin');
+      if (res.success && res.user) {
+        await firestoreSync.saveUserProfile(userId, res.user);
+        await loadAllAdminData();
+        await refreshNotifications();
+      }
+    } catch (err) {
+      console.error('Error rejecting KYC:', err);
+    }
+  };
+
+  const handleReviewKycItem = async (
+    userId: string,
+    itemName: 'identity' | 'proofOfAddress' | 'liveness' | 'ssn',
+    status: 'approved' | 'rejected',
+    reason?: string
+  ) => {
+    try {
+      const res = await api.adminReviewKycItem({
+        userId,
+        itemName,
+        status,
+        reason,
+        adminId: currentUser?.id || 'usr_admin',
+      });
+      if (res.success && res.user) {
+        await firestoreSync.saveUserProfile(userId, res.user);
+        await loadAllAdminData();
+        await refreshNotifications();
+      }
+    } catch (err) {
+      console.error('Error reviewing KYC item:', err);
+    }
+  };
+
+  const handleUpdateTransactionStatus = async (
+    txId: string,
+    status: TransactionStatus,
+    reason: string
+  ) => {
+    try {
+      const res = await api.adminUpdateTransactionStatus(
+        txId,
+        status,
+        reason,
+        currentUser?.id || 'usr_admin'
+      );
+      if (res.success) {
+        await loadAllAdminData();
+        await refreshBalance();
+        await refreshNotifications();
+      }
+    } catch (err) {
+      console.error('Error updating transaction status:', err);
+    }
+  };
+
+  const handleIssueDevFunding = async (params: {
+    targetUserId: string;
+    amount: number;
+    reason: string;
+    targetAccountType: 'CHECKING' | 'SAVINGS';
+  }) => {
+    try {
+      const res = await api.issueAdminDevFunding({
+        adminId: currentUser?.id || 'usr_admin',
+        targetUserId: params.targetUserId,
+        amount: params.amount,
+        reason: params.reason,
+        targetAccountType: params.targetAccountType,
+      });
+
+      if (res.success) {
+        await loadAllAdminData();
+        await refreshBalance();
+        await refreshNotifications();
+        return { success: true };
+      }
+      return { success: false, error: res.error || 'Failed to issue sandbox funding.' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Server error' };
+    }
+  };
+
+  const handleTopUpPool = async (amount: number) => {
+    try {
+      const res = await api.topUpDevFundingPool({
+        adminId: currentUser?.id || 'usr_admin',
+        amount,
+        reason: 'Authorized Reserve Capital Injection',
+      });
+      if (res.success) {
+        await loadAllAdminData();
+        return { success: true };
+      }
+      return { success: false, error: 'Failed to replenish pool' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Server error' };
+    }
+  };
+
+  const pendingKycCount = customers.filter((c) => c.kycStatus === 'pending').length;
+  const pendingTxCount = transactions.filter((t) => t.status === 'PENDING').length;
+  const openTicketsCount = supportTickets.filter((t) => t.supportStatus === 'OPEN' || !t.supportStatus).length;
+
+  const navTabs = [
+    { id: 'overview', label: 'Overview', icon: Building },
+    { id: 'customers', label: 'Customers', icon: Users, badge: customers.length },
+    { id: 'kyc', label: 'KYC & Compliance', icon: ShieldCheck, alertBadge: pendingKycCount },
+    { id: 'support', label: 'Support & Live Chat', icon: MessageSquare, alertBadge: openTicketsCount },
+    { id: 'transactions', label: 'Transactions', icon: RefreshCw, alertBadge: pendingTxCount },
+    { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
+    { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
+    { id: 'transfers', label: 'Transfers', icon: Zap },
+    { id: 'demo_funds', label: 'Sandbox Test Funds', icon: Coins },
+    { id: 'notifications', label: 'Sentinel Alerts', icon: Bell },
+    { id: 'audit', label: 'Audit Trail', icon: FileText },
+  ];
 
   return (
-    <div id="admin-governance-dashboard" className="space-y-8 animate-in fade-in duration-150">
+    <div id="monvera-admin-command-center" className="min-h-screen bg-slate-100/60 pb-16">
       
-      {/* Admin Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-6 rounded-3xl bg-slate-900 text-white shadow-xl border border-slate-800">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 rounded-2xl bg-amber-500/20 text-amber-400 border border-amber-500/30 flex items-center justify-center font-bold">
-            <Shield className="w-6 h-6" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-xl font-bold text-white">Private Administration & Ledger Sentinel</h2>
-              <span className="text-[10px] font-mono font-bold uppercase bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded border border-amber-500/30">
-                Restricted Clearance
-              </span>
-            </div>
-            <p className="text-xs text-slate-400">
-              Authoritative management console for double-entry ledger oversight, customer governance, and testing liquidity.
-            </p>
-          </div>
-        </div>
-
-        <button
-          onClick={loadAllAdminData}
-          className="self-start sm:self-center px-4 py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors flex items-center gap-1.5"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          <span>Refresh Metrics</span>
-        </button>
-      </div>
-
-      {/* --- SYSTEM METRICS OVERVIEW --- */}
-      {metrics && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-2xs space-y-1">
-            <span className="text-[11px] text-slate-400 font-mono uppercase block">Total Customers</span>
-            <div className="text-2xl font-extrabold font-mono text-slate-900">{metrics.totalCustomers}</div>
-            <span className="text-[10px] text-emerald-600 font-semibold block">100% KYC Verified</span>
-          </div>
-
-          <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-2xs space-y-1">
-            <span className="text-[11px] text-slate-400 font-mono uppercase block">Total System Deposits</span>
-            <div className="text-2xl font-extrabold font-mono text-emerald-600">
-              ${(metrics.totalPlatformDeposits || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}
-            </div>
-            <span className="text-[10px] text-slate-500 font-mono block">Inbound Settled</span>
-          </div>
-
-          <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-2xs space-y-1">
-            <span className="text-[11px] text-slate-400 font-mono uppercase block">Active Investments</span>
-            <div className="text-2xl font-extrabold font-mono text-slate-900">
-              ${(metrics.totalPlatformInvestments || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}
-            </div>
-            <span className="text-[10px] text-slate-500 font-mono block">60-360D Sovereign Contracts</span>
-          </div>
-
-          <div className="p-5 rounded-2xl bg-slate-900 text-white border border-slate-800 shadow-2xs space-y-1">
-            <span className="text-[11px] text-amber-400 font-mono uppercase block">Dev Liquidity Pool</span>
-            <div className="text-2xl font-extrabold font-mono text-amber-300">
-              ${(metrics.devFundingPoolBalance || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}
-            </div>
-            <span className="text-[10px] text-slate-400 font-mono block">Isolated Testing Reserve</span>
-          </div>
-        </div>
-      )}
-
-      {/* --- ADMIN DEVELOPMENT FUNDING SYSTEM --- */}
-      <div className="p-6 sm:p-8 rounded-3xl bg-white border border-amber-200/80 shadow-md space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold">
-              <Coins className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-lg font-bold text-slate-900">Admin Development Funding System</h3>
-              <p className="text-xs text-slate-500">
-                Grant test capital from the $1B Development Liquidity Pool directly into any customer's checking account with full ledger tracking.
-              </p>
-            </div>
-          </div>
-
-          <button
-            onClick={handleTopUpPool}
-            disabled={isToppingUp}
-            className="px-3.5 py-2 text-xs font-bold text-amber-900 bg-amber-100 hover:bg-amber-200 rounded-xl border border-amber-300 transition-colors"
-          >
-            {isToppingUp ? 'Topping up...' : '+ Top Up Dev Pool (+$500M)'}
-          </button>
-        </div>
-
-        {fundFeedback && (
-          <div
-            className={`p-3.5 rounded-xl border text-xs flex items-start gap-2.5 ${
-              fundFeedback.type === 'success'
-                ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                : 'bg-red-50 border-red-200 text-red-700'
-            }`}
-          >
-            {fundFeedback.type === 'success' ? (
-              <CheckCircle2 className="w-4 h-4 flex-shrink-0 mt-0.5 text-emerald-600" />
-            ) : (
-              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-600" />
-            )}
-            <span>{fundFeedback.text}</span>
-          </div>
-        )}
-
-        <form onSubmit={handleIssueFunding} className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+      {/* Top Professional Master Navigation Bar */}
+      <header className="sticky top-0 z-30 bg-slate-900 border-b border-slate-800 text-white shadow-lg">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-20 gap-4">
             
-            {/* Target User */}
-            <div className="space-y-1.5">
-              <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                Recipient Customer
-              </label>
-              <select
-                value={targetUserId}
-                onChange={(e) => setTargetUserId(e.target.value)}
-                className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white"
-              >
-                {customers.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.firstName} {u.lastName} ({u.permanentAccountNumber})
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Amount */}
-            <div className="space-y-1.5">
-              <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                Funding Amount (USD)
-              </label>
-              <div className="relative">
-                <span className="absolute left-3.5 top-2.5 text-xs font-bold text-slate-400 font-mono">$</span>
-                <input
-                  type="number"
-                  step="1000"
-                  min="1"
-                  required
-                  value={fundAmount}
-                  onChange={(e) => setFundAmount(e.target.value)}
-                  className="w-full pl-7 pr-4 py-2 text-sm font-bold font-mono rounded-xl border border-slate-300 bg-white"
-                />
+            {/* Brand / Admin Identity */}
+            <div className="flex items-center gap-3.5">
+              <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center text-slate-950 font-black shadow-md">
+                <Shield className="w-6 h-6" />
               </div>
-            </div>
-
-            {/* Reason */}
-            <div className="space-y-1.5">
-              <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                Audit Reason
-              </label>
-              <input
-                type="text"
-                required
-                value={fundReason}
-                onChange={(e) => setFundReason(e.target.value)}
-                className="w-full px-3.5 py-2 text-xs rounded-xl border border-slate-300 bg-white"
-              />
-            </div>
-          </div>
-
-          <div className="flex justify-end pt-2">
-            <button
-              type="submit"
-              disabled={isFunding}
-              className="py-3 px-6 rounded-xl font-bold text-xs text-white bg-slate-900 hover:bg-slate-800 transition-colors shadow-md flex items-center gap-2 disabled:opacity-50"
-            >
-              <span>{isFunding ? 'Executing Ledger Settle...' : 'Issue Development Testing Capital'}</span>
-              <ArrowRight className="w-3.5 h-3.5 text-emerald-400" />
-            </button>
-          </div>
-        </form>
-      </div>
-
-      {/* --- CUSTOMER GOVERNANCE TABLE --- */}
-      <div className="space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <h3 className="text-lg font-bold text-slate-900">Customer Governance ({customers.length})</h3>
-          
-          <div className="relative w-full sm:w-72">
-            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-            <input
-              type="text"
-              placeholder="Search customers..."
-              value={userSearch}
-              onChange={(e) => setUserSearch(e.target.value)}
-              className="w-full pl-8 pr-3 py-1.5 text-xs rounded-xl border border-slate-300 bg-white"
-            />
-          </div>
-        </div>
-
-        <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-2xs">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold uppercase text-[10px]">
-              <tr>
-                <th className="p-3.5">Customer</th>
-                <th className="p-3.5">Permanent Account</th>
-                <th className="p-3.5">Country & ID</th>
-                <th className="p-3.5">KYC Status</th>
-                <th className="p-3.5">Account Status</th>
-                <th className="p-3.5 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 font-mono">
-              {filteredUsers.map((u) => (
-                <tr key={u.id} className="hover:bg-slate-50">
-                  <td className="p-3.5 font-sans">
-                    <div className="font-bold text-slate-900">{u.firstName} {u.lastName}</div>
-                    <div className="text-[10px] text-slate-500">{u.email}</div>
-                  </td>
-                  <td className="p-3.5 text-slate-700">{u.permanentAccountNumber}</td>
-                  <td className="p-3.5 font-sans">
-                    <div className="text-slate-900 font-semibold">{u.country || 'Nigeria'}</div>
-                    <div className="text-[10px] text-slate-500 font-mono">
-                      {u.kycDocumentType ? `${u.kycDocumentType}: ${u.kycDocumentNumber || 'Submitted'}` : 'No ID'}
-                    </div>
-                  </td>
-                  <td className="p-3.5 font-sans">
-                    <span
-                      className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                        u.kycStatus === 'verified'
-                          ? 'bg-sky-100 text-sky-950 border border-sky-300'
-                          : u.kycStatus === 'pending'
-                          ? 'bg-amber-100 text-amber-950 border border-amber-300'
-                          : 'bg-slate-100 text-slate-700 border border-slate-300'
-                      }`}
-                    >
-                      {u.kycStatus === 'verified' ? '✓ Verified' : u.kycStatus === 'pending' ? '⧗ Under Review' : 'Unverified'}
-                    </span>
-                  </td>
-                  <td className="p-3.5 font-sans">
-                    <span
-                      className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                        u.status === 'active'
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : 'bg-red-50 text-red-800 border border-red-200'
-                      }`}
-                    >
-                      {u.status}
-                    </span>
-                  </td>
-                  <td className="p-3.5 text-right font-sans space-x-1.5">
-                    {u.kycStatus !== 'verified' && (
-                      <button
-                        onClick={() => handleApproveKyc(u.id)}
-                        className="px-2.5 py-1 text-xs font-bold rounded-lg bg-sky-600 hover:bg-sky-700 text-white transition-colors cursor-pointer"
-                        title="Approve Customer KYC"
-                      >
-                        Approve KYC
-                      </button>
-                    )}
-                    <button
-                      onClick={() => handleToggleFreezeUser(u.id)}
-                      className={`px-3 py-1 text-xs font-bold rounded-lg transition-colors ${
-                        u.status === 'active'
-                          ? 'bg-red-50 hover:bg-red-100 text-red-700'
-                          : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800'
-                      }`}
-                    >
-                      {u.status === 'active' ? 'Freeze' : 'Unfreeze'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* --- KYC ONBOARDING & COMPLIANCE BOARD --- */}
-      <div className="space-y-4">
-        <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
-          <Shield className="w-5 h-5 text-sky-600" />
-          <span>KYC Compliance & Verification Queue</span>
-        </h3>
-        
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {customers
-            .filter((u) => u.kycStatus === 'pending' || u.kycDocumentType || u.kycDocumentNumber)
-            .map((u) => (
-              <div
-                key={`kyc-card-${u.id}`}
-                className="p-5 rounded-2xl bg-white border-2 border-slate-200 shadow-xs space-y-3"
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h4 className="font-bold text-slate-900 text-sm">
-                      {u.firstName} {u.lastName}
-                    </h4>
-                    <p className="text-xs text-slate-500 font-mono">
-                      Acct: {u.permanentAccountNumber} • {u.country || 'Nigeria'}
-                    </p>
-                  </div>
-                  <span
-                    className={`px-2.5 py-0.5 rounded-md text-xs font-black ${
-                      u.kycStatus === 'verified'
-                        ? 'bg-sky-100 text-sky-950 border border-sky-300'
-                        : 'bg-amber-100 text-amber-950 border border-amber-300'
-                    }`}
-                  >
-                    {u.kycStatus === 'verified' ? 'Verified' : 'Under Review'}
+              <div>
+                <div className="flex items-center gap-2.5">
+                  <h1 className="text-xl font-black text-white tracking-tight">MONVERA</h1>
+                  <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-amber-400/25 border border-amber-400/50 text-amber-300">
+                    BANKING CONTROL CENTER
                   </span>
                 </div>
-
-                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs font-mono space-y-1">
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">ID Type:</span>
-                    <span className="font-bold text-slate-900">{u.kycDocumentType || 'Passport'}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-slate-500">ID Code / No:</span>
-                    <span className="font-bold text-slate-900">{u.kycDocumentNumber || 'N/A'}</span>
-                  </div>
-                  {u.kycSsn && (
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">US SSN:</span>
-                      <span className="font-bold text-sky-800">{u.kycSsn}</span>
-                    </div>
-                  )}
-                  {u.kycStreetAddress && (
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Address:</span>
-                      <span className="font-medium text-slate-900 truncate max-w-[200px]">{u.kycStreetAddress}</span>
-                    </div>
-                  )}
+                <div className="text-xs font-semibold text-slate-300 flex items-center gap-2 mt-0.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  <span>Administrative Clearance Level 4</span>
                 </div>
-
-                {/* Previews if images exist */}
-                {(u.kycDocumentImage || u.kycLiveSelfieImage) && (
-                  <div className="flex items-center gap-2 pt-1">
-                    {u.kycDocumentImage && (
-                      <div className="w-16 h-12 rounded-lg border border-slate-300 overflow-hidden bg-slate-100 shrink-0">
-                        <img
-                          src={u.kycDocumentImage}
-                          alt="Document"
-                          className="w-full h-full object-cover"
-                        />
-                      </div>
-                    )}
-                    {u.kycLiveSelfieImage && (
-                      <div className="w-12 h-12 rounded-full border border-slate-300 overflow-hidden bg-slate-100 shrink-0">
-                        <img
-                          src={u.kycLiveSelfieImage}
-                          alt="Live Selfie"
-                          className="w-full h-full object-cover"
-                        />
-                      </div>
-                    )}
-                    <span className="text-[11px] text-slate-500 font-semibold">
-                      Document & Live Biometric Captured
-                    </span>
-                  </div>
-                )}
-
-                {u.kycStatus !== 'verified' && (
-                  <button
-                    type="button"
-                    onClick={() => handleApproveKyc(u.id)}
-                    className="w-full py-2 px-3 rounded-xl bg-slate-950 hover:bg-slate-900 text-white text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
-                  >
-                    <CheckCircle2 className="w-3.5 h-3.5 text-sky-400" />
-                    <span>Approve & Issue $1,000,000 Daily Limit</span>
-                  </button>
-                )}
               </div>
-            ))}
-        </div>
-      </div>
-
-      {/* --- IMMUTABLE AUDIT LOG --- */}
-      <div className="space-y-4">
-        <h3 className="text-lg font-bold text-slate-900">System Audit Trail</h3>
-        <div className="bg-slate-950 rounded-2xl p-4 font-mono text-xs text-slate-300 max-h-60 overflow-y-auto space-y-1.5 border border-slate-800">
-          {auditLogs.map((log) => (
-            <div key={log.id} className="flex items-center justify-between text-[11px] py-1 border-b border-slate-900">
-              <span className="text-emerald-400">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
-              <span className="text-slate-200 font-bold">{log.action}</span>
-              <span className="text-slate-400 truncate max-w-xs">{log.reason}</span>
-              <span className="text-amber-400">Admin: {log.adminName}</span>
             </div>
-          ))}
-        </div>
-      </div>
 
+            {/* Quick System Tools */}
+            <div className="flex items-center gap-4">
+              <div className="hidden md:flex items-center gap-2 text-sm text-slate-300 font-mono font-semibold">
+                <span>Last Sync:</span>
+                <span className="text-white font-bold">{lastRefreshed.toLocaleTimeString()}</span>
+              </div>
+
+              <button
+                onClick={loadAllAdminData}
+                disabled={isLoading}
+                className="p-2 sm:px-4 sm:py-2 rounded-xl text-sm font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
+              >
+                <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-amber-400' : ''}`} />
+                <span className="hidden sm:inline">Refresh Data</span>
+              </button>
+
+              <div className="flex items-center gap-3 pl-3 border-l border-slate-800">
+                <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-sm font-black text-amber-400">
+                  {currentUser?.firstName?.[0] || 'A'}
+                </div>
+                <div className="hidden lg:block text-left">
+                  <div className="font-bold text-sm text-white">{currentUser?.firstName || 'Chief Admin'} {currentUser?.lastName || ''}</div>
+                  <div className="text-xs font-medium text-slate-400">Executive Officer</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Sub-Navigation Bar Tabs */}
+          <nav className="flex items-center gap-1.5 overflow-x-auto py-2.5 border-t border-slate-800/80 no-scrollbar">
+            {navTabs.map((tab) => {
+              const Icon = tab.icon;
+              const isActive = activeTab === tab.id;
+
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold transition-all whitespace-nowrap ${
+                    isActive
+                      ? 'bg-amber-400 text-slate-950 shadow-md font-extrabold'
+                      : 'text-slate-300 hover:text-white hover:bg-slate-800/80 font-bold'
+                  }`}
+                >
+                  <Icon className={`w-4.5 h-4.5 ${isActive ? 'text-slate-950 stroke-[2.5]' : 'text-slate-400 stroke-[2]'}`} />
+                  <span>{tab.label}</span>
+
+                  {tab.alertBadge !== undefined && tab.alertBadge > 0 && (
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-xs font-black ${
+                        isActive
+                          ? 'bg-slate-950 text-amber-400'
+                          : 'bg-amber-500 text-slate-950'
+                      }`}
+                    >
+                      {tab.alertBadge}
+                    </span>
+                  )}
+
+                  {tab.badge !== undefined && tab.alertBadge === undefined && (
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-xs font-extrabold ${
+                        isActive
+                          ? 'bg-slate-950/20 text-slate-950'
+                          : 'bg-slate-800 text-slate-300'
+                      }`}
+                    >
+                      {tab.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8">
+        {activeTab === 'overview' && (
+          <AdminOverviewView
+            metrics={metrics}
+            customers={customers}
+            transactions={transactions}
+            auditLogs={auditLogs}
+            onNavigateTab={(tab) => setActiveTab(tab)}
+            onSelectCustomer={(cust) => setSelectedCustomer(cust)}
+          />
+        )}
+
+        {activeTab === 'customers' && (
+          <AdminCustomersView
+            customers={customers}
+            onSelectCustomer={(cust) => setSelectedCustomer(cust)}
+            onToggleStatus={handleToggleFreezeUser}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'kyc' && (
+          <AdminKycView
+            customers={customers}
+            onApproveKyc={handleApproveKyc}
+            onRejectKyc={handleRejectKyc}
+            onSelectCustomer={(cust) => setSelectedCustomer(cust)}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'support' && (
+          <AdminSupportView
+            customers={customers}
+            onSelectCustomer={(cust) => setSelectedCustomer(cust)}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'transactions' && (
+          <AdminTransactionsView
+            transactions={transactions}
+            onUpdateStatus={handleUpdateTransactionStatus}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'deposits' && (
+          <AdminDepositsView
+            transactions={transactions}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'withdrawals' && (
+          <AdminWithdrawalsView
+            transactions={transactions}
+            onUpdateStatus={handleUpdateTransactionStatus}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'transfers' && (
+          <AdminTransfersView
+            transactions={transactions}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'demo_funds' && (
+          <AdminDemoFundsView
+            metrics={metrics}
+            customers={customers}
+            transactions={transactions}
+            onIssueFunding={handleIssueDevFunding}
+            onTopUpPool={handleTopUpPool}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'notifications' && (
+          <AdminNotificationsView
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'audit' && (
+          <AdminAuditLogView
+            auditLogs={auditLogs}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+      </main>
+
+      {/* Customer Full Dossier Modal */}
+      {selectedCustomer && (
+        <AdminCustomerDetailsModal
+          customer={selectedCustomer}
+          isOpen={!!selectedCustomer}
+          onClose={() => setSelectedCustomer(null)}
+          transactions={transactions}
+          onToggleStatus={handleToggleFreezeUser}
+          onApproveKyc={handleApproveKyc}
+          onRejectKyc={handleRejectKyc}
+          onReviewKycItem={handleReviewKycItem}
+          onRefreshData={loadAllAdminData}
+        />
+      )}
     </div>
   );
 };

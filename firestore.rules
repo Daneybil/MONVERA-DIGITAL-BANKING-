@@ -7,56 +7,66 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    // User profiles collection: strictly isolated per Firebase UID
-    match /users/{userId} {
-      allow get: if request.auth != null && request.auth.uid == userId;
-      allow create: if request.auth != null && request.auth.uid == userId;
-      allow update: if request.auth != null && request.auth.uid == userId;
-      allow delete: if false;
-      allow list: if false;
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'daneybil2020@gmail.com' ||
+        request.auth.token.email == 'admin@monvera.com'
+      );
     }
 
-    // Transactions collection: readable and creatable only by participants
+    // User profiles collection: accessible for profile display, directory matching, and admin governance
+    match /users/{userId} {
+      allow get, list: if isSignedIn();
+      allow create, update: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow delete: if false;
+    }
+
+    // Account balances collection
+    match /accounts/{userId} {
+      allow get, list: if isSignedIn();
+      allow create, update: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow delete: if false;
+    }
+
+    // Transactions collection: readable and creatable by participants or admin
     match /transactions/{transactionId} {
-      allow get: if isSignedIn() && (
-        resource.data.userId == request.auth.uid ||
-        resource.data.senderUserId == request.auth.uid ||
-        resource.data.recipientUserId == request.auth.uid
-      );
-      allow list: if isSignedIn() && (
+      allow get, list: if isSignedIn() && (
+        isAdmin() ||
         resource.data.userId == request.auth.uid ||
         resource.data.senderUserId == request.auth.uid ||
         resource.data.recipientUserId == request.auth.uid
       );
       allow create: if isSignedIn() && (
+        isAdmin() ||
         request.resource.data.userId == request.auth.uid ||
         request.resource.data.senderUserId == request.auth.uid
       );
-      allow update, delete: if false;
+      allow update: if isSignedIn() && (isAdmin() || resource.data.userId == request.auth.uid);
+      allow delete: if false;
     }
 
-    // Investments collection: strictly isolated per user
+    // Investments collection: strictly isolated per user or admin
     match /investments/{investmentId} {
-      allow get, list: if isSignedIn() && resource.data.userId == request.auth.uid;
-      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
-      allow update: if isSignedIn() && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+      allow get, list: if isSignedIn() && (isAdmin() || resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && (isAdmin() || request.resource.data.userId == request.auth.uid);
+      allow update: if isSignedIn() && (isAdmin() || (resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid));
       allow delete: if false;
     }
 
-    // Cards collection: strictly isolated per user
+    // Cards collection: strictly isolated per user or admin
     match /cards/{cardId} {
-      allow get, list: if isSignedIn() && resource.data.userId == request.auth.uid;
-      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
-      allow update: if isSignedIn() && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+      allow get, list: if isSignedIn() && (isAdmin() || resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && (isAdmin() || request.resource.data.userId == request.auth.uid);
+      allow update: if isSignedIn() && (isAdmin() || (resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid));
       allow delete: if false;
     }
 
-    // Notifications collection: strictly isolated per user
+    // Notifications and Support tickets collection: isolated per user or admin support desk
     match /notifications/{notificationId} {
-      allow get, list: if isSignedIn() && resource.data.userId == request.auth.uid;
-      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
-      allow update: if isSignedIn() && resource.data.userId == request.auth.uid;
-      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get, list: if isSignedIn() && (isAdmin() || resource.data.userId == request.auth.uid);
+      allow create: if isSignedIn() && (isAdmin() || request.resource.data.userId == request.auth.uid);
+      allow update: if isSignedIn() && (isAdmin() || resource.data.userId == request.auth.uid);
+      allow delete: if isSignedIn() && (isAdmin() || resource.data.userId == request.auth.uid);
     }
 
     // Default deny all other access
@@ -65,3 +75,4 @@ service cloud.firestore {
     }
   }
 }
+

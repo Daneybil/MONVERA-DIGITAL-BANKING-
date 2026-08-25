@@ -1470,17 +1470,24 @@ export class MonveraDatabase {
   // --- KYC Submission & Verification Engine ---
   public submitKyc(params: {
     userId: string;
+    fullName?: string;
     firstName?: string;
     lastName?: string;
+    country?: string;
+    phone?: string;
+    email?: string;
+    dateOfBirth?: string;
     documentType: string;
     documentNumber: string;
     documentImage?: string;
+    documentBackImage?: string;
     liveSelfieImage?: string;
     streetAddress?: string;
-    country: string;
-    proofOfAddress?: string;
+    proofOfAddressType?: string;
     proofOfAddressImage?: string;
     ssn?: string;
+    ssnImage?: string;
+    isResubmission?: boolean;
     autoApprove?: boolean;
     reviewDurationMinutes?: number;
   }): { success: boolean; user?: UserProfile; error?: string } {
@@ -1492,78 +1499,210 @@ export class MonveraDatabase {
     }
 
     const now = new Date().toISOString();
+    if (params.fullName) user.kycFullName = params.fullName;
     if (params.firstName) user.firstName = params.firstName;
     if (params.lastName) user.lastName = params.lastName;
     user.kycFirstName = params.firstName || user.firstName;
     user.kycLastName = params.lastName || user.lastName;
-    user.kycDocumentType = params.documentType;
-    user.kycDocumentNumber = params.documentNumber.trim();
     user.kycCountry = params.country || user.country;
     user.country = params.country || user.country;
+    if (params.phone) {
+      user.phone = params.phone;
+      user.kycPhone = params.phone;
+    }
+    if (params.email) user.kycEmail = params.email;
+    if (params.dateOfBirth) user.kycDateOfBirth = params.dateOfBirth;
+
+    user.kycDocumentType = params.documentType;
+    user.kycDocumentNumber = params.documentNumber.trim();
     if (params.documentImage) user.kycDocumentImage = params.documentImage;
+    if (params.documentBackImage) user.kycDocumentBackImage = params.documentBackImage;
     if (params.liveSelfieImage) user.kycLiveSelfieImage = params.liveSelfieImage;
     if (params.streetAddress) user.kycStreetAddress = params.streetAddress;
+    if (params.proofOfAddressType) user.kycProofOfAddressType = params.proofOfAddressType;
     if (params.proofOfAddressImage) user.kycProofOfAddressImage = params.proofOfAddressImage;
     if (params.ssn) user.kycSsn = params.ssn;
+    if (params.ssnImage) user.kycSsnImage = params.ssnImage;
+
     user.kycSubmittedAt = now;
     user.kycReviewDurationMinutes = params.reviewDurationMinutes || 10;
+    user.kycStatus = 'pending';
+    user.kycRejectionReason = undefined;
 
-    const isAutoApproved = params.autoApprove !== false;
-    if (isAutoApproved) {
+    // Granular item reviews initialization / update
+    const currentReviews = user.kycItemReviews || {};
+    const isUS = (user.kycCountry || user.country || '').toLowerCase().includes('united states') ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'US' ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'USA';
+
+    user.kycItemReviews = {
+      identity: {
+        status: 'pending',
+        reviewedAt: undefined,
+        reviewedBy: undefined,
+        reason: undefined,
+      },
+      proofOfAddress: {
+        status: 'pending',
+        reviewedAt: undefined,
+        reviewedBy: undefined,
+        reason: undefined,
+      },
+      liveness: {
+        status: 'pending',
+        reviewedAt: undefined,
+        reviewedBy: undefined,
+        reason: undefined,
+      },
+      ...(isUS || params.ssn
+        ? {
+            ssn: {
+              status: 'pending',
+              reviewedAt: undefined,
+              reviewedBy: undefined,
+              reason: undefined,
+            },
+          }
+        : {}),
+    };
+
+    // If this is a targeted resubmission, preserve already approved items
+    if (params.isResubmission && currentReviews) {
+      if (currentReviews.identity?.status === 'approved' && !params.documentImage && !params.documentBackImage) {
+        user.kycItemReviews.identity = currentReviews.identity;
+      }
+      if (currentReviews.proofOfAddress?.status === 'approved' && !params.proofOfAddressImage) {
+        user.kycItemReviews.proofOfAddress = currentReviews.proofOfAddress;
+      }
+      if (currentReviews.liveness?.status === 'approved' && !params.liveSelfieImage) {
+        user.kycItemReviews.liveness = currentReviews.liveness;
+      }
+      if (currentReviews.ssn?.status === 'approved' && !params.ssn && !params.ssnImage) {
+        user.kycItemReviews.ssn = currentReviews.ssn;
+      }
+    }
+
+    this.notifications.unshift({
+      id: `notif_kyc_sub_${Date.now()}`,
+      userId: user.id,
+      title: 'KYC Verification Submitted',
+      message: `Your ${params.documentType} and address documents have been submitted successfully and are currently under compliance review. Verification may take up to 72 hours.`,
+      type: 'SECURITY',
+      severity: 'info',
+      read: false,
+      createdAt: now,
+    });
+
+    this.auditLogs.unshift({
+      id: `aud_${Date.now()}_kyc_sub`,
+      adminId: 'system',
+      adminName: 'Monvera KYC Ingestion Desk',
+      action: 'KYC_SUBMITTED_FOR_REVIEW',
+      targetUserId: user.id,
+      targetAccountNumber: user.permanentAccountNumber,
+      reason: `Submitted ${params.documentType} (${params.country || 'Global'}) for compliance verification`,
+      timestamp: now,
+      ipAddress: '127.0.0.1',
+      result: 'SUCCESS',
+    });
+
+    return { success: true, user };
+  }
+
+  public reviewKycItem(params: {
+    userId: string;
+    itemName: 'identity' | 'proofOfAddress' | 'liveness' | 'ssn';
+    status: 'approved' | 'rejected' | 'pending';
+    reason?: string;
+    adminId?: string;
+  }): { success: boolean; user?: UserProfile; error?: string } {
+    const user = this.users.get(params.userId);
+    if (!user) return { success: false, error: 'Customer not found.' };
+
+    const now = new Date().toISOString();
+    if (!user.kycItemReviews) {
+      user.kycItemReviews = {};
+    }
+
+    user.kycItemReviews[params.itemName] = {
+      status: params.status,
+      reviewedAt: now,
+      reviewedBy: params.adminId || 'usr_admin',
+      reason: params.reason,
+    };
+
+    // Recalculate overall KYC status
+    const reviews = user.kycItemReviews;
+    const itemKeys = Object.keys(reviews) as (keyof typeof reviews)[];
+    const isUS = (user.kycCountry || user.country || '').toLowerCase().includes('united states') ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'US' ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'USA';
+
+    const requiredKeys: ('identity' | 'proofOfAddress' | 'liveness' | 'ssn')[] = ['identity', 'proofOfAddress', 'liveness'];
+    if (isUS || user.kycSsn) {
+      requiredKeys.push('ssn');
+    }
+
+    const hasRejected = requiredKeys.some((k) => reviews[k]?.status === 'rejected');
+    const allApproved = requiredKeys.every((k) => reviews[k]?.status === 'approved');
+
+    const itemFriendlyNames: Record<string, string> = {
+      identity: 'Identity Document',
+      proofOfAddress: 'Proof of Address',
+      liveness: 'Biometric Liveness Selfie',
+      ssn: 'Social Security / Tax ID',
+    };
+
+    if (hasRejected) {
+      user.kycStatus = 'action_required';
+      const rejectedItems = requiredKeys
+        .filter((k) => reviews[k]?.status === 'rejected')
+        .map((k) => `${itemFriendlyNames[k]}: ${reviews[k]?.reason || 'Requires resubmission'}`)
+        .join('; ');
+      user.kycRejectionReason = rejectedItems;
+
+      this.notifications.unshift({
+        id: `notif_kyc_item_rej_${Date.now()}`,
+        userId: user.id,
+        title: 'KYC Verification Update: Action Required',
+        message: `A KYC document requires correction: ${itemFriendlyNames[params.itemName]} was rejected. Reason: ${params.reason || 'Document does not meet compliance guidelines'}. Please resubmit only this item in your Profile.`,
+        type: 'SECURITY',
+        severity: 'warning',
+        read: false,
+        createdAt: now,
+      });
+    } else if (allApproved) {
       user.kycStatus = 'verified';
       user.kycVerifiedAt = now;
       user.dailyTransactionLimit = 1000000;
+      user.kycRejectionReason = undefined;
 
       this.notifications.unshift({
-        id: `notif_kyc_${Date.now()}`,
+        id: `notif_kyc_all_app_${Date.now()}`,
         userId: user.id,
-        title: 'KYC Identity Verification Approved',
-        message: `Your ${params.documentType} (${params.documentNumber}) has been verified and approved. Your verified badge is now active with your $1,000,000 daily transaction limit.`,
+        title: 'KYC Verification Approved by Compliance',
+        message: 'All your submitted KYC verification documents have been verified and approved by Monvera Compliance Operations. Full account limits ($1,000,000/day) and verified status are active.',
         type: 'SECURITY',
         severity: 'success',
         read: false,
         createdAt: now,
       });
-
-      this.auditLogs.unshift({
-        id: `aud_${Date.now()}_kyc`,
-        adminId: 'usr_admin',
-        adminName: 'Monvera Automated Compliance Engine',
-        action: 'KYC_DOCUMENTS_VERIFIED',
-        targetUserId: user.id,
-        targetAccountNumber: user.permanentAccountNumber,
-        reason: `Automated FinCEN verification of ${params.documentType} (${params.country || 'Global'})`,
-        timestamp: now,
-        ipAddress: '127.0.0.1 (Compliance Node)',
-        result: 'SUCCESS',
-      });
     } else {
       user.kycStatus = 'pending';
-
-      this.notifications.unshift({
-        id: `notif_kyc_sub_${Date.now()}`,
-        userId: user.id,
-        title: 'KYC Verification Submitted',
-        message: `Your ${params.documentType} and address documents have been submitted for compliance verification (5–10 min turnaround).`,
-        type: 'SECURITY',
-        severity: 'info',
-        read: false,
-        createdAt: now,
-      });
-
-      this.auditLogs.unshift({
-        id: `aud_${Date.now()}_kyc_sub`,
-        adminId: 'system',
-        adminName: 'Monvera Security Ingestion',
-        action: 'KYC_SUBMITTED_FOR_REVIEW',
-        targetUserId: user.id,
-        targetAccountNumber: user.permanentAccountNumber,
-        reason: `Submitted ${params.documentType} (${params.country || 'Global'}) for 5-10 min verification`,
-        timestamp: now,
-        ipAddress: '127.0.0.1',
-        result: 'SUCCESS',
-      });
     }
+
+    this.auditLogs.unshift({
+      id: `aud_${Date.now()}_kyc_item`,
+      adminId: params.adminId || 'usr_admin',
+      adminName: 'Monvera Compliance Desk',
+      action: params.status === 'approved' ? 'KYC_ITEM_APPROVED' : params.status === 'rejected' ? 'KYC_ITEM_REJECTED' : 'KYC_ITEM_STATUS_UPDATED',
+      targetUserId: user.id,
+      targetAccountNumber: user.permanentAccountNumber,
+      reason: `Adjudicated ${itemFriendlyNames[params.itemName]} as ${params.status.toUpperCase()}${params.reason ? ` - ${params.reason}` : ''}`,
+      timestamp: now,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS',
+    });
 
     return { success: true, user };
   }
@@ -1576,6 +1715,20 @@ export class MonveraDatabase {
     user.kycStatus = 'verified';
     user.kycVerifiedAt = now;
     user.dailyTransactionLimit = 1000000;
+    user.kycRejectionReason = undefined;
+
+    const isUS = (user.kycCountry || user.country || '').toLowerCase().includes('united states') ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'US' ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'USA';
+
+    user.kycItemReviews = {
+      identity: { status: 'approved', reviewedAt: now, reviewedBy: adminId || 'usr_admin' },
+      proofOfAddress: { status: 'approved', reviewedAt: now, reviewedBy: adminId || 'usr_admin' },
+      liveness: { status: 'approved', reviewedAt: now, reviewedBy: adminId || 'usr_admin' },
+      ...(isUS || user.kycSsn
+        ? { ssn: { status: 'approved', reviewedAt: now, reviewedBy: adminId || 'usr_admin' } }
+        : {}),
+    };
 
     this.notifications.unshift({
       id: `notif_kyc_app_${Date.now()}`,
@@ -1595,13 +1748,93 @@ export class MonveraDatabase {
       action: 'ADMIN_KYC_APPROVAL',
       targetUserId: user.id,
       targetAccountNumber: user.permanentAccountNumber,
-      reason: 'Administrative manual review and identity approval',
+      reason: 'Administrative manual review and overall KYC approval',
       timestamp: now,
       ipAddress: '127.0.0.1 (Admin Console)',
       result: 'SUCCESS',
     });
 
     return { success: true, user };
+  }
+
+  public rejectKyc(params: { userId: string; reason: string; adminId?: string }): { success: boolean; user?: UserProfile; error?: string } {
+    const user = this.users.get(params.userId);
+    if (!user) return { success: false, error: 'Customer not found.' };
+
+    const now = new Date().toISOString();
+    user.kycStatus = 'action_required';
+    user.dailyTransactionLimit = 25000;
+    user.kycRejectionReason = params.reason || 'Documents could not be verified by compliance.';
+
+    const isUS = (user.kycCountry || user.country || '').toLowerCase().includes('united states') ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'US' ||
+                 (user.kycCountry || user.country || '').toUpperCase() === 'USA';
+
+    user.kycItemReviews = {
+      identity: { status: 'rejected', reviewedAt: now, reviewedBy: params.adminId || 'usr_admin', reason: params.reason },
+      proofOfAddress: { status: 'rejected', reviewedAt: now, reviewedBy: params.adminId || 'usr_admin', reason: params.reason },
+      liveness: { status: 'rejected', reviewedAt: now, reviewedBy: params.adminId || 'usr_admin', reason: params.reason },
+      ...(isUS || user.kycSsn
+        ? { ssn: { status: 'rejected', reviewedAt: now, reviewedBy: params.adminId || 'usr_admin', reason: params.reason } }
+        : {}),
+    };
+
+    this.notifications.unshift({
+      id: `notif_kyc_rej_${Date.now()}`,
+      userId: user.id,
+      title: 'KYC Document Verification Status',
+      message: `Your identity verification requires attention. Reason: ${params.reason || 'Document unreadable or invalid credentials'}. Please review and re-submit the required documents in your Profile.`,
+      type: 'SECURITY',
+      severity: 'warning',
+      read: false,
+      createdAt: now,
+    });
+
+    this.auditLogs.unshift({
+      id: `aud_${Date.now()}_kyc_rej`,
+      adminId: params.adminId || 'usr_admin',
+      adminName: 'Monvera Compliance Desk',
+      action: 'ADMIN_KYC_REJECTED',
+      targetUserId: user.id,
+      targetAccountNumber: user.permanentAccountNumber,
+      reason: params.reason || 'Identity documents failed compliance verification',
+      timestamp: now,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS',
+    });
+
+    return { success: true, user };
+  }
+
+  public updateTransactionStatus(params: {
+    txId: string;
+    status: TransactionStatus;
+    adminId?: string;
+    reason?: string;
+  }): { success: boolean; transaction?: Transaction; error?: string } {
+    const tx = this.transactions.find((t) => t.id === params.txId || t.referenceNumber === params.txId);
+    if (!tx) return { success: false, error: 'Transaction record not found.' };
+
+    const oldStatus = tx.status;
+    tx.status = params.status;
+    if (params.status === 'COMPLETED') {
+      tx.completedAt = new Date().toISOString();
+    }
+
+    this.auditLogs.unshift({
+      id: `aud_${Date.now()}_tx_status`,
+      adminId: params.adminId || 'usr_admin',
+      adminName: 'Monvera Settlement Desk',
+      action: `TRANSACTION_STATUS_UPDATED_${params.status}`,
+      targetUserId: tx.senderUserId || tx.recipientUserId,
+      amount: tx.amount,
+      reason: params.reason || `Status changed from ${oldStatus} to ${params.status}`,
+      timestamp: new Date().toISOString(),
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS',
+    });
+
+    return { success: true, transaction: tx };
   }
 
   // --- Support & Notification Management ---

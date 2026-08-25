@@ -266,17 +266,24 @@ app.post('/api/auth/update-avatar', (req: Request, res: Response) => {
 app.post('/api/kyc/submit', (req: Request, res: Response) => {
   const {
     userId,
+    fullName,
     firstName,
     lastName,
     documentType,
     documentNumber,
     documentImage,
+    documentBackImage,
     liveSelfieImage,
     streetAddress,
     country,
-    proofOfAddress,
+    phone,
+    email,
+    dateOfBirth,
+    proofOfAddressType,
     proofOfAddressImage,
     ssn,
+    ssnImage,
+    isResubmission,
     autoApprove,
     reviewDurationMinutes,
   } = req.body;
@@ -287,18 +294,25 @@ app.post('/api/kyc/submit', (req: Request, res: Response) => {
 
   const result = db.submitKyc({
     userId,
+    fullName,
     firstName,
     lastName,
     documentType,
     documentNumber,
     documentImage,
+    documentBackImage,
     liveSelfieImage,
     streetAddress,
     country,
-    proofOfAddress,
+    phone,
+    email,
+    dateOfBirth,
+    proofOfAddressType,
     proofOfAddressImage,
     ssn,
-    autoApprove: autoApprove !== false,
+    ssnImage,
+    isResubmission,
+    autoApprove: false, // Strict compliance: Requires manual/individual review
     reviewDurationMinutes: reviewDurationMinutes || 10,
   });
 
@@ -812,6 +826,58 @@ app.post('/api/admin/customers/:id/toggle-status', (req: Request, res: Response)
   });
 
   res.json({ success: true, user });
+});
+
+// Admin KYC Approval & Rejection Endpoints
+app.post('/api/admin/kyc/approve', (req: Request, res: Response) => {
+  const { userId, adminId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  const result = db.approveKyc(userId, adminId);
+  if (!result.success) return res.status(400).json({ error: result.error });
+
+  res.json(result);
+});
+
+app.post('/api/admin/kyc/reject', (req: Request, res: Response) => {
+  const { userId, reason, adminId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  const result = db.rejectKyc({ userId, reason: reason || 'Documents could not be verified by compliance.', adminId });
+  if (!result.success) return res.status(400).json({ error: result.error });
+
+  res.json(result);
+});
+
+app.post('/api/admin/kyc/review-item', (req: Request, res: Response) => {
+  const { userId, itemName, status, reason, adminId } = req.body;
+  if (!userId || !itemName || !status) {
+    return res.status(400).json({ error: 'userId, itemName, and status are required' });
+  }
+
+  const result = db.reviewKycItem({
+    userId,
+    itemName,
+    status,
+    reason,
+    adminId,
+  });
+
+  if (!result.success) return res.status(400).json({ error: result.error });
+
+  res.json(result);
+});
+
+// Admin Transaction Status Endpoint
+app.post('/api/admin/transactions/:id/update-status', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { status, adminId, reason } = req.body;
+  if (!status) return res.status(400).json({ error: 'status is required' });
+
+  const result = db.updateTransactionStatus({ txId: id, status, adminId, reason });
+  if (!result.success) return res.status(400).json({ error: result.error });
+
+  res.json(result);
 });
 
 // Admin Development Funding System (Isolated for testing/staging)
