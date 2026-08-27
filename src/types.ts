@@ -104,6 +104,7 @@ export interface Transaction {
   amount: number;
   currency: string;
   status: TransactionStatus;
+  userId?: string;
   senderUserId?: string;
   senderName?: string;
   senderAccountNumber?: string;
@@ -236,6 +237,21 @@ export interface SessionInfo {
   ipAddress: string;
   lastActive: string;
   isCurrent: boolean;
+}
+
+export interface ChatMessage {
+  id: string;
+  userId: string;
+  sender: 'user' | 'support' | 'system';
+  senderName: string;
+  senderRole?: string;
+  senderAvatar?: string;
+  message: string;
+  timestamp: string;
+  status: 'sent' | 'delivered' | 'read';
+  attachmentUrl?: string;
+  attachmentType?: 'image' | 'document' | 'receipt';
+  quickAction?: string;
 }
 
 export interface AdminSystemOverview {

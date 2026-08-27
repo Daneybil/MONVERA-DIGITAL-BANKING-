@@ -16,6 +16,7 @@ import {
   Layers,
   Activity,
   ArrowRight,
+  ArrowLeft,
   Plus,
   Lock,
   Unlock,
@@ -33,6 +34,8 @@ import {
   Clock,
   Sparkles,
   MessageSquare,
+  Home,
+  Send,
 } from 'lucide-react';
 import { AdminOverviewView } from './AdminOverviewView';
 import { AdminCustomersView } from './AdminCustomersView';
@@ -48,7 +51,7 @@ import { AdminAuditLogView } from './AdminAuditLogView';
 import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 
 export const AdminDashboard: React.FC = () => {
-  const { currentUser, refreshBalance, refreshNotifications } = useAuth();
+  const { currentUser, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal } = useAuth();
 
   const [activeTab, setActiveTab] = useState<string>('overview');
   const [metrics, setMetrics] = useState<AdminSystemOverview | null>(null);
@@ -83,6 +86,16 @@ export const AdminDashboard: React.FC = () => {
           (s.permanentAccountNumber && s.permanentAccountNumber.replace(/[-\s]/g, '') === accKey)
       );
 
+      // Check if this user is the currently active logged-in user
+      const isCurrentActive = loggedInUser && (loggedInUser.id === fsUser.id || (loggedInUser.email && loggedInUser.email.toLowerCase().trim() === emailKey));
+      
+      let effectiveMetrics = fsUser.balanceMetrics;
+      if (isCurrentActive && currentAuthBalanceMetrics) {
+        effectiveMetrics = currentAuthBalanceMetrics;
+      } else if (!effectiveMetrics || (effectiveMetrics.totalBalance === 0 && effectiveMetrics.checkingBalance === 0)) {
+        effectiveMetrics = matchedServer?.balanceMetrics || effectiveMetrics;
+      }
+
       const defaultMetrics = {
         checkingBalance: 0,
         savingsBalance: 0,
@@ -93,9 +106,15 @@ export const AdminDashboard: React.FC = () => {
         pendingBalance: 0,
       };
 
+      const finalMetrics = effectiveMetrics || defaultMetrics;
+      const total = (finalMetrics.checkingBalance || 0) + (finalMetrics.savingsBalance || 0) + (finalMetrics.investedBalance || 0);
+
       const finalUser: UserProfile & { balanceMetrics?: any } = {
         ...fsUser,
-        balanceMetrics: fsUser.balanceMetrics || matchedServer?.balanceMetrics || defaultMetrics,
+        balanceMetrics: {
+          ...finalMetrics,
+          totalBalance: total > 0 ? total : (finalMetrics.totalBalance || 0),
+        },
       };
 
       userMap.set(fsUser.id, finalUser);
@@ -109,17 +128,19 @@ export const AdminDashboard: React.FC = () => {
       const loggedAcc = (loggedInUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
 
       if (!userMap.has(loggedInUser.id) && !seenEmails.has(loggedEmail)) {
+        const liveMetrics = currentAuthBalanceMetrics || (loggedInUser as any).balanceMetrics || {
+          checkingBalance: 25000.0,
+          savingsBalance: 50000.0,
+          investedBalance: 15000.0,
+          totalBalance: 90000.0,
+          availableBalance: 75000.0,
+          accruedEarnings: 800.0,
+          pendingBalance: 0,
+        };
+
         userMap.set(loggedInUser.id, {
           ...loggedInUser,
-          balanceMetrics: (loggedInUser as any).balanceMetrics || {
-            checkingBalance: 25000.0,
-            savingsBalance: 50000.0,
-            investedBalance: 15000.0,
-            totalBalance: 90000.0,
-            availableBalance: 75000.0,
-            accruedEarnings: 800.0,
-            pendingBalance: 0,
-          },
+          balanceMetrics: liveMetrics,
         });
         if (loggedEmail) seenEmails.add(loggedEmail);
         if (loggedAcc) seenAccountNums.add(loggedAcc);
@@ -312,6 +333,31 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
+  const handleAdminTransfer = async (params: {
+    targetUserId: string;
+    amount: number;
+    description: string;
+  }) => {
+    try {
+      const res = await api.sendAdminTransfer({
+        adminId: currentUser?.id || 'usr_admin',
+        targetUserId: params.targetUserId,
+        amount: params.amount,
+        description: params.description,
+      });
+
+      if (res.success) {
+        await loadAllAdminData();
+        await refreshBalance();
+        await refreshNotifications();
+        return { success: true };
+      }
+      return { success: false, error: res.error || 'Failed to complete administrative transfer.' };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Server error' };
+    }
+  };
+
   const handleIssueDevFunding = async (params: {
     targetUserId: string;
     amount: number;
@@ -402,8 +448,33 @@ export const AdminDashboard: React.FC = () => {
             </div>
 
             {/* Quick System Tools */}
-            <div className="flex items-center gap-4">
-              <div className="hidden md:flex items-center gap-2 text-sm text-slate-300 font-mono font-semibold">
+            <div className="flex items-center gap-2.5 sm:gap-3.5">
+              {/* Send Money Button (Prominent, matching reference) */}
+              <button
+                id="admin-header-send-money-btn"
+                onClick={() => openModal('send')}
+                className="inline-flex items-center gap-2 px-3.5 sm:px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-md hover:shadow-lg transition-all cursor-pointer border border-emerald-500/60 active:scale-95"
+                title="Send Money to Customer Account"
+              >
+                <Send className="w-4 h-4 text-white stroke-[2.5]" />
+                <span>Send Money</span>
+              </button>
+
+              {/* Back to Member Portal / Public Website Button */}
+              <button
+                id="admin-return-portal-btn"
+                onClick={() => {
+                  setCurrentView(currentUser ? 'dashboard' : 'home');
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 hover:text-amber-300 text-xs font-black border border-slate-700 transition-all cursor-pointer shadow-xs active:scale-95"
+                title="Return to Member Dashboard"
+              >
+                <ArrowLeft className="w-4 h-4 text-amber-400 stroke-[3]" />
+                <span className="font-extrabold">{currentUser ? 'Back to Dashboard' : 'Back to Home'}</span>
+              </button>
+
+              <div className="hidden md:flex items-center gap-2 text-xs text-slate-300 font-mono font-semibold">
                 <span>Last Sync:</span>
                 <span className="text-white font-bold">{lastRefreshed.toLocaleTimeString()}</span>
               </div>
@@ -411,19 +482,19 @@ export const AdminDashboard: React.FC = () => {
               <button
                 onClick={loadAllAdminData}
                 disabled={isLoading}
-                className="p-2 sm:px-4 sm:py-2 rounded-xl text-sm font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
+                className="p-2 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
               >
                 <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-amber-400' : ''}`} />
-                <span className="hidden sm:inline">Refresh Data</span>
+                <span className="hidden sm:inline">Refresh</span>
               </button>
 
-              <div className="flex items-center gap-3 pl-3 border-l border-slate-800">
-                <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-sm font-black text-amber-400">
-                  {currentUser?.firstName?.[0] || 'A'}
+              <div className="flex items-center gap-2.5 pl-2 sm:pl-3 border-l border-slate-800">
+                <div className="w-9 h-9 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-black text-amber-400">
+                  {currentUser?.firstName?.[0] || 'B'}
                 </div>
                 <div className="hidden lg:block text-left">
-                  <div className="font-bold text-sm text-white">{currentUser?.firstName || 'Chief Admin'} {currentUser?.lastName || ''}</div>
-                  <div className="text-xs font-medium text-slate-400">Executive Officer</div>
+                  <div className="font-bold text-xs text-white">{currentUser?.firstName || 'Bennett'} {currentUser?.lastName || 'Johnson'}</div>
+                  <div className="text-[11px] font-medium text-amber-400/90">Chief Executive Admin</div>
                 </div>
               </div>
             </div>
@@ -479,7 +550,37 @@ export const AdminDashboard: React.FC = () => {
       </header>
 
       {/* Main Content Area */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8">
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 pb-12">
+        {/* Navigation Breadcrumb Bar with Quick Back Action */}
+        <div className="mb-6 flex items-center justify-between pb-3 border-b border-slate-200">
+          <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => {
+                setCurrentView(currentUser ? 'dashboard' : 'home');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 text-xs font-black transition-colors cursor-pointer shadow-2xs"
+            >
+              <ArrowLeft className="w-3.5 h-3.5 text-slate-600 stroke-[2.5]" />
+              <span>Back to User Banking Portal</span>
+            </button>
+            <span className="text-slate-300">/</span>
+            <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+              {navTabs.find((t) => t.id === activeTab)?.label || 'Control Center'}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => openModal('send')}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow-xs transition-colors cursor-pointer"
+            >
+              <Send className="w-3.5 h-3.5" />
+              <span>Send Money</span>
+            </button>
+          </div>
+        </div>
+
         {activeTab === 'overview' && (
           <AdminOverviewView
             metrics={metrics}
@@ -488,6 +589,7 @@ export const AdminDashboard: React.FC = () => {
             auditLogs={auditLogs}
             onNavigateTab={(tab) => setActiveTab(tab)}
             onSelectCustomer={(cust) => setSelectedCustomer(cust)}
+            onOpenSendMoney={() => openModal('send')}
           />
         )}
 
@@ -544,6 +646,9 @@ export const AdminDashboard: React.FC = () => {
         {activeTab === 'transfers' && (
           <AdminTransfersView
             transactions={transactions}
+            customers={customers}
+            onAdminTransfer={handleAdminTransfer}
+            onOpenSendMoney={() => openModal('send')}
             onRefreshData={loadAllAdminData}
           />
         )}

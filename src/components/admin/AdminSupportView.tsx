@@ -123,13 +123,13 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
         : t.supportStatus === 'OPEN' || !t.supportStatus;
 
     const matchesSearch =
-      t.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      t.message.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (t.title || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (t.message || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
       (t.supportRepName && t.supportRepName.toLowerCase().includes(searchQuery.toLowerCase())) ||
       (targetCustomer &&
-        (`${targetCustomer.firstName} ${targetCustomer.lastName}`.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          targetCustomer.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          targetCustomer.permanentAccountNumber.includes(searchQuery)));
+        (`${targetCustomer.firstName || ''} ${targetCustomer.lastName || ''}`.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          (targetCustomer.email || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+          (targetCustomer.permanentAccountNumber || '').includes(searchQuery)));
 
     return matchesStatus && matchesSearch;
   });

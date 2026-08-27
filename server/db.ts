@@ -36,98 +36,14 @@ export class MonveraDatabase {
   }
 
   private seedInitialData() {
-    // 1. Seed Customer: Eleanor Vance
-    const eleanorId = 'usr_eleanor';
-    const eleanorAccNum = '1045827391';
-    const eleanorUser: UserProfile = {
-      id: eleanorId,
-      username: 'eleanor',
-      firstName: 'Eleanor',
-      lastName: 'Vance',
-      email: 'eleanor.vance@monvera.com',
-      phone: '+1 (555) 234-8901',
-      permanentAccountNumber: eleanorAccNum,
-      dateOfBirth: '1989-04-14',
-      country: 'United States',
-      avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-      status: 'active',
-      role: 'customer',
-      membershipTier: 'Private Wealth',
-      twoFactorEnabled: true,
-      createdAt: '2025-01-15T09:00:00Z',
-      kycStatus: 'verified',
-      kycDocumentType: 'Passport (United States)',
-      kycDocumentNumber: 'US-PASS-99042811',
-      kycSubmittedAt: '2025-01-15T10:00:00Z',
-      kycVerifiedAt: '2025-01-16T10:00:00Z',
-      dailyTransactionLimit: 1000000,
-    };
-    this.users.set(eleanorId, eleanorUser);
-    this.userPasswords.set(eleanorId, 'Password123!');
-
-    // 2. Seed Customer: Marcus Sterling (Business Entrepreneur)
-    const marcusId = 'usr_marcus';
-    const marcusAccNum = '1088492015';
-    const marcusUser: UserProfile = {
-      id: marcusId,
-      username: 'marcus',
-      firstName: 'Marcus',
-      lastName: 'Sterling',
-      email: 'marcus@sterlingtech.io',
-      phone: '+1 (555) 892-4412',
-      permanentAccountNumber: marcusAccNum,
-      dateOfBirth: '1984-11-20',
-      country: 'United States',
-      avatarUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&auto=format&fit=crop&q=80',
-      status: 'active',
-      role: 'business',
-      membershipTier: 'Business Platinum',
-      twoFactorEnabled: true,
-      createdAt: '2025-02-01T11:30:00Z',
-      businessName: 'Sterling Technologies Inc.',
-      kycStatus: 'verified',
-      kycDocumentType: 'Driver License / Corporate ID',
-      kycDocumentNumber: 'DL-CA-44910284',
-      kycSubmittedAt: '2025-02-01T12:00:00Z',
-      kycVerifiedAt: '2025-02-02T12:00:00Z',
-      dailyTransactionLimit: 1000000,
-    };
-    this.users.set(marcusId, marcusUser);
-    this.userPasswords.set(marcusId, 'Password123!');
-
-    // 3. Seed Customer: Sophia Chen
-    const sophiaId = 'usr_sophia';
-    const sophiaAccNum = '1093847294';
-    const sophiaUser: UserProfile = {
-      id: sophiaId,
-      username: 'sophia',
-      firstName: 'Sophia',
-      lastName: 'Chen',
-      email: 'sophia.chen@monvera.com',
-      phone: '+1 (555) 431-7788',
-      permanentAccountNumber: sophiaAccNum,
-      dateOfBirth: '1992-08-05',
-      country: 'United States',
-      avatarUrl: 'https://images.unsplash.com/photo-1517841905240-472988babdf9?w=150&auto=format&fit=crop&q=80',
-      status: 'active',
-      role: 'customer',
-      membershipTier: 'Premier',
-      twoFactorEnabled: true,
-      createdAt: '2025-03-10T14:15:00Z',
-      kycStatus: 'unverified',
-      dailyTransactionLimit: 1000000,
-    };
-    this.users.set(sophiaId, sophiaUser);
-    this.userPasswords.set(sophiaId, 'Password123!');
-
-    // 4. Seed Super Admin
+    // Seed Super Admin Operations User (Bennett Johnson)
     const adminId = 'usr_admin';
     const adminAccNum = '1000000001';
     const adminUser: UserProfile = {
       id: adminId,
-      username: 'admin',
-      firstName: 'Monvera',
-      lastName: 'Operations',
+      username: 'bennett_johnson',
+      firstName: 'Bennett',
+      lastName: 'Johnson',
       email: 'admin@monvera.com',
       phone: '+1 (800) 555-0199',
       permanentAccountNumber: adminAccNum,
@@ -139,180 +55,15 @@ export class MonveraDatabase {
       twoFactorEnabled: true,
       createdAt: '2024-12-01T00:00:00Z',
       kycStatus: 'verified',
-      dailyTransactionLimit: 1000000,
+      dailyTransactionLimit: 10000000,
     };
     this.users.set(adminId, adminUser);
     this.userPasswords.set(adminId, 'Password123!');
 
-    // Initialize Bank Accounts
-    this.initUserAccounts(eleanorId, eleanorAccNum);
-    this.initUserAccounts(marcusId, marcusAccNum);
-    this.initUserAccounts(sophiaId, sophiaAccNum);
+    // Initialize Bank Accounts for Admin
     this.initUserAccounts(adminId, adminAccNum);
 
-    // Initial Cards: Start empty as requested so user can create fresh cards themselves
-    // this.cards is kept empty on initialization
-
-    // Seed Initial Transactions and Ledger records
-    this.seedLedgerTransactions(eleanorId, marcusId, sophiaId);
-    this.seedNotificationsData(eleanorId, marcusId, sophiaId);
-
-    // Seed Initial Term Investment for Eleanor (e.g. 180 Days Term)
-    const inv1Id = 'inv_el_01';
-    const inv1StartDate = new Date(Date.now() - 35 * 24 * 60 * 60 * 1000).toISOString(); // 35 days ago
-    const inv1MaturityDate = new Date(Date.now() + 145 * 24 * 60 * 60 * 1000).toISOString();
-    const invAmount = 25000;
-    const invDailyRate = 4.5; // 4.5% interest every 24 hours
-    const expectedYield = Number((invAmount * 0.045 * 180).toFixed(2));
-    const accruedEarnings = Number((invAmount * 0.045 * 35).toFixed(2));
-
-    this.investments.set(inv1Id, {
-      id: inv1Id,
-      userId: eleanorId,
-      planName: 'Monvera 180-Day Term Investment',
-      termDays: 180,
-      amount: invAmount,
-      apy: 4.5,
-      dailyRate: invDailyRate,
-      expectedYield,
-      expectedMaturityValue: invAmount + expectedYield,
-      totalAccruedEarnings: accruedEarnings,
-      startDate: inv1StartDate,
-      maturityDate: inv1MaturityDate,
-      status: 'ACTIVE',
-      createdAt: inv1StartDate,
-    });
-
-    // Log some earnings for this investment
-    for (let i = 1; i <= 5; i++) {
-      const earnDate = new Date(Date.now() - (35 - i * 7) * 24 * 60 * 60 * 1000).toISOString();
-      this.investmentEarnings.push({
-        id: `earn_${inv1Id}_${i}`,
-        investmentId: inv1Id,
-        userId: eleanorId,
-        date: earnDate,
-        amount: Number((accruedEarnings / 5).toFixed(2)),
-        runningValue: invAmount + Number(((accruedEarnings / 5) * i).toFixed(2)),
-        status: 'POSTED',
-      });
-    }
-
-    // Seed Notifications
-    this.notifications.push(
-      {
-        id: 'notif_sup_01',
-        userId: eleanorId,
-        title: 'Customer Support: Private Wealth Desk',
-        message: 'Hello Eleanor, your dedicated Private Wealth liaison David Vance is available to assist with institutional Treasury allocations or international wire limits. How may we assist you today?',
-        type: 'SUPPORT',
-        severity: 'support',
-        read: false,
-        createdAt: new Date(Date.now() - 1 * 3600000).toISOString(),
-        supportTicketId: 'MV-CS-89210',
-        supportRepName: 'David Vance',
-        supportRepRole: 'Senior Private Wealth Director',
-        supportRepAvatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-        replies: [
-          {
-            id: 'rep_01',
-            sender: 'support',
-            senderName: 'David Vance',
-            senderAvatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150&auto=format&fit=crop&q=80',
-            message: 'Hello Eleanor, your dedicated Private Wealth liaison David Vance is available to assist with institutional Treasury allocations or international wire limits. How may we assist you today?',
-            createdAt: new Date(Date.now() - 1 * 3600000).toISOString(),
-          },
-        ],
-      },
-      {
-        id: 'notif_01',
-        userId: eleanorId,
-        title: 'Dividend & Yield Accrual Posted',
-        message: 'Your 180-Day Sovereign Investment generated +$40.27 in scheduled returns today.',
-        type: 'INVESTMENT',
-        severity: 'success',
-        read: false,
-        createdAt: new Date(Date.now() - 2 * 3600000).toISOString(),
-      },
-      {
-        id: 'notif_02',
-        userId: eleanorId,
-        title: 'Money Received',
-        message: 'You received $5,000.00 from Marcus Sterling (MVB Account •••• 2015).',
-        type: 'TRANSACTION',
-        severity: 'success',
-        read: false,
-        createdAt: new Date(Date.now() - 28 * 3600000).toISOString(),
-      },
-      {
-        id: 'notif_03',
-        userId: eleanorId,
-        title: 'Security Verification Complete',
-        message: 'Biometric and hardware 2-Factor Authentication confirmed for your primary device.',
-        type: 'SECURITY',
-        severity: 'info',
-        read: true,
-        createdAt: new Date(Date.now() - 72 * 3600000).toISOString(),
-      },
-      {
-        id: 'notif_sup_02',
-        userId: marcusId,
-        title: 'Customer Support: Business Platinum Concierge',
-        message: 'Marcus, your corporate liquidity sweep threshold has been verified by the Monvera Treasury operations desk.',
-        type: 'SUPPORT',
-        severity: 'support',
-        read: false,
-        createdAt: new Date(Date.now() - 4 * 3600000).toISOString(),
-        supportTicketId: 'MV-CS-44102',
-        supportRepName: 'Sarah Jenkins',
-        supportRepRole: 'Monvera Corporate Treasury Liaison',
-        supportRepAvatar: 'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150&auto=format&fit=crop&q=80',
-        replies: [
-          {
-            id: 'rep_m01',
-            sender: 'support',
-            senderName: 'Sarah Jenkins',
-            message: 'Marcus, your corporate liquidity sweep threshold has been verified by the Monvera Treasury operations desk.',
-            createdAt: new Date(Date.now() - 4 * 3600000).toISOString(),
-          },
-        ],
-      }
-    );
-
-    // Seed Active Sessions
-    this.sessions.set(eleanorId, [
-      {
-        id: 'ses_01',
-        userId: eleanorId,
-        device: 'Apple MacBook Pro 16" (M3 Max)',
-        browser: 'Chrome 128 / macOS Sequoia',
-        location: 'San Francisco, CA, USA',
-        ipAddress: '192.0.2.45',
-        lastActive: 'Just now',
-        isCurrent: true,
-      },
-      {
-        id: 'ses_02',
-        userId: eleanorId,
-        device: 'Apple iPhone 16 Pro',
-        browser: 'Monvera iOS App v3.2.0',
-        location: 'San Francisco, CA, USA',
-        ipAddress: '198.51.100.12',
-        lastActive: '2 hours ago',
-        isCurrent: false,
-      },
-    ]);
-
-    // Seed Admin Audit Logs
-    this.auditLogs.push({
-      id: 'aud_01',
-      adminId: 'usr_admin',
-      adminName: 'Monvera Operations Officer',
-      action: 'SYSTEM_LIQUIDITY_AUDIT',
-      reason: 'Standard nightly ledger reconciliation',
-      timestamp: new Date(Date.now() - 14 * 3600000).toISOString(),
-      ipAddress: '10.0.0.1',
-      result: 'SUCCESS',
-    });
+    // Initial Cards, Investments, Transactions, and Notifications start clean with only real user data
   }
 
   private initUserAccounts(userId: string, permanentAccNum: string) {
@@ -366,111 +117,6 @@ export class MonveraDatabase {
       interestRateAPY: 8.4,
       status: 'ACTIVE',
       nickname: 'Monvera Capital Investment Portfolio',
-    });
-  }
-
-  private seedLedgerTransactions(eleanorId: string, marcusId: string, sophiaId: string) {
-    const now = Date.now();
-
-    // Eleanor initial funding: Deposit $75,000
-    this.recordLedgerTransaction({
-      type: 'DEPOSIT',
-      amount: 75000,
-      userId: eleanorId,
-      recipientUserId: eleanorId,
-      recipientAccountId: `acc_chk_${eleanorId}`,
-      description: 'Initial Wire Deposit from Chase Private Client',
-      category: 'Deposits',
-      status: 'COMPLETED',
-      paymentProviderRef: 'WIRE-US-9920148',
-      timestamp: new Date(now - 45 * 86400000).toISOString(),
-    });
-
-    // Eleanor transfer to Savings: $20,000
-    this.recordInternalAccountTransfer(
-      eleanorId,
-      `acc_chk_${eleanorId}`,
-      `acc_sav_${eleanorId}`,
-      20000,
-      'Automated High-Yield Savings Allocation',
-      new Date(now - 40 * 86400000).toISOString()
-    );
-
-    // Eleanor invested $25,000 into 180-Day Capital Term
-    this.recordLedgerTransaction({
-      type: 'INVESTMENT',
-      amount: 25000,
-      userId: eleanorId,
-      senderAccountId: `acc_chk_${eleanorId}`,
-      recipientAccountId: `acc_inv_${eleanorId}`,
-      description: 'Allocation to 180-Day Sovereign Term Plan (8.40% APY)',
-      category: 'Investments',
-      status: 'COMPLETED',
-      timestamp: new Date(now - 35 * 86400000).toISOString(),
-    });
-
-    // Marcus deposit: $150,000
-    this.recordLedgerTransaction({
-      type: 'DEPOSIT',
-      amount: 150000,
-      userId: marcusId,
-      recipientUserId: marcusId,
-      recipientAccountId: `acc_chk_${marcusId}`,
-      description: 'Commercial Capital Infusion - Sterling Ventures',
-      category: 'Deposits',
-      status: 'COMPLETED',
-      paymentProviderRef: 'ACH-COMM-881920',
-      timestamp: new Date(now - 30 * 86400000).toISOString(),
-    });
-
-    // Marcus transfers $5,000 to Eleanor (Monvera-to-Monvera)
-    this.recordMonveraTransfer({
-      senderUserId: marcusId,
-      recipientUserId: eleanorId,
-      amount: 5000,
-      description: 'Consulting Advisory Fee - Q1 Strategy',
-      category: 'Transfers',
-      timestamp: new Date(now - 28 * 3600000).toISOString(),
-    });
-
-    // Sophia deposit: $90,000
-    this.recordLedgerTransaction({
-      type: 'DEPOSIT',
-      amount: 90000,
-      userId: sophiaId,
-      recipientUserId: sophiaId,
-      recipientAccountId: `acc_chk_${sophiaId}`,
-      description: 'Wire Transfer - Apex Global Asset Management',
-      category: 'Deposits',
-      status: 'COMPLETED',
-      paymentProviderRef: 'FEDWIRE-NY-448102',
-      timestamp: new Date(now - 20 * 86400000).toISOString(),
-    });
-
-    // Eleanor card payment: Apple Store
-    this.recordLedgerTransaction({
-      type: 'CARD_PURCHASE',
-      amount: 2499.0,
-      userId: eleanorId,
-      senderAccountId: `acc_chk_${eleanorId}`,
-      description: 'Apple Park Infinite Loop - Hardware Upgrade',
-      category: 'Shopping',
-      status: 'COMPLETED',
-      paymentProviderRef: 'AUTH-VISA-99410',
-      timestamp: new Date(now - 5 * 86400000).toISOString(),
-    });
-
-    // Eleanor card payment: Four Seasons Resorts
-    this.recordLedgerTransaction({
-      type: 'CARD_PURCHASE',
-      amount: 1850.0,
-      userId: eleanorId,
-      senderAccountId: `acc_chk_${eleanorId}`,
-      description: 'Four Seasons Resort Maui - Executive Suite',
-      category: 'Shopping',
-      status: 'COMPLETED',
-      paymentProviderRef: 'AUTH-VISA-10492',
-      timestamp: new Date(now - 2 * 86400000).toISOString(),
     });
   }
 
@@ -724,6 +370,141 @@ export class MonveraDatabase {
       read: false,
       createdAt: new Date().toISOString(),
       referenceId: tx.referenceNumber,
+    });
+
+    return { success: true, transaction: tx };
+  }
+
+  // --- Official Administrative Transfer from Bennett Johnson ---
+  public recordAdminTransfer(params: {
+    targetUserId: string;
+    amount: number;
+    description?: string;
+    category?: Transaction['category'];
+    adminId?: string;
+  }): { success: boolean; transaction?: Transaction; error?: string } {
+    let targetUser = this.users.get(params.targetUserId);
+    if (!targetUser) {
+      const cleanTarget = (params.targetUserId || '').replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
+      targetUser = Array.from(this.users.values()).find(
+        (u) =>
+          u.id === params.targetUserId ||
+          (u.permanentAccountNumber && u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget) ||
+          (u.username && u.username.toLowerCase() === cleanTarget) ||
+          (u.email && u.email.toLowerCase() === cleanTarget) ||
+          `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanTarget
+      );
+    }
+
+    if (!targetUser) {
+      // Dynamic user fallback for users registered across Firestore sessions
+      const cleanDigits = (params.targetUserId || '').replace(/[-\s]/g, '');
+      const dynamicId = params.targetUserId.startsWith('usr_') ? params.targetUserId : `usr_${params.targetUserId}`;
+      targetUser = {
+        id: dynamicId,
+        username: `user_${cleanDigits.slice(-4) || 'customer'}`,
+        firstName: 'Monvera',
+        lastName: 'Customer',
+        email: `customer_${cleanDigits || Date.now()}@monvera.com`,
+        phone: '+1 (555) 019-2834',
+        country: 'United States',
+        permanentAccountNumber: cleanDigits.length >= 8 ? cleanDigits : `10${Math.floor(10000000 + Math.random() * 90000000)}`,
+        status: 'active',
+        membershipTier: 'Premier',
+        role: 'customer',
+        createdAt: new Date().toISOString(),
+        twoFactorEnabled: false,
+        kycStatus: 'verified',
+        emailVerified: true,
+        dailyTransactionLimit: 1000000,
+      };
+      this.users.set(dynamicId, targetUser);
+    }
+
+    if (!params.amount || params.amount <= 0) {
+      return { success: false, error: 'Transfer amount must be greater than $0.00.' };
+    }
+
+    const adminSender = this.users.get('usr_admin') || {
+      id: 'usr_admin',
+      firstName: 'Bennett',
+      lastName: 'Johnson',
+      permanentAccountNumber: '1000000001',
+    };
+
+    const targetChk = `acc_chk_${targetUser.id}`;
+    const txId = `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const refNum = `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
+    const txTimestamp = new Date().toISOString();
+
+    const tx: Transaction = {
+      id: txId,
+      referenceNumber: refNum,
+      type: 'TRANSFER',
+      amount: params.amount,
+      currency: 'USD',
+      status: 'COMPLETED',
+      senderUserId: 'usr_admin',
+      senderName: 'Bennett Johnson',
+      senderAccountNumber: '1000000001',
+      recipientUserId: targetUser.id,
+      recipientName: `${targetUser.firstName} ${targetUser.lastName}`.trim() || targetUser.username || 'Customer',
+      recipientAccountNumber: targetUser.permanentAccountNumber,
+      fee: 0.00,
+      description: params.description || 'Administrative Direct Transfer from Bennett Johnson',
+      category: params.category || 'Transfers',
+      createdAt: txTimestamp,
+      completedAt: txTimestamp,
+      metadata: {
+        adminSenderName: 'Bennett Johnson',
+        adminSenderAccount: '1000000001',
+        disbursementType: 'ADMINISTRATIVE_TRANSFER',
+      },
+    };
+
+    this.transactions.unshift(tx);
+
+    // Credit recipient checking ledger
+    this.ledgerEntries.push({
+      id: `led_${Date.now()}_c_${Math.random().toString(36).substring(2, 6)}`,
+      transactionId: txId,
+      userId: targetUser.id,
+      accountId: targetChk,
+      entryType: 'CREDIT',
+      amount: params.amount,
+      balanceAfter: 0, // Computed dynamically
+      description: tx.description,
+      timestamp: txTimestamp,
+    });
+
+    // Notify recipient
+    this.notifications.unshift({
+      id: `notif_${Date.now()}_adm_r`,
+      userId: targetUser.id,
+      title: 'Money Received',
+      message: `Received $${params.amount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })} from Bennett Johnson (MVB •••• 0001).`,
+      type: 'TRANSACTION',
+      severity: 'success',
+      read: false,
+      createdAt: txTimestamp,
+      referenceId: tx.referenceNumber,
+    });
+
+    // Audit log
+    this.auditLogs.unshift({
+      id: `aud_${Date.now()}_adm_tx`,
+      adminId: params.adminId || 'usr_admin',
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_TRANSFER_DISBURSEMENT',
+      targetUserId: targetUser.id,
+      targetAccountNumber: targetUser.permanentAccountNumber,
+      amount: params.amount,
+      reason: params.description || 'Administrative Direct Transfer',
+      timestamp: txTimestamp,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS',
     });
 
     return { success: true, transaction: tx };

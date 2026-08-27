@@ -64,10 +64,10 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
 
   const filtered = currentList.filter(
     (c) =>
-      c.firstName.toLowerCase().includes(search.toLowerCase()) ||
-      c.lastName.toLowerCase().includes(search.toLowerCase()) ||
-      c.email.toLowerCase().includes(search.toLowerCase()) ||
-      c.permanentAccountNumber.includes(search) ||
+      (c.firstName || '').toLowerCase().includes(search.toLowerCase()) ||
+      (c.lastName || '').toLowerCase().includes(search.toLowerCase()) ||
+      (c.email || '').toLowerCase().includes(search.toLowerCase()) ||
+      (c.permanentAccountNumber || '').includes(search) ||
       (c.kycDocumentType && c.kycDocumentType.toLowerCase().includes(search.toLowerCase())) ||
       (c.kycCountry && c.kycCountry.toLowerCase().includes(search.toLowerCase()))
   );

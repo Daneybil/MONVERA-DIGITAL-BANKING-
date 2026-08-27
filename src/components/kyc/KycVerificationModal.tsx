@@ -332,23 +332,23 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/80 backdrop-blur-xs overflow-y-auto">
-      <div className="bg-slate-900 text-slate-100 rounded-3xl max-w-3xl w-full max-h-[92vh] flex flex-col shadow-2xl border-2 border-slate-700 animate-in fade-in zoom-in-95 duration-150 overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-900/60 backdrop-blur-xs overflow-y-auto">
+      <div className="bg-white text-slate-950 rounded-3xl max-w-3xl w-full max-h-[92vh] flex flex-col shadow-2xl border-2 border-slate-200 animate-in fade-in zoom-in-95 duration-150 overflow-hidden">
         
         {/* Top Header */}
-        <div className="p-6 bg-slate-850 border-b border-slate-700/80 flex items-center justify-between gap-4 shrink-0">
+        <div className="p-6 bg-white border-b-2 border-slate-100 flex items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-3.5">
-            <div className="w-12 h-12 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">
+            <div className="w-12 h-12 rounded-2xl bg-amber-500/10 border-2 border-amber-500/30 flex items-center justify-center text-amber-600 shrink-0">
               <ShieldCheck className="w-6 h-6 stroke-[2.5]" />
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-xs font-mono font-black uppercase tracking-wider text-amber-400 bg-amber-950/60 px-2 py-0.5 rounded-md border border-amber-800/60">
+                <span className="text-xs font-mono font-black uppercase tracking-wider text-amber-800 bg-amber-100 px-2.5 py-0.5 rounded-md border border-amber-300">
                   Regulatory Compliance
                 </span>
-                <span className="text-xs text-slate-400 font-semibold">Bank KYC / AML</span>
+                <span className="text-xs text-slate-600 font-extrabold">Bank KYC / AML</span>
               </div>
-              <h3 className="text-xl font-black text-white tracking-tight mt-0.5">
+              <h3 className="text-xl sm:text-2xl font-black text-slate-950 tracking-tight mt-1">
                 {isVerified
                   ? 'Identity Clearance Active'
                   : isPending
@@ -362,31 +362,32 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
           <button
             onClick={onClose}
-            className="p-2.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+            className="p-2.5 rounded-xl text-slate-500 hover:text-slate-950 hover:bg-slate-100 transition-colors cursor-pointer border border-transparent hover:border-slate-200"
+            title="Close"
           >
             <X className="w-6 h-6 stroke-[2.5]" />
           </button>
         </div>
 
         {/* Scrollable Content */}
-        <div className="p-6 sm:p-8 overflow-y-auto space-y-6 flex-1 text-slate-200">
+        <div className="p-6 sm:p-8 overflow-y-auto space-y-6 flex-1 bg-white text-slate-900">
           
           {/* STATE 1: ALREADY VERIFIED */}
           {isVerified && (
-            <div className="p-8 rounded-2xl bg-sky-950/40 border-2 border-sky-600/50 text-center space-y-4">
+            <div className="p-8 rounded-3xl bg-sky-50 border-2 border-sky-300 text-center space-y-4 shadow-sm">
               <div className="flex justify-center">
                 <BlueVerifiedBadge size={64} />
               </div>
-              <h4 className="text-2xl font-black text-white tracking-tight">
+              <h4 className="text-2xl font-black text-sky-950 tracking-tight">
                 Account Fully Verified & Cleared
               </h4>
-              <p className="text-sm text-sky-200/90 max-w-md mx-auto leading-relaxed font-medium">
-                Your government credentials have been approved by Monvera Compliance. You have unrestricted access to all banking features and full <strong>$1,000,000.00 daily transaction limits</strong>.
+              <p className="text-sm text-sky-900 max-w-md mx-auto leading-relaxed font-bold">
+                Your government credentials have been approved by Monvera Compliance. You have unrestricted access to all banking features and full <strong className="text-sky-950 font-black">$1,000,000.00 daily transaction limits</strong>.
               </p>
               <div className="pt-2">
                 <button
                   onClick={onClose}
-                  className="px-6 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-extrabold text-sm shadow-md transition-colors"
+                  className="px-7 py-3 rounded-2xl bg-sky-600 hover:bg-sky-500 text-white font-black text-sm shadow-md transition-colors cursor-pointer"
                 >
                   Return to Dashboard
                 </button>
@@ -396,54 +397,54 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
           {/* STATE 2: PENDING REVIEW CONFIRMATION */}
           {!isVerified && isPending && (
-            <div className="p-8 rounded-2xl bg-amber-950/30 border-2 border-amber-500/40 text-center space-y-5">
-              <div className="w-16 h-16 rounded-full bg-amber-500/20 border-2 border-amber-400/50 text-amber-400 flex items-center justify-center mx-auto animate-pulse">
+            <div className="p-8 rounded-3xl bg-amber-50/80 border-2 border-amber-300 text-center space-y-5 shadow-sm">
+              <div className="w-16 h-16 rounded-full bg-amber-100 border-2 border-amber-400 text-amber-700 flex items-center justify-center mx-auto animate-pulse">
                 <Clock className="w-8 h-8 stroke-[2.5]" />
               </div>
 
               <div className="space-y-2">
-                <span className="text-xs font-mono font-black uppercase tracking-wider text-amber-400 bg-amber-950/80 px-3 py-1 rounded-full border border-amber-700/60">
+                <span className="text-xs font-mono font-black uppercase tracking-wider text-amber-900 bg-amber-200/80 px-3.5 py-1 rounded-full border border-amber-300">
                   STATUS: PENDING REVIEW
                 </span>
-                <h4 className="text-2xl font-black text-white tracking-tight">
+                <h4 className="text-2xl font-black text-slate-950 tracking-tight">
                   KYC Submitted Successfully
                 </h4>
-                <p className="text-base text-amber-100/95 max-w-lg mx-auto leading-relaxed font-semibold">
+                <p className="text-base text-amber-950 max-w-lg mx-auto leading-relaxed font-bold">
                   Your KYC has been submitted successfully and is currently under review. Verification may take up to 72 hours.
                 </p>
               </div>
 
-              <div className="p-4 rounded-xl bg-slate-850/80 border border-slate-700 text-left max-w-md mx-auto space-y-2 text-xs">
-                <div className="flex items-center justify-between text-slate-300">
-                  <span>Applicant Name:</span>
-                  <strong className="text-white font-semibold">{fullName || `${currentUser.firstName} ${currentUser.lastName}`}</strong>
+              <div className="p-5 rounded-2xl bg-white border-2 border-amber-200 text-left max-w-md mx-auto space-y-2.5 text-xs shadow-xs">
+                <div className="flex items-center justify-between text-slate-700 border-b border-slate-100 pb-2">
+                  <span className="font-extrabold text-slate-600 uppercase tracking-wider text-[11px]">Applicant Name:</span>
+                  <strong className="text-slate-950 font-black text-sm">{fullName || `${currentUser.firstName} ${currentUser.lastName}`}</strong>
                 </div>
-                <div className="flex items-center justify-between text-slate-300">
-                  <span>Document Type:</span>
-                  <span className="text-amber-300 font-semibold">{documentType}</span>
+                <div className="flex items-center justify-between text-slate-700 border-b border-slate-100 pb-2">
+                  <span className="font-extrabold text-slate-600 uppercase tracking-wider text-[11px]">Document Type:</span>
+                  <span className="text-amber-900 font-extrabold text-xs bg-amber-50 px-2 py-0.5 rounded border border-amber-200">{documentType}</span>
                 </div>
-                <div className="flex items-center justify-between text-slate-300">
-                  <span>Jurisdiction / Country:</span>
-                  <span className="text-white font-semibold">{country}</span>
+                <div className="flex items-center justify-between text-slate-700 border-b border-slate-100 pb-2">
+                  <span className="font-extrabold text-slate-600 uppercase tracking-wider text-[11px]">Country:</span>
+                  <span className="text-slate-950 font-extrabold text-xs">{country}</span>
                 </div>
-                <div className="flex items-center justify-between text-slate-300">
-                  <span>Proof of Address:</span>
-                  <span className="text-emerald-400 font-semibold">{proofOfAddressType} (Attached)</span>
+                <div className="flex items-center justify-between text-slate-700 border-b border-slate-100 pb-2">
+                  <span className="font-extrabold text-slate-600 uppercase tracking-wider text-[11px]">Proof of Address:</span>
+                  <span className="text-emerald-800 font-extrabold text-xs bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">{proofOfAddressType} (Attached)</span>
                 </div>
-                <div className="flex items-center justify-between text-slate-300">
-                  <span>Review Timeframe:</span>
-                  <span className="text-amber-300 font-bold">Standard Review (Within 72 Hours)</span>
+                <div className="flex items-center justify-between text-slate-700 pt-0.5">
+                  <span className="font-extrabold text-slate-600 uppercase tracking-wider text-[11px]">Review Timeframe:</span>
+                  <span className="text-amber-800 font-black text-xs">Standard Review (Within 72 Hours)</span>
                 </div>
               </div>
 
-              <p className="text-xs text-slate-400 max-w-md mx-auto font-medium">
+              <p className="text-xs text-slate-600 max-w-md mx-auto font-bold leading-relaxed">
                 Our compliance officers manually inspect each security watermark and document signature. You will receive an in-app notice and email once verification is complete.
               </p>
 
               <div className="pt-3">
                 <button
                   onClick={onClose}
-                  className="px-7 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-black text-sm border border-slate-600 transition-colors shadow-sm cursor-pointer"
+                  className="px-7 py-3 rounded-2xl bg-slate-950 hover:bg-slate-800 text-white font-black text-sm shadow-md transition-colors cursor-pointer"
                 >
                   Close & Return to Dashboard
                 </button>
@@ -457,19 +458,19 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
               
               {/* Granular Resubmission Alert Banner */}
               {isResubmissionMode && (
-                <div className="p-5 rounded-2xl bg-rose-950/60 border-2 border-rose-600 text-rose-100 flex items-start gap-4 shadow-lg">
-                  <AlertCircle className="w-6 h-6 text-rose-400 shrink-0 mt-0.5 stroke-[2.5]" />
+                <div className="p-5 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 flex items-start gap-4 shadow-sm">
+                  <AlertCircle className="w-6 h-6 text-rose-600 shrink-0 mt-0.5 stroke-[2.5]" />
                   <div className="space-y-1.5 text-sm">
-                    <h4 className="font-black text-rose-200 text-base">
+                    <h4 className="font-black text-rose-950 text-base">
                       Correction Required: Resubmit Highlighted Items
                     </h4>
-                    <p className="text-rose-200/90 leading-relaxed font-medium">
+                    <p className="text-rose-900 leading-relaxed font-bold">
                       Our compliance desk reviewed your submission. One or more items require correction.
-                      <strong> You only need to correct and resubmit the rejected documents below.</strong> Approved items are saved and locked.
+                      <strong className="text-rose-950 font-black"> You only need to correct and resubmit the rejected documents below.</strong> Approved items are saved and locked.
                     </p>
                     {currentUser.kycRejectionReason && (
-                      <div className="p-3 bg-rose-900/50 rounded-xl border border-rose-700/60 text-xs font-semibold text-rose-100 mt-2">
-                        <strong>Compliance Team Note:</strong> {currentUser.kycRejectionReason}
+                      <div className="p-3 bg-white rounded-xl border-2 border-rose-200 text-xs font-bold text-rose-950 mt-2">
+                        <strong className="font-black text-rose-900">Compliance Team Note:</strong> {currentUser.kycRejectionReason}
                       </div>
                     )}
                   </div>
@@ -478,43 +479,45 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
               {/* Error Message */}
               {errorMsg && (
-                <div className="p-4 rounded-xl bg-rose-950/80 border border-rose-500 text-rose-200 text-sm flex items-start gap-3">
-                  <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-                  <div className="font-semibold">{errorMsg}</div>
+                <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-400 text-rose-950 text-sm flex items-start gap-3 shadow-xs">
+                  <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                  <div className="font-extrabold">{errorMsg}</div>
                 </div>
               )}
 
               {/* SECTION 1: PERSONAL LEGAL DETAILS */}
-              <div className="p-5 rounded-2xl bg-slate-850 border border-slate-700 space-y-4">
-                <div className="flex items-center gap-2 pb-2 border-b border-slate-700/60">
-                  <User className="w-5 h-5 text-amber-400" />
-                  <h4 className="text-base font-black text-white">1. Personal & Contact Information</h4>
+              <div className="p-6 rounded-3xl bg-slate-50 border-2 border-slate-200 space-y-5">
+                <div className="flex items-center gap-2.5 pb-3 border-b-2 border-slate-200">
+                  <div className="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center text-amber-700">
+                    <User className="w-4 h-4 stroke-[2.5]" />
+                  </div>
+                  <h4 className="text-base sm:text-lg font-black text-slate-950">1. Personal & Contact Information</h4>
                 </div>
 
                 <div className="space-y-4 text-sm">
                   {/* Full Legal Name */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                      Full Legal Name <span className="text-rose-400">*</span>
+                    <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                      Full Legal Name <span className="text-rose-600">*</span>
                     </label>
                     <input
                       type="text"
                       value={fullName}
                       onChange={(e) => setFullName(e.target.value)}
                       placeholder="e.g. Johnathan Alexander Doe"
-                      className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 focus:ring-1 focus:ring-amber-400 text-white placeholder:text-slate-500 font-medium"
+                      className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 placeholder:text-slate-400 font-bold"
                       required
                     />
-                    <p className="text-xs text-amber-300/90 mt-1.5 flex items-center gap-1.5 font-medium">
-                      <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+                    <p className="text-xs text-amber-900 mt-1.5 flex items-center gap-1.5 font-bold">
+                      <HelpCircle className="w-3.5 h-3.5 shrink-0 text-amber-700" />
                       Enter your name EXACTLY as it appears on your government-issued identification document.
                     </p>
                   </div>
 
                   {/* Country Selector */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                      Country of Residence / Citizenship <span className="text-rose-400">*</span>
+                    <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                      Country of Residence / Citizenship <span className="text-rose-600">*</span>
                     </label>
                     <CountrySelector
                       value={country}
@@ -526,31 +529,31 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                   {/* Phone & Email Grid */}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
-                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
-                        <Phone className="w-3.5 h-3.5 text-slate-400" />
-                        Phone Number <span className="text-rose-400">*</span>
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+                        <Phone className="w-3.5 h-3.5 text-slate-600" />
+                        Phone Number <span className="text-rose-600">*</span>
                       </label>
                       <input
                         type="tel"
                         value={phone}
                         onChange={(e) => setPhone(e.target.value)}
                         placeholder="+1 (555) 000-0000"
-                        className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 text-white placeholder:text-slate-500 font-medium"
+                        className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 placeholder:text-slate-400 font-bold"
                         required
                       />
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
-                        <Mail className="w-3.5 h-3.5 text-slate-400" />
-                        Email Address <span className="text-rose-400">*</span>
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+                        <Mail className="w-3.5 h-3.5 text-slate-600" />
+                        Email Address <span className="text-rose-600">*</span>
                       </label>
                       <input
                         type="email"
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
                         placeholder="john.doe@example.com"
-                        className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 text-white placeholder:text-slate-500 font-medium"
+                        className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 placeholder:text-slate-400 font-bold"
                         required
                       />
                     </div>
@@ -558,15 +561,15 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
                   {/* Date of Birth */}
                   <div>
-                    <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
-                      <Calendar className="w-3.5 h-3.5 text-slate-400" />
-                      Date of Birth <span className="text-rose-400">*</span>
+                    <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5 text-slate-600" />
+                      Date of Birth <span className="text-rose-600">*</span>
                     </label>
                     <input
                       type="date"
                       value={dateOfBirth}
                       onChange={(e) => setDateOfBirth(e.target.value)}
-                      className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 text-white font-medium"
+                      className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 font-bold"
                       required
                     />
                   </div>
@@ -575,54 +578,56 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
               {/* SECTION 2: GOVERNMENT IDENTIFICATION DOCUMENT */}
               <div
-                className={`p-5 rounded-2xl border transition-all ${
+                className={`p-6 rounded-3xl border-2 transition-all ${
                   identityApproved
-                    ? 'bg-emerald-950/20 border-emerald-600/50'
+                    ? 'bg-emerald-50/70 border-emerald-300'
                     : identityRejected
-                    ? 'bg-rose-950/30 border-rose-500'
-                    : 'bg-slate-850 border-slate-700'
-                } space-y-4`}
+                    ? 'bg-rose-50/70 border-rose-400'
+                    : 'bg-slate-50 border-slate-200'
+                } space-y-5`}
               >
-                <div className="flex items-center justify-between pb-2 border-b border-slate-700/60">
-                  <div className="flex items-center gap-2">
-                    <FileCheck2 className="w-5 h-5 text-amber-400" />
-                    <h4 className="text-base font-black text-white">
+                <div className="flex items-center justify-between pb-3 border-b-2 border-slate-200">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center text-amber-700">
+                      <FileCheck2 className="w-4 h-4 stroke-[2.5]" />
+                    </div>
+                    <h4 className="text-base sm:text-lg font-black text-slate-950">
                       2. Government Identification Document
                     </h4>
                   </div>
                   {identityApproved && (
-                    <span className="px-2.5 py-1 rounded-full text-xs font-black bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Approved
+                    <span className="px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-950 border border-emerald-300 flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" /> Approved
                     </span>
                   )}
                   {identityRejected && (
-                    <span className="px-2.5 py-1 rounded-full text-xs font-black bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1">
-                      <AlertTriangle className="w-3.5 h-3.5" /> Correction Required
+                    <span className="px-3 py-1 rounded-full text-xs font-black bg-rose-100 text-rose-950 border border-rose-300 flex items-center gap-1">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-700" /> Correction Required
                     </span>
                   )}
                 </div>
 
                 {identityRejected && identityRejectReason && (
-                  <div className="p-3 bg-rose-900/60 border border-rose-600 rounded-xl text-xs text-rose-100 font-semibold">
-                    <strong>Rejection Reason:</strong> {identityRejectReason}
+                  <div className="p-3.5 bg-white border-2 border-rose-300 rounded-2xl text-xs text-rose-950 font-bold">
+                    <strong className="font-black text-rose-900">Rejection Reason:</strong> {identityRejectReason}
                   </div>
                 )}
 
                 {identityApproved ? (
-                  <div className="text-xs text-emerald-200/90 font-medium py-2">
+                  <div className="text-xs text-emerald-950 font-bold py-2">
                     ✓ Your {documentType} ({documentNumber}) has been approved by compliance. No changes required.
                   </div>
                 ) : (
                   <div className="space-y-4 text-sm">
                     {/* Document Type Selector */}
                     <div>
-                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                        Government Identification Document Type <span className="text-rose-400">*</span>
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                        Government Identification Document Type <span className="text-rose-600">*</span>
                       </label>
                       <select
                         value={documentType}
                         onChange={(e) => setDocumentType(e.target.value)}
-                        className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 text-white font-medium cursor-pointer"
+                        className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 text-slate-950 font-bold cursor-pointer"
                       >
                         <option value="Driver's License">Driver's License</option>
                         <option value="National ID / Government ID">National ID / Government ID</option>
@@ -633,19 +638,19 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
                     {/* Document Number */}
                     <div>
-                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                        Document Number <span className="text-rose-400">*</span>
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                        Document Number <span className="text-rose-600">*</span>
                       </label>
                       <input
                         type="text"
                         value={documentNumber}
                         onChange={(e) => setDocumentNumber(e.target.value)}
                         placeholder="e.g. DL-98402194 or P982014920"
-                        className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 font-mono text-white placeholder:text-slate-500 font-bold"
+                        className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 font-mono text-slate-950 placeholder:text-slate-400 font-black"
                         required
                       />
-                      <p className="text-xs text-amber-300/90 mt-1.5 flex items-center gap-1.5 font-medium">
-                        <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+                      <p className="text-xs text-amber-900 mt-1.5 flex items-center gap-1.5 font-bold">
+                        <HelpCircle className="w-3.5 h-3.5 shrink-0 text-amber-700" />
                         Enter the actual document number shown on your selected identification document. Do NOT enter the document image or file number.
                       </p>
                     </div>
@@ -654,8 +659,8 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
                       {/* Front Page Upload */}
                       <div>
-                        <span className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                          {isPassport ? 'Photo / Info Page' : 'Front Page Image'} <span className="text-rose-400">*</span>
+                        <span className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                          {isPassport ? 'Photo / Info Page' : 'Front Page Image'} <span className="text-rose-600">*</span>
                         </span>
                         <input
                           type="file"
@@ -666,32 +671,32 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                         />
 
                         {documentImage ? (
-                          <div className="relative rounded-xl border border-slate-600 overflow-hidden bg-slate-950 p-2 group">
+                          <div className="relative rounded-2xl border-2 border-slate-300 overflow-hidden bg-white p-2 group shadow-xs">
                             <img
                               src={documentImage}
                               alt="Front ID"
-                              className="w-full h-32 object-cover rounded-lg"
+                              className="w-full h-32 object-cover rounded-xl"
                             />
                             <button
                               type="button"
                               onClick={() => setDocumentImage('')}
-                              className="absolute top-3 right-3 p-1.5 rounded-lg bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
+                              className="absolute top-3 right-3 p-2 rounded-xl bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
                               title="Remove Image"
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
-                            <span className="block text-[11px] text-emerald-400 font-bold text-center mt-1.5">
+                            <span className="block text-[11px] text-emerald-800 font-black text-center mt-1.5">
                               ✓ Front Page Attached
                             </span>
                           </div>
                         ) : (
                           <div
                             onClick={() => docFrontFileRef.current?.click()}
-                            className="h-32 rounded-xl border-2 border-dashed border-slate-600 hover:border-amber-400 bg-slate-900/60 hover:bg-slate-900 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
+                            className="h-32 rounded-2xl border-2 border-dashed border-slate-300 hover:border-slate-900 bg-white hover:bg-slate-50 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
                           >
-                            <Upload className="w-6 h-6 text-amber-400 mb-1" />
-                            <span className="text-xs font-bold text-white">Upload Front Page</span>
-                            <span className="text-[11px] text-slate-400 mt-0.5">JPG, PNG (Max 15MB)</span>
+                            <Upload className="w-6 h-6 text-amber-600 mb-1" />
+                            <span className="text-xs font-black text-slate-950">Upload Front Page</span>
+                            <span className="text-[11px] text-slate-500 font-semibold mt-0.5">JPG, PNG (Max 15MB)</span>
                           </div>
                         )}
                       </div>
@@ -699,8 +704,8 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       {/* Back Page Upload (If not passport) */}
                       {!isPassport && (
                         <div>
-                          <span className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                            Back Page Image <span className="text-rose-400">*</span>
+                          <span className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                            Back Page Image <span className="text-rose-600">*</span>
                           </span>
                           <input
                             type="file"
@@ -711,32 +716,32 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                           />
 
                           {documentBackImage ? (
-                            <div className="relative rounded-xl border border-slate-600 overflow-hidden bg-slate-950 p-2 group">
+                            <div className="relative rounded-2xl border-2 border-slate-300 overflow-hidden bg-white p-2 group shadow-xs">
                               <img
                                 src={documentBackImage}
                                 alt="Back ID"
-                                className="w-full h-32 object-cover rounded-lg"
+                                className="w-full h-32 object-cover rounded-xl"
                               />
                               <button
                                 type="button"
                                 onClick={() => setDocumentBackImage('')}
-                                className="absolute top-3 right-3 p-1.5 rounded-lg bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
+                                className="absolute top-3 right-3 p-2 rounded-xl bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
                                 title="Remove Image"
                               >
                                 <Trash2 className="w-4 h-4" />
                               </button>
-                              <span className="block text-[11px] text-emerald-400 font-bold text-center mt-1.5">
+                              <span className="block text-[11px] text-emerald-800 font-black text-center mt-1.5">
                                 ✓ Back Page Attached
                               </span>
                             </div>
                           ) : (
                             <div
                               onClick={() => docBackFileRef.current?.click()}
-                              className="h-32 rounded-xl border-2 border-dashed border-slate-600 hover:border-amber-400 bg-slate-900/60 hover:bg-slate-900 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
+                              className="h-32 rounded-2xl border-2 border-dashed border-slate-300 hover:border-slate-900 bg-white hover:bg-slate-50 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
                             >
-                              <Upload className="w-6 h-6 text-amber-400 mb-1" />
-                              <span className="text-xs font-bold text-white">Upload Back Page</span>
-                              <span className="text-[11px] text-slate-400 mt-0.5">Barcode / Signature side</span>
+                              <Upload className="w-6 h-6 text-amber-600 mb-1" />
+                              <span className="text-xs font-black text-slate-950">Upload Back Page</span>
+                              <span className="text-[11px] text-slate-500 font-semibold mt-0.5">Barcode / Signature side</span>
                             </div>
                           )}
                         </div>
@@ -748,67 +753,69 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
               {/* SECTION 3: PROOF OF ADDRESS */}
               <div
-                className={`p-5 rounded-2xl border transition-all ${
+                className={`p-6 rounded-3xl border-2 transition-all ${
                   proofApproved
-                    ? 'bg-emerald-950/20 border-emerald-600/50'
+                    ? 'bg-emerald-50/70 border-emerald-300'
                     : proofRejected
-                    ? 'bg-rose-950/30 border-rose-500'
-                    : 'bg-slate-850 border-slate-700'
-                } space-y-4`}
+                    ? 'bg-rose-50/70 border-rose-400'
+                    : 'bg-slate-50 border-slate-200'
+                } space-y-5`}
               >
-                <div className="flex items-center justify-between pb-2 border-b border-slate-700/60">
-                  <div className="flex items-center gap-2">
-                    <MapPin className="w-5 h-5 text-amber-400" />
-                    <h4 className="text-base font-black text-white">3. Proof of Address</h4>
+                <div className="flex items-center justify-between pb-3 border-b-2 border-slate-200">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center text-amber-700">
+                      <MapPin className="w-4 h-4 stroke-[2.5]" />
+                    </div>
+                    <h4 className="text-base sm:text-lg font-black text-slate-950">3. Proof of Address</h4>
                   </div>
                   {proofApproved && (
-                    <span className="px-2.5 py-1 rounded-full text-xs font-black bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Approved
+                    <span className="px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-950 border border-emerald-300 flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" /> Approved
                     </span>
                   )}
                   {proofRejected && (
-                    <span className="px-2.5 py-1 rounded-full text-xs font-black bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1">
-                      <AlertTriangle className="w-3.5 h-3.5" /> Correction Required
+                    <span className="px-3 py-1 rounded-full text-xs font-black bg-rose-100 text-rose-950 border border-rose-300 flex items-center gap-1">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-700" /> Correction Required
                     </span>
                   )}
                 </div>
 
                 {proofRejected && proofRejectReason && (
-                  <div className="p-3 bg-rose-900/60 border border-rose-600 rounded-xl text-xs text-rose-100 font-semibold">
-                    <strong>Rejection Reason:</strong> {proofRejectReason}
+                  <div className="p-3.5 bg-white border-2 border-rose-300 rounded-2xl text-xs text-rose-950 font-bold">
+                    <strong className="font-black text-rose-900">Rejection Reason:</strong> {proofRejectReason}
                   </div>
                 )}
 
                 {proofApproved ? (
-                  <div className="text-xs text-emerald-200/90 font-medium py-2">
+                  <div className="text-xs text-emerald-950 font-bold py-2">
                     ✓ Your proof of address ({streetAddress}) has been approved by compliance.
                   </div>
                 ) : (
                   <div className="space-y-4 text-sm">
                     {/* Residential Street Address */}
                     <div>
-                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                        Residential Street Address <span className="text-rose-400">*</span>
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                        Residential Street Address <span className="text-rose-600">*</span>
                       </label>
                       <input
                         type="text"
                         value={streetAddress}
                         onChange={(e) => setStreetAddress(e.target.value)}
                         placeholder="e.g. 450 Lexington Avenue, Suite 2400, New York, NY 10017"
-                        className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 text-white placeholder:text-slate-500 font-medium"
+                        className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 text-slate-950 placeholder:text-slate-400 font-bold"
                         required
                       />
                     </div>
 
                     {/* Proof Type Selector */}
                     <div>
-                      <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                        Select Proof of Address Type <span className="text-rose-400">*</span>
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                        Select Proof of Address Type <span className="text-rose-600">*</span>
                       </label>
                       <select
                         value={proofOfAddressType}
                         onChange={(e) => setProofOfAddressType(e.target.value)}
-                        className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 text-white font-medium cursor-pointer"
+                        className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 text-slate-950 font-bold cursor-pointer"
                       >
                         <option value="Bank statement">Bank statement</option>
                         <option value="Utility bill">Utility bill</option>
@@ -819,8 +826,8 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
                     {/* Proof Document Upload */}
                     <div>
-                      <span className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                        Upload Document <span className="text-rose-400">*</span>
+                      <span className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                        Upload Document <span className="text-rose-600">*</span>
                       </span>
                       <input
                         type="file"
@@ -831,36 +838,36 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       />
 
                       {proofOfAddressImage ? (
-                        <div className="relative rounded-xl border border-slate-600 overflow-hidden bg-slate-950 p-2 group">
+                        <div className="relative rounded-2xl border-2 border-slate-300 overflow-hidden bg-white p-2 group shadow-xs">
                           <img
                             src={proofOfAddressImage}
                             alt="Proof of Address"
-                            className="w-full h-36 object-cover rounded-lg"
+                            className="w-full h-36 object-cover rounded-xl"
                           />
                           <button
                             type="button"
                             onClick={() => setProofOfAddressImage('')}
-                            className="absolute top-3 right-3 p-1.5 rounded-lg bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
+                            className="absolute top-3 right-3 p-2 rounded-xl bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
                             title="Remove Document"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
-                          <span className="block text-[11px] text-emerald-400 font-bold text-center mt-1.5">
+                          <span className="block text-[11px] text-emerald-800 font-black text-center mt-1.5">
                             ✓ {proofOfAddressType} Attached
                           </span>
                         </div>
                       ) : (
                         <div
                           onClick={() => proofFileRef.current?.click()}
-                          className="h-32 rounded-xl border-2 border-dashed border-slate-600 hover:border-amber-400 bg-slate-900/60 hover:bg-slate-900 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
+                          className="h-32 rounded-2xl border-2 border-dashed border-slate-300 hover:border-slate-900 bg-white hover:bg-slate-50 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
                         >
-                          <Upload className="w-6 h-6 text-amber-400 mb-1" />
-                          <span className="text-xs font-bold text-white">Upload {proofOfAddressType}</span>
-                          <span className="text-[11px] text-slate-400 mt-0.5">JPG, PNG (Max 15MB)</span>
+                          <Upload className="w-6 h-6 text-amber-600 mb-1" />
+                          <span className="text-xs font-black text-slate-950">Upload {proofOfAddressType}</span>
+                          <span className="text-[11px] text-slate-500 font-semibold mt-0.5">JPG, PNG (Max 15MB)</span>
                         </div>
                       )}
 
-                      <p className="text-xs text-amber-300/90 mt-2 font-medium leading-relaxed">
+                      <p className="text-xs text-amber-900 mt-2 font-bold leading-relaxed">
                         * Note: Proof of address must be recent (less than 3 months old) and contain your full legal name and residential address.
                       </p>
                     </div>
@@ -871,48 +878,50 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
               {/* SECTION 4: US SSN TAX IDENTIFIER (FOR US RESIDENTS) */}
               {isUnitedStates && (
                 <div
-                  className={`p-5 rounded-2xl border transition-all ${
+                  className={`p-6 rounded-3xl border-2 transition-all ${
                     ssnApproved
-                      ? 'bg-emerald-950/20 border-emerald-600/50'
+                      ? 'bg-emerald-50/70 border-emerald-300'
                       : ssnRejected
-                      ? 'bg-rose-950/30 border-rose-500'
-                      : 'bg-slate-850 border-slate-700'
-                  } space-y-4`}
+                      ? 'bg-rose-50/70 border-rose-400'
+                      : 'bg-slate-50 border-slate-200'
+                  } space-y-5`}
                 >
-                  <div className="flex items-center justify-between pb-2 border-b border-slate-700/60">
-                    <div className="flex items-center gap-2">
-                      <Lock className="w-5 h-5 text-amber-400" />
-                      <h4 className="text-base font-black text-white">
+                  <div className="flex items-center justify-between pb-3 border-b-2 border-slate-200">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center text-amber-700">
+                        <Lock className="w-4 h-4 stroke-[2.5]" />
+                      </div>
+                      <h4 className="text-base sm:text-lg font-black text-slate-950">
                         4. US Social Security Number (SSN)
                       </h4>
                     </div>
                     {ssnApproved && (
-                      <span className="px-2.5 py-1 rounded-full text-xs font-black bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Approved
+                      <span className="px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-950 border border-emerald-300 flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" /> Approved
                       </span>
                     )}
                     {ssnRejected && (
-                      <span className="px-2.5 py-1 rounded-full text-xs font-black bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1">
-                        <AlertTriangle className="w-3.5 h-3.5" /> Correction Required
+                      <span className="px-3 py-1 rounded-full text-xs font-black bg-rose-100 text-rose-950 border border-rose-300 flex items-center gap-1">
+                        <AlertTriangle className="w-3.5 h-3.5 text-rose-700" /> Correction Required
                       </span>
                     )}
                   </div>
 
                   {ssnRejected && ssnRejectReason && (
-                    <div className="p-3 bg-rose-900/60 border border-rose-600 rounded-xl text-xs text-rose-100 font-semibold">
-                      <strong>Rejection Reason:</strong> {ssnRejectReason}
+                    <div className="p-3.5 bg-white border-2 border-rose-300 rounded-2xl text-xs text-rose-950 font-bold">
+                      <strong className="font-black text-rose-900">Rejection Reason:</strong> {ssnRejectReason}
                     </div>
                   )}
 
                   {ssnApproved ? (
-                    <div className="text-xs text-emerald-200/90 font-medium py-2">
+                    <div className="text-xs text-emerald-950 font-bold py-2">
                       ✓ Your US Tax Identification has been verified against federal registries.
                     </div>
                   ) : (
                     <div className="space-y-4 text-sm">
                       <div>
-                        <label className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                          Social Security Number (9 Digits) <span className="text-rose-400">*</span>
+                        <label className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                          Social Security Number (9 Digits) <span className="text-rose-600">*</span>
                         </label>
                         <div className="relative">
                           <input
@@ -921,26 +930,26 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                             onChange={handleSsnChange}
                             placeholder="XXX-XX-XXXX"
                             maxLength={11}
-                            className="w-full pl-4 pr-12 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:border-amber-400 font-mono text-white text-base tracking-widest font-bold"
+                            className="w-full pl-4 pr-12 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 font-mono text-slate-950 text-base tracking-widest font-black"
                             required
                           />
                           <button
                             type="button"
                             onClick={() => setShowSsn(!showSsn)}
-                            className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-white"
+                            className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-slate-500 hover:text-slate-950 cursor-pointer"
                           >
                             {showSsn ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                           </button>
                         </div>
-                        <p className="text-xs text-slate-400 mt-1 font-medium">
+                        <p className="text-xs text-slate-600 mt-1 font-bold">
                           Required for FinCEN / IRS CIP compliance on US accounts. Transmitted via 256-bit AES encryption.
                         </p>
                       </div>
 
                       {/* Optional SSN Document Image Upload */}
                       <div>
-                        <span className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                          SSN Card Document Photo <span className="text-slate-400 font-normal">(Optional)</span>
+                        <span className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                          SSN Card Document Photo <span className="text-slate-500 font-bold">(Optional)</span>
                         </span>
                         <input
                           type="file"
@@ -951,31 +960,31 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                         />
 
                         {ssnImage ? (
-                          <div className="relative rounded-xl border border-slate-600 overflow-hidden bg-slate-950 p-2 group">
+                          <div className="relative rounded-2xl border-2 border-slate-300 overflow-hidden bg-white p-2 group shadow-xs">
                             <img
                               src={ssnImage}
                               alt="SSN Card"
-                              className="w-full h-28 object-cover rounded-lg"
+                              className="w-full h-28 object-cover rounded-xl"
                             />
                             <button
                               type="button"
                               onClick={() => setSsnImage('')}
-                              className="absolute top-3 right-3 p-1.5 rounded-lg bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
+                              className="absolute top-3 right-3 p-2 rounded-xl bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
                               title="Remove SSN Document"
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
-                            <span className="block text-[11px] text-emerald-400 font-bold text-center mt-1.5">
+                            <span className="block text-[11px] text-emerald-800 font-black text-center mt-1.5">
                               ✓ Optional SSN Document Attached
                             </span>
                           </div>
                         ) : (
                           <div
                             onClick={() => ssnFileRef.current?.click()}
-                            className="h-24 rounded-xl border-2 border-dashed border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-900 flex flex-col items-center justify-center p-3 text-center cursor-pointer transition-colors"
+                            className="h-24 rounded-2xl border-2 border-dashed border-slate-300 hover:border-slate-900 bg-white hover:bg-slate-50 flex flex-col items-center justify-center p-3 text-center cursor-pointer transition-colors"
                           >
-                            <Upload className="w-5 h-5 text-slate-400 mb-1" />
-                            <span className="text-xs font-bold text-slate-300">Upload SSN Card (Optional)</span>
+                            <Upload className="w-5 h-5 text-slate-600 mb-1" />
+                            <span className="text-xs font-black text-slate-950">Upload SSN Card (Optional)</span>
                           </div>
                         )}
                       </div>
@@ -986,47 +995,49 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
               {/* SECTION 5: LIVE BIOMETRIC SELFIE */}
               <div
-                className={`p-5 rounded-2xl border transition-all ${
+                className={`p-6 rounded-3xl border-2 transition-all ${
                   selfieApproved
-                    ? 'bg-emerald-950/20 border-emerald-600/50'
+                    ? 'bg-emerald-50/70 border-emerald-300'
                     : selfieRejected
-                    ? 'bg-rose-950/30 border-rose-500'
-                    : 'bg-slate-850 border-slate-700'
-                } space-y-4`}
+                    ? 'bg-rose-50/70 border-rose-400'
+                    : 'bg-slate-50 border-slate-200'
+                } space-y-5`}
               >
-                <div className="flex items-center justify-between pb-2 border-b border-slate-700/60">
-                  <div className="flex items-center gap-2">
-                    <Camera className="w-5 h-5 text-amber-400" />
-                    <h4 className="text-base font-black text-white">
+                <div className="flex items-center justify-between pb-3 border-b-2 border-slate-200">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-amber-100 flex items-center justify-center text-amber-700">
+                      <Camera className="w-4 h-4 stroke-[2.5]" />
+                    </div>
+                    <h4 className="text-base sm:text-lg font-black text-slate-950">
                       {isUnitedStates ? '5. Biometric Facial Selfie' : '4. Biometric Facial Selfie'}
                     </h4>
                   </div>
                   {selfieApproved && (
-                    <span className="px-2.5 py-1 rounded-full text-xs font-black bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Approved
+                    <span className="px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-950 border border-emerald-300 flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" /> Approved
                     </span>
                   )}
                   {selfieRejected && (
-                    <span className="px-2.5 py-1 rounded-full text-xs font-black bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1">
-                      <AlertTriangle className="w-3.5 h-3.5" /> Correction Required
+                    <span className="px-3 py-1 rounded-full text-xs font-black bg-rose-100 text-rose-950 border border-rose-300 flex items-center gap-1">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-700" /> Correction Required
                     </span>
                   )}
                 </div>
 
                 {selfieRejected && selfieRejectReason && (
-                  <div className="p-3 bg-rose-900/60 border border-rose-600 rounded-xl text-xs text-rose-100 font-semibold">
-                    <strong>Rejection Reason:</strong> {selfieRejectReason}
+                  <div className="p-3.5 bg-white border-2 border-rose-300 rounded-2xl text-xs text-rose-950 font-bold">
+                    <strong className="font-black text-rose-900">Rejection Reason:</strong> {selfieRejectReason}
                   </div>
                 )}
 
                 {selfieApproved ? (
-                  <div className="text-xs text-emerald-200/90 font-medium py-2">
+                  <div className="text-xs text-emerald-950 font-bold py-2">
                     ✓ Your biometric selfie match has been approved by compliance.
                   </div>
                 ) : (
                   <div>
-                    <span className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                      Live Selfie Photo <span className="text-rose-400">*</span>
+                    <span className="block text-xs font-black text-slate-900 uppercase tracking-wider mb-1.5">
+                      Live Selfie Photo <span className="text-rose-600">*</span>
                     </span>
                     <input
                       type="file"
@@ -1037,32 +1048,32 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                     />
 
                     {liveSelfieImage ? (
-                      <div className="relative rounded-xl border border-slate-600 overflow-hidden bg-slate-950 p-2 group flex flex-col items-center">
+                      <div className="relative rounded-2xl border-2 border-slate-300 overflow-hidden bg-white p-4 group flex flex-col items-center shadow-xs">
                         <img
                           src={liveSelfieImage}
                           alt="Biometric Selfie"
-                          className="w-36 h-36 object-cover rounded-full border-2 border-amber-400"
+                          className="w-36 h-36 object-cover rounded-full border-4 border-amber-400 shadow-md"
                         />
                         <button
                           type="button"
                           onClick={() => setLiveSelfieImage('')}
-                          className="absolute top-3 right-3 p-1.5 rounded-lg bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
+                          className="absolute top-3 right-3 p-2 rounded-xl bg-rose-600 text-white hover:bg-rose-700 shadow-md cursor-pointer"
                           title="Retake Selfie"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
-                        <span className="block text-[11px] text-emerald-400 font-bold text-center mt-2">
+                        <span className="block text-[11px] text-emerald-800 font-black text-center mt-2.5">
                           ✓ Biometric Facial Selfie Ready
                         </span>
                       </div>
                     ) : (
                       <div
                         onClick={() => selfieFileRef.current?.click()}
-                        className="h-32 rounded-xl border-2 border-dashed border-slate-600 hover:border-amber-400 bg-slate-900/60 hover:bg-slate-900 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
+                        className="h-32 rounded-2xl border-2 border-dashed border-slate-300 hover:border-slate-900 bg-white hover:bg-slate-50 flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-colors"
                       >
-                        <Camera className="w-6 h-6 text-amber-400 mb-1" />
-                        <span className="text-xs font-bold text-white">Capture / Upload Selfie Photo</span>
-                        <span className="text-[11px] text-slate-400 mt-0.5">Ensure face is well-lit without glasses or hats</span>
+                        <Camera className="w-6 h-6 text-amber-600 mb-1" />
+                        <span className="text-xs font-black text-slate-950">Capture / Upload Selfie Photo</span>
+                        <span className="text-[11px] text-slate-500 font-semibold mt-0.5">Ensure face is well-lit without glasses or hats</span>
                       </div>
                     )}
                   </div>
@@ -1070,8 +1081,8 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
               </div>
 
               {/* Submit Buttons */}
-              <div className="pt-4 border-t border-slate-700 flex flex-col sm:flex-row items-center justify-between gap-4">
-                <p className="text-xs text-slate-400 font-medium max-w-sm">
+              <div className="pt-4 border-t-2 border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-4">
+                <p className="text-xs text-slate-600 font-bold max-w-sm">
                   By submitting, you certify that all information and documents provided are genuine and legally valid.
                 </p>
 
@@ -1079,7 +1090,7 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                   <button
                     type="button"
                     onClick={onClose}
-                    className="px-5 py-3 rounded-xl border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 text-sm font-bold transition-colors w-full sm:w-auto cursor-pointer"
+                    className="px-5 py-3 rounded-2xl border-2 border-slate-300 text-slate-700 hover:text-slate-950 hover:bg-slate-100 text-sm font-extrabold transition-colors w-full sm:w-auto cursor-pointer"
                   >
                     Cancel
                   </button>
@@ -1087,7 +1098,7 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                   <button
                     type="submit"
                     disabled={isSubmitting}
-                    className="px-7 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-black transition-all shadow-md shadow-amber-500/25 flex items-center justify-center gap-2 w-full sm:w-auto cursor-pointer disabled:opacity-50"
+                    className="px-7 py-3.5 rounded-2xl bg-slate-950 hover:bg-slate-900 text-white text-sm font-black transition-all shadow-md flex items-center justify-center gap-2 w-full sm:w-auto cursor-pointer disabled:opacity-50"
                   >
                     {isSubmitting ? (
                       <>

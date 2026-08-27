@@ -24,7 +24,9 @@ import { Transaction } from '../../types';
 import { QrScannerModal } from './QrScannerModal';
 
 export const SendMoneyModal: React.FC = () => {
-  const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications } = useAuth();
+  const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications, currentView } = useAuth();
+
+  const isAdmin = currentView === 'admin' || currentUser?.id === 'usr_admin';
 
   // Multi-step transfer state: 'INPUT' | 'CONFIRM' | 'PROCESSING' | 'SUCCESS'
   const [step, setStep] = useState<'INPUT' | 'CONFIRM' | 'PROCESSING' | 'SUCCESS'>('INPUT');
@@ -41,6 +43,7 @@ export const SendMoneyModal: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [completedTx, setCompletedTx] = useState<Transaction | null>(null);
   const [copied, setCopied] = useState(false);
+  const [registeredContacts, setRegisteredContacts] = useState<any[]>([]);
 
   useEffect(() => {
     if (activeModal === 'send') {
@@ -54,7 +57,69 @@ export const SendMoneyModal: React.FC = () => {
     }
   }, [activeModal]);
 
-  if (activeModal !== 'send' || !currentUser) return null;
+  // Load real registered users from Firestore & Server directory for suggestions
+  useEffect(() => {
+    let isMounted = true;
+    async function loadContacts() {
+      try {
+        const [users, adminCust] = await Promise.all([
+          api.getUsers().catch(() => []),
+          api.getAdminCustomers().catch(() => ({ customers: [] })),
+        ]);
+        if (isMounted) {
+          const list: any[] = [];
+          const seen = new Set<string>();
+          const myAcc = currentUser?.permanentAccountNumber || '1000000001';
+
+          for (const u of (adminCust?.customers || [])) {
+            const acc = u.permanentAccountNumber || '';
+            if (acc && acc !== myAcc && !seen.has(acc)) {
+              seen.add(acc);
+              list.push({
+                name: `${u.firstName || ''} ${u.lastName || ''}`.trim() || u.username || 'Customer',
+                username: u.username || (u.email ? u.email.split('@')[0] : 'user'),
+                acc,
+                tier: u.membershipTier || 'Premier',
+              });
+            }
+          }
+
+          const userArray: any[] = Array.isArray(users) ? users : ((users as any)?.users || []);
+          for (const u of userArray) {
+            const acc = u.permanentAccountNumber || '';
+            if (acc && acc !== myAcc && !seen.has(acc)) {
+              seen.add(acc);
+              list.push({
+                name: `${u.firstName || ''} ${u.lastName || ''}`.trim() || u.username || 'Customer',
+                username: u.username || (u.email ? u.email.split('@')[0] : 'user'),
+                acc,
+                tier: u.membershipTier || 'Premier',
+              });
+            }
+          }
+
+          setRegisteredContacts(list.slice(0, 6));
+        }
+      } catch {
+        // Fallback gracefully
+      }
+    }
+    if (activeModal === 'send') {
+      loadContacts();
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [activeModal, currentUser]);
+
+  if (activeModal !== 'send' || (!currentUser && !isAdmin)) return null;
+
+  const senderUserId = isAdmin ? 'usr_admin' : (currentUser?.id || 'usr_customer');
+  const senderDisplayName = isAdmin ? 'Bennett Johnson' : `${currentUser?.firstName || 'Monvera'} ${currentUser?.lastName || 'Customer'}`;
+  const senderAccountNumber = isAdmin ? '1000000001' : (currentUser?.permanentAccountNumber || '1000000000');
+  const fromAccountLabel = isAdmin
+    ? 'Monvera Sovereign Treasury • Bennett Johnson (•••• 0001)'
+    : `Checking (•••• ${senderAccountNumber.slice(-4)})`;
 
   // Real-time lookup for either 10-digit account number OR username
   const handleLookup = async (
@@ -76,7 +141,7 @@ export const SendMoneyModal: React.FC = () => {
     setIsLookingUp(true);
     setErrorMessage(null);
     try {
-      const res = await api.lookupRecipient(trimmed, currentUser.id, hint);
+      const res = await api.lookupRecipient(trimmed, senderUserId, hint);
       if (res.valid) {
         setLookupResult(res);
         setErrorMessage(null);
@@ -84,7 +149,7 @@ export const SendMoneyModal: React.FC = () => {
         setLookupResult(null);
         setErrorMessage(res.error || 'Recipient not found.');
       }
-    } catch (err: any) {
+    } catch {
       setLookupResult(null);
       setErrorMessage('Failed to verify recipient account or username.');
     } finally {
@@ -105,13 +170,16 @@ export const SendMoneyModal: React.FC = () => {
     }
     const numAmount = parseFloat(amount);
     if (isNaN(numAmount) || numAmount <= 0) {
-      setErrorMessage('Please enter a valid transfer amount.');
+      setErrorMessage('Please enter a valid transfer amount greater than $0.00.');
       return;
     }
-    const checkingBal = balanceMetrics?.checkingBalance || 0;
-    if (numAmount > checkingBal) {
-      setErrorMessage(`Insufficient checking funds ($${checkingBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}).`);
-      return;
+
+    if (!isAdmin) {
+      const checkingBal = balanceMetrics?.checkingBalance || 0;
+      if (numAmount > checkingBal) {
+        setErrorMessage(`Insufficient checking funds ($${checkingBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}).`);
+        return;
+      }
     }
 
     setErrorMessage(null);
@@ -123,30 +191,58 @@ export const SendMoneyModal: React.FC = () => {
     setErrorMessage(null);
 
     try {
-      const res = await api.sendMonveraTransfer({
-        senderUserId: currentUser.id,
-        recipientIdentifier: lookupResult?.permanentAccountNumber || recipientInput,
-        amount: parseFloat(amount),
-        description: memo || `Transfer to ${lookupResult?.firstName} ${lookupResult?.lastName} (@${lookupResult?.username || 'user'})`,
-        category,
-      });
-
-      if (res.success && res.transaction) {
-        setCompletedTx(res.transaction);
-        setStep('SUCCESS');
-        await refreshBalance();
-        await refreshNotifications();
-        confetti({
-          particleCount: 80,
-          spread: 60,
-          origin: { y: 0.6 },
-          colors: ['#059669', '#10b981', '#0f172a', '#d97706'],
+      if (isAdmin) {
+        // Execute Administrator Transfer via secure backend ledger system
+        const res = await api.sendAdminTransfer({
+          targetUserId: lookupResult?.recipientId || lookupResult?.permanentAccountNumber || recipientInput,
+          amount: parseFloat(amount),
+          description: memo || 'Administrative Direct Transfer from Bennett Johnson',
+          category,
+          adminId: 'usr_admin',
         });
+
+        if (res.success && res.transaction) {
+          setCompletedTx(res.transaction);
+          setStep('SUCCESS');
+          await refreshBalance();
+          await refreshNotifications();
+          confetti({
+            particleCount: 80,
+            spread: 60,
+            origin: { y: 0.6 },
+            colors: ['#059669', '#10b981', '#0f172a', '#d97706'],
+          });
+        } else {
+          setErrorMessage(res.error || 'Administrator transfer failed. Double-entry ledger was not modified.');
+          setStep('CONFIRM');
+        }
       } else {
-        setErrorMessage(res.error || 'Transfer failed. Your balance has not been changed.');
-        setStep('CONFIRM');
+        // Standard Customer Peer Transfer
+        const res = await api.sendMonveraTransfer({
+          senderUserId: currentUser!.id,
+          recipientIdentifier: lookupResult?.permanentAccountNumber || recipientInput,
+          amount: parseFloat(amount),
+          description: memo || `Transfer to ${lookupResult?.firstName} ${lookupResult?.lastName} (@${lookupResult?.username || 'user'})`,
+          category,
+        });
+
+        if (res.success && res.transaction) {
+          setCompletedTx(res.transaction);
+          setStep('SUCCESS');
+          await refreshBalance();
+          await refreshNotifications();
+          confetti({
+            particleCount: 80,
+            spread: 60,
+            origin: { y: 0.6 },
+            colors: ['#059669', '#10b981', '#0f172a', '#d97706'],
+          });
+        } else {
+          setErrorMessage(res.error || 'Transfer failed. Your balance has not been changed.');
+          setStep('CONFIRM');
+        }
       }
-    } catch (err: any) {
+    } catch {
       setErrorMessage('Network or server error during transfer processing.');
       setStep('CONFIRM');
     }
@@ -160,11 +256,13 @@ export const SendMoneyModal: React.FC = () => {
     }
   };
 
-  const quickContacts = [
-    { name: 'Marcus Sterling', username: 'marcus', acc: '1088492015', tier: 'Business' },
-    { name: 'Sophia Chen', username: 'sophia', acc: '1093847294', tier: 'Premier' },
-    { name: 'Eleanor Vance', username: 'eleanor', acc: '1045827391', tier: 'Private Wealth' },
-  ].filter((c) => c.acc !== currentUser.permanentAccountNumber);
+  const quickContacts = registeredContacts.length > 0
+    ? registeredContacts
+    : [
+        { name: 'Marcus Sterling', username: 'marcus', acc: '1088492015', tier: 'Business' },
+        { name: 'Sophia Chen', username: 'sophia', acc: '1093847294', tier: 'Premier' },
+        { name: 'Eleanor Vance', username: 'eleanor', acc: '1045827391', tier: 'Private Wealth' },
+      ].filter((c) => c.acc !== senderAccountNumber);
 
   return (
     <>
@@ -186,8 +284,21 @@ export const SendMoneyModal: React.FC = () => {
               <Zap className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl sm:text-2xl font-black text-slate-950">Send & Transfer Money</h2>
-              <p className="text-xs text-slate-500 font-semibold">Instant Transfers by Username (@handle) or Account Number</p>
+              <div className="flex items-center gap-2">
+                <h2 className="text-xl sm:text-2xl font-black text-slate-950">
+                  {isAdmin ? 'Admin Direct Transfer' : 'Send & Transfer Money'}
+                </h2>
+                {isAdmin && (
+                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-amber-100 border border-amber-300 text-amber-900 uppercase">
+                    Bennett Johnson
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 font-semibold">
+                {isAdmin
+                  ? 'Disburse verified funds directly to any customer account via Core Ledger'
+                  : 'Instant Transfers by Username (@handle) or Account Number'}
+              </p>
             </div>
           </div>
           {step !== 'PROCESSING' && (
@@ -225,23 +336,24 @@ export const SendMoneyModal: React.FC = () => {
                 
                 <div className="flex items-center gap-2">
                   <div className="relative flex-1">
-                    <div className="absolute left-4 top-3.5 text-slate-400">
+                    <div className="absolute left-4 top-3.5 text-slate-500">
                       <AtSign className="w-5 h-5" />
                     </div>
                     <input
                       type="text"
                       required
-                      placeholder="Enter @username or 10-digit account number"
+                      autoFocus
+                      placeholder="Paste 10-digit account number or enter @username"
                       value={recipientInput}
                       onChange={(e) => {
                         const val = e.target.value;
                         setRecipientInput(val);
                         handleLookup(val);
                       }}
-                      className="w-full pl-11 pr-24 py-3.5 text-base font-mono font-bold tracking-wider rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white"
+                      className="w-full pl-11 pr-28 py-3.5 text-base font-mono font-black tracking-wider text-slate-950 bg-white placeholder:text-slate-400 placeholder:font-sans placeholder:font-normal rounded-2xl border-2 border-slate-300 focus:border-emerald-600 focus:ring-2 focus:ring-emerald-500/20 transition-all shadow-xs selection:bg-emerald-200 selection:text-slate-950"
                     />
                     {isLookingUp ? (
-                      <div className="absolute right-4 top-3.5 text-xs text-emerald-600 animate-pulse font-mono font-bold">
+                      <div className="absolute right-4 top-3.5 text-xs text-emerald-700 animate-pulse font-mono font-bold">
                         Verifying...
                       </div>
                     ) : (
@@ -249,7 +361,7 @@ export const SendMoneyModal: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => handleLookup(recipientInput)}
-                          className="absolute right-2.5 top-2 px-3 py-1.5 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-colors cursor-pointer"
+                          className="absolute right-2.5 top-2 px-3 py-1.5 rounded-xl bg-slate-950 text-white text-xs font-bold hover:bg-slate-850 transition-colors cursor-pointer shadow-xs"
                         >
                           Verify
                         </button>
@@ -272,8 +384,8 @@ export const SendMoneyModal: React.FC = () => {
                 {/* Quick Directory Contacts */}
                 <div className="pt-1">
                   <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
-                      Quick Transfer Suggestions
+                    <span className="text-[11px] font-black text-slate-500 uppercase tracking-wider block">
+                      {isAdmin ? 'Registered Customer Accounts' : 'Quick Transfer Suggestions'}
                     </span>
                     <button
                       type="button"
@@ -287,13 +399,13 @@ export const SendMoneyModal: React.FC = () => {
                   <div className="flex flex-wrap gap-2">
                     {quickContacts.map((contact) => (
                       <button
-                        key={contact.username}
+                        key={contact.acc || contact.username}
                         type="button"
-                        onClick={() => handleSelectQuickContact(`@${contact.username}`)}
-                        className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-emerald-50 hover:border-emerald-300 border border-slate-200 text-xs font-medium text-slate-800 flex items-center gap-1.5 transition-colors cursor-pointer"
+                        onClick={() => handleSelectQuickContact(contact.acc || `@${contact.username}`)}
+                        className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-emerald-50 hover:border-emerald-300 border border-slate-200 text-xs font-medium text-slate-900 flex items-center gap-1.5 transition-colors cursor-pointer"
                       >
-                        <span className="font-bold">@{contact.username}</span>
-                        <span className="text-slate-400 text-[10px]">({contact.name})</span>
+                        <span className="font-black text-slate-950">@{contact.username}</span>
+                        <span className="text-slate-600 font-mono text-[11px]">({contact.acc ? `•••• ${contact.acc.slice(-4)}` : contact.name})</span>
                       </button>
                     ))}
                   </div>
@@ -302,7 +414,7 @@ export const SendMoneyModal: React.FC = () => {
 
               {/* Verified Recipient Banner Preview */}
               {lookupResult && (
-                <div className="p-4 sm:p-5 rounded-2xl bg-emerald-50/90 border-2 border-emerald-400 flex items-center justify-between animate-in fade-in slide-in-from-top-1">
+                <div className="p-4 sm:p-5 rounded-2xl bg-emerald-50/90 border-2 border-emerald-500 flex items-center justify-between animate-in fade-in slide-in-from-top-1 shadow-xs">
                   <div className="flex items-center gap-3.5">
                     <img
                       src={lookupResult.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150'}
@@ -310,19 +422,21 @@ export const SendMoneyModal: React.FC = () => {
                       className="w-12 h-12 rounded-2xl object-cover border-2 border-emerald-300 shadow-xs"
                     />
                     <div>
-                      <div className="flex items-center gap-1.5 font-black text-base text-emerald-950">
+                      <div className="flex items-center gap-1.5 font-black text-base text-slate-950">
                         <span>{lookupResult.firstName} {lookupResult.lastName}</span>
                         <CheckCircle2 className="w-4 h-4 text-emerald-600 fill-emerald-100" />
                       </div>
-                      <div className="text-xs text-emerald-700 font-mono font-bold flex items-center gap-2 mt-0.5">
-                        <span className="bg-emerald-200/70 text-emerald-900 px-2 py-0.5 rounded-md">
+                      <div className="text-xs text-slate-800 font-mono font-bold flex flex-wrap items-center gap-2 mt-0.5">
+                        <span className="bg-emerald-200/80 text-emerald-950 px-2 py-0.5 rounded-md font-black">
                           @{lookupResult.username || 'user'}
                         </span>
-                        <span>Acc {lookupResult.maskedAccountNumber}</span>
+                        <span className="text-slate-900 font-mono font-bold">
+                          Account: <strong>{lookupResult.permanentAccountNumber || lookupResult.maskedAccountNumber}</strong>
+                        </span>
                       </div>
                     </div>
                   </div>
-                  <span className="text-xs uppercase font-black text-emerald-900 bg-white px-3 py-1 rounded-xl border border-emerald-200 shadow-xs">
+                  <span className="text-xs uppercase font-black text-emerald-950 bg-white px-3 py-1 rounded-xl border border-emerald-300 shadow-xs">
                     Verified User
                   </span>
                 </div>
@@ -335,10 +449,18 @@ export const SendMoneyModal: React.FC = () => {
                     2. Transfer Amount (USD)
                   </label>
                   <span className="text-xs text-slate-600 font-mono font-semibold">
-                    Available Checking:{' '}
-                    <strong className="text-slate-950 font-black">
-                      ${balanceMetrics?.checkingBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                    </strong>
+                    {isAdmin ? (
+                      <span className="text-emerald-700 font-bold">
+                        Sovereign Reserve Liquidity: <strong className="font-black text-slate-950">$1,000,000,000.00</strong>
+                      </span>
+                    ) : (
+                      <>
+                        Available Checking:{' '}
+                        <strong className="text-slate-950 font-black">
+                          ${(balanceMetrics?.checkingBalance || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </strong>
+                      </>
+                    )}
                   </span>
                 </div>
                 <div className="relative">
@@ -351,7 +473,7 @@ export const SendMoneyModal: React.FC = () => {
                     placeholder="0.00"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
-                    className="w-full pl-10 pr-4 py-3.5 text-2xl sm:text-3xl font-black font-mono text-slate-950 rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white"
+                    className="w-full pl-10 pr-4 py-3.5 text-2xl sm:text-3xl font-black font-mono text-slate-950 rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white shadow-xs"
                   />
                 </div>
               </div>
@@ -377,10 +499,10 @@ export const SendMoneyModal: React.FC = () => {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g. Payment for invoice #8091"
+                  placeholder={isAdmin ? 'e.g. Administrative Direct Transfer from Bennett Johnson' : 'e.g. Payment for invoice #8091'}
                   value={memo}
                   onChange={(e) => setMemo(e.target.value)}
-                  className="w-full px-4 py-3 text-sm rounded-xl border-2 border-slate-200 focus:ring-2 focus:ring-emerald-500 bg-white font-medium"
+                  className="w-full px-4 py-3 text-sm rounded-xl border-2 border-slate-200 focus:ring-2 focus:ring-emerald-500 bg-white font-medium text-slate-950 shadow-xs"
                 />
               </div>
 
@@ -406,7 +528,7 @@ export const SendMoneyModal: React.FC = () => {
                   ${parseFloat(amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
                 <span className="inline-block text-xs text-emerald-800 font-black bg-emerald-100 px-3 py-1 rounded-full border border-emerald-300">
-                  Instant Settlement • $0.00 Fee
+                  Instant Settlement • $0.00 Fee • {isAdmin ? 'Sovereign Treasury Transfer' : 'Direct Transfer'}
                 </span>
               </div>
 
@@ -414,7 +536,7 @@ export const SendMoneyModal: React.FC = () => {
                 <div className="flex items-center justify-between pb-2.5 border-b border-slate-200">
                   <span className="text-slate-500">From Account:</span>
                   <span className="font-mono font-bold text-slate-950">
-                    Checking (•••• {currentUser.permanentAccountNumber.slice(-4)})
+                    {fromAccountLabel}
                   </span>
                 </div>
                 <div className="flex items-center justify-between pb-2.5 border-b border-slate-200">
@@ -433,7 +555,9 @@ export const SendMoneyModal: React.FC = () => {
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-slate-500">Description:</span>
-                  <span className="font-semibold text-slate-800">{memo || 'Monvera Peer Transfer'}</span>
+                  <span className="font-semibold text-slate-800">
+                    {memo || (isAdmin ? 'Administrative Direct Transfer from Bennett Johnson' : 'Monvera Peer Transfer')}
+                  </span>
                 </div>
               </div>
 
@@ -464,7 +588,9 @@ export const SendMoneyModal: React.FC = () => {
               <div className="w-16 h-16 rounded-full border-4 border-emerald-500 border-t-transparent animate-spin mx-auto" />
               <h3 className="text-xl font-black text-slate-950">Authorizing Ledger Transfer...</h3>
               <p className="text-xs sm:text-sm text-slate-500 max-w-xs mx-auto font-medium">
-                Authorizing instant balance debit and recipient credit with verified cryptographic protocol.
+                {isAdmin
+                  ? 'Executing double-entry sovereign disbursement from Bennett Johnson and crediting customer ledger.'
+                  : 'Authorizing instant balance debit and recipient credit with verified cryptographic protocol.'}
               </p>
             </div>
           )}
@@ -479,14 +605,20 @@ export const SendMoneyModal: React.FC = () => {
               <div className="space-y-1.5">
                 <h3 className="text-2xl sm:text-3xl font-black text-slate-950">Transfer Complete</h3>
                 <div className="text-3xl sm:text-4xl font-black text-emerald-600 font-mono">
-                  -${completedTx.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
+                  ${completedTx.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
                 <p className="text-xs sm:text-sm text-slate-600 font-medium">
-                  Successfully sent to {completedTx.recipientName} (@{lookupResult?.username || 'user'} • {lookupResult?.maskedAccountNumber})
+                  Successfully transferred to {completedTx.recipientName} (@{lookupResult?.username || 'user'} • {lookupResult?.maskedAccountNumber})
                 </p>
               </div>
 
               <div className="p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 text-left space-y-2.5 text-xs font-mono">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-sans">Sender:</span>
+                  <span className="font-bold text-slate-950 font-sans">
+                    {completedTx.senderName || 'Bennett Johnson'} (MVB •••• 0001)
+                  </span>
+                </div>
                 <div className="flex items-center justify-between">
                   <span className="text-slate-500 font-sans">Transaction Reference:</span>
                   <div className="flex items-center gap-1.5">
@@ -515,7 +647,7 @@ export const SendMoneyModal: React.FC = () => {
                 onClick={closeModal}
                 className="w-full py-4 rounded-2xl font-black text-base text-white bg-slate-950 hover:bg-slate-800 transition-colors shadow-lg cursor-pointer"
               >
-                Return to Dashboard
+                {isAdmin ? 'Return to Admin Console' : 'Return to Dashboard'}
               </button>
             </div>
           )}

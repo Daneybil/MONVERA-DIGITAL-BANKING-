@@ -22,6 +22,8 @@ import {
   DollarSign,
   Building,
   Lock,
+  Send,
+  Zap,
 } from 'lucide-react';
 
 interface AdminOverviewViewProps {
@@ -31,6 +33,7 @@ interface AdminOverviewViewProps {
   auditLogs: AdminAuditLog[];
   onNavigateTab: (tab: string) => void;
   onSelectCustomer: (customer: UserProfile & { balanceMetrics?: any }) => void;
+  onOpenSendMoney?: () => void;
 }
 
 export const AdminOverviewView: React.FC<AdminOverviewViewProps> = ({
@@ -40,6 +43,7 @@ export const AdminOverviewView: React.FC<AdminOverviewViewProps> = ({
   auditLogs,
   onNavigateTab,
   onSelectCustomer,
+  onOpenSendMoney,
 }) => {
   const pendingKycCustomers = customers.filter((c) => c.kycStatus === 'pending');
   const verifiedCustomers = customers.filter((c) => c.kycStatus === 'verified');
@@ -91,6 +95,38 @@ export const AdminOverviewView: React.FC<AdminOverviewViewProps> = ({
               {metrics?.systemReserveRatio || 100}% Liquid
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Executive Quick Banking Actions Bar */}
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4 p-5 rounded-2xl bg-white border border-slate-200 shadow-xs">
+        <div className="flex items-center gap-3.5">
+          <div className="w-11 h-11 rounded-xl bg-slate-900 text-emerald-400 flex items-center justify-center flex-shrink-0 shadow-xs">
+            <Zap className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="text-base font-black text-slate-950 flex items-center gap-2">
+              <span>Executive Disbursement & Transfers</span>
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300 uppercase">
+                Active
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 font-semibold mt-0.5">
+              Initiate double-entry fund disbursements from Bennett Johnson directly to any customer account.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            id="admin-overview-send-money-btn"
+            onClick={onOpenSendMoney ? onOpenSendMoney : () => onNavigateTab('transfers')}
+            className="w-full sm:w-auto px-5 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer border border-emerald-500/60 active:scale-95"
+            title="Open Administrator Send Money Interface"
+          >
+            <Send className="w-4 h-4 text-white stroke-[2.5]" />
+            <span>Send Money</span>
+          </button>
         </div>
       </div>
 

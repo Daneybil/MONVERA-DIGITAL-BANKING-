@@ -29,6 +29,7 @@ import {
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
+import { firestoreSync } from '../../services/firestoreSync';
 
 export const DashboardOverview: React.FC = () => {
   const { currentUser, balanceMetrics, openModal, setCurrentView } = useAuth();
@@ -41,9 +42,22 @@ export const DashboardOverview: React.FC = () => {
   useEffect(() => {
     async function loadTx() {
       if (currentUser) {
-        const res = await api.getTransactions({ userId: currentUser.id });
-        if (res.transactions) {
-          setRecentTransactions(res.transactions.slice(0, 6));
+        try {
+          const fsTxs = await firestoreSync.getTransactionsForUser(currentUser.id, currentUser.permanentAccountNumber);
+          const res = await api.getTransactions({ userId: currentUser.id });
+          const apiTxs = res.transactions || [];
+
+          const map = new Map<string, Transaction>();
+          fsTxs.forEach((t) => map.set(t.id, t));
+          apiTxs.forEach((t) => map.set(t.id, t));
+
+          const merged = Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+
+          setRecentTransactions(merged.slice(0, 8));
+        } catch {
+          // Fallback
         }
       }
     }

@@ -1,13 +1,12 @@
 import React, { useState } from 'react';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { useAuth } from '../../context/AuthContext';
-import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, UserCheck, Lock } from 'lucide-react';
+import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, Lock, LayoutDashboard } from 'lucide-react';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
 
 export const PublicNavbar: React.FC = () => {
-  const { currentUser, setCurrentView, openModal, availableUsers, switchUser } = useAuth();
+  const { currentUser, setCurrentView, openModal } = useAuth();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [demoDropdownOpen, setDemoDropdownOpen] = useState(false);
   const [isKycModalOpen, setIsKycModalOpen] = useState(false);
 
   const navLinks = [
@@ -77,66 +76,45 @@ export const PublicNavbar: React.FC = () => {
 
         {/* Right CTA Actions & Menu Trigger (Both Mobile and Desktop) */}
         <div className="flex items-center gap-2 sm:gap-3.5">
-          {/* Quick Demo Persona Dropdown (Desktop & Tablets) */}
-          <div className="relative hidden sm:block">
+          {currentUser ? (
             <button
-              id="demo-switcher-btn"
-              onClick={() => setDemoDropdownOpen(!demoDropdownOpen)}
-              className="flex items-center gap-2 px-3.5 py-2.5 text-xs font-bold text-slate-800 bg-slate-100/90 hover:bg-slate-200/90 rounded-xl border border-slate-300/70 shadow-2xs transition-all cursor-pointer"
-              title="Switch demo persona for testing"
+              id="navbar-dashboard-btn"
+              onClick={() => {
+                if (currentUser.role === 'super_admin' || currentUser.role === 'admin') {
+                  setCurrentView('admin');
+                } else {
+                  setCurrentView('dashboard');
+                }
+              }}
+              className="inline-flex items-center gap-2 px-3.5 sm:px-5 py-2.5 text-xs sm:text-sm font-extrabold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-xl shadow-xs border border-amber-500/30 transition-all cursor-pointer"
             >
-              <UserCheck className="w-4 h-4 text-emerald-600" />
-              <span>Persona: <strong className="text-slate-950 font-bold">{currentUser ? currentUser.firstName : 'Demo'}</strong></span>
-              <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+              <LayoutDashboard className="w-4 h-4 text-slate-950" />
+              <span>Dashboard</span>
             </button>
-
-            {demoDropdownOpen && (
-              <div
-                id="demo-persona-menu"
-                className="absolute right-0 mt-2 w-68 bg-white rounded-2xl shadow-2xl border border-slate-200 py-2.5 z-50 animate-in fade-in slide-in-from-top-2 duration-150"
-              >
-                <div className="px-4 py-2 text-[11px] uppercase font-extrabold text-slate-400 tracking-wider">
-                  Select User Persona
-                </div>
-                {availableUsers.map((u) => (
-                  <button
-                    key={u.id}
-                    id={`persona-select-${u.id}`}
-                    onClick={() => {
-                      switchUser(u.id);
-                      setDemoDropdownOpen(false);
-                      if (u.role === 'super_admin' || u.role === 'admin') {
-                        setCurrentView('admin');
-                      } else {
-                        setCurrentView('dashboard');
-                      }
-                    }}
-                    className={`w-full text-left px-4 py-2.5 text-xs flex items-center justify-between hover:bg-slate-50 transition-colors ${
-                      currentUser?.id === u.id ? 'bg-emerald-50/80 text-emerald-950 font-bold' : 'text-slate-700'
-                    }`}
-                  >
-                    <div>
-                      <div className="font-bold text-slate-900 text-sm">{u.firstName} {u.lastName}</div>
-                      <div className="text-[11px] text-slate-500 font-mono">
-                        {u.role === 'super_admin' ? '🛡️ Admin Console' : `MVB •••• ${u.permanentAccountNumber.slice(-4)}`}
-                      </div>
-                    </div>
-                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 border border-slate-200 font-mono">
-                      {u.membershipTier || u.role}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+          ) : (
+            <button
+              id="navbar-signin-btn"
+              onClick={() => openModal('auth_login')}
+              className="hidden sm:inline-flex items-center gap-1.5 px-4 py-2.5 text-xs sm:text-sm font-bold text-slate-800 hover:text-slate-950 hover:bg-slate-200/60 rounded-xl transition-all cursor-pointer"
+            >
+              <Lock className="w-4 h-4 text-slate-600" />
+              <span>Sign In</span>
+            </button>
+          )}
 
           {/* Get Started CTA Button */}
           <button
             id="get-started-btn-header"
-            onClick={() => openModal('auth_prompt')}
+            onClick={() => {
+              if (currentUser) {
+                setCurrentView('dashboard');
+              } else {
+                openModal('auth_prompt');
+              }
+            }}
             className="inline-flex items-center gap-2 px-4 sm:px-6 py-2.5 text-xs sm:text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98] cursor-pointer"
           >
-            <span>Get Started</span>
+            <span>{currentUser ? 'My Account' : 'Get Started'}</span>
             <ArrowRight className="w-4 h-4 text-emerald-400" />
           </button>
 

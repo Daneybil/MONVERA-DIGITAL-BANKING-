@@ -8,7 +8,6 @@ import {
   EyeOff,
   Globe,
   ChevronDown,
-  Fingerprint,
   Shield,
   Zap,
   Headphones,
@@ -28,7 +27,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   onClose,
   isModal = false,
 }) => {
-  const { login, switchUser, availableUsers, setCurrentView, sendPasswordReset } = useAuth();
+  const { login, setCurrentView, sendPasswordReset } = useAuth();
 
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
@@ -38,7 +37,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [isLangOpen, setIsLangOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [showDemoAccounts, setShowDemoAccounts] = useState(false);
 
   // Forgot Password Modal State
   const [forgotModalOpen, setForgotModalOpen] = useState(false);
@@ -66,16 +64,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     } else {
       if (onClose) onClose();
     }
-  };
-
-  const handleBiometricLogin = async () => {
-    // Instant Biometric / Demo Fast Access
-    setIsSubmitting(true);
-    const demoUser = availableUsers[0] || { id: 'usr_eleanor' };
-    await switchUser(demoUser.id);
-    setIsSubmitting(false);
-    setCurrentView('dashboard');
-    if (onClose) onClose();
   };
 
   const handleSendPasswordReset = async (e: React.FormEvent) => {
@@ -354,57 +342,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                 <Lock className="w-4 h-4 text-amber-400" />
                 <span>{isSubmitting ? 'Authenticating...' : 'Sign In to Account'}</span>
               </button>
-            </div>
-
-            {/* OR Divider */}
-            <div className="relative flex items-center justify-center py-2">
-              <div className="w-full border-t border-slate-200" />
-              <span className="bg-white px-3 text-xs font-bold text-slate-400 uppercase tracking-wider font-mono absolute">
-                OR
-              </span>
-            </div>
-
-            {/* Login with Biometrics / Fast Demo Button */}
-            <div>
-              <button
-                type="button"
-                id="login-biometrics-btn"
-                onClick={handleBiometricLogin}
-                className="w-full py-3.5 px-4 rounded-xl font-bold text-xs sm:text-sm text-slate-800 bg-white hover:bg-slate-50 border border-slate-300 shadow-2xs hover:shadow-xs transition-all flex items-center justify-center gap-2.5 cursor-pointer"
-              >
-                <Fingerprint className="w-5 h-5 text-blue-600" />
-                <span>Login with Biometrics (Fast Access)</span>
-              </button>
-            </div>
-
-            {/* 1-Click Demo Users Dropdown */}
-            <div className="pt-1">
-              <button
-                type="button"
-                onClick={() => setShowDemoAccounts(!showDemoAccounts)}
-                className="w-full text-center text-xs font-bold text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
-              >
-                {showDemoAccounts ? '▲ Hide Quick Demo Accounts' : '▼ Instant 1-Click Evaluation Logins'}
-              </button>
-
-              {showDemoAccounts && (
-                <div className="mt-2 p-2.5 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-2 gap-2 animate-in fade-in duration-150">
-                  {availableUsers.map((u) => (
-                    <button
-                      key={u.id}
-                      type="button"
-                      onClick={() => {
-                        setIdentifier(u.email);
-                        setPassword('Password123!');
-                      }}
-                      className="p-2.5 rounded-lg bg-white hover:bg-slate-900 hover:text-white text-slate-800 text-left border border-slate-200 text-xs transition-all shadow-2xs"
-                    >
-                      <div className="font-bold truncate">{u.firstName} {u.lastName}</div>
-                      <div className="text-[11px] text-slate-400 font-mono truncate">{u.email}</div>
-                    </button>
-                  ))}
-                </div>
-              )}
             </div>
           </form>
         </div>

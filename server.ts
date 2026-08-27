@@ -880,6 +880,34 @@ app.post('/api/admin/transactions/:id/update-status', (req: Request, res: Respon
   res.json(result);
 });
 
+// Admin Transfer Direct Endpoint (Bennett Johnson)
+app.post('/api/admin/transfer', (req: Request, res: Response) => {
+  const { adminId, targetUserId, amount, description, category } = req.body;
+
+  if (!targetUserId || !amount || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Target customer ID and positive transfer amount are required.' });
+  }
+
+  const result = db.recordAdminTransfer({
+    adminId: adminId || 'usr_admin',
+    targetUserId,
+    amount: Number(amount),
+    description: description || 'Administrative Direct Transfer from Bennett Johnson',
+    category: category || 'Transfers',
+  });
+
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  const targetMetrics = db.getUserBalanceMetrics(targetUserId);
+  res.json({
+    success: true,
+    transaction: result.transaction,
+    targetBalanceMetrics: targetMetrics,
+  });
+});
+
 // Admin Development Funding System (Isolated for testing/staging)
 app.post('/api/admin/dev-fund', (req: Request, res: Response) => {
   const { adminId, targetUserId, amount, reason, targetAccountType } = req.body;

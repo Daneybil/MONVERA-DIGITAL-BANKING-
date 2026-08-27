@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { firestoreSync } from '../../services/firestoreSync';
 import { Transaction } from '../../types';
 import {
   Search,
@@ -46,10 +47,23 @@ export const TransactionsView: React.FC = () => {
     if (!currentUser) return;
     setIsLoading(true);
     try {
+      // 1. Fetch from Firestore permanent ledger
+      const fsTxs = await firestoreSync.getTransactionsForUser(currentUser.id, currentUser.permanentAccountNumber);
+      
+      // 2. Fetch from backend API
       const res = await api.getTransactions({ userId: currentUser.id });
-      if (res.transactions) {
-        setTransactions(res.transactions);
-      }
+      const apiTxs = res.transactions || [];
+
+      // Merge and deduplicate by transaction ID
+      const map = new Map<string, Transaction>();
+      fsTxs.forEach((t) => map.set(t.id, t));
+      apiTxs.forEach((t) => map.set(t.id, t));
+
+      const merged = Array.from(map.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+
+      setTransactions(merged);
     } catch (err) {
       console.error('Failed to fetch transactions:', err);
     } finally {

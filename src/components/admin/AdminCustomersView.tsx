@@ -55,12 +55,13 @@ export const AdminCustomersView: React.FC<AdminCustomersViewProps> = ({
   });
 
   const filteredCustomers = customers.filter((cust) => {
+    const term = searchTerm.toLowerCase();
     const matchesSearch =
-      cust.firstName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      cust.lastName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      cust.email.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      cust.username.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      cust.permanentAccountNumber.includes(searchTerm);
+      (cust.firstName || '').toLowerCase().includes(term) ||
+      (cust.lastName || '').toLowerCase().includes(term) ||
+      (cust.email || '').toLowerCase().includes(term) ||
+      (cust.username || '').toLowerCase().includes(term) ||
+      (cust.permanentAccountNumber || '').includes(term);
 
     const matchesStatus =
       statusFilter === 'all' ? true : cust.status === statusFilter;

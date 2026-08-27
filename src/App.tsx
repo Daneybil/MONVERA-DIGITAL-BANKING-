@@ -31,6 +31,7 @@ import { SendMoneyModal } from './components/dashboard/SendMoneyModal';
 import { ReceiveMoneyModal } from './components/dashboard/ReceiveMoneyModal';
 import { DepositModal } from './components/dashboard/DepositModal';
 import { WithdrawModal } from './components/dashboard/WithdrawModal';
+import { WhatsAppSupportChat } from './components/common/WhatsAppSupportChat';
 
 const AppContent: React.FC = () => {
   const { currentView, currentUser, setCurrentView } = useAuth();
@@ -245,6 +246,22 @@ const AppContent: React.FC = () => {
     );
   }
 
+  // Dedicated Monvera Bank Admin Control Center
+  if (currentView === 'admin') {
+    return (
+      <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-emerald-500 selection:text-white">
+        <AdminDashboard />
+        {/* Global Modals */}
+        <AuthModals />
+        <SendMoneyModal />
+        <ReceiveMoneyModal />
+        <DepositModal />
+        <WithdrawModal />
+        <WhatsAppSupportChat />
+      </div>
+    );
+  }
+
   // If user is on the public landing page ('home')
   if (currentView === 'home') {
     return (
@@ -264,30 +281,35 @@ const AppContent: React.FC = () => {
         <ReceiveMoneyModal />
         <DepositModal />
         <WithdrawModal />
+        <WhatsAppSupportChat />
       </div>
     );
   }
 
   // Authenticated Portal Views
   return (
-    <DashboardLayout>
-      {currentView === 'dashboard' && <DashboardOverview />}
-      {currentView === 'accounts' && <AccountsView />}
-      {currentView === 'transactions' && <TransactionsView />}
-      {currentView === 'investments' && <InvestmentsView />}
-      {currentView === 'cards' && <CardsView />}
-      {currentView === 'security' && <SecurityView />}
-      {currentView === 'profile' && <ProfileView />}
-      {currentView === 'business' && <BusinessBankingView />}
-      {currentView === 'admin' && <AdminDashboard />}
+    <>
+      <DashboardLayout>
+        {currentView === 'dashboard' && <DashboardOverview />}
+        {currentView === 'accounts' && <AccountsView />}
+        {currentView === 'transactions' && <TransactionsView />}
+        {currentView === 'investments' && <InvestmentsView />}
+        {currentView === 'cards' && <CardsView />}
+        {currentView === 'security' && <SecurityView />}
+        {currentView === 'profile' && <ProfileView />}
+        {currentView === 'business' && <BusinessBankingView />}
 
-      {/* Global Modals */}
-      <AuthModals />
-      <SendMoneyModal />
-      <ReceiveMoneyModal />
-      <DepositModal />
-      <WithdrawModal />
-    </DashboardLayout>
+        {/* Global Modals */}
+        <AuthModals />
+        <SendMoneyModal />
+        <ReceiveMoneyModal />
+        <DepositModal />
+        <WithdrawModal />
+      </DashboardLayout>
+
+      {/* 24/7 WhatsApp Live Customer Service Chat */}
+      <WhatsAppSupportChat />
+    </>
   );
 };
 

@@ -209,9 +209,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const refreshBalance = useCallback(async () => {
     if (!currentUser) return;
     try {
+      // 1. First retrieve verified balances directly from permanent Firestore ledger
+      const fsMetrics = await firestoreSync.getAccountBalances(currentUser.id, currentUser.permanentAccountNumber);
+      if (fsMetrics) {
+        setBalanceMetrics(fsMetrics);
+        setLastUpdateTimestamp(Date.now());
+      }
+
+      // 2. Fetch backend metrics and merge seamlessly
       const metrics = await api.getBalanceMetrics(currentUser.id);
       if (metrics && metrics.accounts) {
-        setBalanceMetrics(metrics);
+        const finalChecking = Math.max(metrics.checkingBalance || 0, fsMetrics?.checkingBalance || 0);
+        const finalSavings = Math.max(metrics.savingsBalance || 0, fsMetrics?.savingsBalance || 0);
+        const finalInvested = Math.max(metrics.investedBalance || 0, fsMetrics?.investedBalance || 0);
+        const mergedMetrics: BalanceMetrics = {
+          ...metrics,
+          checkingBalance: finalChecking,
+          savingsBalance: finalSavings,
+          investedBalance: finalInvested,
+          totalBalance: finalChecking + finalSavings + finalInvested,
+          availableBalance: finalChecking,
+          accounts: metrics.accounts.map((a) => {
+            if (a.type === 'CHECKING') return { ...a, balance: finalChecking, availableBalance: finalChecking };
+            if (a.type === 'SAVINGS') return { ...a, balance: finalSavings, availableBalance: finalSavings };
+            if (a.type === 'INVESTMENT') return { ...a, balance: finalInvested, investedBalance: finalInvested };
+            return a;
+          }),
+        };
+        setBalanceMetrics(mergedMetrics);
         setLastUpdateTimestamp(Date.now());
       }
     } catch (err) {
@@ -326,20 +351,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           console.error('[Auth] Error fetching user profile on auth change:', err);
         }
       } else {
-        // If not logged in and no demo user set yet, load demo profile for initial showcase
-        try {
-          await fetchUsers();
-          const res = await api.getCurrentUser('usr_eleanor');
-          if (res.user && isMounted) {
-            const persistedAvatar = getPersistedAvatar(res.user.id, res.user.avatarUrl);
-            const resolvedUser = { ...res.user, avatarUrl: persistedAvatar };
-            setCurrentUser(resolvedUser);
-            setBalanceMetrics(res.balanceMetrics);
-            const notifRes = await api.getNotifications(res.user.id);
-            if (notifRes.notifications && isMounted) setNotifications(notifRes.notifications);
-          }
-        } catch (err) {
-          console.error('[Auth] Error fetching default preview user:', err);
+        // No authenticated session
+        if (isMounted) {
+          setCurrentUser(null);
+          setBalanceMetrics(null);
+          setNotifications([]);
         }
       }
 
