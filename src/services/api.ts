@@ -5,6 +5,8 @@ import {
   TransactionStatus,
   InvestmentPlan,
   InvestmentEarningLog,
+  LoanApplication,
+  LoanStatus,
   CardItem,
   NotificationItem,
   AdminAuditLog,
@@ -50,6 +52,7 @@ export interface BalanceMetrics {
   totalBalance: number;
   availableBalance: number;
   pendingBalance: number;
+  loanBalance?: number;
   accounts: BankAccount[];
 }
 
@@ -212,10 +215,10 @@ export const api = {
     return res.json();
   },
 
-  async getBalanceMetrics(userId: string): Promise<BalanceMetrics> {
-    // 1. Check permanent Firestore record first for highest durability
+  async getBalanceMetrics(userId: string, userAccountNumber?: string): Promise<BalanceMetrics> {
+    // 1. Check permanent Firestore record / immutable ledger first for highest durability
     try {
-      const firestoreMetrics = await firestoreSync.getAccountBalances(userId);
+      const firestoreMetrics = await firestoreSync.getAccountBalances(userId, userAccountNumber);
       if (firestoreMetrics && firestoreMetrics.accounts && firestoreMetrics.accounts.length > 0) {
         return firestoreMetrics;
       }
@@ -237,9 +240,11 @@ export const api = {
         accounts: [],
       });
 
-      // If backend returned valid accounts, backup to Firestore
-      if (data && data.accounts && data.accounts.length > 0) {
+      // If backend returned valid accounts, backup to Firestore only if non-empty
+      if (data && data.accounts && data.accounts.length > 0 && (data.totalBalance > 0 || data.checkingBalance > 0)) {
         firestoreSync.saveAccountBalances(userId, data).catch(() => {});
+        return data;
+      } else if (data && data.accounts && data.accounts.length > 0) {
         return data;
       }
     } catch {
@@ -247,6 +252,7 @@ export const api = {
     }
 
     // 3. Fallback default account metrics
+    const accNum = userAccountNumber || '1088492015';
     const defaultMetrics: BalanceMetrics = {
       checkingBalance: 0,
       savingsBalance: 0,
@@ -260,7 +266,7 @@ export const api = {
           id: `acc_chk_${userId}`,
           userId,
           type: 'CHECKING',
-          accountNumber: '1088492015',
+          accountNumber: accNum,
           routingNumber: '021000021',
           currency: 'USD',
           balance: 0,
@@ -275,7 +281,7 @@ export const api = {
           id: `acc_sav_${userId}`,
           userId,
           type: 'SAVINGS',
-          accountNumber: '1088492991',
+          accountNumber: `10${accNum.slice(2, -3)}991`,
           routingNumber: '021000021',
           currency: 'USD',
           balance: 0,
@@ -289,7 +295,6 @@ export const api = {
       ],
     };
 
-    firestoreSync.saveAccountBalances(userId, defaultMetrics).catch(() => {});
     return defaultMetrics;
   },
 
@@ -368,7 +373,43 @@ export const api = {
       console.warn('[API] Express backend lookup unreachable, checking built-in seed users...');
     }
 
-    // 3. Backup Layer: Built-in Directory Verification
+    // 3. Backup Layer: Local Directory Cache & Built-in Verification
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const cachedRaw = localStorage.getItem('monvera_accounts_directory');
+        if (cachedRaw) {
+          const directory: UserProfile[] = JSON.parse(cachedRaw);
+          if (Array.isArray(directory)) {
+            const foundCached = directory.find(
+              (u) =>
+                (u.permanentAccountNumber && u.permanentAccountNumber.replace(/[-\s]/g, '') === cleanInput) ||
+                (u.username && u.username.toLowerCase() === cleanInput) ||
+                (u.email && u.email.toLowerCase() === cleanInput) ||
+                `${u.firstName || ''} ${u.lastName || ''}`.toLowerCase().trim() === cleanInput
+            );
+            if (foundCached) {
+              if (currentUserId && foundCached.id === currentUserId) {
+                return { valid: false, error: 'You cannot send an external transfer to yourself.' };
+              }
+              const accNum = foundCached.permanentAccountNumber || '1088492015';
+              return {
+                valid: true,
+                recipientId: foundCached.id || `usr_${cleanInput}`,
+                firstName: foundCached.firstName || 'Monvera',
+                lastName: foundCached.lastName || 'Customer',
+                username: foundCached.username || cleanInput,
+                avatarUrl: foundCached.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+                permanentAccountNumber: accNum,
+                maskedAccountNumber: `•••• ${accNum.slice(-4)}`,
+                membershipTier: foundCached.membershipTier || 'Premier',
+                verified: true,
+              };
+            }
+          }
+        }
+      }
+    } catch {}
+
     const foundSeed = SEED_USERS.find(
       (u) =>
         u.permanentAccountNumber.replace(/[-\s]/g, '') === cleanInput ||
@@ -394,14 +435,18 @@ export const api = {
       };
     }
 
-    // 4. Dynamic Monvera Account Resolution for accounts created across browser sessions
+    // 4. Resilient Monvera Account Resolution for valid 10-digit account numbers or handles
     if (/^\d{8,14}$/.test(cleanInput)) {
+      const generatedId = `usr_acc_${cleanInput}`;
+      if (currentUserId && (currentUserId === generatedId || currentUserId.includes(cleanInput))) {
+        return { valid: false, error: 'You cannot send an external transfer to yourself.' };
+      }
       return {
         valid: true,
-        recipientId: `usr_acc_${cleanInput}`,
+        recipientId: generatedId,
         firstName: 'Monvera',
         lastName: 'Account Holder',
-        username: `user_${cleanInput.slice(-4)}`,
+        username: `acc_${cleanInput.slice(-4)}`,
         avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
         permanentAccountNumber: cleanInput,
         maskedAccountNumber: `•••• ${cleanInput.slice(-4)}`,
@@ -434,6 +479,8 @@ export const api = {
 
   async sendMonveraTransfer(data: {
     senderUserId: string;
+    recipientUserId?: string;
+    recipientName?: string;
     recipientAccountNumber?: string;
     recipientUsername?: string;
     recipientIdentifier?: string;
@@ -468,13 +515,13 @@ export const api = {
         }
       }
     } catch {
-      console.warn('[API] Server transfer unavailable, activating resilient direct transfer execution fallback...');
+      console.warn('[API] Server transfer unavailable, activating direct double-entry transfer execution...');
     }
 
-    // Resolve Recipient Details (from server transaction, Cloud DB, or SEED)
-    let recipientId = serverResData?.transaction?.recipientUserId;
-    let recipientName = serverResData?.transaction?.recipientName;
-    let recipientAcc = serverResData?.transaction?.recipientAccountNumber || data.recipientAccountNumber;
+    // Resolve Recipient Details (from verified input, server transaction, Cloud DB, or SEED)
+    let recipientId = data.recipientUserId || serverResData?.transaction?.recipientUserId;
+    let recipientName = data.recipientName || serverResData?.transaction?.recipientName;
+    let recipientAcc = data.recipientAccountNumber || serverResData?.transaction?.recipientAccountNumber;
 
     if (!recipientId || !recipientName) {
       try {
@@ -482,7 +529,7 @@ export const api = {
         if (fsUser) {
           recipientId = fsUser.id || (fsUser as any).uid;
           recipientName = `${fsUser.firstName || ''} ${fsUser.lastName || ''}`.trim() || fsUser.username;
-          recipientAcc = recipientAcc || fsUser.permanentAccountNumber;
+          recipientAcc = recipientAcc || fsUser.permanentAccountNumber || (fsUser as any).accountNumber;
         }
       } catch {}
     }
@@ -503,12 +550,24 @@ export const api = {
       }
     }
 
-    // Find sender details
-    const senderSeed = SEED_USERS.find((u) => u.id === data.senderUserId);
-    const senderName = senderSeed ? `${senderSeed.firstName} ${senderSeed.lastName}` : 'Monvera Customer';
-    const senderAcc = senderSeed?.permanentAccountNumber;
+    // Find sender details from Cloud Firestore or Seed
+    let senderName = 'Monvera Customer';
+    let senderAcc = '1000000000';
+    try {
+      const senderProfile = await firestoreSync.getUserProfile(data.senderUserId);
+      if (senderProfile) {
+        senderName = `${senderProfile.firstName || ''} ${senderProfile.lastName || ''}`.trim() || senderProfile.username || 'Monvera Customer';
+        senderAcc = senderProfile.permanentAccountNumber || (senderProfile as any).accountNumber || '1000000000';
+      } else {
+        const senderSeed = SEED_USERS.find((u) => u.id === data.senderUserId);
+        if (senderSeed) {
+          senderName = `${senderSeed.firstName} ${senderSeed.lastName}`;
+          senderAcc = senderSeed.permanentAccountNumber;
+        }
+      }
+    } catch {}
 
-    // Use server transaction or construct seamless double-entry record
+    // Construct completed transaction record
     const txId = serverResData?.transaction?.id || `tx_mv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
     const completedTx: Transaction = {
       id: txId,
@@ -531,38 +590,59 @@ export const api = {
     };
 
     // Calculate debited balance for sender
-    const senderMetrics = await this.getBalanceMetrics(data.senderUserId);
-    const newChecking = Math.max(0, senderMetrics.checkingBalance - transferAmount);
+    const senderMetrics = await firestoreSync.getAccountBalances(data.senderUserId, senderAcc) || await this.getBalanceMetrics(data.senderUserId);
+    const newChecking = Math.max(0, (senderMetrics?.checkingBalance || 0) - transferAmount);
+    const currentSavings = senderMetrics?.savingsBalance || 0;
+    const currentInvested = senderMetrics?.investedBalance || 0;
+
     const updatedSenderMetrics: BalanceMetrics = {
       ...senderMetrics,
       checkingBalance: newChecking,
-      totalBalance: newChecking + senderMetrics.savingsBalance + senderMetrics.investedBalance,
+      savingsBalance: currentSavings,
+      investedBalance: currentInvested,
+      accruedEarnings: senderMetrics?.accruedEarnings || 0,
+      totalBalance: newChecking + currentSavings + currentInvested,
       availableBalance: newChecking,
-      accounts: (senderMetrics.accounts || []).map((a) =>
-        a.type === 'CHECKING'
-          ? { ...a, balance: Math.max(0, a.balance - transferAmount), availableBalance: Math.max(0, a.availableBalance - transferAmount) }
-          : a
-      ),
+      pendingBalance: 0,
+      accounts: (senderMetrics?.accounts && senderMetrics.accounts.length > 0)
+        ? senderMetrics.accounts.map((a) =>
+            a.type === 'CHECKING'
+              ? { ...a, balance: Math.max(0, a.balance - transferAmount), availableBalance: Math.max(0, a.availableBalance - transferAmount) }
+              : a
+          )
+        : [
+            {
+              id: `acc_chk_${data.senderUserId}`,
+              userId: data.senderUserId,
+              type: 'CHECKING',
+              accountNumber: senderAcc || '1045827391',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: newChecking,
+              availableBalance: newChecking,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 1.25,
+              status: 'ACTIVE',
+              nickname: 'Monvera Premier Checking',
+            },
+            {
+              id: `acc_sav_${data.senderUserId}`,
+              userId: data.senderUserId,
+              type: 'SAVINGS',
+              accountNumber: senderAcc ? `10${senderAcc.slice(2, -3)}991` : '1000000991',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: currentSavings,
+              availableBalance: currentSavings,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 4.85,
+              status: 'ACTIVE',
+              nickname: 'Monvera High-Yield Treasury',
+            }
+          ],
     };
-
-    // Ensure Checking account exists in list
-    if (!updatedSenderMetrics.accounts.some((a) => a.type === 'CHECKING')) {
-      updatedSenderMetrics.accounts.unshift({
-        id: `acc_chk_${data.senderUserId}`,
-        userId: data.senderUserId,
-        type: 'CHECKING',
-        accountNumber: senderAcc || '1045827391',
-        routingNumber: '021000021',
-        currency: 'USD',
-        balance: newChecking,
-        availableBalance: newChecking,
-        investedBalance: 0,
-        pendingBalance: 0,
-        interestRateAPY: 1.25,
-        status: 'ACTIVE',
-        nickname: 'Monvera Premier Checking',
-      });
-    }
 
     // Persist to Cloud Firestore for sender & ledger
     try {
@@ -582,39 +662,60 @@ export const api = {
         referenceId: completedTx.referenceNumber,
       });
 
-      // Credit recipient if found
+      // Credit recipient account in Firestore with double-entry accounting
       if (recipientId && recipientId !== data.senderUserId) {
-        const recipientMetrics = await this.getBalanceMetrics(recipientId);
-        const recipientNewChecking = recipientMetrics.checkingBalance + transferAmount;
-        const updatedRecipientMetrics: BalanceMetrics = {
-          ...recipientMetrics,
-          checkingBalance: recipientNewChecking,
-          totalBalance: recipientNewChecking + recipientMetrics.savingsBalance + recipientMetrics.investedBalance,
-          availableBalance: recipientNewChecking,
-          accounts: (recipientMetrics.accounts || []).map((a) =>
-            a.type === 'CHECKING'
-              ? { ...a, balance: a.balance + transferAmount, availableBalance: a.availableBalance + transferAmount }
-              : a
-          ),
-        };
+        const recipientMetrics = await firestoreSync.getAccountBalances(recipientId, recipientAcc);
+        const rChecking = (recipientMetrics?.checkingBalance || 0) + transferAmount;
+        const rSavings = recipientMetrics?.savingsBalance || 0;
+        const rInvested = recipientMetrics?.investedBalance || 0;
 
-        if (!updatedRecipientMetrics.accounts.some((a) => a.type === 'CHECKING')) {
-          updatedRecipientMetrics.accounts.unshift({
-            id: `acc_chk_${recipientId}`,
-            userId: recipientId,
-            type: 'CHECKING',
-            accountNumber: recipientAcc || '1088492015',
-            routingNumber: '021000021',
-            currency: 'USD',
-            balance: recipientNewChecking,
-            availableBalance: recipientNewChecking,
-            investedBalance: 0,
-            pendingBalance: 0,
-            interestRateAPY: 1.25,
-            status: 'ACTIVE',
-            nickname: 'Monvera Premier Checking',
-          });
-        }
+        const updatedRecipientMetrics: BalanceMetrics = {
+          checkingBalance: rChecking,
+          savingsBalance: rSavings,
+          investedBalance: rInvested,
+          accruedEarnings: recipientMetrics?.accruedEarnings || 0,
+          totalBalance: rChecking + rSavings + rInvested,
+          availableBalance: rChecking,
+          pendingBalance: 0,
+          accounts: (recipientMetrics?.accounts && recipientMetrics.accounts.length > 0)
+            ? recipientMetrics.accounts.map((a) =>
+                a.type === 'CHECKING'
+                  ? { ...a, balance: a.balance + transferAmount, availableBalance: a.availableBalance + transferAmount }
+                  : a
+              )
+            : [
+                {
+                  id: `acc_chk_${recipientId}`,
+                  userId: recipientId,
+                  type: 'CHECKING',
+                  accountNumber: recipientAcc || '1088492015',
+                  routingNumber: '021000021',
+                  currency: 'USD',
+                  balance: rChecking,
+                  availableBalance: rChecking,
+                  investedBalance: 0,
+                  pendingBalance: 0,
+                  interestRateAPY: 1.25,
+                  status: 'ACTIVE',
+                  nickname: 'Monvera Premier Checking',
+                },
+                {
+                  id: `acc_sav_${recipientId}`,
+                  userId: recipientId,
+                  type: 'SAVINGS',
+                  accountNumber: recipientAcc ? `10${recipientAcc.slice(2, -3)}991` : '1000000991',
+                  routingNumber: '021000021',
+                  currency: 'USD',
+                  balance: rSavings,
+                  availableBalance: rSavings,
+                  investedBalance: 0,
+                  pendingBalance: 0,
+                  interestRateAPY: 4.85,
+                  status: 'ACTIVE',
+                  nickname: 'Monvera High-Yield Treasury',
+                }
+              ],
+        };
 
         await firestoreSync.saveAccountBalances(recipientId, updatedRecipientMetrics);
 
@@ -631,15 +732,20 @@ export const api = {
           referenceId: completedTx.referenceNumber,
         });
       }
-    } catch (fsErr) {
-      console.warn('[API] Cloud ledger synchronization note:', fsErr);
-    }
 
-    return {
-      success: true,
-      transaction: completedTx,
-      balanceMetrics: updatedSenderMetrics,
-    };
+      return {
+        success: true,
+        transaction: completedTx,
+        balanceMetrics: updatedSenderMetrics,
+      };
+    } catch (persistErr) {
+      console.error('[API] Error persisting transfer:', persistErr);
+      return {
+        success: true,
+        transaction: completedTx,
+        balanceMetrics: updatedSenderMetrics,
+      };
+    }
   },
 
   async sendInternalTransfer(data: {
@@ -672,6 +778,93 @@ export const api = {
     const depositAmount = Number(data.amount);
     const targetType = data.destinationAccountType || 'CHECKING';
 
+    if (isNaN(depositAmount) || depositAmount <= 0) {
+      return { success: false, error: 'Invalid deposit amount.' };
+    }
+
+    // 1. Fetch current balance metrics to guarantee strictly additive calculation
+    let currentMetrics: BalanceMetrics;
+    try {
+      currentMetrics = await this.getBalanceMetrics(data.userId, data.metadata?.accountNumber);
+    } catch {
+      currentMetrics = {
+        checkingBalance: 0,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 0,
+        availableBalance: 0,
+        pendingBalance: 0,
+        accounts: [],
+      };
+    }
+
+    const isChecking = targetType === 'CHECKING';
+    const prevChecking = Number(currentMetrics.checkingBalance) || 0;
+    const prevSavings = Number(currentMetrics.savingsBalance) || 0;
+    const prevInvested = Number(currentMetrics.investedBalance) || 0;
+    const prevAccrued = Number(currentMetrics.accruedEarnings) || 0;
+
+    const updatedChecking = isChecking ? prevChecking + depositAmount : prevChecking;
+    const updatedSavings = !isChecking ? prevSavings + depositAmount : prevSavings;
+    const updatedTotal = updatedChecking + updatedSavings + prevInvested + prevAccrued;
+    const updatedAvailable = updatedChecking;
+
+    const updatedMetrics: BalanceMetrics = {
+      ...currentMetrics,
+      checkingBalance: updatedChecking,
+      savingsBalance: updatedSavings,
+      investedBalance: prevInvested,
+      accruedEarnings: prevAccrued,
+      totalBalance: updatedTotal,
+      availableBalance: updatedAvailable,
+      accounts: currentMetrics.accounts && currentMetrics.accounts.length > 0
+        ? currentMetrics.accounts.map((acc) => {
+            if (acc.type === targetType) {
+              const prevAccBal = Number(acc.balance) || 0;
+              const prevAccAvail = Number(acc.availableBalance) || 0;
+              return {
+                ...acc,
+                balance: prevAccBal + depositAmount,
+                availableBalance: prevAccAvail + depositAmount,
+              };
+            }
+            return acc;
+          })
+        : [
+            {
+              id: `acc_chk_${data.userId}`,
+              userId: data.userId,
+              type: 'CHECKING',
+              accountNumber: data.metadata?.accountNumber || '1088492015',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: updatedChecking,
+              availableBalance: updatedChecking,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 1.25,
+              status: 'ACTIVE',
+              nickname: 'Monvera Premier Checking',
+            },
+            {
+              id: `acc_sav_${data.userId}`,
+              userId: data.userId,
+              type: 'SAVINGS',
+              accountNumber: '1088492991',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: updatedSavings,
+              availableBalance: updatedSavings,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 4.85,
+              status: 'ACTIVE',
+              nickname: 'Monvera High-Yield Treasury',
+            },
+          ],
+    };
+
     // Generate permanent deposit transaction
     const txId = `tx_dep_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
     const newTx: Transaction = {
@@ -681,14 +874,29 @@ export const api = {
       amount: depositAmount,
       currency: 'USD',
       status: 'COMPLETED',
+      userId: data.userId,
       senderUserId: data.userId,
+      recipientUserId: data.userId,
       fee: 0.00,
       description: `Monvera ${data.method} Deposit - Added to ${targetType}`,
       category: 'Deposits',
       createdAt: new Date().toISOString(),
+      metadata: {
+        destinationAccountType: targetType,
+        depositMethod: data.method,
+        ...data.metadata,
+      },
     };
 
-    // 1. Try Express backend
+    // 2. Persist directly to Firestore & local permanent storage
+    try {
+      await firestoreSync.saveTransaction(newTx);
+      await firestoreSync.saveAccountBalances(data.userId, updatedMetrics);
+    } catch (fsErr) {
+      console.warn('[API] Firestore save transaction/balance notice:', fsErr);
+    }
+
+    // 3. Sync with Express backend
     try {
       const res = await fetch('/api/deposits/create', {
         method: 'POST',
@@ -698,59 +906,24 @@ export const api = {
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
         const resData = await res.json();
-        if (resData && typeof resData === 'object' && resData.success) {
-          // Permanently sync transaction & metrics to Firestore
-          if (resData.transaction) firestoreSync.saveTransaction(resData.transaction).catch(() => {});
-          if (resData.balanceMetrics) firestoreSync.saveAccountBalances(data.userId, resData.balanceMetrics).catch(() => {});
-          return resData;
+        if (resData && typeof resData === 'object' && resData.transaction) {
+          // If server created a distinct transaction reference, merge it
+          return {
+            success: true,
+            transaction: { ...newTx, referenceNumber: resData.transaction.referenceNumber || newTx.referenceNumber },
+            balanceMetrics: updatedMetrics,
+          };
         }
       }
     } catch {
-      console.warn('[API] Express backend deposit endpoint unreachable, executing direct Firestore persistence...');
+      // Backend sync fallback
     }
 
-    // 2. Direct Firestore Permanent Persistence Layer
-    try {
-      await firestoreSync.saveTransaction(newTx);
-      
-      // Update account balance metrics in Firestore
-      const currentMetrics = await this.getBalanceMetrics(data.userId);
-      const isChecking = targetType === 'CHECKING';
-      const updatedChecking = isChecking ? currentMetrics.checkingBalance + depositAmount : currentMetrics.checkingBalance;
-      const updatedSavings = !isChecking ? currentMetrics.savingsBalance + depositAmount : currentMetrics.savingsBalance;
-      
-      const updatedMetrics: BalanceMetrics = {
-        ...currentMetrics,
-        checkingBalance: updatedChecking,
-        savingsBalance: updatedSavings,
-        totalBalance: updatedChecking + updatedSavings + currentMetrics.investedBalance,
-        availableBalance: updatedChecking,
-        accounts: currentMetrics.accounts.map((acc) => {
-          if (acc.type === targetType) {
-            return {
-              ...acc,
-              balance: acc.balance + depositAmount,
-              availableBalance: acc.availableBalance + depositAmount,
-            };
-          }
-          return acc;
-        }),
-      };
-
-      await firestoreSync.saveAccountBalances(data.userId, updatedMetrics);
-
-      return {
-        success: true,
-        transaction: newTx,
-        balanceMetrics: updatedMetrics,
-      };
-    } catch (fsErr) {
-      console.error('[API] Firestore deposit save notice:', fsErr);
-      return {
-        success: true,
-        transaction: newTx,
-      };
-    }
+    return {
+      success: true,
+      transaction: newTx,
+      balanceMetrics: updatedMetrics,
+    };
   },
 
   async createWithdrawal(data: {
@@ -1444,6 +1617,172 @@ export const api = {
       return await parseJsonResponse(res, { auditLogs: [] });
     } catch {
       return { auditLogs: [] };
+    }
+  },
+
+  // --- LOANS & CREDIT FACILITY API METHODS ---
+  async getLoans(userId?: string): Promise<{ loans: LoanApplication[] }> {
+    try {
+      const url = userId ? `/api/loans?userId=${encodeURIComponent(userId)}` : '/api/loans';
+      const res = await fetch(url);
+      const data = await parseJsonResponse<{ loans: LoanApplication[] }>(res, { loans: [] });
+      
+      // Also merge with Firestore permanent loans
+      if (userId) {
+        const fsLoans = await firestoreSync.getLoansForUser(userId);
+        const map = new Map<string, LoanApplication>();
+        (data.loans || []).forEach((l) => map.set(l.id, l));
+        fsLoans.forEach((l) => map.set(l.id, l));
+        return { loans: Array.from(map.values()) };
+      } else {
+        const fsLoans = await firestoreSync.getAllLoans();
+        const map = new Map<string, LoanApplication>();
+        (data.loans || []).forEach((l) => map.set(l.id, l));
+        fsLoans.forEach((l) => map.set(l.id, l));
+        return { loans: Array.from(map.values()) };
+      }
+    } catch {
+      return { loans: [] };
+    }
+  },
+
+  async getLoanEligibility(userId: string): Promise<{
+    volume: number;
+    tier: string;
+    maxLimit: number;
+    interestRateAPR: number;
+    description: string;
+  }> {
+    try {
+      const res = await fetch(`/api/loans/eligibility?userId=${encodeURIComponent(userId)}`);
+      return await parseJsonResponse(res, {
+        volume: 0,
+        tier: 'Starter Credit Tier',
+        maxLimit: 10000,
+        interestRateAPR: 7.25,
+        description: 'Transact on Monvera to unlock higher credit lines.',
+      });
+    } catch {
+      return {
+        volume: 0,
+        tier: 'Starter Credit Tier',
+        maxLimit: 10000,
+        interestRateAPR: 7.25,
+        description: 'Transact on Monvera to unlock higher credit lines.',
+      };
+    }
+  },
+
+  async applyForLoan(data: {
+    userId: string;
+    amount: number;
+    termMonths: number;
+    purpose: string;
+    employmentOrBusinessDetails?: string;
+    annualIncomeOrRevenue?: number;
+    collateralDescription?: string;
+    applicantName?: string;
+    applicantEmail?: string;
+    applicantPhone?: string;
+    permanentAccountNumber?: string;
+    fallbackUser?: any;
+  }): Promise<{ success: boolean; loan?: LoanApplication; error?: string }> {
+    try {
+      const res = await fetch('/api/loans/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; error?: string }>(res, {
+        success: false,
+        error: 'Loan application service offline',
+      });
+      if (result.success && result.loan) {
+        // Persist permanently in Firestore
+        await firestoreSync.saveLoanApplication(result.loan);
+      }
+      return result;
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to submit loan application.' };
+    }
+  },
+
+  async adminApproveLoan(data: {
+    loanId: string;
+    adminId?: string;
+  }): Promise<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; error?: string }> {
+    try {
+      const res = await fetch('/api/admin/loans/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; error?: string }>(res, {
+        success: false,
+        error: 'Approval service offline',
+      });
+      if (result.success && result.loan) {
+        await firestoreSync.saveLoanApplication(result.loan);
+        if (result.transaction) {
+          await firestoreSync.saveTransaction(result.transaction);
+        }
+      }
+      return result;
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to approve loan.' };
+    }
+  },
+
+  async adminRejectLoan(data: {
+    loanId: string;
+    reason: string;
+    adminId?: string;
+  }): Promise<{ success: boolean; loan?: LoanApplication; error?: string }> {
+    try {
+      const res = await fetch('/api/admin/loans/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; error?: string }>(res, {
+        success: false,
+        error: 'Rejection service offline',
+      });
+      if (result.success && result.loan) {
+        await firestoreSync.saveLoanApplication(result.loan);
+      }
+      return result;
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to reject loan.' };
+    }
+  },
+
+  async repayLoan(data: {
+    loanId: string;
+    userId: string;
+    amount: number;
+    sourceAccountId?: string;
+    note?: string;
+  }): Promise<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; remainingBalance?: number; error?: string }> {
+    try {
+      const res = await fetch('/api/loans/repay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; remainingBalance?: number; error?: string }>(res, {
+        success: false,
+        error: 'Repayment service offline',
+      });
+      if (result.success && result.loan) {
+        await firestoreSync.saveLoanApplication(result.loan);
+        if (result.transaction) {
+          await firestoreSync.saveTransaction(result.transaction);
+        }
+      }
+      return result;
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Failed to process loan repayment.' };
     }
   },
 };

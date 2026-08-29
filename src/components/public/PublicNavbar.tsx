@@ -14,6 +14,7 @@ export const PublicNavbar: React.FC = () => {
     { label: 'Business', target: 'business' },
     { label: 'Investments', target: 'investments' },
     { label: 'Cards', target: 'cards' },
+    { label: 'Loans', target: 'loans' },
     { label: 'How It Works', target: 'how-it-works' },
     { label: 'Security', target: 'security' },
   ];
@@ -30,7 +31,7 @@ export const PublicNavbar: React.FC = () => {
       window.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
-    if (target === 'investments' || target === 'cards' || target === 'security') {
+    if (target === 'investments' || target === 'cards' || target === 'loans' || target === 'security') {
       setCurrentView('home');
       setTimeout(() => {
         const elem = document.getElementById(target);

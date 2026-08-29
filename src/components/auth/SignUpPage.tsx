@@ -154,12 +154,227 @@ export const SignUpPage: React.FC<SignUpPageProps> = ({
     }
   };
 
+  // MODAL VIEW: Clean dedicated card inside modal dialog
+  if (isModal) {
+    return (
+      <div
+        id="monvera-signup-modal-card"
+        className="w-full bg-white rounded-[28px] sm:rounded-[36px] p-6 sm:p-8 shadow-2xl border border-slate-200 relative overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header with Close */}
+        <div className="flex items-center justify-between pb-4 mb-4 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <MonveraLogo variant="icon" size="sm" />
+            <span className="font-extrabold text-slate-900 text-sm">Monvera Bank</span>
+          </div>
+          {onClose && (
+            <button
+              onClick={onClose}
+              id="signup-modal-close-btn"
+              className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+
+        {/* Quick Switcher */}
+        <div className="flex rounded-2xl bg-slate-100 p-1.5 mb-5 max-w-xs mx-auto border border-slate-200 shadow-inner">
+          <button
+            type="button"
+            onClick={onSwitchToLogin}
+            className="flex-1 py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-600 hover:text-slate-950 hover:bg-white/60 transition-all flex items-center justify-center gap-1.5 cursor-pointer select-none"
+          >
+            <Lock className="w-3.5 h-3.5 text-slate-400" />
+            <span>Sign In</span>
+          </button>
+          <button
+            type="button"
+            className="flex-1 py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold text-slate-950 bg-white shadow-xs transition-all flex items-center justify-center gap-1.5 select-none"
+          >
+            <User className="w-3.5 h-3.5 text-amber-500" />
+            <span>Create Account</span>
+          </button>
+        </div>
+
+        {/* Title */}
+        <div className="text-center pb-4">
+          <h1 className="text-2xl font-black text-slate-900 tracking-tight font-sans">
+            Create Your Account
+          </h1>
+          <p className="text-xs text-slate-500 font-medium mt-1">
+            Join Monvera and experience secure, high-yield digital banking
+          </p>
+        </div>
+
+        {/* Success Banner */}
+        {successMessage && (
+          <div className="mb-4 p-3.5 rounded-2xl bg-emerald-50 border-2 border-emerald-300 text-xs sm:text-sm text-emerald-950 flex items-center gap-2.5">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+            <div>
+              <span className="font-extrabold block">{successMessage}</span>
+              <span className="text-xs text-emerald-800">Redirecting to your dashboard...</span>
+            </div>
+          </div>
+        )}
+
+        {/* Error Banner */}
+        {errorMessage && (
+          <div className="mb-4 p-3.5 rounded-2xl bg-red-50 border-2 border-red-200 text-xs text-red-900 flex items-start justify-between gap-2.5">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <span className="font-bold">{errorMessage}</span>
+            </div>
+            {(errorMessage.includes('already registered') || errorMessage.includes('already exists') || errorMessage.includes('log in')) && onSwitchToLogin && (
+              <button
+                type="button"
+                onClick={onSwitchToLogin}
+                className="shrink-0 px-2.5 py-1 bg-red-600 hover:bg-red-700 text-white rounded-md font-bold text-xs cursor-pointer"
+              >
+                Log In
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Form */}
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Full Name <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="text"
+                required
+                id="signup-fullname-modal"
+                value={fullName}
+                onClick={(e) => e.stopPropagation()}
+                onFocus={(e) => e.stopPropagation()}
+                onChange={(e) => setFullName(e.target.value)}
+                placeholder="Enter your full name"
+                className="w-full px-3.5 py-2.5 text-sm font-medium text-slate-900 bg-slate-50 border border-slate-200 focus:border-slate-800 rounded-xl focus:outline-hidden"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Email Address <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="email"
+                required
+                id="signup-email-modal"
+                value={email}
+                onClick={(e) => e.stopPropagation()}
+                onFocus={(e) => e.stopPropagation()}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="Enter your email address"
+                className="w-full px-3.5 py-2.5 text-sm font-medium text-slate-900 bg-slate-50 border border-slate-200 focus:border-slate-800 rounded-xl focus:outline-hidden"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Phone Number <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="tel"
+                required
+                id="signup-phone-modal"
+                value={phoneNumber}
+                onClick={(e) => e.stopPropagation()}
+                onFocus={(e) => e.stopPropagation()}
+                onChange={(e) => setPhoneNumber(e.target.value)}
+                placeholder="+1 (555) 000-0000"
+                className="w-full px-3.5 py-2.5 text-sm font-medium text-slate-900 bg-slate-50 border border-slate-200 focus:border-slate-800 rounded-xl focus:outline-hidden"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Password <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  required
+                  id="signup-password-modal"
+                  value={password}
+                  onClick={(e) => e.stopPropagation()}
+                  onFocus={(e) => e.stopPropagation()}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Min. 6 characters"
+                  className="w-full pl-3.5 pr-10 py-2.5 text-sm font-medium text-slate-900 bg-slate-50 border border-slate-200 focus:border-slate-800 rounded-xl focus:outline-hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Confirm Password <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  type={showConfirmPassword ? 'text' : 'password'}
+                  required
+                  id="signup-confirm-password-modal"
+                  value={confirmPassword}
+                  onClick={(e) => e.stopPropagation()}
+                  onFocus={(e) => e.stopPropagation()}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="Re-enter password"
+                  className="w-full pl-3.5 pr-10 py-2.5 text-sm font-medium text-slate-900 bg-slate-50 border border-slate-200 focus:border-slate-800 rounded-xl focus:outline-hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                  className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                >
+                  {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="pt-1">
+              <label className="flex items-start gap-2 text-xs text-slate-600 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  id="signup-terms-modal"
+                  checked={agreedToTerms}
+                  onChange={(e) => setAgreedToTerms(e.target.checked)}
+                  className="mt-0.5 w-4 h-4 rounded border-slate-300 text-slate-900 focus:ring-slate-800 cursor-pointer"
+                />
+                <span>I agree to Monvera Bank's Terms & Conditions and Privacy Policy.</span>
+              </label>
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="w-full py-3.5 px-6 rounded-xl font-black text-sm text-white bg-slate-950 hover:bg-slate-900 shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+          >
+            <ShieldCheck className="w-4 h-4 text-amber-400" />
+            <span>{isSubmitting ? 'Creating Account...' : 'Open My Account'}</span>
+          </button>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div
       id="monvera-signup-page"
-      className={`min-h-screen w-full flex flex-col justify-between relative overflow-x-hidden ${
-        isModal ? 'p-3 sm:p-6' : 'py-8 px-4 sm:px-6 lg:px-8'
-      }`}
+      className="min-h-screen w-full flex flex-col justify-between relative overflow-x-hidden py-8 px-4 sm:px-6 lg:px-8"
       style={{
         background: 'linear-gradient(135deg, #F8F9FA 0%, #EDF1F7 50%, #F5F7FA 100%)',
       }}

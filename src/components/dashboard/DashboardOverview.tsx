@@ -25,6 +25,7 @@ import {
   Lock,
   Sparkles,
   FileText,
+  Banknote,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
@@ -345,6 +346,29 @@ export const DashboardOverview: React.FC = () => {
             </div>
           </button>
 
+          <button
+            id="action-btn-loans"
+            onClick={() => handleProtectedAction(() => setCurrentView('loans'))}
+            className={`p-5 sm:p-6 rounded-3xl bg-gradient-to-b from-amber-50/60 to-white border-2 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative ${
+              !isVerified
+                ? 'border-amber-300 hover:border-amber-500 bg-amber-50/20'
+                : 'hover:bg-amber-50/90 border-amber-400 hover:border-amber-600'
+            }`}
+          >
+            {!isVerified && (
+              <span className="absolute top-2.5 right-2.5 p-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300" title="Locked - KYC Required">
+                <Lock className="w-3.5 h-3.5" />
+              </span>
+            )}
+            <div className="w-14 h-14 rounded-2xl bg-amber-500 text-slate-950 flex items-center justify-center group-hover:scale-110 group-hover:bg-amber-600 group-hover:text-white transition-all shadow-sm">
+              <Banknote className="w-7 h-7 stroke-[2.5]" />
+            </div>
+            <div>
+              <span className="text-base font-black text-slate-950 block">Loans</span>
+              <span className="text-xs text-amber-900 font-black block">{!isVerified ? 'Locked (Verify)' : '$1k – $1M USD'}</span>
+            </div>
+          </button>
+
         </div>
       </div>
 
@@ -354,7 +378,7 @@ export const DashboardOverview: React.FC = () => {
           <div>
             <h3 className="text-xl sm:text-2xl font-black text-slate-950">Account Summary & Balances</h3>
             <p className="text-xs sm:text-sm text-slate-800 font-bold">
-              Institutional segregation across Checking, High-Yield Savings, and Term Investment portfolios.
+              Institutional segregation across Checking, High-Yield Savings, Term Investment, and Liquidity Credit portfolios.
             </p>
           </div>
           <button
@@ -366,7 +390,7 @@ export const DashboardOverview: React.FC = () => {
           </button>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           
           {/* Card 1: Premier Checking Account */}
           <div className="p-6 sm:p-7 rounded-3xl bg-white border-2 border-slate-300 shadow-md space-y-5 flex flex-col justify-between hover:border-slate-400 transition-all">
@@ -406,7 +430,7 @@ export const DashboardOverview: React.FC = () => {
                   <Landmark className="w-6 h-6" />
                 </div>
                 <span className="text-xs uppercase font-black text-emerald-950 bg-emerald-200 px-3 py-1 rounded-full border border-emerald-400 shadow-xs">
-                  SAVINGS ACCOUNT • 4.85% APY
+                  SAVINGS • 4.85% APY
                 </span>
               </div>
               <div>
@@ -436,7 +460,7 @@ export const DashboardOverview: React.FC = () => {
                   <TrendingUp className="w-6 h-6" />
                 </div>
                 <span className="text-xs uppercase font-black text-slate-900 bg-slate-200 px-3 py-1 rounded-full border border-slate-300">
-                  INVESTMENT PORTFOLIO
+                  INVESTMENTS
                 </span>
               </div>
               <div>
@@ -445,7 +469,7 @@ export const DashboardOverview: React.FC = () => {
                   Active Sovereign Terms (60-360D)
                 </div>
                 <p className="text-xs text-slate-800 font-medium mt-1">
-                  Fixed sovereign term contracts generating guaranteed 4.50% fixed daily interest (credited every 24 hours) until maturity.
+                  Fixed sovereign term contracts generating guaranteed 4.50% daily interest until maturity.
                 </p>
               </div>
             </div>
@@ -455,6 +479,43 @@ export const DashboardOverview: React.FC = () => {
               <div className="text-2xl sm:text-3xl font-black font-mono text-emerald-700">
                 {hideBalances ? '••••••' : `$${balanceMetrics.investedBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </div>
+            </div>
+          </div>
+
+          {/* Card 4: Monvera Credit & Loans Facility */}
+          <div className="p-6 sm:p-7 rounded-3xl bg-gradient-to-b from-amber-50/60 to-white border-2 border-amber-400 shadow-md space-y-5 flex flex-col justify-between hover:border-amber-500 transition-all">
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="w-12 h-12 rounded-2xl bg-amber-500 text-slate-950 flex items-center justify-center shadow-sm">
+                  <Banknote className="w-6 h-6" />
+                </div>
+                <span className="text-xs uppercase font-black text-amber-950 bg-amber-200 px-3 py-1 rounded-full border border-amber-400">
+                  CREDIT & LOANS
+                </span>
+              </div>
+              <div>
+                <h4 className="font-black text-slate-950 text-lg">Institutional Credit Line</h4>
+                <div className="text-xs font-mono font-bold text-amber-900 mt-0.5">
+                  $1,000 to $1,000,000 Facility
+                </div>
+                <p className="text-xs text-slate-800 font-medium mt-1">
+                  Transaction-based loan eligibility. Disbursed directly into your checking account upon underwriting approval.
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-3 border-t-2 border-amber-200 space-y-2">
+              <div className="flex justify-between items-center">
+                <div className="text-xs text-slate-700 font-black uppercase tracking-wider font-mono">Credit Status</div>
+                <span className="text-xs font-black text-emerald-800 font-mono">Instant Apply</span>
+              </div>
+              <button
+                onClick={() => setCurrentView('loans')}
+                className="w-full py-2.5 rounded-xl bg-slate-950 hover:bg-slate-850 text-white text-xs font-black flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm"
+              >
+                <span>Apply / Manage Loans</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
 

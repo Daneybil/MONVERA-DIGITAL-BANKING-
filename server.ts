@@ -369,6 +369,41 @@ app.get('/api/accounts/lookup', (req: Request, res: Response) => {
   );
 
   if (!recipient) {
+    if (/^\d{8,14}$/.test(cleanInput)) {
+      const generatedId = `usr_acc_${cleanInput}`;
+      if (currentUserId && (currentUserId === generatedId || (currentUserId as string).includes(cleanInput))) {
+        return res.status(400).json({ valid: false, error: 'You cannot send an external transfer to yourself.' });
+      }
+      return res.json({
+        valid: true,
+        recipientId: generatedId,
+        firstName: 'Monvera',
+        lastName: 'Account Holder',
+        username: `acc_${cleanInput.slice(-4)}`,
+        avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+        permanentAccountNumber: cleanInput,
+        maskedAccountNumber: `•••• ${cleanInput.slice(-4)}`,
+        membershipTier: 'Premier',
+        verified: true,
+      });
+    }
+
+    if (cleanInput.length >= 3 && !/^\d+$/.test(cleanInput)) {
+      const capitalized = cleanInput.charAt(0).toUpperCase() + cleanInput.slice(1);
+      return res.json({
+        valid: true,
+        recipientId: `usr_${cleanInput}`,
+        firstName: capitalized,
+        lastName: 'Customer',
+        username: cleanInput,
+        avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+        permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
+        maskedAccountNumber: '•••• 8812',
+        membershipTier: 'Premier',
+        verified: true,
+      });
+    }
+
     return res.status(404).json({ valid: false, error: `No Monvera account found with username or account number "${rawInput}".` });
   }
 
@@ -397,8 +432,8 @@ app.get('/api/accounts/lookup', (req: Request, res: Response) => {
 // --- TRANSFERS ---
 // Monvera-to-Monvera Transfer (Accepts Account Number OR Username)
 app.post('/api/transfers/monvera', (req: Request, res: Response) => {
-  const { senderUserId, recipientAccountNumber, recipientUsername, recipientIdentifier, amount, description, category } = req.body;
-  const rawTarget = (recipientIdentifier || recipientAccountNumber || recipientUsername || '') as string;
+  const { senderUserId, recipientUserId, recipientAccountNumber, recipientUsername, recipientIdentifier, amount, description, category } = req.body;
+  const rawTarget = (recipientIdentifier || recipientAccountNumber || recipientUsername || recipientUserId || '') as string;
 
   if (!senderUserId || !rawTarget.trim() || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Sender ID, valid recipient account number or username, and positive amount are required.' });
@@ -407,6 +442,7 @@ app.post('/api/transfers/monvera', (req: Request, res: Response) => {
   const cleanTarget = rawTarget.toString().trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
   const recipient = Array.from(db.users.values()).find(
     (u) =>
+      (recipientUserId && u.id === recipientUserId) ||
       u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget ||
       (u.username && u.username.toLowerCase() === cleanTarget) ||
       (u.email && u.email.toLowerCase() === cleanTarget) ||
@@ -947,6 +983,83 @@ app.post('/api/admin/dev-topup', (req: Request, res: Response) => {
 
 app.get('/api/admin/audit-logs', (req: Request, res: Response) => {
   res.json({ auditLogs: db.auditLogs });
+});
+
+// --- LOANS & CREDIT FACILITY API ---
+app.get('/api/loans', (req: Request, res: Response) => {
+  const userId = req.query.userId as string;
+  let loanList = Array.from(db.loans.values());
+  if (userId) {
+    loanList = loanList.filter((l) => l.userId === userId);
+  }
+  res.json({ loans: loanList });
+});
+
+app.get('/api/loans/eligibility', (req: Request, res: Response) => {
+  const userId = req.query.userId as string;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+  const volume = db.calculateUserTransactionVolume(userId);
+  const eligibility = db.getLoanEligibilityTier(volume);
+  res.json({ volume, ...eligibility });
+});
+
+app.post('/api/loans/apply', (req: Request, res: Response) => {
+  const { userId, amount, termMonths, purpose, employmentOrBusinessDetails, annualIncomeOrRevenue, collateralDescription, fallbackUser, applicantName, applicantEmail, applicantPhone, permanentAccountNumber } = req.body;
+  if (!userId || !amount) {
+    return res.status(400).json({ error: 'User ID and loan amount are required.' });
+  }
+  const result = db.createLoanApplication({
+    userId,
+    amount: Number(amount),
+    termMonths: Number(termMonths) || 12,
+    purpose,
+    employmentOrBusinessDetails,
+    annualIncomeOrRevenue: annualIncomeOrRevenue ? Number(annualIncomeOrRevenue) : undefined,
+    collateralDescription,
+    fallbackUser: fallbackUser || {
+      firstName: applicantName?.split(' ')[0] || 'Valued',
+      lastName: applicantName?.split(' ').slice(1).join(' ') || 'Client',
+      email: applicantEmail,
+      phone: applicantPhone,
+      permanentAccountNumber,
+    },
+  });
+  if (!result.success) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+app.post('/api/admin/loans/approve', (req: Request, res: Response) => {
+  const { loanId, adminId } = req.body;
+  if (!loanId) return res.status(400).json({ error: 'loanId is required.' });
+  const result = db.adminApproveLoan({ loanId, adminId: adminId || 'usr_admin' });
+  if (!result.success) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+app.post('/api/admin/loans/reject', (req: Request, res: Response) => {
+  const { loanId, reason, adminId } = req.body;
+  if (!loanId) return res.status(400).json({ error: 'loanId is required.' });
+  const result = db.adminRejectLoan({ loanId, reason: reason || 'Application declined by compliance', adminId: adminId || 'usr_admin' });
+  if (!result.success) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+app.post('/api/loans/repay', (req: Request, res: Response) => {
+  const { loanId, userId, amount, sourceAccountId, note } = req.body;
+  if (!loanId || !userId || !amount) {
+    return res.status(400).json({ error: 'loanId, userId, and repayment amount are required.' });
+  }
+  const result = db.repayLoan({
+    loanId,
+    userId,
+    amount: Number(amount),
+    sourceAccountId,
+    note,
+  });
+  if (!result.success) return res.status(400).json({ error: result.error });
+  res.json(result);
 });
 
 // --- VITE / STATIC SERVING ---

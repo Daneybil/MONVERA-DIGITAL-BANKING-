@@ -10,7 +10,7 @@ import {
   serverTimestamp,
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
-import { UserProfile, Transaction, InvestmentPlan, CardItem, NotificationItem, ChatMessage } from '../types';
+import { UserProfile, Transaction, InvestmentPlan, LoanApplication, CardItem, NotificationItem, ChatMessage } from '../types';
 import type { BalanceMetrics } from './api';
 
 export enum OperationType {
@@ -655,26 +655,58 @@ export const firestoreSync = {
    * Search for any Monvera recipient across all fields (username, account number, email, user ID)
    */
   async findRecipient(identifier: string): Promise<UserProfile | null> {
-    if (!db || !identifier) return null;
+    if (!identifier) return null;
     const raw = identifier.trim();
     const cleanNoAt = raw.replace(/^@/, '').trim();
     const cleanDigits = cleanNoAt.replace(/[-\s]/g, '');
     const cleanLower = cleanNoAt.toLowerCase();
 
+    // 0. Check localStorage cached directory first for instant zero-latency match
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const cachedRaw = localStorage.getItem('monvera_accounts_directory');
+        if (cachedRaw) {
+          const directory: UserProfile[] = JSON.parse(cachedRaw);
+          if (Array.isArray(directory)) {
+            const match = directory.find((u) => {
+              const uAcc = (u.permanentAccountNumber || (u as any).accountNumber || '').replace(/[-\s]/g, '');
+              const uUser = (u.username || '').replace(/^@/, '').toLowerCase();
+              const uEmail = (u.email || '').toLowerCase();
+              const uId = (u.id || (u as any).uid || '').toLowerCase();
+              const uName = `${u.firstName || ''} ${u.lastName || ''}`.toLowerCase().trim();
+              return (
+                (cleanDigits && uAcc === cleanDigits) ||
+                (cleanLower && uUser === cleanLower) ||
+                (cleanLower && uEmail === cleanLower) ||
+                (raw && uId === raw.toLowerCase()) ||
+                (cleanLower.length >= 3 && uName === cleanLower)
+              );
+            });
+            if (match) return match;
+          }
+        }
+      }
+    } catch {}
+
+    if (!db) return null;
     const usersCol = collection(db, 'users');
 
-    try {
-      // 1. Direct indexed queries for rapid matching
-      const queryList = [
+    // 1. Direct indexed queries for rapid matching with isolated error handling
+    const queryQueries = [
+      ...(cleanDigits ? [
         query(usersCol, where('permanentAccountNumber', '==', cleanDigits)),
         query(usersCol, where('accountNumber', '==', cleanDigits)),
+      ] : []),
+      ...(cleanLower ? [
         query(usersCol, where('usernameLower', '==', cleanLower)),
         query(usersCol, where('username', '==', cleanNoAt)),
         query(usersCol, where('username', '==', cleanLower)),
         query(usersCol, where('email', '==', cleanLower)),
-      ];
+      ] : []),
+    ];
 
-      for (const q of queryList) {
+    for (const q of queryQueries) {
+      try {
         const snap = await getDocs(q);
         if (!snap.empty) {
           const docData = snap.docs[0].data() as UserProfile;
@@ -683,17 +715,41 @@ export const firestoreSync = {
             ...docData,
           };
         }
-      }
+      } catch {}
+    }
 
-      // Check direct document ID lookup
-      if (raw.length >= 8) {
+    // 2. Check direct document ID lookup
+    if (raw.length >= 6) {
+      try {
         const directDoc = await getDoc(doc(db, 'users', raw));
         if (directDoc.exists()) {
           return { id: directDoc.id, ...directDoc.data() } as UserProfile;
         }
-      }
+      } catch {}
+    }
 
-      // 2. Comprehensive resilient fallback: scan users collection to match any case-insensitive field
+    // 3. Check accounts collection in Firestore
+    if (cleanDigits) {
+      try {
+        const accCol = collection(db, 'accounts');
+        const accSnap = await getDocs(accCol);
+        for (const ad of accSnap.docs) {
+          const aData = ad.data() as any;
+          const accountsList: any[] = aData.accounts || [];
+          const hasAcc = accountsList.some(
+            (a) => (a.accountNumber || '').replace(/[-\s]/g, '') === cleanDigits
+          );
+          if (hasAcc) {
+            const uid = ad.id;
+            const uProfile = await this.getUserProfile(uid);
+            if (uProfile) return uProfile;
+          }
+        }
+      } catch {}
+    }
+
+    // 4. Comprehensive resilient fallback: scan users collection to match any field
+    try {
       const allUsersSnap = await getDocs(usersCol);
       for (const d of allUsersSnap.docs) {
         const u = d.data() as UserProfile & Record<string, any>;
@@ -716,12 +772,11 @@ export const firestoreSync = {
           };
         }
       }
-
-      return null;
     } catch (err) {
       handleFirestoreError(err, OperationType.LIST, 'users');
-      return null;
     }
+
+    return null;
   },
 
   /**
@@ -1292,6 +1347,151 @@ export const firestoreSync = {
       return unsubscribe;
     } catch (err) {
       console.warn('[Firestore] Error subscribing to live chat:', err);
+      return () => {};
+    }
+  },
+
+  /**
+   * --- PERMANENT LOAN PERSISTENCE & SYNC ---
+   */
+  async saveLoanApplication(loan: LoanApplication): Promise<{ success: boolean; error?: string }> {
+    if (!loan || !loan.id) return { success: false, error: 'Invalid loan payload' };
+
+    // 1. Save to local permanent cache
+    try {
+      const localStr = localStorage.getItem('monvera_permanent_loans');
+      const existing: LoanApplication[] = localStr ? JSON.parse(localStr) : [];
+      const updated = [loan, ...existing.filter((l) => l.id !== loan.id)];
+      localStorage.setItem('monvera_permanent_loans', JSON.stringify(updated));
+    } catch {}
+
+    if (!db) return { success: true };
+
+    const path = `loans/${loan.id}`;
+    try {
+      const loanRef = doc(db, 'loans', loan.id);
+      const cleanData: Record<string, any> = {
+        id: loan.id,
+        userId: loan.userId,
+        applicantName: loan.applicantName,
+        applicantEmail: loan.applicantEmail,
+        applicantPhone: loan.applicantPhone || '',
+        permanentAccountNumber: loan.permanentAccountNumber,
+        amount: Number(loan.amount),
+        termMonths: Number(loan.termMonths),
+        monthlyPayment: Number(loan.monthlyPayment),
+        interestRateAPR: Number(loan.interestRateAPR),
+        purpose: loan.purpose || '',
+        employmentOrBusinessDetails: loan.employmentOrBusinessDetails || '',
+        annualIncomeOrRevenue: loan.annualIncomeOrRevenue ? Number(loan.annualIncomeOrRevenue) : 0,
+        collateralDescription: loan.collateralDescription || '',
+        status: loan.status,
+        userTransactionVolume: Number(loan.userTransactionVolume || 0),
+        eligibilityTier: loan.eligibilityTier || 'Starter Credit Tier',
+        rejectionReason: loan.rejectionReason || '',
+        approvedAt: loan.approvedAt || '',
+        approvedBy: loan.approvedBy || '',
+        rejectedAt: loan.rejectedAt || '',
+        rejectedBy: loan.rejectedBy || '',
+        disbursedAt: loan.disbursedAt || '',
+        disbursedAmount: loan.disbursedAmount ? Number(loan.disbursedAmount) : 0,
+        totalRepaid: loan.totalRepaid ? Number(loan.totalRepaid) : 0,
+        remainingBalance: loan.remainingBalance !== undefined ? Number(loan.remainingBalance) : Number(loan.amount),
+        createdAt: loan.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      await setDoc(loanRef, cleanData, { merge: true });
+      return { success: true };
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, path);
+      return { success: false, error: 'Firestore loan save failed.' };
+    }
+  },
+
+  async getLoansForUser(userId: string): Promise<LoanApplication[]> {
+    if (!userId) return [];
+    let localList: LoanApplication[] = [];
+    try {
+      const localStr = localStorage.getItem('monvera_permanent_loans');
+      if (localStr) {
+        const parsed: LoanApplication[] = JSON.parse(localStr);
+        localList = parsed.filter((l) => l.userId === userId);
+      }
+    } catch {}
+
+    if (!db) return localList;
+
+    const path = 'loans';
+    try {
+      const colRef = collection(db, 'loans');
+      const q = query(colRef, where('userId', '==', userId));
+      const snap = await getDocs(q);
+      const map = new Map<string, LoanApplication>();
+      localList.forEach((l) => map.set(l.id, l));
+      snap.forEach((d) => {
+        const item = d.data() as LoanApplication;
+        map.set(item.id || d.id, item);
+      });
+      return Array.from(map.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, path);
+      return localList;
+    }
+  },
+
+  async getAllLoans(): Promise<LoanApplication[]> {
+    let localList: LoanApplication[] = [];
+    try {
+      const localStr = localStorage.getItem('monvera_permanent_loans');
+      if (localStr) localList = JSON.parse(localStr);
+    } catch {}
+
+    if (!db) return localList;
+
+    const path = 'loans';
+    try {
+      const colRef = collection(db, 'loans');
+      const snap = await getDocs(colRef);
+      const map = new Map<string, LoanApplication>();
+      localList.forEach((l) => map.set(l.id, l));
+      snap.forEach((d) => {
+        const item = d.data() as LoanApplication;
+        map.set(item.id || d.id, item);
+      });
+      return Array.from(map.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, path);
+      return localList;
+    }
+  },
+
+  subscribeToLoans(onUpdate: (loans: LoanApplication[]) => void): () => void {
+    if (!db) {
+      this.getAllLoans().then(onUpdate);
+      return () => {};
+    }
+    try {
+      const colRef = collection(db, 'loans');
+      const unsubscribe = onSnapshot(
+        colRef,
+        (snap) => {
+          const list: LoanApplication[] = [];
+          snap.forEach((d) => list.push(d.data() as LoanApplication));
+          list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          onUpdate(list);
+        },
+        (error) => {
+          console.warn('[Firestore loans subscription notice]:', error);
+        }
+      );
+      return unsubscribe;
+    } catch (err) {
+      console.warn('[Firestore] Error subscribing to loans:', err);
       return () => {};
     }
   },

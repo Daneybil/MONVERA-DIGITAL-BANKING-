@@ -521,7 +521,7 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                     </label>
                     <CountrySelector
                       value={country}
-                      onChange={(val) => setCountry(val)}
+                      onChange={(opt) => setCountry(opt.name)}
                       className="w-full"
                     />
                   </div>

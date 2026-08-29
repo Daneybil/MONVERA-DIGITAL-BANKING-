@@ -5,6 +5,7 @@ import { HeroSection } from './components/public/HeroSection';
 import { ServiceOfferings } from './components/public/ServiceOfferings';
 import { InvestmentTermPreview } from './components/public/InvestmentTermPreview';
 import { CardShowcaseSection } from './components/public/CardShowcaseSection';
+import { LoanSection } from './components/public/LoanSection';
 import { HowItWorksSection } from './components/public/HowItWorksSection';
 import { SecuritySection } from './components/public/SecuritySection';
 import { PrivacyPolicyPage } from './components/public/PrivacyPolicyPage';
@@ -19,6 +20,7 @@ import { AccountsView } from './components/dashboard/AccountsView';
 import { TransactionsView } from './components/dashboard/TransactionsView';
 import { InvestmentsView } from './components/dashboard/InvestmentsView';
 import { CardsView } from './components/dashboard/CardsView';
+import { LoansView } from './components/dashboard/LoansView';
 import { SecurityView } from './components/dashboard/SecurityView';
 import { ProfileView } from './components/dashboard/ProfileView';
 import { BusinessBankingView } from './components/dashboard/BusinessBankingView';
@@ -271,6 +273,7 @@ const AppContent: React.FC = () => {
           <HeroSection />
           <InvestmentTermPreview />
           <CardShowcaseSection />
+          <LoanSection />
           <SecuritySection />
         </main>
         <PublicFooter />
@@ -295,6 +298,7 @@ const AppContent: React.FC = () => {
         {currentView === 'transactions' && <TransactionsView />}
         {currentView === 'investments' && <InvestmentsView />}
         {currentView === 'cards' && <CardsView />}
+        {currentView === 'loans' && <LoansView />}
         {currentView === 'security' && <SecurityView />}
         {currentView === 'profile' && <ProfileView />}
         {currentView === 'business' && <BusinessBankingView />}

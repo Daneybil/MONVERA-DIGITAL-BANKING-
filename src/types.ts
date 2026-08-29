@@ -22,6 +22,7 @@ export interface KycItemReviews {
 export interface UserProfile {
   id: string;
   username: string; // Unique Monvera handle e.g. "eleanor", "marcus"
+  name?: string;
   firstName: string;
   lastName: string;
   email: string;
@@ -29,6 +30,7 @@ export interface UserProfile {
   permanentAccountNumber: string; // 10-digit unique number e.g. "1045827391"
   dateOfBirth?: string;
   country: string;
+  streetAddress?: string;
   avatarUrl?: string;
   status: UserStatus;
   role: UserRole;
@@ -161,6 +163,51 @@ export interface InvestmentEarningLog {
   status: 'POSTED' | 'PENDING';
 }
 
+export type LoanStatus = 'PENDING' | 'APPROVED' | 'ACTIVE' | 'REJECTED' | 'PAID' | 'CANCELLED';
+
+export interface LoanApplication {
+  id: string;
+  userId: string;
+  applicantName: string;
+  applicantEmail: string;
+  applicantPhone?: string;
+  permanentAccountNumber: string;
+  amount: number; // $1,000 to $1,000,000
+  termMonths: number; // e.g. 6, 12, 24, 36, 48, 60
+  monthlyPayment: number;
+  interestRateAPR: number; // e.g. 4.9% - 7.5%
+  purpose: string;
+  employmentOrBusinessDetails?: string;
+  annualIncomeOrRevenue?: number;
+  collateralDescription?: string;
+  status: LoanStatus;
+  userTransactionVolume?: number;
+  eligibilityTier?: string;
+  rejectionReason?: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
+  disbursedAt?: string;
+  disbursedAmount?: number;
+  totalRepaid?: number;
+  remainingBalance?: number;
+  totalRepaymentAmount?: number;
+  interestAmount?: number;
+  maturityDate?: string;
+  paidAt?: string;
+  repaymentHistory?: Array<{
+    id: string;
+    amount: number;
+    date: string;
+    paymentMethod: string;
+    note?: string;
+    remainingAfter?: number;
+  }>;
+  createdAt: string;
+  updatedAt?: string;
+}
+
 export interface CardItem {
   id: string;
   userId: string;
@@ -267,3 +314,14 @@ export interface AdminSystemOverview {
   systemReserveRatio: number;
   activeNodesCount: number;
 }
+
+export interface LoanEligibilityTier {
+  volume: number;
+  tier: string;
+  maxLimit: number;
+  interestRateAPR: number;
+  minRequiredVolume?: number;
+  description: string;
+}
+
+

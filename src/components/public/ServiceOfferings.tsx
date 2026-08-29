@@ -1,11 +1,19 @@
 import React from 'react';
-import { Wallet, PiggyBank, TrendingUp, CreditCard, Building2, ArrowRight, ShieldCheck } from 'lucide-react';
+import { Wallet, PiggyBank, TrendingUp, CreditCard, Building2, ArrowRight, ShieldCheck, Banknote } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
 export const ServiceOfferings: React.FC = () => {
   const { openModal, currentUser, setCurrentView } = useAuth();
 
   const offerings = [
+    {
+      icon: Banknote,
+      title: 'Loans & Liquidity Credit Facilities',
+      tag: '$1k to $1M • Fixed 20% Interest',
+      description: 'Instant liquidity lines disbursed straight into your checking account. Backed by transaction-driven qualification, transparent 20% fixed interest, and flexible terms up to 60 months.',
+      action: 'Explore Loan Facilities',
+      tagBg: 'bg-amber-100 text-amber-950 border-amber-400 font-black',
+    },
     {
       icon: Wallet,
       title: 'Everyday Checking Accounts',
@@ -50,12 +58,17 @@ export const ServiceOfferings: React.FC = () => {
 
   const handleAction = (itemTitle: string) => {
     if (currentUser) {
-      if (itemTitle.includes('Term')) setCurrentView('investments');
+      if (itemTitle.includes('Loan') || itemTitle.includes('Credit')) setCurrentView('loans');
+      else if (itemTitle.includes('Term')) setCurrentView('investments');
       else if (itemTitle.includes('Obsidian')) setCurrentView('cards');
       else if (itemTitle.includes('Business')) setCurrentView('business');
       else setCurrentView('accounts');
     } else {
-      if (itemTitle.includes('Term')) {
+      if (itemTitle.includes('Loan') || itemTitle.includes('Credit')) {
+        const el = document.getElementById('loans');
+        if (el) el.scrollIntoView({ behavior: 'smooth' });
+        else openModal('auth_register');
+      } else if (itemTitle.includes('Term')) {
         setCurrentView('investments');
         window.scrollTo({ top: 0, behavior: 'smooth' });
       } else {
@@ -78,7 +91,7 @@ export const ServiceOfferings: React.FC = () => {
             What Monvera Offers
           </h2>
           <p className="text-lg sm:text-xl lg:text-2xl text-slate-900 font-extrabold leading-relaxed">
-            Modern, secure banking built for your personal wealth and business success with total transparency.
+            Modern, secure banking built for personal wealth, instant credit liquidity, and business success with total transparency.
           </p>
         </div>
 
@@ -122,37 +135,6 @@ export const ServiceOfferings: React.FC = () => {
               </div>
             );
           })}
-
-          {/* Sixth Feature Block: Monvera Full-Reserve & Deposit Safety */}
-          <div className="p-8 rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 text-white border-2 border-emerald-400 flex flex-col justify-between shadow-2xl space-y-6">
-            <div className="space-y-5">
-              <div className="flex items-center justify-between">
-                <span className="text-xs sm:text-sm font-black uppercase tracking-wider text-emerald-300 bg-emerald-950 px-3.5 py-1.5 rounded-xl border-2 border-emerald-500">
-                  100% Full-Reserve Security
-                </span>
-                <ShieldCheck className="w-8 h-8 text-emerald-400" />
-              </div>
-              <h3 className="text-2xl sm:text-3xl font-black text-white tracking-tight leading-snug">
-                Guaranteed Deposit Protection & Peace of Mind
-              </h3>
-              <p className="text-base sm:text-lg font-extrabold text-slate-200 leading-relaxed">
-                Unlike traditional banks that lend out your deposits, Monvera holds 100% full backing for every dollar in real time. Your funds are always ready, protected, and FDIC-insured up to $250,000 via our partner financial institutions.
-              </p>
-            </div>
-
-            <div className="pt-6 border-t-2 border-slate-700">
-              <button
-                onClick={() => {
-                  if (currentUser) setCurrentView('dashboard');
-                  else openModal('auth_register');
-                }}
-                className="w-full inline-flex items-center justify-center gap-2 py-4 px-6 rounded-xl text-base sm:text-lg font-black bg-gradient-to-b from-emerald-500 to-emerald-700 hover:from-emerald-400 hover:to-emerald-600 text-white border-2 border-emerald-400 border-b-[5px] border-b-emerald-950 shadow-xl active:translate-y-1 active:border-b-[2px] transition-all cursor-pointer"
-              >
-                <span>{currentUser ? 'Go to Your Dashboard' : 'Open a Verified Account'}</span>
-                <ArrowRight className="w-5 h-5 text-emerald-100" />
-              </button>
-            </div>
-          </div>
         </div>
 
       </div>

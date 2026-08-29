@@ -27,6 +27,7 @@ import {
   ChevronRight,
   Lock,
   CheckCircle2,
+  Banknote,
 } from 'lucide-react';
 
 interface DashboardLayoutProps {
@@ -99,6 +100,7 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
 
   const wealthItems: NavMenuItem[] = [
     { id: 'cards', label: 'Card', sublabel: 'Monvera Visa Infinite & virtual cards', icon: CreditCard, actionType: 'view', badge: 'Visa' },
+    { id: 'loans', label: 'Loans & Credit', sublabel: '$1k to $1M liquidity facility', icon: Banknote, actionType: 'view', badge: '$1M Max' },
     { id: 'investments', label: 'Investment', sublabel: '4.5% fixed daily interest term plans', icon: TrendingUp, actionType: 'view', badge: '4.5% Daily' },
     { id: 'business', label: 'Business Banking', sublabel: 'Company accounts, staff payroll & invoices', icon: Building2, actionType: 'view', badge: 'Company' },
   ];

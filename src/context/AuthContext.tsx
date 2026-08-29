@@ -31,6 +31,7 @@ export type AppView =
   | 'withdraw'
   | 'investments'
   | 'cards'
+  | 'loans'
   | 'security'
   | 'profile'
   | 'business'
@@ -209,34 +210,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const refreshBalance = useCallback(async () => {
     if (!currentUser) return;
     try {
-      // 1. First retrieve verified balances directly from permanent Firestore ledger
+      // 1. Retrieve verified balances directly from permanent Firestore ledger
       const fsMetrics = await firestoreSync.getAccountBalances(currentUser.id, currentUser.permanentAccountNumber);
-      if (fsMetrics) {
+      if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0) {
         setBalanceMetrics(fsMetrics);
+        cacheUserBalances(currentUser.id, fsMetrics);
         setLastUpdateTimestamp(Date.now());
+        return;
       }
 
-      // 2. Fetch backend metrics and merge seamlessly
-      const metrics = await api.getBalanceMetrics(currentUser.id);
-      if (metrics && metrics.accounts) {
-        const finalChecking = Math.max(metrics.checkingBalance || 0, fsMetrics?.checkingBalance || 0);
-        const finalSavings = Math.max(metrics.savingsBalance || 0, fsMetrics?.savingsBalance || 0);
-        const finalInvested = Math.max(metrics.investedBalance || 0, fsMetrics?.investedBalance || 0);
-        const mergedMetrics: BalanceMetrics = {
-          ...metrics,
-          checkingBalance: finalChecking,
-          savingsBalance: finalSavings,
-          investedBalance: finalInvested,
-          totalBalance: finalChecking + finalSavings + finalInvested,
-          availableBalance: finalChecking,
-          accounts: metrics.accounts.map((a) => {
-            if (a.type === 'CHECKING') return { ...a, balance: finalChecking, availableBalance: finalChecking };
-            if (a.type === 'SAVINGS') return { ...a, balance: finalSavings, availableBalance: finalSavings };
-            if (a.type === 'INVESTMENT') return { ...a, balance: finalInvested, investedBalance: finalInvested };
-            return a;
-          }),
-        };
-        setBalanceMetrics(mergedMetrics);
+      // 2. Fetch backend metrics if Firestore is initializing
+      const metrics = await api.getBalanceMetrics(currentUser.id, currentUser.permanentAccountNumber);
+      if (metrics && metrics.accounts && metrics.accounts.length > 0) {
+        setBalanceMetrics(metrics);
+        cacheUserBalances(currentUser.id, metrics);
         setLastUpdateTimestamp(Date.now());
       }
     } catch (err) {
@@ -277,9 +264,56 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return defaultAvatar;
   };
 
+  const cacheUserBalances = (userId: string, metrics: BalanceMetrics) => {
+    try {
+      if (typeof window === 'undefined' || !window.localStorage || !userId || !metrics) return;
+      localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(metrics));
+    } catch {}
+  };
+
+  const getCachedUserBalances = (userId: string): BalanceMetrics | null => {
+    try {
+      if (typeof window === 'undefined' || !window.localStorage || !userId) return null;
+      const raw = localStorage.getItem(`monvera_balances_${userId}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.accounts) && parsed.accounts.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {}
+    return null;
+  };
+
+  const cacheUserInDirectory = (user: UserProfile) => {
+    try {
+      if (typeof window === 'undefined' || !window.localStorage || !user) return;
+      const existingRaw = localStorage.getItem('monvera_accounts_directory');
+      let dir: UserProfile[] = existingRaw ? JSON.parse(existingRaw) : [];
+      if (!Array.isArray(dir)) dir = [];
+      const idx = dir.findIndex(
+        (u) =>
+          (u.id && u.id === user.id) ||
+          (u.permanentAccountNumber && u.permanentAccountNumber === user.permanentAccountNumber)
+      );
+      if (idx >= 0) {
+        dir[idx] = { ...dir[idx], ...user };
+      } else {
+        dir.push(user);
+      }
+      localStorage.setItem('monvera_accounts_directory', JSON.stringify(dir));
+    } catch {}
+  };
+
   const switchUser = useCallback(async (userId: string) => {
     setIsLoading(true);
     try {
+      // 1. Immediately hydrate cached balances to eliminate any 00 flicker
+      const cachedBalances = getCachedUserBalances(userId);
+      if (cachedBalances) {
+        setBalanceMetrics(cachedBalances);
+      }
+
       // Check if user exists in Firestore
       let userProfile = await firestoreSync.getUserProfile(userId);
       if (!userProfile) {
@@ -293,11 +327,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
         const resolvedUser = { ...userProfile, avatarUrl: persistedAvatar };
         setCurrentUser(resolvedUser);
+        cacheUserInDirectory(resolvedUser);
 
-        // Fetch balance metrics
-        const res = await api.getCurrentUser(resolvedUser.id);
-        if (res.balanceMetrics) {
-          setBalanceMetrics(res.balanceMetrics);
+        // Fetch verified balance metrics from Firestore ledger first
+        const fsMetrics = await firestoreSync.getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber);
+        if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0) {
+          setBalanceMetrics(fsMetrics);
+          cacheUserBalances(resolvedUser.id, fsMetrics);
+        } else {
+          const res = await api.getCurrentUser(resolvedUser.id);
+          if (res.balanceMetrics) {
+            setBalanceMetrics(res.balanceMetrics);
+            cacheUserBalances(resolvedUser.id, res.balanceMetrics);
+          }
         }
         const notifRes = await api.getNotifications(resolvedUser.id);
         if (notifRes.notifications) setNotifications(notifRes.notifications);
@@ -320,6 +362,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (firebaseUser) {
         try {
           console.log('[Auth] Authenticated Firebase user detected:', firebaseUser.uid);
+          
+          // Instant hydration from local cache to prevent any 00 flicker
+          const cachedBalances = getCachedUserBalances(firebaseUser.uid);
+          if (cachedBalances && isMounted) {
+            setBalanceMetrics(cachedBalances);
+          }
+
           let userProfile = await firestoreSync.getUserProfile(firebaseUser.uid);
 
           if (!userProfile) {
@@ -332,20 +381,33 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
             const isEmailVerified = !!firebaseUser.emailVerified;
             const resolvedUser = { ...userProfile, emailVerified: isEmailVerified, avatarUrl: persistedAvatar };
+            
+            // Concurrently fetch verified balances from Firestore
+            const [fsMetrics, notifRes] = await Promise.all([
+              firestoreSync.getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber).catch(() => null),
+              api.getNotifications(resolvedUser.id).catch(() => ({ notifications: [] }))
+            ]);
+
+            if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0 && isMounted) {
+              setBalanceMetrics(fsMetrics);
+              cacheUserBalances(resolvedUser.id, fsMetrics);
+            } else if (!cachedBalances && isMounted) {
+              const metricsRes = await api.getCurrentUser(resolvedUser.id);
+              if (metricsRes.balanceMetrics && isMounted) {
+                setBalanceMetrics(metricsRes.balanceMetrics);
+                cacheUserBalances(resolvedUser.id, metricsRes.balanceMetrics);
+              }
+            }
+
             setCurrentUser(resolvedUser);
+            cacheUserInDirectory(resolvedUser);
 
             // If email verification status changed in Firebase Auth, sync to Firestore
             if (userProfile.emailVerified !== isEmailVerified) {
               firestoreSync.saveUserProfile(userProfile.id, { ...userProfile, emailVerified: isEmailVerified }).catch(console.error);
             }
 
-            // Sync with backend accounts
-            const metricsRes = await api.getCurrentUser(resolvedUser.id);
-            if (metricsRes.balanceMetrics && isMounted) {
-              setBalanceMetrics(metricsRes.balanceMetrics);
-            }
-            const notifRes = await api.getNotifications(resolvedUser.id);
-            if (notifRes.notifications && isMounted) setNotifications(notifRes.notifications);
+            if (notifRes?.notifications && isMounted) setNotifications(notifRes.notifications);
           }
         } catch (err) {
           console.error('[Auth] Error fetching user profile on auth change:', err);
@@ -454,11 +516,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
       const finalUser: UserProfile = { ...userProfile, avatarUrl: persistedAvatar };
 
+      // Instant cache check so balance appears with zero lag
+      const cachedBalances = getCachedUserBalances(uid);
+      if (cachedBalances) {
+        setBalanceMetrics(cachedBalances);
+      }
+
       // Set user immediately for responsive UI feedback
       setCurrentUser(finalUser);
+      cacheUserInDirectory(finalUser);
 
       // Concurrently synchronize ledger and metrics in parallel
-      const [backendSync, notifRes] = await Promise.all([
+      const [backendSync, notifRes, realFsMetrics] = await Promise.all([
         api.register({
           uid,
           id: uid,
@@ -476,7 +545,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           kycVerifiedAt: finalUser.kycVerifiedAt,
           password: cleanPassword,
         }).catch(() => ({ success: true, user: finalUser, balanceMetrics: null })),
-        api.getNotifications(uid).catch(() => ({ notifications: [] }))
+        api.getNotifications(uid).catch(() => ({ notifications: [] })),
+        firestoreSync.getAccountBalances(uid, finalUser.permanentAccountNumber).catch(() => null)
       ]);
 
       if (backendSync?.user) {
@@ -486,49 +556,60 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           avatarUrl: persistedAvatar,
         };
         setCurrentUser(mergedUser);
+        cacheUserInDirectory(mergedUser);
       }
 
-      if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts) {
+      if (realFsMetrics && realFsMetrics.accounts && realFsMetrics.accounts.length > 0) {
+        setBalanceMetrics(realFsMetrics);
+        cacheUserBalances(uid, realFsMetrics);
+      } else if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts && backendSync.balanceMetrics.accounts.length > 0) {
         setBalanceMetrics(backendSync.balanceMetrics);
-      } else {
-        // Fallback default banking accounts metrics
-        setBalanceMetrics({
-          checkingBalance: 24500.00,
-          savingsBalance: 52140.50,
-          investedBalance: 15000.00,
-          accruedEarnings: 842.20,
-          totalBalance: 92482.70,
-          availableBalance: 76640.50,
+        cacheUserBalances(uid, backendSync.balanceMetrics);
+      } else if (!cachedBalances) {
+        // Fallback baseline only if user has never transacted
+        const initialZeroMetrics: BalanceMetrics = {
+          checkingBalance: 0,
+          savingsBalance: 0,
+          investedBalance: 0,
+          accruedEarnings: 0,
+          totalBalance: 0,
+          availableBalance: 0,
           pendingBalance: 0,
           accounts: [
             {
               id: `acc_chk_${uid}`,
+              userId: uid,
+              type: 'CHECKING',
               accountNumber: finalUser.permanentAccountNumber || '1048291048',
-              accountType: 'CHECKING',
-              balance: 24500.00,
-              currency: 'USD',
-              isPrimary: true,
-              status: 'ACTIVE',
               routingNumber: '021000021',
-              interestRate: 0.05,
-              dailyLimit: 50000,
-              createdAt: finalUser.createdAt || new Date().toISOString()
+              currency: 'USD',
+              balance: 0,
+              availableBalance: 0,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 0.05,
+              status: 'ACTIVE',
+              nickname: 'Monvera Checking Account',
             },
             {
               id: `acc_svg_${uid}`,
+              userId: uid,
+              type: 'SAVINGS',
               accountNumber: `20${(finalUser.permanentAccountNumber || '1048291048').slice(2)}`,
-              accountType: 'SAVINGS',
-              balance: 52140.50,
-              currency: 'USD',
-              isPrimary: false,
-              status: 'ACTIVE',
               routingNumber: '021000021',
-              interestRate: 4.85,
-              dailyLimit: 25000,
-              createdAt: finalUser.createdAt || new Date().toISOString()
+              currency: 'USD',
+              balance: 0,
+              availableBalance: 0,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 4.85,
+              status: 'ACTIVE',
+              nickname: 'Monvera Savings Account',
             }
           ]
-        });
+        };
+        setBalanceMetrics(initialZeroMetrics);
+        cacheUserBalances(uid, initialZeroMetrics);
       }
 
       if (notifRes?.notifications) {
@@ -689,6 +770,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const finalMetrics = serverRes.balanceMetrics || (await api.getBalanceMetrics(uid));
 
       setCurrentUser(finalUser);
+      cacheUserInDirectory(finalUser);
       if (finalMetrics) setBalanceMetrics(finalMetrics);
       await fetchUsers();
       await refreshNotifications();
@@ -747,25 +829,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  // Auto-check email verification status when user focuses window
-  useEffect(() => {
-    const handleFocus = async () => {
-      if (auth.currentUser && currentUser && !currentUser.emailVerified) {
-        try {
-          await auth.currentUser.reload();
-          if (auth.currentUser.emailVerified) {
-            const updated = { ...currentUser, emailVerified: true };
-            setCurrentUser(updated);
-            await firestoreSync.saveUserProfile(currentUser.id, updated);
-          }
-        } catch (e) {
-          console.warn('[Auth] Window focus verification check note:', e);
-        }
-      }
-    };
-    window.addEventListener('focus', handleFocus);
-    return () => window.removeEventListener('focus', handleFocus);
-  }, [currentUser]);
+  // Email verification helper without intrusive window focus listener
 
   /**
    * Resend Firebase Authentication Verification Email to Current Customer

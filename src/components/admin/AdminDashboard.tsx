@@ -36,6 +36,7 @@ import {
   MessageSquare,
   Home,
   Send,
+  Banknote,
 } from 'lucide-react';
 import { AdminOverviewView } from './AdminOverviewView';
 import { AdminCustomersView } from './AdminCustomersView';
@@ -48,6 +49,7 @@ import { AdminTransfersView } from './AdminTransfersView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
 import { AdminNotificationsView } from './AdminNotificationsView';
 import { AdminAuditLogView } from './AdminAuditLogView';
+import { AdminLoansView } from './AdminLoansView';
 import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 
 export const AdminDashboard: React.FC = () => {
@@ -415,6 +417,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
     { id: 'transfers', label: 'Transfers', icon: Zap },
+    { id: 'loans', label: 'Loan Underwriting', icon: Banknote },
     { id: 'demo_funds', label: 'Sandbox Test Funds', icon: Coins },
     { id: 'notifications', label: 'Sentinel Alerts', icon: Bell },
     { id: 'audit', label: 'Audit Trail', icon: FileText },
@@ -651,6 +654,10 @@ export const AdminDashboard: React.FC = () => {
             onOpenSendMoney={() => openModal('send')}
             onRefreshData={loadAllAdminData}
           />
+        )}
+
+        {activeTab === 'loans' && (
+          <AdminLoansView />
         )}
 
         {activeTab === 'demo_funds' && (

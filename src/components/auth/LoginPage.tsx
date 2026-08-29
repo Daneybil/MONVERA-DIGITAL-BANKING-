@@ -87,12 +87,254 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     }
   };
 
+  const renderForgotModal = () => {
+    if (!forgotModalOpen) return null;
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) setForgotModalOpen(false);
+        }}
+      >
+        <div
+          className="bg-white rounded-3xl p-6 sm:p-8 max-w-md w-full text-center space-y-4 shadow-2xl border border-slate-200 relative"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => setForgotModalOpen(false)}
+            className="absolute top-4 right-4 text-slate-400 hover:text-slate-700 p-1.5 rounded-full hover:bg-slate-100 transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+
+          <div className="w-14 h-14 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto shadow-inner border border-blue-100">
+            <Lock className="w-7 h-7" />
+          </div>
+
+          <div>
+            <h3 className="text-xl font-black text-slate-900 tracking-tight">Reset Your Password</h3>
+            <p className="text-xs sm:text-sm text-slate-500 mt-1 font-medium">
+              Enter your registered email address below. We'll send an official password reset link directly to your inbox.
+            </p>
+          </div>
+
+          {resetSuccessMsg && (
+            <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs sm:text-sm text-emerald-800 font-semibold flex items-start gap-2.5 text-left">
+              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+              <span>{resetSuccessMsg}</span>
+            </div>
+          )}
+
+          {resetErrorMsg && (
+            <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs sm:text-sm text-red-700 font-semibold flex items-start gap-2.5 text-left">
+              <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <span>{resetErrorMsg}</span>
+            </div>
+          )}
+
+          {!resetSuccessMsg ? (
+            <form onSubmit={handleSendPasswordReset} className="space-y-4 text-left">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                  Registered Email Address
+                </label>
+                <input
+                  type="email"
+                  required
+                  placeholder="e.g. user@domain.com"
+                  value={forgotEmail}
+                  onChange={(e) => setForgotEmail(e.target.value)}
+                  className="w-full px-4 py-3.5 text-sm rounded-xl border border-slate-300 focus:border-slate-900 focus:outline-hidden font-medium text-slate-900"
+                />
+              </div>
+
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs text-slate-600 font-medium">
+                Default evaluation password: <strong className="text-slate-900 font-bold">Password123!</strong>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSendingReset}
+                className="w-full py-3.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white font-black text-sm shadow-md transition-all cursor-pointer disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {isSendingReset ? 'Sending Reset Instructions...' : 'Send Password Reset Email'}
+              </button>
+            </form>
+          ) : (
+            <button
+              onClick={() => setForgotModalOpen(false)}
+              className="w-full py-3.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white font-black text-sm shadow-md cursor-pointer"
+            >
+              Close & Return to Sign In
+            </button>
+          )}
+
+          <button
+            onClick={() => setForgotModalOpen(false)}
+            className="text-xs font-bold text-slate-500 hover:text-slate-800 block mx-auto pt-1 cursor-pointer"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // MODAL VIEW: Render clean dedicated card inside modal dialog
+  if (isModal) {
+    return (
+      <div
+        id="monvera-login-modal-card"
+        className="w-full bg-white rounded-[28px] sm:rounded-[32px] p-6 sm:p-8 shadow-2xl border border-slate-200 relative overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header with Close */}
+        <div className="flex items-center justify-between pb-4 mb-4 border-b border-slate-100">
+          <div className="flex items-center gap-2">
+            <MonveraLogo variant="icon" size="sm" />
+            <span className="font-extrabold text-slate-900 text-sm">Monvera Bank</span>
+          </div>
+          {onClose && (
+            <button
+              onClick={onClose}
+              id="login-modal-close-btn"
+              className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+
+        {/* Quick Switcher */}
+        <div className="flex rounded-2xl bg-slate-100 p-1.5 mb-5 border border-slate-200 shadow-inner">
+          <button
+            type="button"
+            className="flex-1 py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold text-slate-950 bg-white shadow-xs transition-all flex items-center justify-center gap-1.5 select-none"
+          >
+            <Lock className="w-3.5 h-3.5 text-amber-500" />
+            <span>Sign In</span>
+          </button>
+          <button
+            type="button"
+            onClick={onSwitchToSignUp}
+            className="flex-1 py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-600 hover:text-slate-950 hover:bg-white/60 transition-all flex items-center justify-center gap-1.5 cursor-pointer select-none"
+          >
+            <User className="w-3.5 h-3.5 text-slate-400" />
+            <span>Create Account</span>
+          </button>
+        </div>
+
+        {/* Title */}
+        <div className="text-center pb-4">
+          <h1 className="text-2xl font-black text-slate-900 tracking-tight font-sans">
+            Welcome Back
+          </h1>
+          <p className="text-xs text-slate-500 font-medium mt-1">
+            Sign in to access your Monvera financial account
+          </p>
+        </div>
+
+        {/* Error Message */}
+        {errorMessage && (
+          <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+            <span className="font-semibold">{errorMessage}</span>
+          </div>
+        )}
+
+        {/* Form */}
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="block text-xs font-bold text-slate-700">
+              Account Number, Username, or Email
+            </label>
+            <div className="relative">
+              <User className="w-5 h-5 text-slate-400 absolute left-4 top-3.5 pointer-events-none" />
+              <input
+                type="text"
+                required
+                id="login-identifier-input-modal"
+                value={identifier}
+                onClick={(e) => e.stopPropagation()}
+                onFocus={(e) => e.stopPropagation()}
+                onChange={(e) => setIdentifier(e.target.value)}
+                placeholder="Enter account number, email, or username"
+                className="w-full pl-12 pr-4 py-3 text-sm font-medium text-slate-900 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-slate-900 rounded-xl focus:outline-hidden transition-all shadow-2xs placeholder:text-slate-400"
+              />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="block text-xs font-bold text-slate-700">
+              Password
+            </label>
+            <div className="relative">
+              <Lock className="w-5 h-5 text-slate-400 absolute left-4 top-3.5 pointer-events-none" />
+              <input
+                type={showPassword ? 'text' : 'password'}
+                required
+                id="login-password-input-modal"
+                value={password}
+                onClick={(e) => e.stopPropagation()}
+                onFocus={(e) => e.stopPropagation()}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Enter your account password"
+                className="w-full pl-12 pr-12 py-3 text-sm font-medium text-slate-900 bg-slate-50/80 hover:bg-slate-50 focus:bg-white border border-slate-200 focus:border-slate-900 rounded-xl focus:outline-hidden transition-all shadow-2xs placeholder:text-slate-400"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-4 top-3.5 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
+              >
+                {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between pt-1 text-xs">
+            <label className="flex items-center gap-2 font-medium text-slate-600 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(e) => setRememberMe(e.target.checked)}
+                className="w-4 h-4 rounded text-slate-900 border-slate-300 focus:ring-slate-800 cursor-pointer"
+              />
+              <span>Remember me</span>
+            </label>
+
+            <button
+              type="button"
+              onClick={() => {
+                setForgotEmail(identifier.includes('@') ? identifier : '');
+                setResetSuccessMsg(null);
+                setResetErrorMsg(null);
+                setForgotModalOpen(true);
+              }}
+              className="font-bold text-blue-600 hover:text-blue-700 hover:underline cursor-pointer"
+            >
+              Forgot Password?
+            </button>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="w-full py-3.5 px-6 rounded-xl font-black text-sm text-white bg-[#0A1227] hover:bg-[#060B18] active:scale-[0.99] border border-slate-800 shadow-md hover:shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+          >
+            <Lock className="w-4 h-4 text-amber-400" />
+            <span>{isSubmitting ? 'Authenticating...' : 'Sign In to Account'}</span>
+          </button>
+        </form>
+
+        {renderForgotModal()}
+      </div>
+    );
+  }
+
   return (
     <div
       id="monvera-login-page"
-      className={`min-h-screen w-full flex flex-col justify-between relative overflow-x-hidden ${
-        isModal ? 'p-3 sm:p-6' : 'py-8 px-4 sm:px-6 lg:px-8'
-      }`}
+      className="min-h-screen w-full flex flex-col justify-between relative overflow-x-hidden py-8 px-4 sm:px-6 lg:px-8"
       style={{
         background: 'radial-gradient(ellipse at 50% 20%, #0c1833 0%, #070e1e 50%, #03070f 100%)',
       }}
@@ -412,88 +654,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         </div>
       </footer>
 
-      {/* Forgot Password Dialog (Full-featured real Firebase Password Reset) */}
-      {forgotModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
-          <div className="bg-white rounded-3xl p-6 sm:p-8 max-w-md w-full text-center space-y-4 shadow-2xl border border-slate-200 relative">
-            <button
-              onClick={() => setForgotModalOpen(false)}
-              className="absolute top-4 right-4 text-slate-400 hover:text-slate-700 p-1.5 rounded-full hover:bg-slate-100 transition-colors"
-            >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="w-14 h-14 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mx-auto shadow-inner border border-blue-100">
-              <Lock className="w-7 h-7" />
-            </div>
-
-            <div>
-              <h3 className="text-xl font-black text-slate-900 tracking-tight">Reset Your Password</h3>
-              <p className="text-xs sm:text-sm text-slate-500 mt-1 font-medium">
-                Enter your registered email address below. We'll send an official password reset link directly to your inbox.
-              </p>
-            </div>
-
-            {resetSuccessMsg && (
-              <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-xs sm:text-sm text-emerald-800 font-semibold flex items-start gap-2.5 text-left">
-                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-                <span>{resetSuccessMsg}</span>
-              </div>
-            )}
-
-            {resetErrorMsg && (
-              <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs sm:text-sm text-red-700 font-semibold flex items-start gap-2.5 text-left">
-                <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                <span>{resetErrorMsg}</span>
-              </div>
-            )}
-
-            {!resetSuccessMsg ? (
-              <form onSubmit={handleSendPasswordReset} className="space-y-4 text-left">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">
-                    Registered Email Address
-                  </label>
-                  <input
-                    type="email"
-                    required
-                    placeholder="e.g. user@domain.com"
-                    value={forgotEmail}
-                    onChange={(e) => setForgotEmail(e.target.value)}
-                    className="w-full px-4 py-3.5 text-sm rounded-xl border border-slate-300 focus:border-slate-900 focus:outline-hidden font-medium text-slate-900"
-                  />
-                </div>
-
-                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs text-slate-600 font-medium">
-                  Default evaluation password: <strong className="text-slate-900 font-bold">Password123!</strong>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isSendingReset}
-                  className="w-full py-3.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white font-black text-sm shadow-md transition-all cursor-pointer disabled:opacity-50 flex items-center justify-center gap-2"
-                >
-                  {isSendingReset ? 'Sending Reset Instructions...' : 'Send Password Reset Email'}
-                </button>
-              </form>
-            ) : (
-              <button
-                onClick={() => setForgotModalOpen(false)}
-                className="w-full py-3.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white font-black text-sm shadow-md cursor-pointer"
-              >
-                Close & Return to Sign In
-              </button>
-            )}
-
-            <button
-              onClick={() => setForgotModalOpen(false)}
-              className="text-xs font-bold text-slate-500 hover:text-slate-800 block mx-auto pt-1 cursor-pointer"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Forgot Password Dialog */}
+      {renderForgotModal()}
     </div>
   );
 };

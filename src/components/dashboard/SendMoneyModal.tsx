@@ -44,6 +44,13 @@ export const SendMoneyModal: React.FC = () => {
   const [completedTx, setCompletedTx] = useState<Transaction | null>(null);
   const [copied, setCopied] = useState(false);
   const [registeredContacts, setRegisteredContacts] = useState<any[]>([]);
+  const lookupTimerRef = React.useRef<any>(null);
+
+  useEffect(() => {
+    return () => {
+      if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (activeModal === 'send') {
@@ -116,7 +123,7 @@ export const SendMoneyModal: React.FC = () => {
 
   const senderUserId = isAdmin ? 'usr_admin' : (currentUser?.id || 'usr_customer');
   const senderDisplayName = isAdmin ? 'Bennett Johnson' : `${currentUser?.firstName || 'Monvera'} ${currentUser?.lastName || 'Customer'}`;
-  const senderAccountNumber = isAdmin ? '1000000001' : (currentUser?.permanentAccountNumber || '1000000000');
+  const senderAccountNumber = String(isAdmin ? '1000000001' : (currentUser?.permanentAccountNumber || '1000000000'));
   const fromAccountLabel = isAdmin
     ? 'Monvera Sovereign Treasury • Bennett Johnson (•••• 0001)'
     : `Checking (•••• ${senderAccountNumber.slice(-4)})`;
@@ -126,15 +133,17 @@ export const SendMoneyModal: React.FC = () => {
     inputVal: string,
     hint?: { name?: string; username?: string; accountNumber?: string }
   ) => {
-    const trimmed = inputVal.trim();
+    const trimmed = (inputVal || '').trim();
     if (!trimmed && !hint?.accountNumber && !hint?.username) {
       setLookupResult(null);
       setErrorMessage(null);
+      setIsLookingUp(false);
       return;
     }
 
     if (trimmed.length < 2 && !hint?.accountNumber && !hint?.username) {
       setLookupResult(null);
+      setIsLookingUp(false);
       return;
     }
 
@@ -142,12 +151,14 @@ export const SendMoneyModal: React.FC = () => {
     setErrorMessage(null);
     try {
       const res = await api.lookupRecipient(trimmed, senderUserId, hint);
-      if (res.valid) {
+      if (res && res.valid) {
         setLookupResult(res);
         setErrorMessage(null);
       } else {
         setLookupResult(null);
-        setErrorMessage(res.error || 'Recipient not found.');
+        if (trimmed.length >= 3) {
+          setErrorMessage(res?.error || 'Recipient not found.');
+        }
       }
     } catch {
       setLookupResult(null);
@@ -157,7 +168,27 @@ export const SendMoneyModal: React.FC = () => {
     }
   };
 
+  const handleLookupDebounced = (val: string) => {
+    if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
+    const trimmed = (val || '').trim();
+    if (!trimmed) {
+      setLookupResult(null);
+      setErrorMessage(null);
+      setIsLookingUp(false);
+      return;
+    }
+    if (trimmed.length < 2) {
+      setLookupResult(null);
+      setIsLookingUp(false);
+      return;
+    }
+    lookupTimerRef.current = setTimeout(() => {
+      handleLookup(trimmed);
+    }, 280);
+  };
+
   const handleSelectQuickContact = (identifier: string) => {
+    if (lookupTimerRef.current) clearTimeout(lookupTimerRef.current);
     setRecipientInput(identifier);
     handleLookup(identifier);
   };
@@ -220,7 +251,11 @@ export const SendMoneyModal: React.FC = () => {
         // Standard Customer Peer Transfer
         const res = await api.sendMonveraTransfer({
           senderUserId: currentUser!.id,
-          recipientIdentifier: lookupResult?.permanentAccountNumber || recipientInput,
+          recipientUserId: lookupResult?.recipientId,
+          recipientAccountNumber: lookupResult?.permanentAccountNumber,
+          recipientUsername: lookupResult?.username,
+          recipientName: lookupResult ? `${lookupResult.firstName} ${lookupResult.lastName}`.trim() : undefined,
+          recipientIdentifier: lookupResult?.permanentAccountNumber || lookupResult?.username || recipientInput,
           amount: parseFloat(amount),
           description: memo || `Transfer to ${lookupResult?.firstName} ${lookupResult?.lastName} (@${lookupResult?.username || 'user'})`,
           category,
@@ -256,13 +291,14 @@ export const SendMoneyModal: React.FC = () => {
     }
   };
 
-  const quickContacts = registeredContacts.length > 0
+  const quickContacts = (registeredContacts.length > 0
     ? registeredContacts
     : [
         { name: 'Marcus Sterling', username: 'marcus', acc: '1088492015', tier: 'Business' },
         { name: 'Sophia Chen', username: 'sophia', acc: '1093847294', tier: 'Premier' },
         { name: 'Eleanor Vance', username: 'eleanor', acc: '1045827391', tier: 'Private Wealth' },
-      ].filter((c) => c.acc !== senderAccountNumber);
+      ]
+  ).filter((c) => String(c.acc || '') !== senderAccountNumber);
 
   return (
     <>
@@ -273,10 +309,11 @@ export const SendMoneyModal: React.FC = () => {
           if (e.target === e.currentTarget && step !== 'PROCESSING') closeModal();
         }}
       >
-      <div
-        id="send-money-modal-container"
-        className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl border-2 border-slate-200 overflow-hidden relative max-h-[94vh] flex flex-col"
-      >
+        <div
+          id="send-money-modal-container"
+          className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl border-2 border-slate-200 overflow-hidden relative max-h-[94vh] flex flex-col"
+          onClick={(e) => e.stopPropagation()}
+        >
         {/* Header */}
         <div className="p-6 sm:p-7 bg-slate-50 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
           <div className="flex items-center gap-3.5">
@@ -340,15 +377,20 @@ export const SendMoneyModal: React.FC = () => {
                       <AtSign className="w-5 h-5" />
                     </div>
                     <input
+                      id="recipient-input-field"
+                      name="recipientInput"
                       type="text"
                       required
-                      autoFocus
+                      autoComplete="off"
+                      spellCheck="false"
                       placeholder="Paste 10-digit account number or enter @username"
                       value={recipientInput}
+                      onClick={(e) => e.stopPropagation()}
+                      onFocus={(e) => e.stopPropagation()}
                       onChange={(e) => {
                         const val = e.target.value;
                         setRecipientInput(val);
-                        handleLookup(val);
+                        handleLookupDebounced(val);
                       }}
                       className="w-full pl-11 pr-28 py-3.5 text-base font-mono font-black tracking-wider text-slate-950 bg-white placeholder:text-slate-400 placeholder:font-sans placeholder:font-normal rounded-2xl border-2 border-slate-300 focus:border-emerald-600 focus:ring-2 focus:ring-emerald-500/20 transition-all shadow-xs selection:bg-emerald-200 selection:text-slate-950"
                     />
@@ -397,17 +439,23 @@ export const SendMoneyModal: React.FC = () => {
                     </button>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    {quickContacts.map((contact) => (
-                      <button
-                        key={contact.acc || contact.username}
-                        type="button"
-                        onClick={() => handleSelectQuickContact(contact.acc || `@${contact.username}`)}
-                        className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-emerald-50 hover:border-emerald-300 border border-slate-200 text-xs font-medium text-slate-900 flex items-center gap-1.5 transition-colors cursor-pointer"
-                      >
-                        <span className="font-black text-slate-950">@{contact.username}</span>
-                        <span className="text-slate-600 font-mono text-[11px]">({contact.acc ? `•••• ${contact.acc.slice(-4)}` : contact.name})</span>
-                      </button>
-                    ))}
+                    {quickContacts.map((contact, idx) => {
+                      const accStr = String(contact.acc || '');
+                      const userStr = String(contact.username || 'user');
+                      return (
+                        <button
+                          key={accStr || userStr || idx}
+                          type="button"
+                          onClick={() => handleSelectQuickContact(accStr || `@${userStr}`)}
+                          className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-emerald-50 hover:border-emerald-300 border border-slate-200 text-xs font-medium text-slate-900 flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <span className="font-black text-slate-950">@{userStr}</span>
+                          <span className="text-slate-600 font-mono text-[11px]">
+                            ({accStr ? `•••• ${accStr.slice(-4)}` : (contact.name || 'Customer')})
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
@@ -525,7 +573,7 @@ export const SendMoneyModal: React.FC = () => {
               <div className="text-center space-y-1.5">
                 <span className="text-xs font-mono uppercase text-slate-500 font-bold tracking-widest">Total Transfer Amount</span>
                 <div className="text-4xl sm:text-5xl font-black text-slate-950 font-mono">
-                  ${parseFloat(amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
+                  ${(Number(amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
                 <span className="inline-block text-xs text-emerald-800 font-black bg-emerald-100 px-3 py-1 rounded-full border border-emerald-300">
                   Instant Settlement • $0.00 Fee • {isAdmin ? 'Sovereign Treasury Transfer' : 'Direct Transfer'}
@@ -605,7 +653,7 @@ export const SendMoneyModal: React.FC = () => {
               <div className="space-y-1.5">
                 <h3 className="text-2xl sm:text-3xl font-black text-slate-950">Transfer Complete</h3>
                 <div className="text-3xl sm:text-4xl font-black text-emerald-600 font-mono">
-                  ${completedTx.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
+                  ${(Number(completedTx.amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
                 <p className="text-xs sm:text-sm text-slate-600 font-medium">
                   Successfully transferred to {completedTx.recipientName} (@{lookupResult?.username || 'user'} • {lookupResult?.maskedAccountNumber})

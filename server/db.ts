@@ -8,6 +8,8 @@ import {
   LedgerEntry,
   InvestmentPlan,
   InvestmentEarningLog,
+  LoanApplication,
+  LoanStatus,
   CardItem,
   NotificationItem,
   AdminAuditLog,
@@ -25,6 +27,7 @@ export class MonveraDatabase {
   public ledgerEntries: LedgerEntry[] = [];
   public investments: Map<string, InvestmentPlan> = new Map();
   public investmentEarnings: InvestmentEarningLog[] = [];
+  public loans: Map<string, LoanApplication> = new Map();
   public cards: Map<string, CardItem> = new Map();
   public notifications: NotificationItem[] = [];
   public auditLogs: AdminAuditLog[] = [];
@@ -120,6 +123,48 @@ export class MonveraDatabase {
     });
   }
 
+  public ensureUserExists(userId: string, data?: Partial<UserProfile>): UserProfile {
+    let user = this.users.get(userId);
+    if (!user && data?.email) {
+      user = Array.from(this.users.values()).find(
+        (u) => u.email.toLowerCase() === data.email!.trim().toLowerCase()
+      );
+      if (user) {
+        // Associate this ID
+        this.users.set(userId, user);
+      }
+    }
+
+    if (!user) {
+      const permanentAccountNumber =
+        data?.permanentAccountNumber || `10${Math.floor(10000000 + Math.random() * 90000000)}`;
+      user = {
+        id: userId,
+        username: data?.username || `user_${userId.slice(-6)}`,
+        firstName: data?.firstName || 'Monvera',
+        lastName: data?.lastName || 'Client',
+        email: data?.email || `${userId}@monvera.com`,
+        phone: data?.phone || '+1 (555) 000-0000',
+        permanentAccountNumber,
+        country: data?.country || 'United States',
+        avatarUrl:
+          data?.avatarUrl ||
+          'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+        status: 'active',
+        role: data?.role || 'customer',
+        membershipTier: data?.membershipTier || 'Premier',
+        twoFactorEnabled: false,
+        createdAt: data?.createdAt || new Date().toISOString(),
+        businessName: data?.businessName,
+        kycStatus: data?.kycStatus || 'verified',
+        dailyTransactionLimit: 1000000,
+      };
+      this.users.set(userId, user);
+      this.initUserAccounts(userId, permanentAccountNumber);
+    }
+    return user;
+  }
+
   // --- Authoritative Balance Calculation Engine ---
   public getUserBalanceMetrics(userId: string) {
     const userAccounts = Array.from(this.accounts.values()).filter((a) => a.userId === userId);
@@ -169,6 +214,12 @@ export class MonveraDatabase {
       inv.investedBalance = totalActiveInvestmentsAmount;
     }
 
+    // Active approved loan principal calculation
+    const activeLoans = Array.from(this.loans.values()).filter(
+      (l) => l.userId === userId && (l.status === 'ACTIVE' || l.status === 'APPROVED')
+    );
+    const loanBalance = activeLoans.reduce((sum, l) => sum + (l.remainingBalance ?? l.amount), 0);
+
     const totalBalance = checkingBal + savingsBal + totalActiveInvestmentsAmount + totalAccruedEarnings;
     const availableBalance = checkingBal + savingsBal; // Liquid funds available for withdrawal/send
 
@@ -179,6 +230,7 @@ export class MonveraDatabase {
       accruedEarnings: totalAccruedEarnings,
       totalBalance,
       availableBalance,
+      loanBalance,
       pendingBalance: 0,
       accounts: userAccounts,
     };
@@ -1668,6 +1720,429 @@ export class MonveraDatabase {
       return true;
     }
     return false;
+  }
+
+  // --- Loan & Dynamic Credit Facility Engine ---
+  public calculateUserTransactionVolume(userId: string): number {
+    const txs = this.transactions.filter(
+      (t) =>
+        (t.userId === userId || t.senderUserId === userId || t.recipientUserId === userId) &&
+        t.status === 'COMPLETED'
+    );
+    return txs.reduce((sum, t) => sum + (t.amount || 0), 0);
+  }
+
+  public getLoanEligibilityTier(volume: number): {
+    tier: string;
+    maxLimit: number;
+    interestRateAPR: number;
+    minRequiredVolume: number;
+    description: string;
+  } {
+    // Fixed 20.00% loan interest rate across all terms as requested
+    const fixedRate = 20.00;
+
+    if (volume >= 50000) {
+      return {
+        tier: 'Sovereign Institutional Tier',
+        maxLimit: 1000000,
+        interestRateAPR: fixedRate,
+        minRequiredVolume: 50000,
+        description: 'Elite clearance tier ($50,000+ volume): Eligible for up to $1,000,000 USD facility with fixed 20% interest.',
+      };
+    } else if (volume >= 10000) {
+      return {
+        tier: 'Prime Capital Tier',
+        maxLimit: 250000,
+        interestRateAPR: fixedRate,
+        minRequiredVolume: 10000,
+        description: 'High volume tier ($10,000+ volume): Eligible for $20,000 to $50,000+ USD credit line (up to $250,000 USD facility) with fixed 20% interest.',
+      };
+    } else if (volume >= 5000) {
+      return {
+        tier: 'Growth Business Tier',
+        maxLimit: 50000,
+        interestRateAPR: fixedRate,
+        minRequiredVolume: 5000,
+        description: 'Active banking tier ($5,000+ volume): Eligible for up to $50,000 USD financing line with fixed 20% interest.',
+      };
+    } else if (volume >= 2000) {
+      return {
+        tier: 'Starter Credit Tier',
+        maxLimit: 10000,
+        interestRateAPR: fixedRate,
+        minRequiredVolume: 2000,
+        description: 'Tier unlocked with $2,000+ transaction volume: Eligible for $1,000 to $10,000 USD credit line with fixed 20% interest.',
+      };
+    } else {
+      return {
+        tier: 'Initial Tier (Deposit Required)',
+        maxLimit: 0,
+        interestRateAPR: fixedRate,
+        minRequiredVolume: 2000,
+        description: `Monvera requirement: A minimum of $2,000.00 in cumulative deposits or verified transaction volume is required to unlock your first credit facility ($1,000 – $10,000 USD). Current volume: $${volume.toLocaleString('en-US', { minimumFractionDigits: 2 })}. Build your transaction history through legitimate deposits and transactions to qualify for higher available loan limits.`,
+      };
+    }
+  }
+
+  public createLoanApplication(params: {
+    userId: string;
+    amount: number;
+    termMonths: number;
+    purpose: string;
+    employmentOrBusinessDetails?: string;
+    annualIncomeOrRevenue?: number;
+    collateralDescription?: string;
+    fallbackUser?: Partial<UserProfile>;
+  }): { success: boolean; loan?: LoanApplication; error?: string } {
+    const user = this.ensureUserExists(params.userId, params.fallbackUser);
+
+    if (params.amount < 1000 || params.amount > 1000000) {
+      return { success: false, error: 'Loan amounts must be between $1,000 and $1,000,000 USD.' };
+    }
+
+    const validTerms = [6, 12, 24, 36, 48, 60];
+    const termMonths = validTerms.includes(params.termMonths) ? params.termMonths : 12;
+
+    const txVolume = this.calculateUserTransactionVolume(user.id);
+    const eligibility = this.getLoanEligibilityTier(txVolume);
+
+    // Fixed 20.00% loan interest: Total Interest = 20% of borrowed principal. Total Repayment = 120%.
+    const totalRepayment = Number((params.amount * 1.20).toFixed(2));
+    const interestAmount = Number((params.amount * 0.20).toFixed(2));
+    const monthlyPayment = Number((totalRepayment / termMonths).toFixed(2));
+    const maturityDate = new Date(Date.now() + termMonths * 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const loanId = `loan_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const newLoan: LoanApplication = {
+      id: loanId,
+      userId: user.id,
+      applicantName: `${user.firstName} ${user.lastName}`,
+      applicantEmail: user.email,
+      applicantPhone: user.phone,
+      permanentAccountNumber: user.permanentAccountNumber,
+      amount: params.amount,
+      termMonths,
+      monthlyPayment,
+      interestRateAPR: 20.0,
+      interestAmount,
+      totalRepaymentAmount: totalRepayment,
+      remainingBalance: totalRepayment,
+      totalRepaid: 0,
+      maturityDate,
+      purpose: params.purpose || 'Business Expansion & Working Capital',
+      employmentOrBusinessDetails:
+        params.employmentOrBusinessDetails || user.businessName || 'Verified Monvera Account Holder (Corporate & Personal)',
+      annualIncomeOrRevenue: params.annualIncomeOrRevenue || 120000,
+      collateralDescription: params.collateralDescription || 'Ledger Cash Flow Guarantee',
+      status: 'PENDING',
+      userTransactionVolume: txVolume,
+      eligibilityTier: eligibility.tier,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.loans.set(loanId, newLoan);
+
+    // Create user notification
+    this.notifications.unshift({
+      id: `notif_${Date.now()}_loan`,
+      userId: user.id,
+      title: 'Loan Application Received for Monvera Review',
+      message: `Your credit application for $${params.amount.toLocaleString(
+        'en-US',
+        { minimumFractionDigits: 2 }
+      )} (Fixed 20% Interest) has been submitted and is currently undergoing review by our Monvera team.`,
+      type: 'SYSTEM',
+      severity: 'info',
+      read: false,
+      createdAt: new Date().toISOString(),
+      referenceId: loanId,
+    });
+
+    return { success: true, loan: newLoan };
+  }
+
+  public adminApproveLoan(params: {
+    loanId: string;
+    adminId: string;
+  }): { success: boolean; loan?: LoanApplication; transaction?: Transaction; error?: string } {
+    const loan = this.loans.get(params.loanId);
+    if (!loan) return { success: false, error: 'Loan record not found.' };
+
+    if (loan.status === 'ACTIVE' || loan.status === 'APPROVED') {
+      return { success: false, error: 'This loan has already been approved and disbursed.' };
+    }
+
+    const user = this.ensureUserExists(loan.userId, {
+      email: loan.applicantEmail,
+      firstName: loan.applicantName.split(' ')[0] || 'Valued',
+      lastName: loan.applicantName.split(' ').slice(1).join(' ') || 'Client',
+      permanentAccountNumber: loan.permanentAccountNumber,
+      phone: loan.applicantPhone,
+    });
+
+    const now = new Date().toISOString();
+    const totalRepay = Number((loan.amount * 1.20).toFixed(2));
+    const interestAmt = Number((loan.amount * 0.20).toFixed(2));
+    const termMonths = loan.termMonths || 12;
+    const maturityDate = new Date(Date.now() + termMonths * 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    loan.status = 'ACTIVE';
+    loan.approvedAt = now;
+    loan.approvedBy = params.adminId;
+    loan.disbursedAt = now;
+    loan.disbursedAmount = loan.amount;
+    loan.interestAmount = interestAmt;
+    loan.totalRepaymentAmount = totalRepay;
+    loan.remainingBalance = loan.remainingBalance !== undefined ? loan.remainingBalance : totalRepay;
+    loan.totalRepaid = loan.totalRepaid || 0;
+    loan.maturityDate = maturityDate;
+    loan.updatedAt = now;
+
+    // Disburse loan amount directly into customer's Checking Account via Double-Entry Ledger
+    const chkId = `acc_chk_${user.id}`;
+    const tx = this.recordLedgerTransaction({
+      type: 'ADMIN_DEVELOPMENT_FUNDING',
+      amount: loan.amount,
+      userId: user.id,
+      recipientUserId: user.id,
+      recipientAccountId: chkId,
+      description: `Monvera Approved Loan Credit Disbursement ($${loan.amount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })}) - Ref: ${loan.id}`,
+      category: 'Deposits',
+      status: 'COMPLETED',
+      timestamp: now,
+    });
+
+    // Notify customer
+    this.notifications.unshift({
+      id: `notif_${Date.now()}_loan_appr`,
+      userId: user.id,
+      title: '🎉 Loan Approved & Disbursed!',
+      message: `Congratulations! Your loan application for $${loan.amount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })} has been approved and the capital has been credited directly into your Checking Account.`,
+      type: 'TRANSACTION',
+      severity: 'success',
+      read: false,
+      createdAt: now,
+      referenceId: loan.id,
+    });
+
+    // Admin Audit Log
+    this.auditLogs.unshift({
+      id: `audit_${Date.now()}_loan_appr`,
+      adminId: params.adminId,
+      adminName: 'Operations Compliance Officer',
+      action: 'APPROVE_LOAN_DISBURSEMENT',
+      targetUserId: user.id,
+      targetAccountNumber: user.permanentAccountNumber,
+      amount: loan.amount,
+      reason: `Authorized underwriting approval for ${loan.purpose}`,
+      timestamp: now,
+      ipAddress: '127.0.0.1',
+      result: 'SUCCESS',
+    });
+
+    return { success: true, loan, transaction: tx };
+  }
+
+  public adminRejectLoan(params: {
+    loanId: string;
+    reason: string;
+    adminId: string;
+  }): { success: boolean; loan?: LoanApplication; error?: string } {
+    const loan = this.loans.get(params.loanId);
+    if (!loan) return { success: false, error: 'Loan record not found.' };
+
+    const user = this.users.get(loan.userId);
+    if (!user) return { success: false, error: 'Customer account not found.' };
+
+    const now = new Date().toISOString();
+    const rejectionReason = params.reason || 'Insufficient platform transaction volume or additional documentation required.';
+    loan.status = 'REJECTED';
+    loan.rejectionReason = rejectionReason;
+    loan.rejectedAt = now;
+    loan.rejectedBy = params.adminId;
+    loan.updatedAt = now;
+
+    // Notify customer with exact reason
+    this.notifications.unshift({
+      id: `notif_${Date.now()}_loan_rej`,
+      userId: user.id,
+      title: 'Loan Application Update',
+      message: `Your loan application for $${loan.amount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })} was not approved at this time. Compliance Reason: "${rejectionReason}". You may increase your transaction activity on Monvera to qualify for higher credit limits.`,
+      type: 'SYSTEM',
+      severity: 'error',
+      read: false,
+      createdAt: now,
+      referenceId: loan.id,
+    });
+
+    // Admin Audit Log
+    this.auditLogs.unshift({
+      id: `audit_${Date.now()}_loan_rej`,
+      adminId: params.adminId,
+      adminName: 'Operations Compliance Officer',
+      action: 'REJECT_LOAN_APPLICATION',
+      targetUserId: user.id,
+      targetAccountNumber: user.permanentAccountNumber,
+      amount: loan.amount,
+      reason: rejectionReason,
+      timestamp: now,
+      ipAddress: '127.0.0.1',
+      result: 'SUCCESS',
+    });
+
+    return { success: true, loan };
+  }
+
+  public repayLoan(params: {
+    loanId: string;
+    userId: string;
+    amount: number;
+    sourceAccountId?: string;
+    note?: string;
+  }): { success: boolean; loan?: LoanApplication; transaction?: Transaction; remainingBalance?: number; error?: string } {
+    const loan = this.loans.get(params.loanId);
+    if (!loan) return { success: false, error: 'Loan record not found.' };
+
+    if (loan.userId !== params.userId) {
+      return { success: false, error: 'Unauthorized to make payments on this loan facility.' };
+    }
+
+    if (loan.status !== 'ACTIVE' && loan.status !== 'APPROVED') {
+      return { success: false, error: `Loan is currently ${loan.status.toLowerCase()} and cannot accept repayments.` };
+    }
+
+    const totalRepayRequired = loan.totalRepaymentAmount || Number((loan.amount * 1.20).toFixed(2));
+    const currentRemaining = loan.remainingBalance !== undefined ? loan.remainingBalance : totalRepayRequired;
+
+    if (currentRemaining <= 0) {
+      return { success: false, error: 'This loan is already fully settled and paid off.' };
+    }
+
+    const repayAmount = Number(params.amount);
+    if (isNaN(repayAmount) || repayAmount <= 0) {
+      return { success: false, error: 'Please enter a valid repayment amount.' };
+    }
+
+    if (repayAmount > currentRemaining + 0.01) {
+      return {
+        success: false,
+        error: `Repayment amount ($${repayAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}) exceeds the outstanding balance ($${currentRemaining.toLocaleString('en-US', { minimumFractionDigits: 2 })}).`,
+      };
+    }
+
+    const user = this.users.get(params.userId);
+    if (!user) return { success: false, error: 'User account not found.' };
+
+    // Determine debit source account (default to checking account)
+    const sourceAccId = params.sourceAccountId || `acc_chk_${user.id}`;
+    const sourceAcc = this.accounts.get(sourceAccId);
+    
+    let availableBal = 0;
+    if (sourceAcc) {
+      availableBal = sourceAcc.balance;
+    } else {
+      const chk = this.accounts.get(`acc_chk_${user.id}`);
+      availableBal = chk ? chk.balance : 0;
+    }
+
+    if (availableBal < repayAmount) {
+      return {
+        success: false,
+        error: `Insufficient available balance in your account. Available: $${availableBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}, Required: $${repayAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}.`,
+      };
+    }
+
+    const now = new Date().toISOString();
+    const actualRepay = Math.min(repayAmount, currentRemaining);
+    const newRemaining = Math.max(0, Number((currentRemaining - actualRepay).toFixed(2)));
+    const newTotalRepaid = Number(((loan.totalRepaid || 0) + actualRepay).toFixed(2));
+
+    // Record Ledger Debit Transaction
+    const tx = this.recordLedgerTransaction({
+      type: 'TRANSFER',
+      amount: actualRepay,
+      userId: user.id,
+      senderAccountId: sourceAccId,
+      recipientUserId: 'monvera_treasury',
+      recipientAccountId: 'acc_monvera_loan_facility',
+      description: `Monvera Credit Facility Repayment (${loan.purpose}) - Ref: ${loan.id}`,
+      category: 'Transfers',
+      status: 'COMPLETED',
+      timestamp: now,
+    });
+
+    // Update Loan Record
+    loan.totalRepaid = newTotalRepaid;
+    loan.remainingBalance = newRemaining;
+    loan.totalRepaymentAmount = totalRepayRequired;
+    loan.updatedAt = now;
+
+    if (!loan.repaymentHistory) {
+      loan.repaymentHistory = [];
+    }
+
+    loan.repaymentHistory.unshift({
+      id: `rep_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      amount: actualRepay,
+      date: now,
+      paymentMethod: sourceAcc?.nickname || 'Monvera Checking Account',
+      note: params.note || (newRemaining === 0 ? 'Full Loan Settlement' : 'Partial Loan Repayment'),
+      remainingAfter: newRemaining,
+    });
+
+    if (newRemaining === 0) {
+      loan.status = 'PAID';
+      loan.paidAt = now;
+    }
+
+    // User Notification
+    this.notifications.unshift({
+      id: `notif_${Date.now()}_repay`,
+      userId: user.id,
+      title: newRemaining === 0 ? '🎊 Loan Fully Settled & Closed!' : '💳 Loan Repayment Successful',
+      message: newRemaining === 0
+        ? `Congratulations! Your loan facility (${loan.purpose}) has been 100% repaid and settled in full. Thank you for your business!`
+        : `Your payment of $${actualRepay.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })} for Loan #${loan.id} has been posted. Outstanding remaining balance is $${newRemaining.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })}.`,
+      type: 'TRANSACTION',
+      severity: 'success',
+      read: false,
+      createdAt: now,
+      referenceId: loan.id,
+    });
+
+    // Admin Audit Log
+    this.auditLogs.unshift({
+      id: `audit_${Date.now()}_loan_repay`,
+      adminId: 'system',
+      adminName: 'Monvera Automated Treasury',
+      action: 'LOAN_REPAYMENT_POSTED',
+      targetUserId: user.id,
+      targetAccountNumber: user.permanentAccountNumber,
+      amount: actualRepay,
+      reason: `Borrower posted repayment of $${actualRepay.toLocaleString('en-US', { minimumFractionDigits: 2 })} towards loan ${loan.id}. Remaining: $${newRemaining.toLocaleString('en-US', { minimumFractionDigits: 2 })}.`,
+      timestamp: now,
+      ipAddress: '127.0.0.1',
+      result: 'SUCCESS',
+    });
+
+    return {
+      success: true,
+      loan,
+      transaction: tx,
+      remainingBalance: newRemaining,
+    };
   }
 }
 

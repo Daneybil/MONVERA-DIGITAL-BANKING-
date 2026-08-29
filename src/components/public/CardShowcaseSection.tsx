@@ -238,6 +238,42 @@ export const CardShowcaseSection: React.FC = () => {
 
         </div>
 
+        {/* Prominent Luxury Monvera Cardholder Image Showcase */}
+        <div className="mt-16 relative rounded-3xl overflow-hidden border-2 border-slate-300 shadow-2xl bg-slate-950">
+          <div className="grid grid-cols-1 lg:grid-cols-12 items-center">
+            <div className="lg:col-span-7 relative h-72 sm:h-96 lg:h-[420px] w-full overflow-hidden">
+              <img
+                src="/src/assets/images/monvera_luxury_cardholder_1787487721200.jpg"
+                alt="Monvera Obsidian Cardholder Executive"
+                className="w-full h-full object-cover object-center"
+                referrerPolicy="no-referrer"
+              />
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-transparent to-transparent lg:bg-gradient-to-r lg:from-transparent lg:to-slate-950" />
+            </div>
+            <div className="lg:col-span-5 p-8 sm:p-10 space-y-5 text-white">
+              <span className="text-xs sm:text-sm font-black uppercase tracking-widest text-emerald-400 bg-emerald-950/80 px-3.5 py-1.5 rounded-lg border border-emerald-500/40 inline-block font-mono">
+                Worldwide Prestige & Recognition
+              </span>
+              <h3 className="text-2xl sm:text-3xl lg:text-4xl font-black tracking-tight text-white">
+                Global Purchasing Power Without Limits
+              </h3>
+              <p className="text-slate-300 text-base sm:text-lg font-bold leading-relaxed">
+                Accepted at over 44 million merchant locations across 200+ countries with instant settlement, comprehensive fraud protection, and zero foreign currency conversion markups.
+              </p>
+              <div className="flex flex-wrap gap-4 pt-2">
+                <div className="bg-white/10 backdrop-blur-md border border-white/20 px-4 py-2.5 rounded-xl">
+                  <div className="text-xl sm:text-2xl font-black text-amber-300 font-mono">$100,000</div>
+                  <div className="text-xs font-bold text-slate-300 uppercase">Daily Limit Option</div>
+                </div>
+                <div className="bg-white/10 backdrop-blur-md border border-white/20 px-4 py-2.5 rounded-xl">
+                  <div className="text-xl sm:text-2xl font-black text-emerald-400 font-mono">0.00%</div>
+                  <div className="text-xs font-bold text-slate-300 uppercase">Foreign Exchange Fee</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
       </div>
     </section>
   );

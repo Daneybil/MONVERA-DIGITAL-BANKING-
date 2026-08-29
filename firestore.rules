@@ -67,6 +67,12 @@ service cloud.firestore {
       allow delete: if isSignedIn();
     }
 
+    // Loans & credit facilities collection
+    match /loans/{loanId} {
+      allow get, list, create, update: if true;
+      allow delete: if isSignedIn();
+    }
+
     // Default match
     match /{document=**} {
       allow read, write: if isSignedIn();

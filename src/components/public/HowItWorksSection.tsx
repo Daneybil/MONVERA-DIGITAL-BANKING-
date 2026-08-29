@@ -1,5 +1,5 @@
 import React from 'react';
-import { UserCheck, Landmark, ArrowLeftRight, Activity, ArrowRight } from 'lucide-react';
+import { UserCheck, Landmark, ArrowLeftRight, Activity, ArrowRight, Banknote, ShieldAlert } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
 export const HowItWorksSection: React.FC = () => {
@@ -8,27 +8,27 @@ export const HowItWorksSection: React.FC = () => {
   const steps = [
     {
       step: '01',
-      title: 'Create Your Account',
+      title: 'Open & Verify Account',
       icon: UserCheck,
-      description: 'Complete our secure 2-minute onboarding to receive your unique permanent 10-digit Monvera account number.',
+      description: 'Complete our secure 2-minute onboarding to receive your unique permanent 10-digit Monvera account number and verified profile.',
     },
     {
       step: '02',
-      title: 'Fund Your Account',
+      title: 'Fund & Transact',
       icon: Landmark,
-      description: 'Transfer funds securely via ACH, same-day FedWire, linked debit card, or verified instant payment gateways.',
+      description: 'Deposit funds or transact $2,000+ to automatically establish your verified credit score and unlock your initial liquidity facility.',
     },
     {
       step: '03',
-      title: 'Grow & Manage Your Money',
-      icon: ArrowLeftRight,
-      description: 'Send instant fee-free transfers, earn 4.85% APY in savings, or lock into term plans earning 4.50% yield every 24 hours.',
+      title: 'Request Instant Loan',
+      icon: Banknote,
+      description: 'Apply for $1,000 to $1,000,000 USD credit lines with a flat 20% fixed interest, direct checking account disbursement, and rapid approval.',
     },
     {
       step: '04',
-      title: 'Stay in Full Control',
+      title: 'Manage & Repay Effortlessly',
       icon: Activity,
-      description: 'Enjoy 100% full-reserve protection, 24/7 security monitoring, and complete card controls from any desktop or mobile device.',
+      description: 'Track daily earnings, make automated installment payments, build institutional credit history, and scale to higher credit tiers seamlessly.',
     },
   ];
 
@@ -38,13 +38,13 @@ export const HowItWorksSection: React.FC = () => {
         
         <div className="text-center max-w-3xl mx-auto space-y-4 mb-16">
           <span className="text-xs sm:text-sm font-black uppercase tracking-wider text-emerald-900 bg-emerald-100 px-4 py-1.5 rounded-xl border-2 border-emerald-400">
-            Frictionless Onboarding
+            Frictionless Onboarding & Credit
           </span>
           <h2 className="text-4xl sm:text-5xl lg:text-6xl font-black tracking-tight text-slate-950">
             How Monvera Works
           </h2>
           <p className="text-lg sm:text-xl font-extrabold text-slate-900 leading-relaxed">
-            A simple, transparent four-step journey designed for effortless financial growth.
+            A simple, transparent four-step journey designed for everyday banking, high-yield savings, and rapid credit liquidity.
           </p>
         </div>
 
