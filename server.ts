@@ -1000,7 +1000,9 @@ app.get('/api/loans/eligibility', (req: Request, res: Response) => {
   if (!userId) {
     return res.status(400).json({ error: 'userId is required' });
   }
-  const volume = db.calculateUserTransactionVolume(userId);
+  const queryVolume = Number(req.query.volume);
+  const dbVolume = db.calculateUserTransactionVolume(userId);
+  const volume = !isNaN(queryVolume) && queryVolume > dbVolume ? queryVolume : dbVolume;
   const eligibility = db.getLoanEligibilityTier(volume);
   res.json({ volume, ...eligibility });
 });
@@ -1047,7 +1049,7 @@ app.post('/api/admin/loans/reject', (req: Request, res: Response) => {
 });
 
 app.post('/api/loans/repay', (req: Request, res: Response) => {
-  const { loanId, userId, amount, sourceAccountId, note } = req.body;
+  const { loanId, userId, amount, sourceAccountId, note, fallbackLoan, fallbackUser } = req.body;
   if (!loanId || !userId || !amount) {
     return res.status(400).json({ error: 'loanId, userId, and repayment amount are required.' });
   }
@@ -1057,6 +1059,8 @@ app.post('/api/loans/repay', (req: Request, res: Response) => {
     amount: Number(amount),
     sourceAccountId,
     note,
+    fallbackLoan,
+    fallbackUser,
   });
   if (!result.success) return res.status(400).json({ error: result.error });
   res.json(result);

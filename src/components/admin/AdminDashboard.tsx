@@ -417,7 +417,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
     { id: 'transfers', label: 'Transfers', icon: Zap },
-    { id: 'loans', label: 'Loan Underwriting', icon: Banknote },
+    { id: 'loans', label: 'Loan Monvera', icon: Banknote },
     { id: 'demo_funds', label: 'Sandbox Test Funds', icon: Coins },
     { id: 'notifications', label: 'Sentinel Alerts', icon: Bell },
     { id: 'audit', label: 'Audit Trail', icon: FileText },

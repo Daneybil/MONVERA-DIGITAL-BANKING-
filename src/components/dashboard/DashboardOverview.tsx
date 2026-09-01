@@ -499,7 +499,7 @@ export const DashboardOverview: React.FC = () => {
                   $1,000 to $1,000,000 Facility
                 </div>
                 <p className="text-xs text-slate-800 font-medium mt-1">
-                  Transaction-based loan eligibility. Disbursed directly into your checking account upon underwriting approval.
+                  Transaction-based loan eligibility. Disbursed directly into your checking account upon Monvera approval.
                 </p>
               </div>
             </div>

@@ -153,7 +153,7 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
   const ssnRejected = itemReviews.ssn?.status === 'rejected';
   const ssnRejectReason = itemReviews.ssn?.rejectionReason;
 
-  // Handle generic base64 file upload
+  // Handle generic base64 file upload with automatic in-browser compression
   const handleFileUpload = (
     e: React.ChangeEvent<HTMLInputElement>,
     setter: (val: string) => void
@@ -161,15 +161,64 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.size > 15 * 1024 * 1024) {
-      setErrorMsg('Document size exceeds maximum limit of 15MB.');
+    if (file.size > 25 * 1024 * 1024) {
+      setErrorMsg('Document size exceeds maximum limit of 25MB.');
       return;
     }
 
     const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setter(reader.result);
+    reader.onload = (event) => {
+      const rawBase64 = event.target?.result as string;
+      if (!rawBase64) return;
+
+      // In-browser canvas compression to ensure rapid mobile upload without HTTP 413 or JSON parse errors
+      try {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const canvas = document.createElement('canvas');
+            const MAX_DIMENSION = 1280;
+            let width = img.width;
+            let height = img.height;
+
+            if (width > height) {
+              if (width > MAX_DIMENSION) {
+                height = Math.round((height * MAX_DIMENSION) / width);
+                width = MAX_DIMENSION;
+              }
+            } else {
+              if (height > MAX_DIMENSION) {
+                width = Math.round((width * MAX_DIMENSION) / height);
+                height = MAX_DIMENSION;
+              }
+            }
+
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.imageSmoothingEnabled = true;
+              ctx.imageSmoothingQuality = 'high';
+              ctx.drawImage(img, 0, 0, width, height);
+              const compressedBase64 = canvas.toDataURL('image/jpeg', 0.82);
+              setter(compressedBase64);
+              setErrorMsg(null);
+            } else {
+              setter(rawBase64);
+              setErrorMsg(null);
+            }
+          } catch {
+            setter(rawBase64);
+            setErrorMsg(null);
+          }
+        };
+        img.onerror = () => {
+          setter(rawBase64);
+          setErrorMsg(null);
+        };
+        img.src = rawBase64;
+      } catch {
+        setter(rawBase64);
         setErrorMsg(null);
       }
     };

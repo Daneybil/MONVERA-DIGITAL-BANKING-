@@ -155,7 +155,7 @@ export const LoanSection: React.FC = () => {
           <div className="lg:col-span-6 space-y-6">
             <div className="space-y-3">
               <span className="text-xs sm:text-sm font-black uppercase tracking-widest text-emerald-900 bg-emerald-100 px-3.5 py-1.5 rounded-lg border border-emerald-400 inline-block font-mono">
-                Rapid Underwriting & Instant Credit
+                Rapid Monvera Review & Instant Credit
               </span>
               <h3 className="text-2xl sm:text-3xl lg:text-4xl font-black tracking-tight text-slate-950">
                 Transparent Capital on Your Own Terms
@@ -173,7 +173,7 @@ export const LoanSection: React.FC = () => {
                 <div>
                   <h4 className="text-lg font-black text-slate-950">Direct Checking Account Disbursement</h4>
                   <p className="text-sm font-bold text-slate-700">
-                    Once approved by underwriting compliance, funds are deposited immediately into your liquid checking account balance.
+                    Once approved by Monvera compliance, funds are deposited immediately into your liquid checking account balance.
                   </p>
                 </div>
               </div>
@@ -344,12 +344,12 @@ export const LoanSection: React.FC = () => {
                 Empowering Business Expansion & Private Wealth
               </h3>
               <p className="text-slate-300 text-base sm:text-lg font-bold leading-relaxed">
-                Whether you need $5,000 for immediate operational flexibility or $1,000,000 for strategic corporate acquisitions, Monvera credit underwriting provides rapid decisions, dedicated relationship managers, and swift execution.
+                Whether you need $5,000 for immediate operational flexibility or $1,000,000 for strategic corporate acquisitions, Monvera credit services provide rapid decisions, dedicated relationship managers, and swift execution.
               </p>
               <div className="flex flex-wrap gap-4 pt-2">
                 <div className="bg-white/10 backdrop-blur-md border border-white/20 px-4 py-2.5 rounded-xl">
                   <div className="text-xl sm:text-2xl font-black text-amber-300 font-mono">&lt; 24 Hours</div>
-                  <div className="text-xs font-bold text-slate-300 uppercase">Underwriting Turnaround</div>
+                  <div className="text-xs font-bold text-slate-300 uppercase">Monvera Turnaround</div>
                 </div>
                 <div className="bg-white/10 backdrop-blur-md border border-white/20 px-4 py-2.5 rounded-xl">
                   <div className="text-xl sm:text-2xl font-black text-emerald-400 font-mono">$1,000,000</div>

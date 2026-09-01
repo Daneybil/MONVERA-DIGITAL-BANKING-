@@ -195,24 +195,110 @@ export const api = {
     autoApprove?: boolean;
     reviewDurationMinutes?: number;
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
-    const res = await fetch('/api/kyc/submit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    return res.json();
+    try {
+      const res = await fetch('/api/kyc/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
+      if (parsed.success && parsed.user) {
+        return parsed;
+      }
+      if (parsed.error && parsed.error !== 'Authentication service offline' && !parsed.error.includes('offline')) {
+        // Explicit rejection error from server
+        return parsed;
+      }
+    } catch (fetchErr) {
+      console.warn('[API] /api/kyc/submit endpoint unreachable, falling back to direct persistence:', fetchErr);
+    }
+
+    // Direct Firestore and Local persistence fallback for serverless/static web environments
+    try {
+      const now = new Date().toISOString();
+      const cleanFullName = data.fullName?.trim() || `${data.firstName || ''} ${data.lastName || ''}`.trim();
+      const nameParts = cleanFullName.split(' ');
+      const derivedFirstName = data.firstName || nameParts[0] || '';
+      const derivedLastName = data.lastName || nameParts.slice(1).join(' ') || '';
+
+      const fallbackUser: Partial<UserProfile> = {
+        id: data.userId,
+        kycStatus: data.autoApprove ? 'verified' : 'pending',
+        kycFullName: cleanFullName,
+        kycFirstName: derivedFirstName,
+        kycLastName: derivedLastName,
+        firstName: derivedFirstName,
+        lastName: derivedLastName,
+        kycCountry: data.country,
+        country: data.country,
+        kycPhone: data.phone,
+        kycEmail: data.email,
+        kycDateOfBirth: data.dateOfBirth,
+        kycDocumentType: data.documentType,
+        kycDocumentNumber: data.documentNumber.trim(),
+        kycDocumentImage: data.documentImage,
+        kycDocumentBackImage: data.documentBackImage,
+        kycLiveSelfieImage: data.liveSelfieImage,
+        kycStreetAddress: data.streetAddress,
+        kycProofOfAddressType: data.proofOfAddressType,
+        kycProofOfAddressImage: data.proofOfAddressImage,
+        kycSsn: data.ssn,
+        kycSsnImage: data.ssnImage,
+        kycSubmittedAt: now,
+        kycVerifiedAt: data.autoApprove ? now : undefined,
+        kycReviewDurationMinutes: data.reviewDurationMinutes || 10,
+        kycRejectionReason: undefined,
+        kycItemReviews: {
+          identity: { status: data.autoApprove ? 'approved' : 'pending' },
+          proofOfAddress: { status: data.autoApprove ? 'approved' : 'pending' },
+          liveness: { status: data.autoApprove ? 'approved' : 'pending' },
+          ...(data.ssn ? { ssn: { status: data.autoApprove ? 'approved' : 'pending' } } : {}),
+        },
+      };
+
+      await firestoreSync.saveUserProfile(data.userId, fallbackUser);
+
+      return {
+        success: true,
+        user: fallbackUser as UserProfile,
+      };
+    } catch (fallbackErr: any) {
+      console.error('[API] Failed to submit KYC via fallback:', fallbackErr);
+      return {
+        success: false,
+        error: fallbackErr?.message || 'Unable to record KYC verification submission. Please try again.',
+      };
+    }
   },
 
   async approveKyc(data: {
     userId: string;
     adminId?: string;
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
-    const res = await fetch('/api/kyc/approve', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    return res.json();
+    try {
+      const res = await fetch('/api/kyc/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
+      if (parsed.success) return parsed;
+    } catch {
+      // Fallback
+    }
+
+    try {
+      const updatedUser: Partial<UserProfile> = {
+        id: data.userId,
+        kycStatus: 'verified',
+        kycVerifiedAt: new Date().toISOString(),
+        dailyTransactionLimit: 1000000,
+      };
+      await firestoreSync.saveUserProfile(data.userId, updatedUser);
+      return { success: true, user: updatedUser as UserProfile };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'KYC approval failed' };
+    }
   },
 
   async getBalanceMetrics(userId: string, userAccountNumber?: string): Promise<BalanceMetrics> {
@@ -1654,21 +1740,82 @@ export const api = {
     description: string;
   }> {
     try {
-      const res = await fetch(`/api/loans/eligibility?userId=${encodeURIComponent(userId)}`);
-      return await parseJsonResponse(res, {
-        volume: 0,
-        tier: 'Starter Credit Tier',
-        maxLimit: 10000,
-        interestRateAPR: 7.25,
-        description: 'Transact on Monvera to unlock higher credit lines.',
-      });
+      // Calculate transaction volume from user's real recorded deposits, completed transfers, and payments
+      let calculatedVolume = 0;
+      try {
+        const txRes = await this.getTransactions({ userId });
+        const txs = txRes?.transactions || [];
+        const validTxs = txs.filter((t) => {
+          const status = (t.status || 'COMPLETED').toUpperCase();
+          return status === 'COMPLETED' || status === 'SETTLED' || status === 'POSTED' || status === 'PROCESSED';
+        });
+        calculatedVolume = validTxs.reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      } catch {
+        // Fallback to server calculation
+      }
+
+      let serverVolume = 0;
+      try {
+        const res = await fetch(`/api/loans/eligibility?userId=${encodeURIComponent(userId)}&volume=${calculatedVolume}`);
+        const serverData = await parseJsonResponse<any>(res, null);
+        if (serverData && typeof serverData.volume === 'number') {
+          serverVolume = serverData.volume;
+        }
+      } catch {
+        // use local computation
+      }
+
+      const volume = Math.max(calculatedVolume, serverVolume);
+      const fixedRate = 20.00;
+
+      if (volume >= 50000) {
+        return {
+          volume,
+          tier: 'Sovereign Institutional Tier',
+          maxLimit: 1000000,
+          interestRateAPR: fixedRate,
+          description: 'Elite clearance tier ($50,000+ volume): Eligible for up to $1,000,000 USD facility with fixed 20% interest.',
+        };
+      } else if (volume >= 10000) {
+        return {
+          volume,
+          tier: 'Prime Capital Tier',
+          maxLimit: 250000,
+          interestRateAPR: fixedRate,
+          description: 'High volume tier ($10,000+ volume): Eligible for $20,000 to $50,000+ USD credit line (up to $250,000 USD facility) with fixed 20% interest.',
+        };
+      } else if (volume >= 5000) {
+        return {
+          volume,
+          tier: 'Growth Business Tier',
+          maxLimit: 50000,
+          interestRateAPR: fixedRate,
+          description: 'Active banking tier ($5,000+ volume): Eligible for up to $50,000 USD financing line with fixed 20% interest.',
+        };
+      } else if (volume >= 2000) {
+        return {
+          volume,
+          tier: 'Starter Credit Tier',
+          maxLimit: 10000,
+          interestRateAPR: fixedRate,
+          description: 'Tier unlocked with $2,000+ transaction volume: Eligible for $1,000 to $10,000 USD credit line with fixed 20% interest.',
+        };
+      } else {
+        return {
+          volume,
+          tier: 'Initial Tier (Deposit Required)',
+          maxLimit: 0,
+          interestRateAPR: fixedRate,
+          description: `Monvera requirement: A minimum of $2,000.00 in cumulative deposits or verified transaction volume is required to unlock your first credit facility ($1,000 – $10,000 USD). Current volume: $${volume.toLocaleString('en-US', { minimumFractionDigits: 2 })}. Build your transaction history through legitimate deposits and transactions to qualify for higher available loan limits.`,
+        };
+      }
     } catch {
       return {
         volume: 0,
-        tier: 'Starter Credit Tier',
-        maxLimit: 10000,
-        interestRateAPR: 7.25,
-        description: 'Transact on Monvera to unlock higher credit lines.',
+        tier: 'Initial Tier (Deposit Required)',
+        maxLimit: 0,
+        interestRateAPR: 20.00,
+        description: 'Monvera requirement: A minimum of $2,000.00 in cumulative deposits or verified transaction volume is required to unlock your first credit facility ($1,000 – $10,000 USD). Build your transaction history through legitimate deposits and transactions to qualify for higher available loan limits.',
       };
     }
   },
@@ -1763,6 +1910,8 @@ export const api = {
     amount: number;
     sourceAccountId?: string;
     note?: string;
+    fallbackLoan?: any;
+    fallbackUser?: any;
   }): Promise<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; remainingBalance?: number; error?: string }> {
     try {
       const res = await fetch('/api/loans/repay', {

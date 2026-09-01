@@ -180,7 +180,7 @@ export const AdminLoansView: React.FC = () => {
     try {
       const res = await api.adminRejectLoan({
         loanId: rejectModalLoan.id,
-        reason: rejectionReason || 'Application does not meet current transaction volume underwriting guidelines.',
+        reason: rejectionReason || 'Application does not meet current transaction volume Monvera guidelines.',
         adminId: currentUser?.id || 'usr_admin',
       });
 
@@ -233,10 +233,10 @@ export const AdminLoansView: React.FC = () => {
         <div>
           <div className="inline-flex items-center gap-2 text-xs font-mono font-black uppercase tracking-wider text-emerald-400 bg-emerald-950/60 px-3 py-1 rounded-lg border border-emerald-500/30 mb-2">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span>Institutional Credit & Underwriting Terminal</span>
+            <span>Institutional Credit & Monvera Terminal</span>
           </div>
           <h1 className="text-3xl sm:text-4xl font-black text-white tracking-tight">
-            Loan Underwriting & Review
+            Loan Monvera & Review
           </h1>
           <p className="text-slate-400 text-sm sm:text-base font-bold mt-1">
             Review customer credit applications, verify live transaction history & deposit qualification, and disburse capital directly to checking accounts.
@@ -284,7 +284,7 @@ export const AdminLoansView: React.FC = () => {
             <Clock className="w-5 h-5 text-amber-400" />
           </div>
           <div className="text-2xl sm:text-3xl font-black text-white font-mono">{pendingLoans.length}</div>
-          <p className="text-xs font-bold text-slate-400">Applications awaiting underwriting</p>
+          <p className="text-xs font-bold text-slate-400">Applications awaiting Monvera review</p>
         </div>
 
         <div className="bg-slate-850 border border-slate-750 rounded-2xl p-5 space-y-2">
@@ -436,7 +436,7 @@ export const AdminLoansView: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Financial & Underwriting Metrics Grid (with 3-Card Clarity) */}
+                {/* Financial & Monvera Metrics Grid (with 3-Card Clarity) */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 bg-slate-900/60 p-4 rounded-xl border border-slate-750 text-sm">
                   <div>
                     <span className="text-xs font-bold text-slate-400 uppercase block">Requested Principal</span>

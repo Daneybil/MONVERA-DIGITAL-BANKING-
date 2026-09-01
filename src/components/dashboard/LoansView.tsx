@@ -212,18 +212,11 @@ export const LoansView: React.FC = () => {
 
   // Set default source account when repayment modal opens
   useEffect(() => {
-    if (repayModalLoan && balanceMetrics?.accounts && balanceMetrics.accounts.length > 0) {
+    if (repayModalLoan && balanceMetrics?.accounts && balanceMetrics.accounts.length > 0 && !selectedSourceAccount) {
       const chk = balanceMetrics.accounts.find((a) => a.type === 'CHECKING') || balanceMetrics.accounts[0];
       setSelectedSourceAccount(chk.id);
-
-      const totalRepay = repayModalLoan.totalRepaymentAmount || Number((repayModalLoan.amount * 1.20).toFixed(2));
-      const remaining = repayModalLoan.remainingBalance !== undefined ? repayModalLoan.remainingBalance : totalRepay;
-      
-      setRepayAmountType('full');
-      setCustomRepayAmount(remaining);
-      setRepayFeedback(null);
     }
-  }, [repayModalLoan, balanceMetrics]);
+  }, [repayModalLoan, balanceMetrics, selectedSourceAccount]);
 
   // Fixed 20% Interest Calculation across all terms
   const totalInterest = Number((amount * 0.20).toFixed(2));
@@ -269,7 +262,7 @@ export const LoansView: React.FC = () => {
       if (res.success && res.loan) {
         setFeedback({
           type: 'success',
-          message: `Loan application for $${amount.toLocaleString('en-US')} submitted to underwriting! You will receive a notification upon review.`,
+          message: `Loan application for $${amount.toLocaleString('en-US')} submitted to Monvera! You will receive a notification upon review.`,
         });
         loadData();
         refreshBalance();
@@ -280,7 +273,7 @@ export const LoansView: React.FC = () => {
         });
       }
     } catch (err: any) {
-      setFeedback({ type: 'error', message: err?.message || 'Error communicating with loan underwriting.' });
+      setFeedback({ type: 'error', message: err?.message || 'Error communicating with Monvera.' });
     } finally {
       setIsSubmitting(false);
     }
@@ -293,6 +286,10 @@ export const LoansView: React.FC = () => {
     setRepayAmountType('full');
     setCustomRepayAmount(remaining);
     setRepayFeedback(null);
+    if (balanceMetrics?.accounts && balanceMetrics.accounts.length > 0) {
+      const chk = balanceMetrics.accounts.find((a) => a.type === 'CHECKING') || balanceMetrics.accounts[0];
+      setSelectedSourceAccount(chk.id);
+    }
   };
 
   const handleProcessRepayment = async () => {
@@ -327,12 +324,21 @@ export const LoansView: React.FC = () => {
     setRepayFeedback(null);
 
     try {
+      const applicantAccount = currentUser.permanentAccountNumber || (balanceMetrics?.accounts?.[0]?.accountNumber) || '1088492015';
       const res = await api.repayLoan({
         loanId: repayModalLoan.id,
         userId: currentUser.id,
         amount: amountToPay,
         sourceAccountId: selectedSourceAccount,
         note: repayAmountType === 'full' ? 'Full Loan Payoff Settlement' : `Partial Installment Repayment ($${amountToPay})`,
+        fallbackLoan: repayModalLoan,
+        fallbackUser: {
+          firstName: currentUser.firstName || 'Valued',
+          lastName: currentUser.lastName || 'Customer',
+          email: currentUser.email || 'customer@monvera.com',
+          phone: currentUser.phone || '+1 (555) 019-2834',
+          permanentAccountNumber: applicantAccount,
+        },
       });
 
       if (res.success && res.loan) {
@@ -488,7 +494,7 @@ export const LoansView: React.FC = () => {
             <div>
               <h4 className="text-lg font-black text-amber-950">Minimum Deposit Requirement ($2,000 USD)</h4>
               <p className="text-sm sm:text-base font-bold text-amber-900 leading-relaxed mt-1">
-                Monvera institutional underwriting requires a cumulative deposit or completed transaction volume of <span className="underline font-black">$2,000.00</span> to unlock Tier 1 instant credit ($1,000 – $10,000 USD). Your current volume is <span className="font-mono font-black text-slate-950">${eligibility.volume.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>.
+                Monvera requires a cumulative deposit or completed transaction volume of <span className="underline font-black">$2,000.00</span> to unlock Tier 1 instant credit ($1,000 – $10,000 USD). Your current volume is <span className="font-mono font-black text-slate-950">${eligibility.volume.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>. Build your transaction history through legitimate deposits and transactions to qualify for higher available loan limits.
               </p>
             </div>
           </div>
@@ -536,7 +542,7 @@ export const LoansView: React.FC = () => {
               Apply for Capital Liquidity
             </h2>
             <p className="text-sm font-bold text-slate-700 mt-1">
-              Submit your request to Monvera Underwriting for disbursement directly into your checking account.
+              Submit your request to Monvera for disbursement directly into your checking account.
             </p>
           </div>
 
@@ -797,7 +803,7 @@ export const LoansView: React.FC = () => {
                           ) : loan.status === 'PENDING' ? (
                             <span className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-black uppercase text-amber-950 bg-amber-100 px-4 py-2 rounded-xl border-2 border-amber-400 animate-pulse shadow-sm">
                               <Clock className="w-4 h-4 text-amber-700" />
-                              Underwriting In Review
+                              Monvera In Review
                             </span>
                           ) : loan.status === 'REJECTED' ? (
                             <span className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-black uppercase text-red-950 bg-red-100 px-4 py-2 rounded-xl border-2 border-red-400 shadow-sm">
@@ -941,7 +947,7 @@ export const LoansView: React.FC = () => {
                       {loan.status === 'REJECTED' && loan.rejectionReason && (
                         <div className="p-4 bg-red-100 rounded-2xl border-2 border-red-400 text-xs font-bold text-red-950 space-y-1">
                           <span className="font-black uppercase tracking-wider text-red-950 block">
-                            Underwriting Compliance Note:
+                            Monvera Compliance Note:
                           </span>
                           <p className="leading-relaxed text-sm">{loan.rejectionReason}</p>
                         </div>
@@ -967,7 +973,7 @@ export const LoansView: React.FC = () => {
                           </div>
                         ) : (
                           <div className="text-xs font-black text-slate-500">
-                            Status: Underwriting Compliance Assessment
+                            Status: Monvera Compliance Assessment
                           </div>
                         )}
 
@@ -1111,22 +1117,22 @@ export const LoansView: React.FC = () => {
                   {/* Repayment Type Selector */}
                   <div className="space-y-2">
                     <label className="text-xs font-black uppercase tracking-wider text-slate-950 block">
-                      Choose Repayment Method:
+                      Choose Repayment Option:
                     </label>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                       <button
                         type="button"
                         onClick={() => {
                           setRepayAmountType('full');
                           setCustomRepayAmount(currentRemaining);
                         }}
-                        className={`py-3 px-2 rounded-xl text-xs font-black transition-all cursor-pointer text-center ${
+                        className={`py-3 px-3 rounded-xl text-xs font-black transition-all cursor-pointer text-center ${
                           repayAmountType === 'full'
-                            ? 'bg-emerald-700 text-white border-2 border-emerald-950 shadow-md scale-102'
+                            ? 'bg-emerald-700 text-white border-2 border-emerald-950 shadow-md ring-2 ring-emerald-500'
                             : 'bg-slate-100 text-slate-800 border-2 border-slate-300 hover:bg-slate-200'
                         }`}
                       >
-                        <div>Pay Full Balance</div>
+                        <div className="font-black text-sm">Pay Full Balance</div>
                         <div className="font-mono text-[11px] opacity-90 mt-0.5">${currentRemaining.toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>
                       </button>
 
@@ -1136,27 +1142,32 @@ export const LoansView: React.FC = () => {
                           setRepayAmountType('installment');
                           setCustomRepayAmount(Math.min(repayModalLoan.monthlyPayment, currentRemaining));
                         }}
-                        className={`py-3 px-2 rounded-xl text-xs font-black transition-all cursor-pointer text-center ${
+                        className={`py-3 px-3 rounded-xl text-xs font-black transition-all cursor-pointer text-center ${
                           repayAmountType === 'installment'
-                            ? 'bg-emerald-700 text-white border-2 border-emerald-950 shadow-md scale-102'
+                            ? 'bg-emerald-700 text-white border-2 border-emerald-950 shadow-md ring-2 ring-emerald-500'
                             : 'bg-slate-100 text-slate-800 border-2 border-slate-300 hover:bg-slate-200'
                         }`}
                       >
-                        <div>Monthly Installment</div>
+                        <div className="font-black text-sm">Monthly Installment</div>
                         <div className="font-mono text-[11px] opacity-90 mt-0.5">${Math.min(repayModalLoan.monthlyPayment, currentRemaining).toLocaleString('en-US')}</div>
                       </button>
 
                       <button
                         type="button"
-                        onClick={() => setRepayAmountType('custom')}
-                        className={`py-3 px-2 rounded-xl text-xs font-black transition-all cursor-pointer text-center ${
+                        onClick={() => {
+                          setRepayAmountType('custom');
+                          if (!customRepayAmount || customRepayAmount === currentRemaining) {
+                            setCustomRepayAmount(Math.min(repayModalLoan.monthlyPayment, currentRemaining));
+                          }
+                        }}
+                        className={`py-3 px-3 rounded-xl text-xs font-black transition-all cursor-pointer text-center ${
                           repayAmountType === 'custom'
-                            ? 'bg-emerald-700 text-white border-2 border-emerald-950 shadow-md scale-102'
+                            ? 'bg-emerald-700 text-white border-2 border-emerald-950 shadow-md ring-2 ring-emerald-500'
                             : 'bg-slate-100 text-slate-800 border-2 border-slate-300 hover:bg-slate-200'
                         }`}
                       >
-                        <div>Custom Partial</div>
-                        <div className="font-mono text-[11px] opacity-90 mt-0.5">Enter amount</div>
+                        <div className="font-black text-sm">Custom Partial Payment</div>
+                        <div className="font-mono text-[11px] opacity-90 mt-0.5">Enter custom amount</div>
                       </button>
                     </div>
                   </div>
