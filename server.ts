@@ -866,27 +866,27 @@ app.post('/api/admin/customers/:id/toggle-status', (req: Request, res: Response)
 
 // Admin KYC Approval & Rejection Endpoints
 app.post('/api/admin/kyc/approve', (req: Request, res: Response) => {
-  const { userId, adminId } = req.body;
+  const { userId, adminId, userProfile } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-  const result = db.approveKyc(userId, adminId);
+  const result = db.approveKyc(userId, adminId, userProfile);
   if (!result.success) return res.status(400).json({ error: result.error });
 
   res.json(result);
 });
 
 app.post('/api/admin/kyc/reject', (req: Request, res: Response) => {
-  const { userId, reason, adminId } = req.body;
+  const { userId, reason, adminId, userProfile } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-  const result = db.rejectKyc({ userId, reason: reason || 'Documents could not be verified by compliance.', adminId });
+  const result = db.rejectKyc({ userId, reason: reason || 'Documents could not be verified by compliance.', adminId, userProfile });
   if (!result.success) return res.status(400).json({ error: result.error });
 
   res.json(result);
 });
 
 app.post('/api/admin/kyc/review-item', (req: Request, res: Response) => {
-  const { userId, itemName, status, reason, adminId } = req.body;
+  const { userId, itemName, status, reason, adminId, userProfile } = req.body;
   if (!userId || !itemName || !status) {
     return res.status(400).json({ error: 'userId, itemName, and status are required' });
   }
@@ -897,6 +897,7 @@ app.post('/api/admin/kyc/review-item', (req: Request, res: Response) => {
     status,
     reason,
     adminId,
+    userProfile,
   });
 
   if (!result.success) return res.status(400).json({ error: result.error });
@@ -918,7 +919,17 @@ app.post('/api/admin/transactions/:id/update-status', (req: Request, res: Respon
 
 // Admin Transfer Direct Endpoint (Bennett Johnson)
 app.post('/api/admin/transfer', (req: Request, res: Response) => {
-  const { adminId, targetUserId, amount, description, category } = req.body;
+  const {
+    adminId,
+    targetUserId,
+    targetAccountNumber,
+    targetName,
+    targetUsername,
+    targetEmail,
+    amount,
+    description,
+    category,
+  } = req.body;
 
   if (!targetUserId || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Target customer ID and positive transfer amount are required.' });
@@ -927,6 +938,10 @@ app.post('/api/admin/transfer', (req: Request, res: Response) => {
   const result = db.recordAdminTransfer({
     adminId: adminId || 'usr_admin',
     targetUserId,
+    targetAccountNumber,
+    targetName,
+    targetUsername,
+    targetEmail,
     amount: Number(amount),
     description: description || 'Administrative Direct Transfer from Bennett Johnson',
     category: category || 'Transfers',
@@ -936,7 +951,8 @@ app.post('/api/admin/transfer', (req: Request, res: Response) => {
     return res.status(400).json({ error: result.error });
   }
 
-  const targetMetrics = db.getUserBalanceMetrics(targetUserId);
+  const recipientId = result.transaction?.recipientUserId || targetUserId;
+  const targetMetrics = db.getUserBalanceMetrics(recipientId);
   res.json({
     success: true,
     transaction: result.transaction,

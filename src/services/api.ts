@@ -1294,13 +1294,30 @@ export const api = {
   },
 
   async getNotifications(userId?: string): Promise<{ notifications: NotificationItem[] }> {
+    const notifMap = new Map<string, NotificationItem>();
+
+    // 1. Fetch from permanent Firestore notifications
+    if (userId) {
+      try {
+        const fsNotifs = await firestoreSync.getNotificationsForUser(userId);
+        fsNotifs.forEach((n) => notifMap.set(n.id, n));
+      } catch {}
+    }
+
+    // 2. Fetch from backend Express API
     try {
       const url = userId ? `/api/notifications?userId=${encodeURIComponent(userId)}` : '/api/notifications';
       const res = await fetch(url);
-      return await parseJsonResponse(res, { notifications: [] });
-    } catch {
-      return { notifications: [] };
-    }
+      const data = await parseJsonResponse<{ notifications: NotificationItem[] }>(res, { notifications: [] });
+      if (data && Array.isArray(data.notifications)) {
+        data.notifications.forEach((n) => notifMap.set(n.id, n));
+      }
+    } catch {}
+
+    const sorted = Array.from(notifMap.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    return { notifications: sorted };
   },
 
   async markNotificationsRead(userId: string): Promise<{ success: boolean }> {
@@ -1440,20 +1457,80 @@ export const api = {
     dataOrUserId: string | { userId: string; adminId?: string },
     adminId?: string
   ): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
-    const payload =
-      typeof dataOrUserId === 'string'
-        ? { userId: dataOrUserId, adminId }
-        : dataOrUserId;
+    const userId = typeof dataOrUserId === 'string' ? dataOrUserId : dataOrUserId.userId;
+    const effectiveAdminId = (typeof dataOrUserId === 'string' ? adminId : dataOrUserId.adminId) || adminId || 'usr_admin';
+
+    if (!userId) {
+      return { success: false, error: 'User ID is required for KYC approval.' };
+    }
 
     try {
-      const res = await fetch('/api/admin/kyc/approve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      // 1. Authoritatively fetch the current user profile from Firestore
+      const existing = await firestoreSync.getUserProfile(userId);
+      const now = new Date().toISOString();
+      const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
+                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
+                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'USA';
+
+      // 2. Prepare verified profile - strictly preserving ALL submitted KYC documents and profile fields
+      const updatedProfile: UserProfile = {
+        ...(existing || {
+          id: userId,
+          username: `user_${userId.slice(0, 6)}`,
+          firstName: '',
+          lastName: '',
+          email: '',
+          phone: '',
+          permanentAccountNumber: '1000000000',
+          country: 'United States',
+          role: 'customer',
+          membershipTier: 'Premier',
+          twoFactorEnabled: false,
+          createdAt: now,
+        }),
+        kycStatus: 'verified',
+        status: 'active',
+        kycVerifiedAt: now,
+        dailyTransactionLimit: 1000000,
+        kycRejectionReason: undefined,
+        kycItemReviews: {
+          identity: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
+          proofOfAddress: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
+          liveness: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
+          ...(isUS || existing?.kycSsn
+            ? { ssn: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId } }
+            : {}),
+        },
+      };
+
+      // 3. Authoritatively persist to Firestore
+      await firestoreSync.saveUserProfile(userId, updatedProfile);
+
+      // 4. Save notification to Firestore for the user
+      await firestoreSync.saveNotification({
+        id: `notif_kyc_app_${Date.now()}`,
+        userId: userId,
+        title: 'KYC Verification Approved by Compliance',
+        message: 'Your banking profile has been officially verified by Monvera Compliance Operations. Full account limits ($1,000,000/day) and verified status are active.',
+        type: 'SECURITY',
+        severity: 'success',
+        read: false,
+        createdAt: now,
       });
-      return await parseJsonResponse(res, { success: false, error: 'KYC approval service unavailable' });
-    } catch {
-      return { success: false, error: 'KYC approval request failed' };
+
+      // 5. Also sync to backend to keep server cache aligned
+      try {
+        await fetch('/api/admin/kyc/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, adminId: effectiveAdminId, userProfile: updatedProfile }),
+        });
+      } catch {}
+
+      return { success: true, user: updatedProfile };
+    } catch (err: any) {
+      console.error('[adminApproveKyc] Error:', err);
+      return { success: false, error: err?.message || 'KYC approval failed' };
     }
   },
 
@@ -1462,20 +1539,80 @@ export const api = {
     reason?: string,
     adminId?: string
   ): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
-    const payload =
-      typeof dataOrUserId === 'string'
-        ? { userId: dataOrUserId, reason: reason || 'Compliance review failed', adminId }
-        : dataOrUserId;
+    const userId = typeof dataOrUserId === 'string' ? dataOrUserId : dataOrUserId.userId;
+    const rejectionReason = (typeof dataOrUserId === 'string' ? reason : dataOrUserId.reason) || reason || 'Compliance review failed';
+    const effectiveAdminId = (typeof dataOrUserId === 'string' ? adminId : dataOrUserId.adminId) || adminId || 'usr_admin';
+
+    if (!userId) {
+      return { success: false, error: 'User ID is required for KYC rejection.' };
+    }
 
     try {
-      const res = await fetch('/api/admin/kyc/reject', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      // 1. Authoritatively fetch the current user profile from Firestore
+      const existing = await firestoreSync.getUserProfile(userId);
+      const now = new Date().toISOString();
+      const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
+                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
+                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'USA';
+
+      // 2. Prepare rejected profile - strictly preserving ALL submitted KYC documents and profile fields
+      const updatedProfile: UserProfile = {
+        ...(existing || {
+          id: userId,
+          username: `user_${userId.slice(0, 6)}`,
+          firstName: '',
+          lastName: '',
+          email: '',
+          phone: '',
+          permanentAccountNumber: '1000000000',
+          country: 'United States',
+          role: 'customer',
+          membershipTier: 'Premier',
+          twoFactorEnabled: false,
+          createdAt: now,
+        }),
+        kycStatus: 'action_required',
+        kycRejectionReason: rejectionReason,
+        dailyTransactionLimit: 25000,
+        status: existing?.status || 'active',
+        kycItemReviews: {
+          identity: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason },
+          proofOfAddress: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason },
+          liveness: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason },
+          ...(isUS || existing?.kycSsn
+            ? { ssn: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason } }
+            : {}),
+        },
+      };
+
+      // 3. Authoritatively persist to Firestore
+      await firestoreSync.saveUserProfile(userId, updatedProfile);
+
+      // 4. Save notification to Firestore for the user
+      await firestoreSync.saveNotification({
+        id: `notif_kyc_rej_${Date.now()}`,
+        userId: userId,
+        title: 'KYC Document Verification Status',
+        message: `Your identity verification requires attention. Reason: ${rejectionReason}. Please review and re-submit the required documents in your Profile.`,
+        type: 'SECURITY',
+        severity: 'warning',
+        read: false,
+        createdAt: now,
       });
-      return await parseJsonResponse(res, { success: false, error: 'KYC rejection service unavailable' });
-    } catch {
-      return { success: false, error: 'KYC rejection request failed' };
+
+      // 5. Also sync to backend to keep server cache aligned
+      try {
+        await fetch('/api/admin/kyc/reject', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId, reason: rejectionReason, adminId: effectiveAdminId, userProfile: updatedProfile }),
+        });
+      } catch {}
+
+      return { success: true, user: updatedProfile };
+    } catch (err: any) {
+      console.error('[adminRejectKyc] Error:', err);
+      return { success: false, error: err?.message || 'KYC rejection failed' };
     }
   },
 
@@ -1486,15 +1623,83 @@ export const api = {
     reason?: string;
     adminId?: string;
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
+    if (!data.userId || !data.itemName || !data.status) {
+      return { success: false, error: 'userId, itemName, and status are required' };
+    }
+
     try {
-      const res = await fetch('/api/admin/kyc/review-item', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      return await parseJsonResponse(res, { success: false, error: 'KYC item review service unavailable' });
-    } catch {
-      return { success: false, error: 'KYC item review request failed' };
+      const existing = await firestoreSync.getUserProfile(data.userId);
+      const now = new Date().toISOString();
+      const currentReviews = existing?.kycItemReviews || {};
+      const updatedReviews = {
+        ...currentReviews,
+        [data.itemName]: {
+          status: data.status,
+          reviewedAt: now,
+          reviewedBy: data.adminId || 'usr_admin',
+          reason: data.reason,
+        },
+      };
+
+      const requiredKeys = ['identity', 'proofOfAddress', 'liveness'];
+      if (existing?.kycSsn) requiredKeys.push('ssn');
+      const hasRejected = requiredKeys.some((k) => (updatedReviews as any)[k]?.status === 'rejected');
+      const allApproved = requiredKeys.every((k) => (updatedReviews as any)[k]?.status === 'approved');
+
+      let newKycStatus = existing?.kycStatus || 'pending';
+      let newRejectionReason = existing?.kycRejectionReason;
+      let newLimit = existing?.dailyTransactionLimit || 25000;
+      let newVerifiedAt = existing?.kycVerifiedAt;
+
+      if (hasRejected) {
+        newKycStatus = 'action_required';
+        newRejectionReason = data.reason || 'Document requires correction';
+      } else if (allApproved) {
+        newKycStatus = 'verified';
+        newVerifiedAt = now;
+        newLimit = 1000000;
+        newRejectionReason = undefined;
+      } else {
+        newKycStatus = 'pending';
+      }
+
+      const updatedProfile: UserProfile = {
+        ...(existing || {
+          id: data.userId,
+          username: `user_${data.userId.slice(0, 6)}`,
+          firstName: '',
+          lastName: '',
+          email: '',
+          phone: '',
+          permanentAccountNumber: '1000000000',
+          country: 'United States',
+          role: 'customer',
+          membershipTier: 'Premier',
+          twoFactorEnabled: false,
+          createdAt: now,
+          status: 'active',
+        }),
+        kycStatus: newKycStatus as any,
+        kycItemReviews: updatedReviews,
+        kycRejectionReason: newRejectionReason,
+        dailyTransactionLimit: newLimit,
+        kycVerifiedAt: newVerifiedAt,
+      };
+
+      await firestoreSync.saveUserProfile(data.userId, updatedProfile);
+
+      try {
+        await fetch('/api/admin/kyc/review-item', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...data, userProfile: updatedProfile }),
+        });
+      } catch {}
+
+      return { success: true, user: updatedProfile };
+    } catch (err: any) {
+      console.error('[adminReviewKycItem] Error:', err);
+      return { success: false, error: err?.message || 'KYC item review failed' };
     }
   },
 
@@ -1535,121 +1740,216 @@ export const api = {
     category?: Transaction['category'];
     adminId?: string;
   }): Promise<{ success: boolean; transaction?: Transaction; targetBalanceMetrics?: BalanceMetrics; error?: string }> {
+    if (!data.targetUserId || !data.amount || Number(data.amount) <= 0) {
+      return { success: false, error: 'Please enter a valid recipient account number and positive transfer amount.' };
+    }
+
+    // 1. Authoritatively resolve the recipient from Firestore or Directory
     let resolvedUser: UserProfile | null = null;
     try {
       resolvedUser = await firestoreSync.findRecipient(data.targetUserId);
     } catch {}
 
-    const targetId = resolvedUser?.id || data.targetUserId;
-    const targetAcc = resolvedUser?.permanentAccountNumber || (data.targetUserId.replace(/[-\s]/g, ''));
-    const targetName = resolvedUser ? `${resolvedUser.firstName} ${resolvedUser.lastName}`.trim() : 'Customer';
+    if (!resolvedUser) {
+      try {
+        resolvedUser = await firestoreSync.getUserProfile(data.targetUserId);
+      } catch {}
+    }
+
+    // Fallback: check local accounts directory cache
+    if (!resolvedUser && typeof window !== 'undefined' && window.localStorage) {
+      try {
+        const cachedRaw = localStorage.getItem('monvera_accounts_directory');
+        if (cachedRaw) {
+          const directory: UserProfile[] = JSON.parse(cachedRaw);
+          const cleanInput = data.targetUserId.trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
+          resolvedUser = directory.find((u) => {
+            const uAcc = (u.permanentAccountNumber || (u as any).accountNumber || '').replace(/[-\s]/g, '');
+            const uUser = (u.username || '').replace(/^@/, '').toLowerCase();
+            const uEmail = (u.email || '').toLowerCase();
+            const uId = (u.id || (u as any).uid || '').toLowerCase();
+            return (
+              (cleanInput && uAcc === cleanInput) ||
+              (cleanInput && uUser === cleanInput) ||
+              (cleanInput && uEmail === cleanInput) ||
+              (cleanInput && uId === cleanInput)
+            );
+          }) || null;
+        }
+      } catch {}
+    }
+
+    // Fallback: lookup via backend
+    if (!resolvedUser) {
+      try {
+        const lookup = await this.lookupRecipient(data.targetUserId, data.adminId || 'usr_admin');
+        if (lookup && lookup.valid) {
+          resolvedUser = {
+            id: lookup.recipientId,
+            username: lookup.username || 'customer',
+            firstName: lookup.firstName || 'Monvera',
+            lastName: lookup.lastName || 'Customer',
+            email: `${lookup.username || 'customer'}@monvera.com`,
+            phone: '+1 (555) 019-2834',
+            permanentAccountNumber: lookup.permanentAccountNumber,
+            country: 'United States',
+            status: 'active',
+            membershipTier: lookup.membershipTier || 'Premier',
+            role: 'customer',
+            createdAt: new Date().toISOString(),
+            twoFactorEnabled: false,
+            kycStatus: 'verified',
+            emailVerified: true,
+            dailyTransactionLimit: 1000000,
+          };
+        }
+      } catch {}
+    }
+
+    // Authoritatively reject if recipient cannot be resolved - DO NOT fall back to account number as targetId
+    if (!resolvedUser) {
+      return {
+        success: false,
+        error: 'Recipient account could not be resolved. Please verify the 10-digit Monvera permanent account number.',
+      };
+    }
+
+    const targetId = resolvedUser.id; // Strictly authoritative Firebase UID
+    const targetAcc = resolvedUser.permanentAccountNumber || data.targetUserId.replace(/[-\s]/g, '');
+    const targetName = `${resolvedUser.firstName || ''} ${resolvedUser.lastName || ''}`.trim() || 'Monvera Customer';
+    const targetUsername = resolvedUser.username;
+    const targetEmail = resolvedUser.email;
 
     try {
+      // 2. Authoritative backend transaction execution
       const res = await fetch('/api/admin/transfer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...data,
+          adminId: data.adminId || 'usr_admin',
           targetUserId: targetId,
           targetAccountNumber: targetAcc,
           targetName,
+          targetUsername,
+          targetEmail,
+          amount: Number(data.amount),
+          description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
+          category: data.category || 'Transfers',
         }),
       });
+
       const result = await parseJsonResponse<{ success: boolean; transaction?: Transaction; targetBalanceMetrics?: BalanceMetrics; error?: string }>(
         res,
-        { success: false, error: 'Admin transfer service unavailable' }
+        { success: false, error: 'Admin transfer server is unavailable' }
       );
 
-      const completedTx: Transaction = result.transaction || {
-        id: `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        referenceNumber: `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`,
-        type: 'TRANSFER',
-        amount: Number(data.amount),
-        currency: 'USD',
-        status: 'COMPLETED',
-        senderUserId: 'usr_admin',
-        senderName: 'Bennett Johnson',
-        senderAccountNumber: '1000000001',
-        recipientUserId: targetId,
-        recipientName: targetName,
-        recipientAccountNumber: targetAcc,
-        fee: 0.0,
-        description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
-        category: data.category || 'Transfers',
-        createdAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
-        metadata: {
-          adminSenderName: 'Bennett Johnson',
-          adminSenderAccount: '1000000001',
-          disbursementType: 'ADMINISTRATIVE_TRANSFER',
-        },
-      };
-
-      // Save to permanent Firestore collections
-      await firestoreSync.saveTransaction(completedTx);
-
-      // Recompute and persist balance
-      const updatedMetrics = await firestoreSync.getAccountBalances(targetId, targetAcc);
-      if (updatedMetrics) {
-        await firestoreSync.saveAccountBalances(targetId, updatedMetrics);
+      if (!result.success || !result.transaction) {
+        return { success: false, error: result.error || 'Failed to complete authoritative administrative transfer.' };
       }
 
-      // Save notification for customer
-      await firestoreSync.saveNotification({
-        id: `notif_${Date.now()}_adm_r`,
-        userId: targetId,
-        title: 'Money Received',
-        message: `Received $${Number(data.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} from Bennett Johnson (MVB •••• 0001).`,
-        type: 'TRANSACTION',
-        severity: 'success',
-        read: false,
-        createdAt: new Date().toISOString(),
-        referenceId: completedTx.referenceNumber,
-      });
+      const authoritativeTx: Transaction = result.transaction;
 
-      return {
-        success: true,
-        transaction: completedTx,
-        targetBalanceMetrics: updatedMetrics || result.targetBalanceMetrics,
-      };
-    } catch {
-      // Offline / direct persistence fallback
-      const fallbackTx: Transaction = {
-        id: `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        referenceNumber: `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`,
-        type: 'TRANSFER',
-        amount: Number(data.amount),
-        currency: 'USD',
-        status: 'COMPLETED',
-        senderUserId: 'usr_admin',
-        senderName: 'Bennett Johnson',
-        senderAccountNumber: '1000000001',
-        recipientUserId: targetId,
-        recipientName: targetName,
-        recipientAccountNumber: targetAcc,
-        fee: 0.0,
-        description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
-        category: data.category || 'Transfers',
-        createdAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
-        metadata: {
-          adminSenderName: 'Bennett Johnson',
-          adminSenderAccount: '1000000001',
-          disbursementType: 'ADMINISTRATIVE_TRANSFER',
-        },
-      };
+      // 3. Atomically persist to Firestore
+      try {
+        // 3a. Save transaction record to Firestore ledger
+        await firestoreSync.saveTransaction(authoritativeTx);
 
-      await firestoreSync.saveTransaction(fallbackTx);
-      const updatedMetrics = await firestoreSync.getAccountBalances(targetId, targetAcc);
-      if (updatedMetrics) {
-        await firestoreSync.saveAccountBalances(targetId, updatedMetrics);
+        // 3b. Read recipient's latest Firestore balance, add transfer amount, and persist to accounts/{targetId}
+        const transferAmt = Number(data.amount);
+        const currentRecipientMetrics = await firestoreSync.getAccountBalances(targetId, targetAcc);
+
+        const curChecking = Number(currentRecipientMetrics?.checkingBalance) || 0;
+        const curSavings = Number(currentRecipientMetrics?.savingsBalance) || 0;
+        const curInvested = Number(currentRecipientMetrics?.investedBalance) || 0;
+        const curAccrued = Number(currentRecipientMetrics?.accruedEarnings) || 0;
+        const curPending = Number(currentRecipientMetrics?.pendingBalance) || 0;
+        const curTotal = Number(currentRecipientMetrics?.totalBalance) || (curChecking + curSavings + curInvested + curAccrued);
+        const curAvailable = Number(currentRecipientMetrics?.availableBalance) || curChecking;
+        const curMonthlyIncome = Number((currentRecipientMetrics as any)?.monthlyIncome) || 0;
+        const curMonthlySpending = Number((currentRecipientMetrics as any)?.monthlySpending) || 0;
+
+        const newChecking = curChecking + transferAmt;
+        const newAvailable = curAvailable + transferAmt;
+        const newTotal = curTotal + transferAmt;
+        const newMonthlyIncome = curMonthlyIncome + transferAmt;
+
+        const updatedRecipientMetrics: BalanceMetrics = {
+          checkingBalance: newChecking,
+          availableBalance: newAvailable,
+          totalBalance: newTotal,
+          savingsBalance: curSavings,
+          investedBalance: curInvested,
+          accruedEarnings: curAccrued,
+          pendingBalance: curPending,
+          accounts: [
+            {
+              id: `acc_chk_${targetId}`,
+              userId: targetId,
+              type: 'CHECKING',
+              accountNumber: targetAcc || '1000000000',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: newChecking,
+              availableBalance: newAvailable,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 1.25,
+              status: 'ACTIVE',
+              nickname: 'Monvera Premier Checking',
+            },
+            {
+              id: `acc_sav_${targetId}`,
+              userId: targetId,
+              type: 'SAVINGS',
+              accountNumber: targetAcc ? `10${targetAcc.slice(2, -3)}991` : '1000000991',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: curSavings,
+              availableBalance: curSavings,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 4.85,
+              status: 'ACTIVE',
+              nickname: 'Monvera High-Yield Treasury',
+            },
+          ],
+        };
+
+        // Also preserve monthly tracking metrics
+        (updatedRecipientMetrics as any).monthlyIncome = newMonthlyIncome;
+        (updatedRecipientMetrics as any).monthlySpending = curMonthlySpending;
+
+        await firestoreSync.saveAccountBalances(targetId, updatedRecipientMetrics);
+
+        // 3c. Create and save official recipient notification in Firestore
+        const notifId = `notif_${Date.now()}_adm_${Math.random().toString(36).substring(2, 6)}`;
+        await firestoreSync.saveNotification({
+          id: notifId,
+          userId: targetId,
+          title: 'Money Received',
+          message: `Received $${Number(data.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} from Bennett Johnson (MVB •••• 0001).`,
+          type: 'TRANSACTION',
+          severity: 'success',
+          read: false,
+          createdAt: authoritativeTx.createdAt || new Date().toISOString(),
+          referenceId: authoritativeTx.referenceNumber,
+        });
+
+        return {
+          success: true,
+          transaction: authoritativeTx,
+          targetBalanceMetrics: updatedRecipientMetrics,
+        };
+      } catch (fsErr) {
+        console.warn('[Firestore] Sync note during admin transfer:', fsErr);
+        return {
+          success: true,
+          transaction: authoritativeTx,
+          targetBalanceMetrics: result.targetBalanceMetrics,
+        };
       }
-
-      return {
-        success: true,
-        transaction: fallbackTx,
-        targetBalanceMetrics: updatedMetrics || undefined,
-      };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Network error occurred while processing administrative transfer.' };
     }
   },
 

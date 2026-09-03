@@ -430,6 +430,10 @@ export class MonveraDatabase {
   // --- Official Administrative Transfer from Bennett Johnson ---
   public recordAdminTransfer(params: {
     targetUserId: string;
+    targetAccountNumber?: string;
+    targetName?: string;
+    targetUsername?: string;
+    targetEmail?: string;
     amount: number;
     description?: string;
     category?: Transaction['category'];
@@ -438,10 +442,11 @@ export class MonveraDatabase {
     let targetUser = this.users.get(params.targetUserId);
     if (!targetUser) {
       const cleanTarget = (params.targetUserId || '').replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
+      const cleanAcc = (params.targetAccountNumber || '').replace(/[-\s]/g, '').toLowerCase();
       targetUser = Array.from(this.users.values()).find(
         (u) =>
           u.id === params.targetUserId ||
-          (u.permanentAccountNumber && u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget) ||
+          (u.permanentAccountNumber && (u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget || (cleanAcc && u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanAcc))) ||
           (u.username && u.username.toLowerCase() === cleanTarget) ||
           (u.email && u.email.toLowerCase() === cleanTarget) ||
           `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanTarget
@@ -449,28 +454,34 @@ export class MonveraDatabase {
     }
 
     if (!targetUser) {
-      // Dynamic user fallback for users registered across Firestore sessions
-      const cleanDigits = (params.targetUserId || '').replace(/[-\s]/g, '');
-      const dynamicId = params.targetUserId.startsWith('usr_') ? params.targetUserId : `usr_${params.targetUserId}`;
-      targetUser = {
-        id: dynamicId,
-        username: `user_${cleanDigits.slice(-4) || 'customer'}`,
-        firstName: 'Monvera',
-        lastName: 'Customer',
-        email: `customer_${cleanDigits || Date.now()}@monvera.com`,
-        phone: '+1 (555) 019-2834',
-        country: 'United States',
-        permanentAccountNumber: cleanDigits.length >= 8 ? cleanDigits : `10${Math.floor(10000000 + Math.random() * 90000000)}`,
-        status: 'active',
-        membershipTier: 'Premier',
-        role: 'customer',
-        createdAt: new Date().toISOString(),
-        twoFactorEnabled: false,
-        kycStatus: 'verified',
-        emailVerified: true,
-        dailyTransactionLimit: 1000000,
-      };
-      this.users.set(dynamicId, targetUser);
+      if (params.targetUserId && (params.targetAccountNumber || params.targetName)) {
+        // Register verified Firestore user into memory state using real Firebase UID and real details
+        const cleanAcc = (params.targetAccountNumber || params.targetUserId).replace(/[-\s]/g, '');
+        const nameParts = (params.targetName || 'Monvera Customer').trim().split(' ');
+        const fName = nameParts[0] || 'Monvera';
+        const lName = nameParts.slice(1).join(' ') || 'Customer';
+        targetUser = {
+          id: params.targetUserId,
+          username: params.targetUsername || `user_${cleanAcc.slice(-4) || 'customer'}`,
+          firstName: fName,
+          lastName: lName,
+          email: params.targetEmail || `${params.targetUsername || 'customer'}@monvera.com`,
+          phone: '+1 (555) 019-2834',
+          country: 'United States',
+          permanentAccountNumber: cleanAcc,
+          status: 'active',
+          membershipTier: 'Premier',
+          role: 'customer',
+          createdAt: new Date().toISOString(),
+          twoFactorEnabled: false,
+          kycStatus: 'verified',
+          emailVerified: true,
+          dailyTransactionLimit: 1000000,
+        };
+        this.users.set(params.targetUserId, targetUser);
+      } else {
+        return { success: false, error: 'Recipient customer account not found. Please verify the account number.' };
+      }
     }
 
     if (!params.amount || params.amount <= 0) {
@@ -485,6 +496,46 @@ export class MonveraDatabase {
     };
 
     const targetChk = `acc_chk_${targetUser.id}`;
+    const targetSav = `acc_sav_${targetUser.id}`;
+    const recipientDisplayName = params.targetName || `${targetUser.firstName} ${targetUser.lastName}`.trim() || targetUser.username || 'Customer';
+    const recipientAcc = params.targetAccountNumber || targetUser.permanentAccountNumber;
+
+    if (!this.accounts.has(targetChk)) {
+      this.accounts.set(targetChk, {
+        id: targetChk,
+        userId: targetUser.id,
+        type: 'CHECKING',
+        accountNumber: recipientAcc || targetUser.permanentAccountNumber || '1000000000',
+        routingNumber: '021000021',
+        currency: 'USD',
+        balance: 0,
+        availableBalance: 0,
+        investedBalance: 0,
+        pendingBalance: 0,
+        interestRateAPY: 1.25,
+        status: 'ACTIVE',
+        nickname: 'Monvera Premier Checking',
+      });
+    }
+
+    if (!this.accounts.has(targetSav)) {
+      this.accounts.set(targetSav, {
+        id: targetSav,
+        userId: targetUser.id,
+        type: 'SAVINGS',
+        accountNumber: recipientAcc ? `10${recipientAcc.slice(2, -3)}991` : '1000000991',
+        routingNumber: '021000021',
+        currency: 'USD',
+        balance: 0,
+        availableBalance: 0,
+        investedBalance: 0,
+        pendingBalance: 0,
+        interestRateAPY: 4.85,
+        status: 'ACTIVE',
+        nickname: 'Monvera High-Yield Treasury',
+      });
+    }
+
     const txId = `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const refNum = `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
     const txTimestamp = new Date().toISOString();
@@ -500,8 +551,8 @@ export class MonveraDatabase {
       senderName: 'Bennett Johnson',
       senderAccountNumber: '1000000001',
       recipientUserId: targetUser.id,
-      recipientName: `${targetUser.firstName} ${targetUser.lastName}`.trim() || targetUser.username || 'Customer',
-      recipientAccountNumber: targetUser.permanentAccountNumber,
+      recipientName: recipientDisplayName,
+      recipientAccountNumber: recipientAcc,
       fee: 0.00,
       description: params.description || 'Administrative Direct Transfer from Bennett Johnson',
       category: params.category || 'Transfers',
@@ -1471,9 +1522,32 @@ export class MonveraDatabase {
     status: 'approved' | 'rejected' | 'pending';
     reason?: string;
     adminId?: string;
+    userProfile?: UserProfile;
   }): { success: boolean; user?: UserProfile; error?: string } {
-    const user = this.users.get(params.userId);
-    if (!user) return { success: false, error: 'Customer not found.' };
+    let user = this.users.get(params.userId);
+    if (!user && params.userProfile) {
+      this.users.set(params.userId, { ...params.userProfile });
+      user = this.users.get(params.userId);
+    }
+    if (!user) {
+      user = {
+        id: params.userId,
+        username: `user_${params.userId.slice(0, 6)}`,
+        firstName: '',
+        lastName: '',
+        email: '',
+        phone: '',
+        permanentAccountNumber: '1000000000',
+        country: 'United States',
+        role: 'customer',
+        membershipTier: 'Premier',
+        twoFactorEnabled: false,
+        createdAt: new Date().toISOString(),
+        status: 'active',
+        kycStatus: 'pending',
+      };
+      this.users.set(params.userId, user);
+    }
 
     const now = new Date().toISOString();
     if (!user.kycItemReviews) {
@@ -1563,9 +1637,31 @@ export class MonveraDatabase {
     return { success: true, user };
   }
 
-  public approveKyc(userId: string, adminId?: string): { success: boolean; user?: UserProfile; error?: string } {
-    const user = this.users.get(userId);
-    if (!user) return { success: false, error: 'Customer not found.' };
+  public approveKyc(userId: string, adminId?: string, userProfile?: UserProfile): { success: boolean; user?: UserProfile; error?: string } {
+    let user = this.users.get(userId);
+    if (!user && userProfile) {
+      this.users.set(userId, { ...userProfile });
+      user = this.users.get(userId);
+    }
+    if (!user) {
+      user = {
+        id: userId,
+        username: `user_${userId.slice(0, 6)}`,
+        firstName: '',
+        lastName: '',
+        email: '',
+        phone: '',
+        permanentAccountNumber: '1000000000',
+        country: 'United States',
+        role: 'customer',
+        membershipTier: 'Premier',
+        twoFactorEnabled: false,
+        createdAt: new Date().toISOString(),
+        status: 'active',
+        kycStatus: 'pending',
+      };
+      this.users.set(userId, user);
+    }
 
     const now = new Date().toISOString();
     user.kycStatus = 'verified';
@@ -1613,9 +1709,31 @@ export class MonveraDatabase {
     return { success: true, user };
   }
 
-  public rejectKyc(params: { userId: string; reason: string; adminId?: string }): { success: boolean; user?: UserProfile; error?: string } {
-    const user = this.users.get(params.userId);
-    if (!user) return { success: false, error: 'Customer not found.' };
+  public rejectKyc(params: { userId: string; reason: string; adminId?: string; userProfile?: UserProfile }): { success: boolean; user?: UserProfile; error?: string } {
+    let user = this.users.get(params.userId);
+    if (!user && params.userProfile) {
+      this.users.set(params.userId, { ...params.userProfile });
+      user = this.users.get(params.userId);
+    }
+    if (!user) {
+      user = {
+        id: params.userId,
+        username: `user_${params.userId.slice(0, 6)}`,
+        firstName: '',
+        lastName: '',
+        email: '',
+        phone: '',
+        permanentAccountNumber: '1000000000',
+        country: 'United States',
+        role: 'customer',
+        membershipTier: 'Premier',
+        twoFactorEnabled: false,
+        createdAt: new Date().toISOString(),
+        status: 'active',
+        kycStatus: 'pending',
+      };
+      this.users.set(params.userId, user);
+    }
 
     const now = new Date().toISOString();
     user.kycStatus = 'action_required';

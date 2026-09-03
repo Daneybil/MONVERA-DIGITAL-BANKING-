@@ -244,15 +244,50 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [currentUser]);
 
-  // Real-time synchronization interval (every 4 seconds for instant reflection)
+  // Real-time synchronization interval & Firestore onSnapshot listeners
   useEffect(() => {
-    if (!currentUser) return;
+    if (!currentUser?.id) return;
+
+    // 1. Real-time Firestore account balance listener under accounts/{uid}
+    const unsubBalance = firestoreSync.subscribeToAccountBalances(
+      currentUser.id,
+      currentUser.permanentAccountNumber,
+      (newMetrics) => {
+        setBalanceMetrics(newMetrics);
+        cacheUserBalances(currentUser.id, newMetrics);
+        setLastUpdateTimestamp(Date.now());
+      }
+    );
+
+    // 2. Real-time Firestore profile listener under users/{uid} for instant KYC status reflection
+    const unsubProfile = firestoreSync.subscribeToUserProfile(
+      currentUser.id,
+      (updatedProfile) => {
+        if (updatedProfile) {
+          setCurrentUser((prev) => {
+            if (!prev) return updatedProfile;
+            return {
+              ...prev,
+              ...updatedProfile,
+              avatarUrl: getPersistedAvatar(updatedProfile.id, updatedProfile.avatarUrl || prev.avatarUrl),
+            };
+          });
+        }
+      }
+    );
+
+    // 3. Fallback interval for polling notifications and backup sync
     const interval = setInterval(() => {
       refreshBalance();
       refreshNotifications();
     }, 4000);
-    return () => clearInterval(interval);
-  }, [currentUser, refreshBalance, refreshNotifications]);
+
+    return () => {
+      unsubBalance();
+      unsubProfile();
+      clearInterval(interval);
+    };
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, refreshBalance, refreshNotifications]);
 
   const getPersistedAvatar = (userId: string, defaultAvatar?: string) => {
     try {

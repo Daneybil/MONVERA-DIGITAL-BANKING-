@@ -327,6 +327,30 @@ export const firestoreSync = {
   },
 
   /**
+   * Fetch all notifications for a specific user from Firestore
+   */
+  async getNotificationsForUser(userId: string): Promise<NotificationItem[]> {
+    if (!userId || !db) return [];
+    try {
+      const notifCol = collection(db, 'notifications');
+      const qUser = query(notifCol, where('userId', '==', userId));
+      const snap = await getDocs(qUser);
+      const notifs: NotificationItem[] = [];
+      snap.forEach((d) => {
+        const item = d.data() as NotificationItem;
+        notifs.push({
+          id: d.id || item.id,
+          ...item,
+        });
+      });
+      return notifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    } catch (err) {
+      console.warn('[Firestore] Error fetching user notifications:', err);
+      return [];
+    }
+  },
+
+  /**
    * Save and update permanent user account balances in Firestore under accounts/{userId}
    */
   async saveAccountBalances(userId: string, balances: BalanceMetrics): Promise<boolean> {
@@ -514,38 +538,118 @@ export const firestoreSync = {
     try {
       const accRef = doc(db, 'accounts', userId);
       const snap = await getDoc(accRef);
-      const data = snap.exists() ? snap.data() : null;
+      let data = snap.exists() ? snap.data() : null;
 
-      // Also get Firestore transactions to guarantee balance synchronization
+      // Resilient check: If accounts/{userId} is missing or empty, check legacy accounts/{userAccountNumber}
+      if (!data && userAccountNumber) {
+        const cleanAcc = userAccountNumber.replace(/[-\s]/g, '');
+        if (cleanAcc && cleanAcc !== userId) {
+          try {
+            const legacyRef = doc(db, 'accounts', cleanAcc);
+            const legacySnap = await getDoc(legacyRef);
+            if (legacySnap.exists()) {
+              const legacyData = legacySnap.data();
+              // Seamlessly copy legacy balance into accounts/{userId} without deleting legacy document
+              await setDoc(accRef, {
+                userId,
+                ...legacyData,
+                migratedFromAccountNumberDoc: cleanAcc,
+                updatedAt: new Date().toISOString(),
+              }, { merge: true });
+              data = legacyData;
+            }
+          } catch {}
+        }
+      }
+
+      if (data) {
+        const chk = Number(data.checkingBalance ?? 0);
+        const sav = Number(data.savingsBalance ?? data.savings ?? 0);
+        const inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
+        const accrued = Number(data.accruedEarnings ?? 0);
+        const total = Number(
+          data.totalBalance ?? (chk + sav + inv + accrued)
+        );
+        const avail = Number(data.availableBalance ?? chk);
+        const accountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
+          ? data.accounts.map((a: any) => {
+              if (a.type === 'CHECKING') {
+                return { ...a, balance: chk, availableBalance: avail };
+              }
+              if (a.type === 'SAVINGS') {
+                return { ...a, balance: sav, availableBalance: sav };
+              }
+              if (a.type === 'INVESTMENT') {
+                return { ...a, balance: inv, investedBalance: inv };
+              }
+              return a;
+            })
+          : [
+              {
+                id: `acc_chk_${userId}`,
+                userId,
+                type: 'CHECKING',
+                accountNumber: userAccountNumber || '1000000000',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: chk,
+                availableBalance: avail,
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 1.25,
+                status: 'ACTIVE',
+                nickname: 'Monvera Premier Checking',
+              },
+              {
+                id: `acc_sav_${userId}`,
+                userId,
+                type: 'SAVINGS',
+                accountNumber: userAccountNumber ? `10${userAccountNumber.slice(2, -3)}991` : '1000000991',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: sav,
+                availableBalance: sav,
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 4.85,
+                status: 'ACTIVE',
+                nickname: 'Monvera High-Yield Treasury',
+              },
+            ];
+
+        const metrics: BalanceMetrics = {
+          checkingBalance: chk,
+          savingsBalance: sav,
+          investedBalance: inv,
+          accruedEarnings: accrued,
+          totalBalance: total,
+          availableBalance: avail,
+          pendingBalance: Number(data.pendingBalance ?? 0),
+          accounts: accountsList,
+        };
+
+        if (data.monthlyIncome !== undefined) {
+          (metrics as any).monthlyIncome = Number(data.monthlyIncome);
+        }
+        if (data.monthlySpending !== undefined) {
+          (metrics as any).monthlySpending = Number(data.monthlySpending);
+        }
+
+        return metrics;
+      }
+
+      // If document does not exist yet in Firestore, compute from verified transactions
       const txs = await this.getTransactionsForUser(userId, userAccountNumber);
       if (txs.length > 0) {
         const computed = this.computeBalancesFromTransactions(
           userId,
           txs,
-          data?.accounts || cachedMetrics?.accounts || [],
+          cachedMetrics?.accounts || [],
           userAccountNumber
         );
         // Persist computed result in background
         this.saveAccountBalances(userId, computed).catch(() => {});
         return computed;
-      }
-
-      if (data) {
-        return {
-          checkingBalance: Number(data.checkingBalance ?? 0),
-          savingsBalance: Number(data.savingsBalance ?? 0),
-          investedBalance: Number(data.investedBalance ?? 0),
-          accruedEarnings: Number(data.accruedEarnings ?? 0),
-          totalBalance: Number(
-            data.totalBalance ??
-              Number(data.checkingBalance ?? 0) +
-                Number(data.savingsBalance ?? 0) +
-                Number(data.investedBalance ?? 0)
-          ),
-          availableBalance: Number(data.availableBalance ?? Number(data.checkingBalance ?? 0)),
-          pendingBalance: Number(data.pendingBalance ?? 0),
-          accounts: data.accounts || [],
-        };
       }
       return cachedMetrics;
     } catch (err) {
@@ -999,16 +1103,25 @@ export const firestoreSync = {
               maritalStatus: data.maritalStatus,
               taxId: data.taxId,
               kycStatus: data.kycStatus || 'unverified',
-              kycFirstName: data.kycFirstName,
-              kycLastName: data.kycLastName,
-              kycCountry: data.kycCountry,
+              kycFullName: data.kycFullName || data.fullName,
+              kycFirstName: data.kycFirstName || data.firstName,
+              kycLastName: data.kycLastName || data.lastName,
+              kycCountry: data.kycCountry || data.country,
+              kycPhone: data.kycPhone || data.phone,
+              kycEmail: data.kycEmail || data.email,
+              kycDateOfBirth: data.kycDateOfBirth || data.dateOfBirth,
               kycDocumentType: data.kycDocumentType,
               kycDocumentNumber: data.kycDocumentNumber,
               kycDocumentImage: data.kycDocumentImage,
+              kycDocumentBackImage: data.kycDocumentBackImage,
               kycLiveSelfieImage: data.kycLiveSelfieImage,
               kycStreetAddress: data.kycStreetAddress,
+              kycProofOfAddressType: data.kycProofOfAddressType,
               kycProofOfAddressImage: data.kycProofOfAddressImage,
               kycSsn: data.kycSsn,
+              kycSsnImage: data.kycSsnImage,
+              kycItemReviews: data.kycItemReviews || null,
+              kycRejectionReason: data.kycRejectionReason,
               kycSubmittedAt: data.kycSubmittedAt,
               kycVerifiedAt: data.kycVerifiedAt,
               kycReviewDurationMinutes: data.kycReviewDurationMinutes,
@@ -1016,7 +1129,7 @@ export const firestoreSync = {
               dailyTransactionLimit: data.dailyTransactionLimit || 1000000,
             };
 
-            const balances = await this.getAccountBalances(uid);
+            const balances = await this.getAccountBalances(uid, cleanAcc);
             const metrics: BalanceMetrics = balances || {
               checkingBalance: 0,
               savingsBalance: 0,
@@ -1043,6 +1156,171 @@ export const firestoreSync = {
       return unsubscribe;
     } catch (err) {
       console.warn('[Firestore] Error subscribing to users with balances:', err);
+      return () => {};
+    }
+  },
+
+  /**
+   * Real-time listener for a user's account balances under accounts/{userId}
+   */
+  subscribeToAccountBalances(
+    userId: string,
+    userAccountNumber: string | undefined,
+    onUpdate: (metrics: BalanceMetrics) => void
+  ): () => void {
+    if (!userId || !db) return () => {};
+    try {
+      const accRef = doc(db, 'accounts', userId);
+      const unsubscribe = onSnapshot(
+        accRef,
+        async (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            const chk = Number(data.checkingBalance ?? 0);
+            const sav = Number(data.savingsBalance ?? data.savings ?? 0);
+            const inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
+            const accrued = Number(data.accruedEarnings ?? 0);
+            const total = Number(data.totalBalance ?? (chk + sav + inv + accrued));
+            const avail = Number(data.availableBalance ?? chk);
+            const accountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
+              ? data.accounts.map((a: any) => {
+                  if (a.type === 'CHECKING') return { ...a, balance: chk, availableBalance: avail };
+                  if (a.type === 'SAVINGS') return { ...a, balance: sav, availableBalance: sav };
+                  if (a.type === 'INVESTMENT') return { ...a, balance: inv, investedBalance: inv };
+                  return a;
+                })
+              : [
+                  {
+                    id: `acc_chk_${userId}`,
+                    userId,
+                    type: 'CHECKING',
+                    accountNumber: userAccountNumber || '1000000000',
+                    routingNumber: '021000021',
+                    currency: 'USD',
+                    balance: chk,
+                    availableBalance: avail,
+                    investedBalance: 0,
+                    pendingBalance: 0,
+                    interestRateAPY: 1.25,
+                    status: 'ACTIVE',
+                    nickname: 'Monvera Premier Checking',
+                  },
+                  {
+                    id: `acc_sav_${userId}`,
+                    userId,
+                    type: 'SAVINGS',
+                    accountNumber: userAccountNumber ? `10${userAccountNumber.slice(2, -3)}991` : '1000000991',
+                    routingNumber: '021000021',
+                    currency: 'USD',
+                    balance: sav,
+                    availableBalance: sav,
+                    investedBalance: 0,
+                    pendingBalance: 0,
+                    interestRateAPY: 4.85,
+                    status: 'ACTIVE',
+                    nickname: 'Monvera High-Yield Treasury',
+                  },
+                ];
+
+            const metrics: BalanceMetrics = {
+              checkingBalance: chk,
+              savingsBalance: sav,
+              investedBalance: inv,
+              accruedEarnings: accrued,
+              totalBalance: total,
+              availableBalance: avail,
+              pendingBalance: Number(data.pendingBalance ?? 0),
+              accounts: accountsList,
+            };
+            if (data.monthlyIncome !== undefined) (metrics as any).monthlyIncome = Number(data.monthlyIncome);
+            if (data.monthlySpending !== undefined) (metrics as any).monthlySpending = Number(data.monthlySpending);
+
+            onUpdate(metrics);
+          }
+        },
+        (err) => {
+          console.warn('[Firestore] Error in account balances realtime listener:', err);
+        }
+      );
+      return unsubscribe;
+    } catch (err) {
+      console.warn('[Firestore] Error subscribing to account balances:', err);
+      return () => {};
+    }
+  },
+
+  /**
+   * Real-time listener for a user's profile under users/{userId}
+   */
+  subscribeToUserProfile(
+    userId: string,
+    onUpdate: (profile: UserProfile | null) => void
+  ): () => void {
+    if (!userId || !db) return () => {};
+    try {
+      const userRef = doc(db, 'users', userId);
+      const unsubscribe = onSnapshot(
+        userRef,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            const profile: UserProfile = {
+              id: data.id || userId,
+              username: data.username || data.email?.split('@')[0] || 'customer',
+              firstName: data.firstName || '',
+              lastName: data.lastName || '',
+              email: data.email || '',
+              phone: data.phone || '',
+              permanentAccountNumber: data.permanentAccountNumber || '1000000000',
+              dateOfBirth: data.dateOfBirth,
+              country: data.country || 'United States',
+              avatarUrl: data.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+              status: data.status || 'active',
+              role: data.role || 'customer',
+              membershipTier: data.membershipTier || 'Standard',
+              twoFactorEnabled: data.twoFactorEnabled ?? false,
+              createdAt: data.createdAt || new Date().toISOString(),
+              businessName: data.businessName,
+              maritalStatus: data.maritalStatus,
+              taxId: data.taxId,
+              kycStatus: data.kycStatus || 'unverified',
+              kycFullName: data.kycFullName || data.fullName,
+              kycFirstName: data.kycFirstName || data.firstName,
+              kycLastName: data.kycLastName || data.lastName,
+              kycCountry: data.kycCountry || data.country,
+              kycPhone: data.kycPhone || data.phone,
+              kycEmail: data.kycEmail || data.email,
+              kycDateOfBirth: data.kycDateOfBirth || data.dateOfBirth,
+              kycDocumentType: data.kycDocumentType,
+              kycDocumentNumber: data.kycDocumentNumber,
+              kycDocumentImage: data.kycDocumentImage,
+              kycDocumentBackImage: data.kycDocumentBackImage,
+              kycLiveSelfieImage: data.kycLiveSelfieImage,
+              kycStreetAddress: data.kycStreetAddress,
+              kycProofOfAddressType: data.kycProofOfAddressType,
+              kycProofOfAddressImage: data.kycProofOfAddressImage,
+              kycSsn: data.kycSsn,
+              kycSsnImage: data.kycSsnImage,
+              kycItemReviews: data.kycItemReviews || null,
+              kycRejectionReason: data.kycRejectionReason,
+              kycSubmittedAt: data.kycSubmittedAt,
+              kycVerifiedAt: data.kycVerifiedAt,
+              kycReviewDurationMinutes: data.kycReviewDurationMinutes,
+              emailVerified: data.emailVerified ?? false,
+              dailyTransactionLimit: data.dailyTransactionLimit || 1000000,
+            };
+            onUpdate(profile);
+          } else {
+            onUpdate(null);
+          }
+        },
+        (err) => {
+          console.warn('[Firestore] Error in user profile realtime listener:', err);
+        }
+      );
+      return unsubscribe;
+    } catch (err) {
+      console.warn('[Firestore] Error subscribing to user profile:', err);
       return () => {};
     }
   },
