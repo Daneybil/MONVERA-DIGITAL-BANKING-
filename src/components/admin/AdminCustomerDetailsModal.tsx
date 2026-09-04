@@ -42,13 +42,14 @@ interface AdminCustomerDetailsModalProps {
   onClose: () => void;
   transactions: Transaction[];
   onToggleStatus: (userId: string, reason: string) => Promise<void>;
-  onApproveKyc: (userId: string) => Promise<void>;
-  onRejectKyc: (userId: string, reason: string) => Promise<void>;
+  onApproveKyc: (userId: string, customer?: any) => Promise<void>;
+  onRejectKyc: (userId: string, reason: string, customer?: any) => Promise<void>;
   onReviewKycItem?: (
     userId: string,
     itemName: 'identity' | 'proofOfAddress' | 'liveness' | 'ssn',
     status: 'approved' | 'rejected',
-    reason?: string
+    reason?: string,
+    customer?: any
   ) => Promise<void>;
   onRefreshData?: () => Promise<void>;
 }
@@ -658,8 +659,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                                 confirmLabel: 'Reject ID',
                                 variant: 'danger',
                                 action: async (reason) => {
-                                  await onReviewKycItem(customer.id, 'identity', 'rejected', reason || 'Unclear, expired, or cropped ID photo.');
-                                  if (onRefreshData) await onRefreshData();
+                                  await onReviewKycItem(customer.id, 'identity', 'rejected', reason || 'Unclear, expired, or cropped ID photo.', customer);
+                                  if (onRefreshData) onRefreshData().catch(() => {});
                                 },
                               });
                             }}
@@ -670,8 +671,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                           <button
                             type="button"
                             onClick={async () => {
-                              await onReviewKycItem(customer.id, 'identity', 'approved');
-                              if (onRefreshData) await onRefreshData();
+                              await onReviewKycItem(customer.id, 'identity', 'approved', undefined, customer);
+                              if (onRefreshData) onRefreshData().catch(() => {});
                             }}
                             className="px-4 py-1.5 text-xs font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer shadow-xs"
                           >
@@ -759,8 +760,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                                 confirmLabel: 'Reject Address',
                                 variant: 'danger',
                                 action: async (reason) => {
-                                  await onReviewKycItem(customer.id, 'proofOfAddress', 'rejected', reason || 'Proof of address older than 3 months or illegible.');
-                                  if (onRefreshData) await onRefreshData();
+                                  await onReviewKycItem(customer.id, 'proofOfAddress', 'rejected', reason || 'Proof of address older than 3 months or illegible.', customer);
+                                  if (onRefreshData) onRefreshData().catch(() => {});
                                 },
                               });
                             }}
@@ -771,8 +772,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                           <button
                             type="button"
                             onClick={async () => {
-                              await onReviewKycItem(customer.id, 'proofOfAddress', 'approved');
-                              if (onRefreshData) await onRefreshData();
+                              await onReviewKycItem(customer.id, 'proofOfAddress', 'approved', undefined, customer);
+                              if (onRefreshData) onRefreshData().catch(() => {});
                             }}
                             className="px-4 py-1.5 text-xs font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer shadow-xs"
                           >
@@ -857,8 +858,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                                 confirmLabel: 'Reject Selfie',
                                 variant: 'danger',
                                 action: async (reason) => {
-                                  await onReviewKycItem(customer.id, 'liveness', 'rejected', reason || 'Selfie image is blurry or poorly lit.');
-                                  if (onRefreshData) await onRefreshData();
+                                  await onReviewKycItem(customer.id, 'liveness', 'rejected', reason || 'Selfie image is blurry or poorly lit.', customer);
+                                  if (onRefreshData) onRefreshData().catch(() => {});
                                 },
                               });
                             }}
@@ -869,8 +870,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                           <button
                             type="button"
                             onClick={async () => {
-                              await onReviewKycItem(customer.id, 'liveness', 'approved');
-                              if (onRefreshData) await onRefreshData();
+                              await onReviewKycItem(customer.id, 'liveness', 'approved', undefined, customer);
+                              if (onRefreshData) onRefreshData().catch(() => {});
                             }}
                             className="px-4 py-1.5 text-xs font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer shadow-xs"
                           >
@@ -969,8 +970,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                                 confirmLabel: 'Reject SSN',
                                 variant: 'danger',
                                 action: async (reason) => {
-                                  await onReviewKycItem(customer.id, 'ssn', 'rejected', reason || 'Invalid or mismatched SSN record.');
-                                  if (onRefreshData) await onRefreshData();
+                                  await onReviewKycItem(customer.id, 'ssn', 'rejected', reason || 'Invalid or mismatched SSN record.', customer);
+                                  if (onRefreshData) onRefreshData().catch(() => {});
                                 },
                               });
                             }}
@@ -981,8 +982,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                           <button
                             type="button"
                             onClick={async () => {
-                              await onReviewKycItem(customer.id, 'ssn', 'approved');
-                              if (onRefreshData) await onRefreshData();
+                              await onReviewKycItem(customer.id, 'ssn', 'approved', undefined, customer);
+                              if (onRefreshData) onRefreshData().catch(() => {});
                             }}
                             className="px-4 py-1.5 text-xs font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors cursor-pointer shadow-xs"
                           >
@@ -1013,8 +1014,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                               confirmLabel: 'Reject All KYC',
                               variant: 'danger',
                               action: async (reason) => {
-                                await onRejectKyc(customer.id, reason);
-                                if (onRefreshData) await onRefreshData();
+                                await onRejectKyc(customer.id, reason, customer);
+                                if (onRefreshData) onRefreshData().catch(() => {});
                               },
                             });
                           }}
@@ -1032,8 +1033,8 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                               confirmLabel: 'Approve All & Verify',
                               variant: 'primary',
                               action: async () => {
-                                await onApproveKyc(customer.id);
-                                if (onRefreshData) await onRefreshData();
+                                await onApproveKyc(customer.id, customer);
+                                if (onRefreshData) onRefreshData().catch(() => {});
                               },
                             });
                           }}

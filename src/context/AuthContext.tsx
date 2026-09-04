@@ -66,6 +66,7 @@ interface AuthContextType {
     businessName?: string;
     username?: string;
   }) => Promise<{ success: boolean; error?: string }>;
+  refreshProfile: () => Promise<void>;
   refreshBalance: () => Promise<void>;
   refreshNotifications: () => Promise<void>;
   markAllNotificationsAsRead: () => Promise<void>;
@@ -244,6 +245,44 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [currentUser]);
 
+  const refreshProfile = useCallback(async () => {
+    if (!currentUser?.id) return;
+    try {
+      // 1. Authoritative Firestore document read
+      const fsProfile = await firestoreSync.getUserProfile(currentUser.id);
+      if (fsProfile) {
+        if (
+          fsProfile.kycStatus !== currentUser.kycStatus ||
+          fsProfile.dailyTransactionLimit !== currentUser.dailyTransactionLimit ||
+          fsProfile.status !== currentUser.status
+        ) {
+          setCurrentUser((prev) => {
+            if (!prev) return fsProfile;
+            return {
+              ...prev,
+              ...fsProfile,
+              avatarUrl: getPersistedAvatar(fsProfile.id, fsProfile.avatarUrl || prev.avatarUrl),
+            };
+          });
+          return;
+        }
+      }
+
+      // 2. Also check backend server state
+      const backendRes = await api.getCurrentUser(currentUser.id);
+      if (backendRes?.user && (backendRes.user.kycStatus !== currentUser.kycStatus || backendRes.user.dailyTransactionLimit !== currentUser.dailyTransactionLimit)) {
+        setCurrentUser((prev) => {
+          if (!prev) return backendRes.user;
+          return {
+            ...prev,
+            ...backendRes.user,
+            avatarUrl: getPersistedAvatar(backendRes.user.id, backendRes.user.avatarUrl || prev.avatarUrl),
+          };
+        });
+      }
+    } catch {}
+  }, [currentUser?.id, currentUser?.kycStatus, currentUser?.dailyTransactionLimit, currentUser?.status]);
+
   // Real-time synchronization interval & Firestore onSnapshot listeners
   useEffect(() => {
     if (!currentUser?.id) return;
@@ -276,18 +315,69 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     );
 
-    // 3. Fallback interval for polling notifications and backup sync
+    // 3. Fallback interval for polling notifications, balances, and backup KYC status sync
     const interval = setInterval(() => {
       refreshBalance();
       refreshNotifications();
-    }, 4000);
+      refreshProfile();
+    }, 3000);
+
+    // 4. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
+    const handleKycStatusUpdated = (e: any) => {
+      const detail = e.detail;
+      if (!detail) return;
+      if (currentUser?.id && detail.userId === currentUser.id) {
+        if (detail.user) {
+          setCurrentUser((prev) => ({
+            ...(prev || {}),
+            ...detail.user,
+            avatarUrl: getPersistedAvatar(detail.userId, detail.user.avatarUrl || prev?.avatarUrl),
+          }));
+        } else if (detail.kycStatus) {
+          setCurrentUser((prev) => ({
+            ...(prev as any),
+            kycStatus: detail.kycStatus,
+            dailyTransactionLimit: detail.kycStatus === 'verified' ? 1000000 : (prev?.dailyTransactionLimit || 25000),
+            status: 'active',
+          }));
+        }
+      }
+    };
+
+    const handleStorageEvent = (e: StorageEvent) => {
+      if (e.key === 'monvera_kyc_sync_event' && e.newValue) {
+        try {
+          const data = JSON.parse(e.newValue);
+          if (currentUser?.id && data.userId === currentUser.id) {
+            refreshProfile();
+          }
+        } catch {}
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        refreshProfile();
+        refreshBalance();
+        refreshNotifications();
+      }
+    };
+
+    window.addEventListener('monvera_kyc_status_updated', handleKycStatusUpdated);
+    window.addEventListener('storage', handleStorageEvent);
+    window.addEventListener('focus', refreshProfile);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       unsubBalance();
       unsubProfile();
       clearInterval(interval);
+      window.removeEventListener('monvera_kyc_status_updated', handleKycStatusUpdated);
+      window.removeEventListener('storage', handleStorageEvent);
+      window.removeEventListener('focus', refreshProfile);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [currentUser?.id, currentUser?.permanentAccountNumber, refreshBalance, refreshNotifications]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, refreshBalance, refreshNotifications, refreshProfile]);
 
   const getPersistedAvatar = (userId: string, defaultAvatar?: string) => {
     try {
@@ -1028,6 +1118,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         logout,
         switchUser,
         registerUser,
+        refreshProfile,
         refreshBalance,
         refreshNotifications,
         markAllNotificationsAsRead,

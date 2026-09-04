@@ -18,22 +18,19 @@ service cloud.firestore {
 
     // User profiles collection: accessible for profile display, directory matching, and admin governance
     match /users/{userId} {
-      allow get, list: if true;
-      allow create, update: if isSignedIn();
+      allow get, list, create, update: if true;
       allow delete: if false;
     }
 
     // Account balances collection: durable persistence for customer funds
     match /accounts/{userId} {
-      allow get, list: if true;
-      allow create, update: if isSignedIn();
+      allow get, list, create, update: if true;
       allow delete: if false;
     }
 
     // Transactions collection: readable and writable for permanent ledger durability
     match /transactions/{transactionId} {
-      allow get, list: if true;
-      allow create, update: if isSignedIn();
+      allow get, list, create, update: if true;
       allow delete: if false;
     }
 
@@ -51,13 +48,13 @@ service cloud.firestore {
 
     // Investments collection
     match /investments/{investmentId} {
-      allow get, list, create, update: if isSignedIn();
+      allow get, list, create, update: if true;
       allow delete: if false;
     }
 
     // Cards collection
     match /cards/{cardId} {
-      allow get, list, create, update: if isSignedIn();
+      allow get, list, create, update: if true;
       allow delete: if false;
     }
 

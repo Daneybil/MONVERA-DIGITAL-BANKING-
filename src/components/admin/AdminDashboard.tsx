@@ -53,7 +53,7 @@ import { AdminLoansView } from './AdminLoansView';
 import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 
 export const AdminDashboard: React.FC = () => {
-  const { currentUser, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal } = useAuth();
+  const { currentUser, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal, updateUser } = useAuth();
 
   const [activeTab, setActiveTab] = useState<string>('overview');
   const [metrics, setMetrics] = useState<AdminSystemOverview | null>(null);
@@ -263,27 +263,120 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  const handleApproveKyc = async (userId: string) => {
-    try {
-      const res = await api.adminApproveKyc(userId, currentUser?.id || 'usr_admin');
-      if (res.success && res.user) {
-        await firestoreSync.saveUserProfile(userId, res.user);
-        await loadAllAdminData();
-        await refreshNotifications();
+  const handleApproveKyc = async (userId: string, passedCustomer?: UserProfile & { balanceMetrics?: any }) => {
+    const existingCust = passedCustomer || customers.find((c) => c.id === userId);
+    const now = new Date().toISOString();
+
+    // 1. Instant optimistic UI update (0ms lag for Admin)
+    const optimisticVerified = existingCust
+      ? {
+          ...existingCust,
+          kycStatus: 'verified' as const,
+          status: 'active' as const,
+          dailyTransactionLimit: 1000000,
+          kycVerifiedAt: now,
+          kycRejectionReason: '',
+          kycItemReviews: {
+            identity: { status: 'approved' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin' },
+            proofOfAddress: { status: 'approved' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin' },
+            liveness: { status: 'approved' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin' },
+            ...(existingCust.kycSsn
+              ? { ssn: { status: 'approved' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin' } }
+              : {}),
+          },
+        }
+      : null;
+
+    if (optimisticVerified) {
+      setCustomers((prev) => prev.map((c) => (c.id === userId ? { ...c, ...optimisticVerified } : c)));
+      if (selectedCustomer?.id === userId) {
+        setSelectedCustomer((prev) => (prev ? { ...prev, ...optimisticVerified } : null));
       }
+    }
+
+    // 2. If the approved user happens to be the currently active session, update currentUser immediately
+    if (currentUser?.id === userId && optimisticVerified) {
+      updateUser({
+        ...currentUser,
+        kycStatus: 'verified',
+        status: 'active',
+        dailyTransactionLimit: 1000000,
+        kycVerifiedAt: now,
+        kycRejectionReason: '',
+      });
+    }
+
+    try {
+      // 3. Fast non-blocking approval via API service
+      const res = await api.adminApproveKyc(
+        { userId, adminId: currentUser?.id || 'usr_admin', userProfile: (existingCust || optimisticVerified) as any }
+      );
+      if (res.success && res.user) {
+        if (currentUser?.id === userId) {
+          updateUser(res.user);
+        }
+        setCustomers((prev) => prev.map((c) => (c.id === userId ? { ...c, ...res.user } : c)));
+        if (selectedCustomer?.id === userId) {
+          setSelectedCustomer((prev) => (prev ? { ...prev, ...res.user } : null));
+        }
+      }
+      refreshNotifications().catch(() => {});
     } catch (err) {
       console.error('Error approving KYC:', err);
     }
   };
 
-  const handleRejectKyc = async (userId: string, reason: string) => {
-    try {
-      const res = await api.adminRejectKyc(userId, reason, currentUser?.id || 'usr_admin');
-      if (res.success && res.user) {
-        await firestoreSync.saveUserProfile(userId, res.user);
-        await loadAllAdminData();
-        await refreshNotifications();
+  const handleRejectKyc = async (userId: string, reason: string, passedCustomer?: UserProfile & { balanceMetrics?: any }) => {
+    const existingCust = passedCustomer || customers.find((c) => c.id === userId);
+    const now = new Date().toISOString();
+
+    const optimisticRejected = existingCust
+      ? {
+          ...existingCust,
+          kycStatus: 'action_required' as const,
+          kycRejectionReason: reason,
+          dailyTransactionLimit: 25000,
+          kycItemReviews: {
+            identity: { status: 'rejected' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin', reason },
+            proofOfAddress: { status: 'rejected' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin', reason },
+            liveness: { status: 'rejected' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin', reason },
+            ...(existingCust.kycSsn
+              ? { ssn: { status: 'rejected' as const, reviewedAt: now, reviewedBy: currentUser?.id || 'usr_admin', reason } }
+              : {}),
+          },
+        }
+      : null;
+
+    if (optimisticRejected) {
+      setCustomers((prev) => prev.map((c) => (c.id === userId ? { ...c, ...optimisticRejected } : c)));
+      if (selectedCustomer?.id === userId) {
+        setSelectedCustomer((prev) => (prev ? { ...prev, ...optimisticRejected } : null));
       }
+    }
+
+    if (currentUser?.id === userId && optimisticRejected) {
+      updateUser({
+        ...currentUser,
+        kycStatus: 'action_required',
+        kycRejectionReason: reason,
+        dailyTransactionLimit: 25000,
+      });
+    }
+
+    try {
+      const res = await api.adminRejectKyc(
+        { userId, reason, adminId: currentUser?.id || 'usr_admin', userProfile: (existingCust || optimisticRejected) as any }
+      );
+      if (res.success && res.user) {
+        if (currentUser?.id === userId) {
+          updateUser(res.user);
+        }
+        setCustomers((prev) => prev.map((c) => (c.id === userId ? { ...c, ...res.user } : c)));
+        if (selectedCustomer?.id === userId) {
+          setSelectedCustomer((prev) => (prev ? { ...prev, ...res.user } : null));
+        }
+      }
+      refreshNotifications().catch(() => {});
     } catch (err) {
       console.error('Error rejecting KYC:', err);
     }
@@ -293,8 +386,10 @@ export const AdminDashboard: React.FC = () => {
     userId: string,
     itemName: 'identity' | 'proofOfAddress' | 'liveness' | 'ssn',
     status: 'approved' | 'rejected',
-    reason?: string
+    reason?: string,
+    passedCustomer?: UserProfile & { balanceMetrics?: any }
   ) => {
+    const existingCust = passedCustomer || customers.find((c) => c.id === userId);
     try {
       const res = await api.adminReviewKycItem({
         userId,
@@ -302,12 +397,18 @@ export const AdminDashboard: React.FC = () => {
         status,
         reason,
         adminId: currentUser?.id || 'usr_admin',
+        userProfile: existingCust as any,
       });
       if (res.success && res.user) {
-        await firestoreSync.saveUserProfile(userId, res.user);
-        await loadAllAdminData();
-        await refreshNotifications();
+        if (currentUser?.id === userId) {
+          updateUser(res.user);
+        }
+        setCustomers((prev) => prev.map((c) => (c.id === userId ? { ...c, ...res.user } : c)));
+        if (selectedCustomer?.id === userId) {
+          setSelectedCustomer((prev) => (prev ? { ...prev, ...res.user } : null));
+        }
       }
+      refreshNotifications().catch(() => {});
     } catch (err) {
       console.error('Error reviewing KYC item:', err);
     }
@@ -610,6 +711,7 @@ export const AdminDashboard: React.FC = () => {
             customers={customers}
             onApproveKyc={handleApproveKyc}
             onRejectKyc={handleRejectKyc}
+            onReviewKycItem={handleReviewKycItem}
             onSelectCustomer={(cust) => setSelectedCustomer(cust)}
             onRefreshData={loadAllAdminData}
           />

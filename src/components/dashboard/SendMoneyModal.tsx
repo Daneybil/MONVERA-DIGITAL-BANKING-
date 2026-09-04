@@ -23,6 +23,45 @@ import {
 import { Transaction } from '../../types';
 import { QrScannerModal } from './QrScannerModal';
 
+const parseNumericAmount = (val: string): number => {
+  if (!val) return 0;
+  const cleaned = val.replace(/,/g, '');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+};
+
+const formatAmountString = (val: string): string => {
+  if (!val) return '';
+  // Keep only digits and decimal dot
+  let cleaned = val.replace(/[^0-9.]/g, '');
+
+  // Disallow more than one decimal point
+  const parts = cleaned.split('.');
+  if (parts.length > 2) {
+    cleaned = parts[0] + '.' + parts.slice(1).join('');
+  }
+
+  const [intPart, decPart] = cleaned.split('.');
+
+  // Format integer portion with commas
+  let formattedInt = '';
+  if (intPart !== undefined && intPart !== '') {
+    const parsed = parseInt(intPart, 10);
+    formattedInt = isNaN(parsed) ? '' : parsed.toLocaleString('en-US');
+  }
+
+  if (decPart !== undefined) {
+    return `${formattedInt || '0'}.${decPart.slice(0, 2)}`;
+  }
+  return formattedInt;
+};
+
+const formatAmountOnBlur = (val: string): string => {
+  const num = parseNumericAmount(val);
+  if (!num || num <= 0) return '';
+  return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+
 export const SendMoneyModal: React.FC = () => {
   const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications, currentView } = useAuth();
 
@@ -199,7 +238,7 @@ export const SendMoneyModal: React.FC = () => {
       setErrorMessage('Please enter a valid Monvera Username (e.g. @marcus) or 10-digit Account Number.');
       return;
     }
-    const numAmount = parseFloat(amount);
+    const numAmount = parseNumericAmount(amount);
     if (isNaN(numAmount) || numAmount <= 0) {
       setErrorMessage('Please enter a valid transfer amount greater than $0.00.');
       return;
@@ -222,11 +261,12 @@ export const SendMoneyModal: React.FC = () => {
     setErrorMessage(null);
 
     try {
+      const transferAmount = parseNumericAmount(amount);
       if (isAdmin) {
         // Execute Administrator Transfer via secure backend ledger system
         const res = await api.sendAdminTransfer({
           targetUserId: lookupResult?.recipientId || lookupResult?.permanentAccountNumber || recipientInput,
-          amount: parseFloat(amount),
+          amount: transferAmount,
           description: memo || 'Administrative Direct Transfer from Bennett Johnson',
           category,
           adminId: 'usr_admin',
@@ -256,7 +296,7 @@ export const SendMoneyModal: React.FC = () => {
           recipientUsername: lookupResult?.username,
           recipientName: lookupResult ? `${lookupResult.firstName} ${lookupResult.lastName}`.trim() : undefined,
           recipientIdentifier: lookupResult?.permanentAccountNumber || lookupResult?.username || recipientInput,
-          amount: parseFloat(amount),
+          amount: transferAmount,
           description: memo || `Transfer to ${lookupResult?.firstName} ${lookupResult?.lastName} (@${lookupResult?.username || 'user'})`,
           category,
         });
@@ -514,13 +554,13 @@ export const SendMoneyModal: React.FC = () => {
                 <div className="relative">
                   <span className="absolute left-5 top-3.5 text-2xl font-black text-slate-400 font-mono">$</span>
                   <input
-                    type="number"
-                    step="0.01"
-                    min="1"
+                    type="text"
+                    inputMode="decimal"
                     required
                     placeholder="0.00"
                     value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
+                    onChange={(e) => setAmount(formatAmountString(e.target.value))}
+                    onBlur={() => setAmount(formatAmountOnBlur(amount))}
                     className="w-full pl-10 pr-4 py-3.5 text-2xl sm:text-3xl font-black font-mono text-slate-950 rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white shadow-xs"
                   />
                 </div>
@@ -532,10 +572,10 @@ export const SendMoneyModal: React.FC = () => {
                   <button
                     key={preset}
                     type="button"
-                    onClick={() => setAmount(preset.toString())}
+                    onClick={() => setAmount(preset.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}
                     className="py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-xs font-mono font-black text-slate-800 transition-colors cursor-pointer border border-slate-200"
                   >
-                    +${preset.toLocaleString()}
+                    +${preset.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                   </button>
                 ))}
               </div>
@@ -573,7 +613,7 @@ export const SendMoneyModal: React.FC = () => {
               <div className="text-center space-y-1.5">
                 <span className="text-xs font-mono uppercase text-slate-500 font-bold tracking-widest">Total Transfer Amount</span>
                 <div className="text-4xl sm:text-5xl font-black text-slate-950 font-mono">
-                  ${(Number(amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
+                  ${parseNumericAmount(amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
                 <span className="inline-block text-xs text-emerald-800 font-black bg-emerald-100 px-3 py-1 rounded-full border border-emerald-300">
                   Instant Settlement • $0.00 Fee • {isAdmin ? 'Sovereign Treasury Transfer' : 'Direct Transfer'}

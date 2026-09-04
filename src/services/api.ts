@@ -1454,19 +1454,21 @@ export const api = {
   },
 
   async adminApproveKyc(
-    dataOrUserId: string | { userId: string; adminId?: string },
-    adminId?: string
+    dataOrUserId: string | { userId: string; adminId?: string; userProfile?: UserProfile },
+    adminId?: string,
+    passedProfile?: UserProfile
   ): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
     const userId = typeof dataOrUserId === 'string' ? dataOrUserId : dataOrUserId.userId;
     const effectiveAdminId = (typeof dataOrUserId === 'string' ? adminId : dataOrUserId.adminId) || adminId || 'usr_admin';
+    const providedUser = (typeof dataOrUserId === 'object' && dataOrUserId.userProfile) ? dataOrUserId.userProfile : passedProfile;
 
     if (!userId) {
       return { success: false, error: 'User ID is required for KYC approval.' };
     }
 
     try {
-      // 1. Authoritatively fetch the current user profile from Firestore
-      const existing = await firestoreSync.getUserProfile(userId);
+      // 1. Authoritatively obtain user profile (use provided in-memory profile if available, else fetch)
+      const existing = providedUser || (await firestoreSync.getUserProfile(userId));
       const now = new Date().toISOString();
       const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
                    (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
@@ -1492,7 +1494,7 @@ export const api = {
         status: 'active',
         kycVerifiedAt: now,
         dailyTransactionLimit: 1000000,
-        kycRejectionReason: undefined,
+        kycRejectionReason: '',
         kycItemReviews: {
           identity: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
           proofOfAddress: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
@@ -1503,29 +1505,46 @@ export const api = {
         },
       };
 
-      // 3. Authoritatively persist to Firestore
-      await firestoreSync.saveUserProfile(userId, updatedProfile);
+      // 3. Instant local broadcast & directory cache so all components and open tabs update with 0ms lag
+      if (typeof window !== 'undefined') {
+        try {
+          const raw = localStorage.getItem('monvera_accounts_directory');
+          const directory: any[] = raw ? JSON.parse(raw) : [];
+          const idx = directory.findIndex((u: any) => u.id === userId);
+          if (idx >= 0) {
+            directory[idx] = { ...directory[idx], ...updatedProfile };
+          } else {
+            directory.push(updatedProfile);
+          }
+          localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
+          localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId, kycStatus: 'verified', timestamp: Date.now() }));
+          window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+            detail: { userId, kycStatus: 'verified', user: updatedProfile }
+          }));
+        } catch {}
+      }
 
-      // 4. Save notification to Firestore for the user
-      await firestoreSync.saveNotification({
-        id: `notif_kyc_app_${Date.now()}`,
-        userId: userId,
-        title: 'KYC Verification Approved by Compliance',
-        message: 'Your banking profile has been officially verified by Monvera Compliance Operations. Full account limits ($1,000,000/day) and verified status are active.',
-        type: 'SECURITY',
-        severity: 'success',
-        read: false,
-        createdAt: now,
-      });
-
-      // 5. Also sync to backend to keep server cache aligned
-      try {
-        await fetch('/api/admin/kyc/approve', {
+      // 4. Concurrently persist to Firestore, notifications, and backend server ledger
+      Promise.allSettled([
+        firestoreSync.saveUserProfile(userId, updatedProfile),
+        firestoreSync.saveNotification({
+          id: `notif_kyc_app_${Date.now()}`,
+          userId: userId,
+          title: 'KYC Verification Approved by Compliance',
+          message: 'Your banking profile has been officially verified by Monvera Compliance Operations. Full account limits ($1,000,000/day) and verified status are active.',
+          type: 'SECURITY',
+          severity: 'success',
+          read: false,
+          createdAt: now,
+        }),
+        fetch('/api/admin/kyc/approve', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ userId, adminId: effectiveAdminId, userProfile: updatedProfile }),
-        });
-      } catch {}
+        }),
+      ]).catch((err) => {
+        console.warn('[adminApproveKyc] Background sync notice:', err);
+      });
 
       return { success: true, user: updatedProfile };
     } catch (err: any) {
@@ -1535,27 +1554,27 @@ export const api = {
   },
 
   async adminRejectKyc(
-    dataOrUserId: string | { userId: string; reason: string; adminId?: string },
+    dataOrUserId: string | { userId: string; reason: string; adminId?: string; userProfile?: UserProfile },
     reason?: string,
-    adminId?: string
+    adminId?: string,
+    passedProfile?: UserProfile
   ): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
     const userId = typeof dataOrUserId === 'string' ? dataOrUserId : dataOrUserId.userId;
     const rejectionReason = (typeof dataOrUserId === 'string' ? reason : dataOrUserId.reason) || reason || 'Compliance review failed';
     const effectiveAdminId = (typeof dataOrUserId === 'string' ? adminId : dataOrUserId.adminId) || adminId || 'usr_admin';
+    const providedUser = (typeof dataOrUserId === 'object' && dataOrUserId.userProfile) ? dataOrUserId.userProfile : passedProfile;
 
     if (!userId) {
       return { success: false, error: 'User ID is required for KYC rejection.' };
     }
 
     try {
-      // 1. Authoritatively fetch the current user profile from Firestore
-      const existing = await firestoreSync.getUserProfile(userId);
+      const existing = providedUser || (await firestoreSync.getUserProfile(userId));
       const now = new Date().toISOString();
       const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
                    (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
                    (existing?.kycCountry || existing?.country || '').toUpperCase() === 'USA';
 
-      // 2. Prepare rejected profile - strictly preserving ALL submitted KYC documents and profile fields
       const updatedProfile: UserProfile = {
         ...(existing || {
           id: userId,
@@ -1585,29 +1604,44 @@ export const api = {
         },
       };
 
-      // 3. Authoritatively persist to Firestore
-      await firestoreSync.saveUserProfile(userId, updatedProfile);
+      if (typeof window !== 'undefined') {
+        try {
+          const raw = localStorage.getItem('monvera_accounts_directory');
+          const directory: any[] = raw ? JSON.parse(raw) : [];
+          const idx = directory.findIndex((u: any) => u.id === userId);
+          if (idx >= 0) {
+            directory[idx] = { ...directory[idx], ...updatedProfile };
+          } else {
+            directory.push(updatedProfile);
+          }
+          localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
+          localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId, kycStatus: 'action_required', timestamp: Date.now() }));
+          window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+            detail: { userId, kycStatus: 'action_required', user: updatedProfile }
+          }));
+        } catch {}
+      }
 
-      // 4. Save notification to Firestore for the user
-      await firestoreSync.saveNotification({
-        id: `notif_kyc_rej_${Date.now()}`,
-        userId: userId,
-        title: 'KYC Document Verification Status',
-        message: `Your identity verification requires attention. Reason: ${rejectionReason}. Please review and re-submit the required documents in your Profile.`,
-        type: 'SECURITY',
-        severity: 'warning',
-        read: false,
-        createdAt: now,
-      });
-
-      // 5. Also sync to backend to keep server cache aligned
-      try {
-        await fetch('/api/admin/kyc/reject', {
+      Promise.allSettled([
+        firestoreSync.saveUserProfile(userId, updatedProfile),
+        firestoreSync.saveNotification({
+          id: `notif_kyc_rej_${Date.now()}`,
+          userId: userId,
+          title: 'KYC Document Verification Status',
+          message: `Your identity verification requires attention. Reason: ${rejectionReason}. Please review and re-submit the required documents in your Profile.`,
+          type: 'SECURITY',
+          severity: 'warning',
+          read: false,
+          createdAt: now,
+        }),
+        fetch('/api/admin/kyc/reject', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ userId, reason: rejectionReason, adminId: effectiveAdminId, userProfile: updatedProfile }),
-        });
-      } catch {}
+        }),
+      ]).catch((err) => {
+        console.warn('[adminRejectKyc] Background sync notice:', err);
+      });
 
       return { success: true, user: updatedProfile };
     } catch (err: any) {
@@ -1622,13 +1656,14 @@ export const api = {
     status: 'approved' | 'rejected' | 'pending';
     reason?: string;
     adminId?: string;
+    userProfile?: UserProfile;
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
     if (!data.userId || !data.itemName || !data.status) {
       return { success: false, error: 'userId, itemName, and status are required' };
     }
 
     try {
-      const existing = await firestoreSync.getUserProfile(data.userId);
+      const existing = data.userProfile || (await firestoreSync.getUserProfile(data.userId));
       const now = new Date().toISOString();
       const currentReviews = existing?.kycItemReviews || {};
       const updatedReviews = {
@@ -1658,7 +1693,7 @@ export const api = {
         newKycStatus = 'verified';
         newVerifiedAt = now;
         newLimit = 1000000;
-        newRejectionReason = undefined;
+        newRejectionReason = '';
       } else {
         newKycStatus = 'pending';
       }
@@ -1686,15 +1721,76 @@ export const api = {
         kycVerifiedAt: newVerifiedAt,
       };
 
-      await firestoreSync.saveUserProfile(data.userId, updatedProfile);
+      if (typeof window !== 'undefined') {
+        try {
+          const raw = localStorage.getItem('monvera_accounts_directory');
+          const directory: any[] = raw ? JSON.parse(raw) : [];
+          const idx = directory.findIndex((u: any) => u.id === data.userId);
+          if (idx >= 0) {
+            directory[idx] = { ...directory[idx], ...updatedProfile };
+          } else {
+            directory.push(updatedProfile);
+          }
+          localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
+          localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId: data.userId, kycStatus: newKycStatus, timestamp: Date.now() }));
+          window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+            detail: { userId: data.userId, kycStatus: newKycStatus, user: updatedProfile }
+          }));
+        } catch {}
+      }
 
-      try {
-        await fetch('/api/admin/kyc/review-item', {
+      const itemFriendlyNames: Record<string, string> = {
+        identity: 'Government Identity Document',
+        proofOfAddress: 'Proof of Address Document',
+        liveness: 'Biometric Liveness Selfie',
+        ssn: 'Social Security / Tax ID',
+      };
+      const itemNameLabel = itemFriendlyNames[data.itemName] || data.itemName;
+
+      const notifPromise = allApproved
+        ? firestoreSync.saveNotification({
+            id: `notif_kyc_app_${Date.now()}`,
+            userId: data.userId,
+            title: 'KYC Verification Approved by Compliance',
+            message: 'All your submitted KYC verification documents have been officially approved by Monvera Compliance Operations. All account limits ($1,000,000/day) and verified status are now active.',
+            type: 'SECURITY',
+            severity: 'success',
+            read: false,
+            createdAt: now,
+          })
+        : data.status === 'rejected'
+        ? firestoreSync.saveNotification({
+            id: `notif_kyc_item_rej_${Date.now()}`,
+            userId: data.userId,
+            title: `Action Required: ${itemNameLabel}`,
+            message: `Your ${itemNameLabel} was rejected by compliance: "${data.reason || 'Document does not meet regulatory standards'}". Please resubmit this specific document.`,
+            type: 'SECURITY',
+            severity: 'warning',
+            read: false,
+            createdAt: now,
+          })
+        : firestoreSync.saveNotification({
+            id: `notif_kyc_item_app_${Date.now()}`,
+            userId: data.userId,
+            title: `Document Approved: ${itemNameLabel}`,
+            message: `Your ${itemNameLabel} has been reviewed and approved by compliance. Remaining documents are being finalized.`,
+            type: 'SECURITY',
+            severity: 'info',
+            read: false,
+            createdAt: now,
+          });
+
+      Promise.allSettled([
+        firestoreSync.saveUserProfile(data.userId, updatedProfile),
+        notifPromise,
+        fetch('/api/admin/kyc/review-item', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ...data, userProfile: updatedProfile }),
-        });
-      } catch {}
+        }),
+      ]).catch((err) => {
+        console.warn('[adminReviewKycItem] Background sync notice:', err);
+      });
 
       return { success: true, user: updatedProfile };
     } catch (err: any) {

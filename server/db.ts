@@ -1642,6 +1642,8 @@ export class MonveraDatabase {
     if (!user && userProfile) {
       this.users.set(userId, { ...userProfile });
       user = this.users.get(userId);
+    } else if (user && userProfile) {
+      Object.assign(user, userProfile);
     }
     if (!user) {
       user = {
@@ -1714,6 +1716,8 @@ export class MonveraDatabase {
     if (!user && params.userProfile) {
       this.users.set(params.userId, { ...params.userProfile });
       user = this.users.get(params.userId);
+    } else if (user && params.userProfile) {
+      Object.assign(user, params.userProfile);
     }
     if (!user) {
       user = {

@@ -80,62 +80,68 @@ export const firestoreSync = {
       const payload: Record<string, any> = {
         uid: uid,
         id: uid,
-        fullName: profileData.fullName || `${profileData.firstName || ''} ${profileData.lastName || ''}`.trim(),
-        firstName: profileData.firstName || '',
-        lastName: profileData.lastName || '',
-        email: (profileData.email || '').toLowerCase().trim(),
-        phone: profileData.phone || profileData.phoneNumber || '',
-        country: profileData.country || 'United States',
-        dateOfBirth: profileData.dateOfBirth || '',
-        age: profileData.age || '',
-        maritalStatus: profileData.maritalStatus || 'Single',
-        address: profileData.address || '',
-        permanentAccountNumber: cleanAcc,
-        accountNumber: cleanAcc,
-        username: cleanUsername,
-        usernameLower: cleanUsername.toLowerCase(),
-        role: profileData.role || 'customer',
-        status: profileData.status || 'active',
-        kycStatus: profileData.kycStatus || 'unverified',
-        kycFullName: profileData.kycFullName || profileData.fullName || `${profileData.firstName || ''} ${profileData.lastName || ''}`.trim(),
-        kycFirstName: profileData.kycFirstName || profileData.firstName || '',
-        kycLastName: profileData.kycLastName || profileData.lastName || '',
-        kycCountry: profileData.kycCountry || profileData.country || 'United States',
-        kycPhone: profileData.kycPhone || profileData.phone || profileData.phoneNumber || '',
-        kycEmail: profileData.kycEmail || profileData.email || '',
-        kycDateOfBirth: profileData.kycDateOfBirth || profileData.dateOfBirth || '',
-        kycDocumentType: profileData.kycDocumentType || '',
-        kycDocumentNumber: profileData.kycDocumentNumber || '',
-        kycDocumentImage: profileData.kycDocumentImage || '',
-        kycDocumentBackImage: profileData.kycDocumentBackImage || '',
-        kycLiveSelfieImage: profileData.kycLiveSelfieImage || '',
-        kycStreetAddress: profileData.kycStreetAddress || profileData.address || '',
-        kycProofOfAddressType: profileData.kycProofOfAddressType || '',
-        kycProofOfAddressImage: profileData.kycProofOfAddressImage || '',
-        kycSsn: profileData.kycSsn || '',
-        kycSsnImage: profileData.kycSsnImage || '',
-        kycItemReviews: profileData.kycItemReviews || null,
-        kycRejectionReason: profileData.kycRejectionReason || '',
-        kycSubmittedAt: profileData.kycSubmittedAt || '',
-        kycVerifiedAt: profileData.kycVerifiedAt || '',
-        kycReviewDurationMinutes: profileData.kycReviewDurationMinutes || 10,
-        emailVerified: profileData.emailVerified ?? false,
-        membershipTier: profileData.membershipTier || 'Premier',
-        twoFactorEnabled: profileData.twoFactorEnabled ?? false,
-        createdAt: profileData.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        dailyTransactionLimit: profileData.dailyTransactionLimit || 1000000,
       };
 
-      if (profileData.businessName) {
-        payload.businessName = profileData.businessName;
+      if (profileData.fullName) {
+        payload.fullName = profileData.fullName;
+      } else if (profileData.firstName || profileData.lastName) {
+        payload.fullName = `${profileData.firstName || ''} ${profileData.lastName || ''}`.trim();
       }
-      if (profileData.taxId) {
-        payload.taxId = profileData.taxId;
+      if (profileData.firstName !== undefined) payload.firstName = profileData.firstName;
+      if (profileData.lastName !== undefined) payload.lastName = profileData.lastName;
+      if (profileData.email !== undefined) payload.email = (profileData.email || '').toLowerCase().trim();
+      if (profileData.phone !== undefined) payload.phone = profileData.phone;
+      if (profileData.phoneNumber !== undefined) payload.phone = profileData.phoneNumber;
+      if (profileData.country !== undefined) payload.country = profileData.country;
+      if (profileData.dateOfBirth !== undefined) payload.dateOfBirth = profileData.dateOfBirth;
+      if (profileData.age !== undefined) payload.age = profileData.age;
+      if (profileData.maritalStatus !== undefined) payload.maritalStatus = profileData.maritalStatus;
+      if (profileData.address !== undefined) payload.address = profileData.address;
+      if (cleanAcc) {
+        payload.permanentAccountNumber = cleanAcc;
+        payload.accountNumber = cleanAcc;
       }
-      if (profileData.avatarUrl) {
-        payload.avatarUrl = profileData.avatarUrl;
+      if (cleanUsername) {
+        payload.username = cleanUsername;
+        payload.usernameLower = cleanUsername.toLowerCase();
       }
+      if (profileData.role !== undefined) payload.role = profileData.role;
+      if (profileData.status !== undefined) payload.status = profileData.status;
+      if (profileData.membershipTier !== undefined) payload.membershipTier = profileData.membershipTier;
+      if (profileData.twoFactorEnabled !== undefined) payload.twoFactorEnabled = profileData.twoFactorEnabled;
+      if (profileData.emailVerified !== undefined) payload.emailVerified = profileData.emailVerified;
+      if (profileData.dailyTransactionLimit !== undefined) payload.dailyTransactionLimit = profileData.dailyTransactionLimit;
+      if (profileData.createdAt !== undefined) payload.createdAt = profileData.createdAt;
+      if (profileData.businessName !== undefined) payload.businessName = profileData.businessName;
+      if (profileData.taxId !== undefined) payload.taxId = profileData.taxId;
+      if (profileData.avatarUrl !== undefined) payload.avatarUrl = profileData.avatarUrl;
+
+      // KYC SPECIFIC FIELDS: Strictly preserve existing KYC documents & status.
+      // Only write to Firestore when explicitly provided in profileData.
+      if (profileData.kycStatus !== undefined) payload.kycStatus = profileData.kycStatus;
+      if (profileData.kycFullName !== undefined) payload.kycFullName = profileData.kycFullName;
+      if (profileData.kycFirstName !== undefined) payload.kycFirstName = profileData.kycFirstName;
+      if (profileData.kycLastName !== undefined) payload.kycLastName = profileData.kycLastName;
+      if (profileData.kycCountry !== undefined) payload.kycCountry = profileData.kycCountry;
+      if (profileData.kycPhone !== undefined) payload.kycPhone = profileData.kycPhone;
+      if (profileData.kycEmail !== undefined) payload.kycEmail = profileData.kycEmail;
+      if (profileData.kycDateOfBirth !== undefined) payload.kycDateOfBirth = profileData.kycDateOfBirth;
+      if (profileData.kycDocumentType !== undefined) payload.kycDocumentType = profileData.kycDocumentType;
+      if (profileData.kycDocumentNumber !== undefined) payload.kycDocumentNumber = profileData.kycDocumentNumber;
+      if (profileData.kycDocumentImage !== undefined) payload.kycDocumentImage = profileData.kycDocumentImage;
+      if (profileData.kycDocumentBackImage !== undefined) payload.kycDocumentBackImage = profileData.kycDocumentBackImage;
+      if (profileData.kycLiveSelfieImage !== undefined) payload.kycLiveSelfieImage = profileData.kycLiveSelfieImage;
+      if (profileData.kycStreetAddress !== undefined) payload.kycStreetAddress = profileData.kycStreetAddress;
+      if (profileData.kycProofOfAddressType !== undefined) payload.kycProofOfAddressType = profileData.kycProofOfAddressType;
+      if (profileData.kycProofOfAddressImage !== undefined) payload.kycProofOfAddressImage = profileData.kycProofOfAddressImage;
+      if (profileData.kycSsn !== undefined) payload.kycSsn = profileData.kycSsn;
+      if (profileData.kycSsnImage !== undefined) payload.kycSsnImage = profileData.kycSsnImage;
+      if (profileData.kycItemReviews !== undefined) payload.kycItemReviews = profileData.kycItemReviews;
+      if (profileData.kycRejectionReason !== undefined) payload.kycRejectionReason = profileData.kycRejectionReason;
+      if (profileData.kycSubmittedAt !== undefined) payload.kycSubmittedAt = profileData.kycSubmittedAt;
+      if (profileData.kycVerifiedAt !== undefined) payload.kycVerifiedAt = profileData.kycVerifiedAt;
+      if (profileData.kycReviewDurationMinutes !== undefined) payload.kycReviewDurationMinutes = profileData.kycReviewDurationMinutes;
 
       // Strip out any remaining keys that have undefined values
       Object.keys(payload).forEach((k) => {
