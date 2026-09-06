@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
-import { firestoreSync } from '../../services/firestoreSync';
+import { firestoreSync, isNonExistentAccount } from '../../services/firestoreSync';
 import {
   UserProfile,
+  UserStatus,
   Transaction,
   AdminAuditLog,
   AdminSystemOverview,
@@ -62,6 +63,7 @@ export const AdminDashboard: React.FC = () => {
   const [supportTickets, setSupportTickets] = useState<any[]>([]);
   const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<(UserProfile & { balanceMetrics?: any }) | null>(null);
+  const [pendingLiveChatsCount, setPendingLiveChatsCount] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
 
@@ -72,93 +74,167 @@ export const AdminDashboard: React.FC = () => {
     loggedInUser?: UserProfile | null
   ): (UserProfile & { balanceMetrics?: any })[] => {
     const userMap = new Map<string, UserProfile & { balanceMetrics?: any }>();
-    const seenEmails = new Set<string>();
     const seenAccountNums = new Set<string>();
 
-    // 1. First add real users from Firestore (authoritative source of real registrations)
-    for (const fsUser of firestoreUsers) {
-      const emailKey = (fsUser.email || '').toLowerCase().trim();
-      const accKey = (fsUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+    const frozenRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_frozen_accounts') : null;
+    const frozenIds = new Set<string>(frozenRaw ? JSON.parse(frozenRaw) : []);
 
-      // Locate if server already computed balance metrics for this UID or email
-      const matchedServer = serverUsers.find(
-        (s) =>
-          s.id === fsUser.id ||
-          (s.email && s.email.toLowerCase().trim() === emailKey) ||
-          (s.permanentAccountNumber && s.permanentAccountNumber.replace(/[-\s]/g, '') === accKey)
-      );
+    // Ensure customer balances are 100% synchronized with what is on the user dashboard
+    const resolveCustomerBalances = (
+      userId: string,
+      accNum?: string,
+      incomingMetrics?: any
+    ): any => {
+      let checking = Number(incomingMetrics?.checkingBalance || 0);
+      let savings = Number(incomingMetrics?.savingsBalance || 0);
+      let invested = Number(incomingMetrics?.investedBalance || 0);
+      let accrued = Number(incomingMetrics?.accruedEarnings || 0);
+      let total = Number(incomingMetrics?.totalBalance || (checking + savings + invested + accrued));
 
-      // Check if this user is the currently active logged-in user
-      const isCurrentActive = loggedInUser && (loggedInUser.id === fsUser.id || (loggedInUser.email && loggedInUser.email.toLowerCase().trim() === emailKey));
-      
-      let effectiveMetrics = fsUser.balanceMetrics;
-      if (isCurrentActive && currentAuthBalanceMetrics) {
-        effectiveMetrics = currentAuthBalanceMetrics;
-      } else if (!effectiveMetrics || (effectiveMetrics.totalBalance === 0 && effectiveMetrics.checkingBalance === 0)) {
-        effectiveMetrics = matchedServer?.balanceMetrics || effectiveMetrics;
+      // Always check localStorage for live balance on user dashboard
+      if (typeof window !== 'undefined') {
+        try {
+          const candidates = [
+            localStorage.getItem(`monvera_balances_${userId}`),
+            accNum ? localStorage.getItem(`monvera_balances_${accNum}`) : null,
+          ];
+          for (const raw of candidates) {
+            if (!raw) continue;
+            const parsed = JSON.parse(raw);
+            if (parsed) {
+              const lChk = Number(parsed.checkingBalance || 0);
+              const lSav = Number(parsed.savingsBalance || 0);
+              const lInv = Number(parsed.investedBalance || 0);
+              const lAcc = Number(parsed.accruedEarnings || 0);
+              const lTot = Number(parsed.totalBalance || (lChk + lSav + lInv + lAcc));
+              if (lTot > 0 || lChk > 0) {
+                checking = lChk;
+                savings = lSav;
+                invested = lInv;
+                accrued = lAcc;
+                total = lTot;
+                break;
+              }
+            }
+          }
+        } catch {}
       }
 
-      const defaultMetrics = {
-        checkingBalance: 0,
-        savingsBalance: 0,
-        investedBalance: 0,
-        totalBalance: 0,
-        availableBalance: 0,
-        accruedEarnings: 0,
-        pendingBalance: 0,
+      return {
+        checkingBalance: checking,
+        savingsBalance: savings,
+        investedBalance: invested,
+        accruedEarnings: accrued,
+        totalBalance: total || (checking + savings + invested + accrued),
+        availableBalance: Number(incomingMetrics?.availableBalance || checking),
+        pendingBalance: Number(incomingMetrics?.pendingBalance || 0),
+        accounts: incomingMetrics?.accounts || [],
       };
+    };
 
-      const finalMetrics = effectiveMetrics || defaultMetrics;
-      const total = (finalMetrics.checkingBalance || 0) + (finalMetrics.savingsBalance || 0) + (finalMetrics.investedBalance || 0);
+    const registerCustomer = (u: UserProfile & { balanceMetrics?: any }, source: 'firestore' | 'local' | 'auth' | 'server') => {
+      if (!u || !u.id) return;
+      // Admin is executive staff; customers table displays banking clients
+      if (u.id === 'usr_admin' || u.role === 'super_admin') return;
+      if (isNonExistentAccount(u)) return;
 
-      const finalUser: UserProfile & { balanceMetrics?: any } = {
-        ...fsUser,
-        balanceMetrics: {
-          ...finalMetrics,
-          totalBalance: total > 0 ? total : (finalMetrics.totalBalance || 0),
-        },
-      };
+      const emailKey = (u.email || '').toLowerCase().trim();
+      const accKey = (u.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const shouldBeFrozen = frozenIds.has(u.id) || (emailKey && frozenIds.has(emailKey)) || u.status === 'frozen';
+      if (shouldBeFrozen) {
+        u.status = 'frozen';
+      }
 
-      userMap.set(fsUser.id, finalUser);
-      if (emailKey) seenEmails.add(emailKey);
-      if (accKey) seenAccountNums.add(accKey);
-    }
-
-    // 2. Include logged in user if not already present
-    if (loggedInUser && loggedInUser.id) {
-      const loggedEmail = (loggedInUser.email || '').toLowerCase().trim();
-      const loggedAcc = (loggedInUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
-
-      if (!userMap.has(loggedInUser.id) && !seenEmails.has(loggedEmail)) {
-        const liveMetrics = currentAuthBalanceMetrics || (loggedInUser as any).balanceMetrics || {
-          checkingBalance: 25000.0,
-          savingsBalance: 50000.0,
-          investedBalance: 15000.0,
-          totalBalance: 90000.0,
-          availableBalance: 75000.0,
-          accruedEarnings: 800.0,
-          pendingBalance: 0,
+      // Check if already in map by ID
+      if (userMap.has(u.id)) {
+        const existing = userMap.get(u.id)!;
+        const mergedObj = {
+          ...existing,
+          ...u,
+          status: ((shouldBeFrozen || existing.status === 'frozen' || u.status === 'frozen') ? 'frozen' : (u.status || existing.status || 'active')) as UserStatus,
+          // Preserve KYC submission data if existing or incoming has it
+          kycStatus: u.kycStatus || existing.kycStatus || 'unverified',
+          kycDocumentImage: u.kycDocumentImage || existing.kycDocumentImage,
+          kycDocumentBackImage: u.kycDocumentBackImage || existing.kycDocumentBackImage,
+          kycProofOfAddressImage: u.kycProofOfAddressImage || existing.kycProofOfAddressImage,
+          kycLiveSelfieImage: u.kycLiveSelfieImage || existing.kycLiveSelfieImage,
+          kycSsn: u.kycSsn || existing.kycSsn,
+          kycSsnImage: u.kycSsnImage || existing.kycSsnImage,
+          kycDocumentNumber: u.kycDocumentNumber || existing.kycDocumentNumber,
+          kycDocumentType: u.kycDocumentType || existing.kycDocumentType,
+          balanceMetrics: resolveCustomerBalances(u.id, accKey, u.balanceMetrics || existing.balanceMetrics),
         };
+        userMap.set(u.id, mergedObj);
+        return;
+      }
 
-        userMap.set(loggedInUser.id, {
-          ...loggedInUser,
-          balanceMetrics: liveMetrics,
-        });
-        if (loggedEmail) seenEmails.add(loggedEmail);
-        if (loggedAcc) seenAccountNums.add(loggedAcc);
+      // Check if already in map by unique permanent account number (if non-default)
+      if (accKey && accKey !== '1000000000' && accKey !== '1000000001' && seenAccountNums.has(accKey)) {
+        for (const [id, ex] of userMap.entries()) {
+          const exAcc = (ex.permanentAccountNumber || '').replace(/[-\s]/g, '');
+          if (exAcc && exAcc === accKey) {
+            userMap.set(id, {
+              ...ex,
+              ...u,
+              kycStatus: u.kycStatus || ex.kycStatus || 'unverified',
+              kycDocumentImage: u.kycDocumentImage || ex.kycDocumentImage,
+              kycDocumentBackImage: u.kycDocumentBackImage || ex.kycDocumentBackImage,
+              kycProofOfAddressImage: u.kycProofOfAddressImage || ex.kycProofOfAddressImage,
+              kycLiveSelfieImage: u.kycLiveSelfieImage || ex.kycLiveSelfieImage,
+              kycSsn: u.kycSsn || ex.kycSsn,
+              kycSsnImage: u.kycSsnImage || ex.kycSsnImage,
+              balanceMetrics: resolveCustomerBalances(id, accKey, u.balanceMetrics || ex.balanceMetrics),
+            });
+            return;
+          }
+        }
+      }
+
+      // Add as distinct customer account (never deduplicate by email so all registered accounts are visible)
+      u.balanceMetrics = resolveCustomerBalances(u.id, accKey, u.balanceMetrics);
+      userMap.set(u.id, u);
+      if (accKey) seenAccountNums.add(accKey);
+
+      // If user came from local accounts directory and was not yet in Firestore, sync to Firestore
+      if (source === 'local') {
+        firestoreSync.saveUserProfile(u.id, u).catch(() => {});
+      }
+    };
+
+    // 1. First add real users from Firestore (authoritative cloud database)
+    for (const fsUser of firestoreUsers) {
+      if (!isNonExistentAccount(fsUser)) {
+        registerCustomer(fsUser, 'firestore');
       }
     }
 
-    // 3. Include seed/server accounts if not duplicating real accounts
-    for (const sUser of serverUsers) {
-      const emailKey = (sUser.email || '').toLowerCase().trim();
-      const accKey = (sUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
-
-      if (!userMap.has(sUser.id) && !seenEmails.has(emailKey) && !seenAccountNums.has(accKey)) {
-        userMap.set(sUser.id, sUser);
-        if (emailKey) seenEmails.add(emailKey);
-        if (accKey) seenAccountNums.add(accKey);
+    // 2. Read local persistent accounts directory from localStorage (only verified real accounts)
+    try {
+      const localDirRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_accounts_directory') : null;
+      if (localDirRaw) {
+        const localList: UserProfile[] = JSON.parse(localDirRaw);
+        for (const lu of localList) {
+          if (!isNonExistentAccount(lu)) {
+            registerCustomer(lu, 'local');
+          }
+        }
       }
+    } catch {}
+
+    // 3. Include currently logged-in user if available and is a customer
+    if (loggedInUser && loggedInUser.id && loggedInUser.id !== 'usr_admin' && loggedInUser.role !== 'super_admin') {
+      registerCustomer(
+        {
+          ...loggedInUser,
+          balanceMetrics: currentAuthBalanceMetrics || (loggedInUser as any).balanceMetrics,
+        },
+        'auth'
+      );
+    }
+
+    // 4. Include server users if any
+    for (const sUser of serverUsers) {
+      registerCustomer(sUser, 'server');
     }
 
     return Array.from(userMap.values());
@@ -180,17 +256,20 @@ export const AdminDashboard: React.FC = () => {
       setCustomers(merged);
       setSupportTickets(tickets || []);
 
+      const totalUserDeposits = merged.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0);
+
       if (overviewRes) {
         setMetrics({
           ...overviewRes,
           totalCustomers: merged.length,
           activeAccounts: merged.length * 3,
+          totalPlatformDeposits: totalUserDeposits > 0 ? totalUserDeposits : overviewRes.totalPlatformDeposits,
         });
       } else {
         setMetrics({
           totalCustomers: merged.length,
           activeAccounts: merged.length * 3,
-          totalPlatformDeposits: 0,
+          totalPlatformDeposits: totalUserDeposits,
           totalPlatformWithdrawals: 0,
           totalPlatformTransfers: 0,
           totalPlatformInvestments: 0,
@@ -218,9 +297,9 @@ export const AdminDashboard: React.FC = () => {
 
     // Subscribe to Firestore users with balances collection so new signups appear automatically
     const unsubscribeUsers = firestoreSync.subscribeToUsersWithBalances((firestoreUsers) => {
-      if (firestoreUsers && firestoreUsers.length > 0) {
-        setCustomers((prevCustomers) => {
-          const merged = mergeCustomers(firestoreUsers, prevCustomers, currentUser);
+      if (firestoreUsers) {
+        setCustomers(() => {
+          const merged = mergeCustomers(firestoreUsers, [], currentUser);
           setMetrics((prevMetrics) =>
             prevMetrics
               ? {
@@ -242,17 +321,39 @@ export const AdminDashboard: React.FC = () => {
       }
     });
 
+    // Subscribe to Live Customer Chat Messages (alerts admin when any customer sends a message)
+    const unsubscribeChats = firestoreSync.subscribeToAllChatMessages((liveMessages) => {
+      if (liveMessages) {
+        const unrepliedCustomerMsgs = liveMessages.filter(
+          (m) => m.sender === 'user' && m.status !== 'read'
+        );
+        const uniquePendingUsers = new Set(unrepliedCustomerMsgs.map((m) => m.userId));
+        setPendingLiveChatsCount(uniquePendingUsers.size);
+      }
+    });
+
     return () => {
       if (unsubscribeUsers) unsubscribeUsers();
       if (unsubscribeTickets) unsubscribeTickets();
+      if (unsubscribeChats) unsubscribeChats();
     };
   }, []);
 
   const handleToggleFreezeUser = async (userId: string, reason: string) => {
     try {
+      const existing = customers.find((c) => c.id === userId);
+      const nextStatus = existing?.status === 'frozen' ? 'active' : 'frozen';
+
+      // Immediate optimistic update in state
+      setCustomers((prev) => prev.map((c) => (c.id === userId ? { ...c, status: nextStatus } : c)));
+      if (selectedCustomer?.id === userId) {
+        setSelectedCustomer((prev) => (prev ? { ...prev, status: nextStatus } : null));
+      }
+
       const res = await api.toggleCustomerStatus(userId, {
         adminId: currentUser?.id,
         reason: reason || 'Administrative compliance audit',
+        targetStatus: nextStatus,
       });
       if (res.success) {
         await loadAllAdminData();
@@ -513,7 +614,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'overview', label: 'Overview', icon: Building },
     { id: 'customers', label: 'Customers', icon: Users, badge: customers.length },
     { id: 'kyc', label: 'KYC & Compliance', icon: ShieldCheck, alertBadge: pendingKycCount },
-    { id: 'support', label: 'Support & Live Chat', icon: MessageSquare, alertBadge: openTicketsCount },
+    { id: 'support', label: 'Support & Live Chat', icon: MessageSquare, alertBadge: pendingLiveChatsCount > 0 ? pendingLiveChatsCount : (openTicketsCount > 0 ? openTicketsCount : undefined) },
     { id: 'transactions', label: 'Transactions', icon: RefreshCw, alertBadge: pendingTxCount },
     { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },

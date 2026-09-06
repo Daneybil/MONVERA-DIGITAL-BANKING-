@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useAuth, AppView } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { NotificationsDrawer } from './NotificationsDrawer';
+import { KycStatusAlertModal } from '../kyc/KycStatusAlertModal';
 import {
   LayoutDashboard,
   Wallet,
@@ -857,6 +858,9 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
 
       {/* Notifications Drawer */}
       <NotificationsDrawer isOpen={notifsOpen} onClose={() => setNotifsOpen(false)} />
+
+      {/* KYC Adjudication Status Pop-up Alert */}
+      <KycStatusAlertModal />
     </div>
   );
 };

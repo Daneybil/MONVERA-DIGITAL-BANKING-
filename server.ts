@@ -829,24 +829,49 @@ app.get('/api/admin/overview', (req: Request, res: Response) => {
 });
 
 app.get('/api/admin/customers', (req: Request, res: Response) => {
-  const customers = Array.from(db.users.values()).map((u) => {
-    const metrics = db.getUserBalanceMetrics(u.id);
-    return {
-      ...u,
-      balanceMetrics: metrics,
-    };
-  });
+  const customers = Array.from(db.users.values())
+    .filter((u) => u.id !== 'usr_admin' && u.role !== 'super_admin' && !u.email?.endsWith('@monvera.internal'))
+    .map((u) => {
+      const metrics = db.getUserBalanceMetrics(u.id);
+      return {
+        ...u,
+        balanceMetrics: metrics,
+      };
+    });
   res.json({ customers });
 });
 
 app.post('/api/admin/customers/:id/toggle-status', (req: Request, res: Response) => {
   const { id } = req.params;
-  const { adminId, reason } = req.body;
-  const user = db.users.get(id);
+  const { adminId, reason, targetStatus } = req.body;
+  let user = db.users.get(id);
+  if (!user) {
+    user = Array.from(db.users.values()).find((u) => u.id === id || u.email === id);
+  }
 
-  if (!user) return res.status(404).json({ error: 'Customer not found' });
-
-  user.status = user.status === 'active' ? 'frozen' : 'active';
+  if (!user) {
+    const placeholderUser: UserProfile = {
+      id,
+      username: `user_${id.slice(0, 6)}`,
+      firstName: 'Account',
+      lastName: 'Holder',
+      email: `${id}@monvera.internal`,
+      phone: '+1 (555) 000-0000',
+      permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
+      status: targetStatus || 'frozen',
+      role: 'customer',
+      membershipTier: 'Premier',
+      twoFactorEnabled: false,
+      createdAt: new Date().toISOString(),
+      kycStatus: 'unverified',
+      country: 'United States',
+      dailyTransactionLimit: 1000000,
+    };
+    db.users.set(id, placeholderUser);
+    user = placeholderUser;
+  } else {
+    user.status = targetStatus || (user.status === 'active' ? 'frozen' : 'active');
+  }
 
   db.auditLogs.unshift({
     id: `aud_${Date.now()}`,
@@ -855,13 +880,42 @@ app.post('/api/admin/customers/:id/toggle-status', (req: Request, res: Response)
     action: user.status === 'frozen' ? 'CUSTOMER_ACCOUNT_RESTRICTED' : 'CUSTOMER_ACCOUNT_UNFROZEN',
     targetUserId: user.id,
     targetAccountNumber: user.permanentAccountNumber,
-    reason: reason || 'Administrative compliance review',
+    reason: reason || (user.status === 'frozen' ? 'Account placed on administrative freeze' : 'Administrative hold lifted'),
     timestamp: new Date().toISOString(),
     ipAddress: '127.0.0.1 (Admin Console)',
     result: 'SUCCESS',
   });
 
   res.json({ success: true, user });
+});
+
+app.post('/api/user/unfreeze', (req: Request, res: Response) => {
+  const { userId, reason } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  let user = db.users.get(userId);
+  if (!user) {
+    user = Array.from(db.users.values()).find((u) => u.id === userId || u.email === userId);
+  }
+
+  if (user) {
+    user.status = 'active';
+  }
+
+  db.auditLogs.unshift({
+    id: `aud_${Date.now()}`,
+    adminId: userId,
+    adminName: user ? `${user.firstName} ${user.lastName}` : 'Customer Self-Unfreeze',
+    action: 'CUSTOMER_ACCOUNT_UNFROZEN',
+    targetUserId: userId,
+    targetAccountNumber: user?.permanentAccountNumber || '1000000000',
+    reason: reason || 'Customer completed security verification',
+    timestamp: new Date().toISOString(),
+    ipAddress: '127.0.0.1 (Customer Portal)',
+    result: 'SUCCESS',
+  });
+
+  res.json({ success: true, status: 'active', user });
 });
 
 // Admin KYC Approval & Rejection Endpoints
@@ -1080,6 +1134,45 @@ app.post('/api/loans/repay', (req: Request, res: Response) => {
   });
   if (!result.success) return res.status(400).json({ error: result.error });
   res.json(result);
+});
+
+// --- SUPPORT CHAT LIVE PERSISTENCE ---
+app.get('/api/support/messages', (req: Request, res: Response) => {
+  const userId = req.query.userId as string;
+  const allMessages = Array.from(db.supportMessages.values());
+  if (!userId) {
+    return res.json({ messages: allMessages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()) });
+  }
+  const userMessages = allMessages
+    .filter((m) => m.userId === userId || m.userEmail === userId || m.userAccountNumber === userId)
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  res.json({ messages: userMessages });
+});
+
+app.post('/api/support/messages', (req: Request, res: Response) => {
+  const msg = req.body;
+  if (!msg || !msg.id || !msg.userId) {
+    return res.status(400).json({ error: 'Valid message with id and userId required.' });
+  }
+  db.supportMessages.set(msg.id, msg);
+  res.json({ success: true, message: msg });
+});
+
+app.post('/api/support/messages/read', (req: Request, res: Response) => {
+  const { userId, role } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+  for (const [id, msg] of db.supportMessages.entries()) {
+    if (msg.userId === userId) {
+      if (role === 'admin' && msg.sender === 'user') {
+        db.supportMessages.set(id, { ...msg, status: 'read' });
+      } else if (role === 'user' && msg.sender === 'support') {
+        db.supportMessages.set(id, { ...msg, status: 'read' });
+      }
+    }
+  }
+  res.json({ success: true });
 });
 
 // --- VITE / STATIC SERVING ---

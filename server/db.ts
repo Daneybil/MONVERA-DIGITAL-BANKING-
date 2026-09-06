@@ -32,6 +32,7 @@ export class MonveraDatabase {
   public notifications: NotificationItem[] = [];
   public auditLogs: AdminAuditLog[] = [];
   public sessions: Map<string, SessionInfo[]> = new Map();
+  public supportMessages: Map<string, any> = new Map(); // Persistent live chat store
   public devFundingPoolBalance: number = 1000000000.0; // $1,000,000,000.00 Development Testing Liquidity Pool
 
   constructor() {
@@ -65,14 +66,20 @@ export class MonveraDatabase {
 
     // Initialize Bank Accounts for Admin
     this.initUserAccounts(adminId, adminAccNum);
-
-    // Initial Cards, Investments, Transactions, and Notifications start clean with only real user data
   }
 
-  private initUserAccounts(userId: string, permanentAccNum: string) {
+  private initUserAccounts(
+    userId: string,
+    permanentAccNum: string,
+    initialBalances?: { checking?: number; savings?: number; invested?: number }
+  ) {
     const chkId = `acc_chk_${userId}`;
     const savId = `acc_sav_${userId}`;
     const invId = `acc_inv_${userId}`;
+
+    const chkBal = initialBalances?.checking ?? 0;
+    const savBal = initialBalances?.savings ?? 0;
+    const invBal = initialBalances?.invested ?? 0;
 
     this.accounts.set(chkId, {
       id: chkId,
@@ -81,8 +88,8 @@ export class MonveraDatabase {
       accountNumber: permanentAccNum,
       routingNumber: '021000021', // Monvera NY Fed Routing
       currency: 'USD',
-      balance: 0,
-      availableBalance: 0,
+      balance: chkBal,
+      availableBalance: chkBal,
       investedBalance: 0,
       pendingBalance: 0,
       interestRateAPY: 1.25,
@@ -97,8 +104,8 @@ export class MonveraDatabase {
       accountNumber: `${permanentAccNum.slice(0, 7)}991`,
       routingNumber: '021000021',
       currency: 'USD',
-      balance: 0,
-      availableBalance: 0,
+      balance: savBal,
+      availableBalance: savBal,
       investedBalance: 0,
       pendingBalance: 0,
       interestRateAPY: 4.85,
@@ -113,9 +120,9 @@ export class MonveraDatabase {
       accountNumber: `${permanentAccNum.slice(0, 7)}882`,
       routingNumber: '021000021',
       currency: 'USD',
-      balance: 0,
+      balance: invBal,
       availableBalance: 0,
-      investedBalance: 0,
+      investedBalance: invBal,
       pendingBalance: 0,
       interestRateAPY: 8.4,
       status: 'ACTIVE',
@@ -125,15 +132,6 @@ export class MonveraDatabase {
 
   public ensureUserExists(userId: string, data?: Partial<UserProfile>): UserProfile {
     let user = this.users.get(userId);
-    if (!user && data?.email) {
-      user = Array.from(this.users.values()).find(
-        (u) => u.email.toLowerCase() === data.email!.trim().toLowerCase()
-      );
-      if (user) {
-        // Associate this ID
-        this.users.set(userId, user);
-      }
-    }
 
     if (!user) {
       const permanentAccountNumber =

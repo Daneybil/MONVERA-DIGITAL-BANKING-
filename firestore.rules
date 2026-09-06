@@ -37,13 +37,19 @@ service cloud.firestore {
     // Support messages collection for WhatsApp live chat
     match /support_messages/{messageId} {
       allow get, list, create, update: if true;
-      allow delete: if isSignedIn();
+      allow delete: if true;
+    }
+
+    // Support typing indicator status
+    match /support_typing/{userId} {
+      allow get, list, create, update: if true;
+      allow delete: if true;
     }
 
     // Support tickets collection
     match /support_tickets/{ticketId} {
       allow get, list, create, update: if true;
-      allow delete: if isSignedIn();
+      allow delete: if true;
     }
 
     // Investments collection
@@ -61,7 +67,7 @@ service cloud.firestore {
     // Notifications collection
     match /notifications/{notificationId} {
       allow get, list, create, update: if true;
-      allow delete: if isSignedIn();
+      allow delete: if true;
     }
 
     // Loans & credit facilities collection

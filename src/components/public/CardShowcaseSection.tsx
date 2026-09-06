@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { CreditCard, Shield, Lock, Sliders, Globe, Zap, Sparkles, CheckCircle2, ArrowRight } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import luxuryCardholderImage from '../../assets/images/monvera_luxury_cardholder_1787487721200.jpg';
 
 export const CardShowcaseSection: React.FC = () => {
   const { openModal, currentUser, setCurrentView } = useAuth();
@@ -243,7 +244,10 @@ export const CardShowcaseSection: React.FC = () => {
           <div className="grid grid-cols-1 lg:grid-cols-12 items-center">
             <div className="lg:col-span-7 relative h-72 sm:h-96 lg:h-[420px] w-full overflow-hidden">
               <img
-                src="/src/assets/images/monvera_luxury_cardholder_1787487721200.jpg"
+                src={luxuryCardholderImage}
+                onError={(e) => {
+                  (e.target as HTMLImageElement).src = '/assets/images/monvera_luxury_cardholder_1787487721200.jpg';
+                }}
                 alt="Monvera Obsidian Cardholder Executive"
                 className="w-full h-full object-cover object-center"
                 referrerPolicy="no-referrer"

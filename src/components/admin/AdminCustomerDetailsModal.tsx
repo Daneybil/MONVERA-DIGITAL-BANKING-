@@ -33,6 +33,7 @@ import {
   HelpCircle,
   Copy,
   Check,
+  Download,
 } from 'lucide-react';
 import { AdminConfirmationModal } from './AdminConfirmationModal';
 
@@ -93,6 +94,70 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
     navigator.clipboard.writeText(text);
     setCopiedField(fieldId);
     setTimeout(() => setCopiedField(null), 2000);
+  };
+
+  const downloadDocument = (url: string, filename: string) => {
+    if (!url) return;
+    try {
+      if (url.startsWith('data:')) {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return;
+      }
+      fetch(url)
+        .then((res) => res.blob())
+        .then((blob) => {
+          const objectUrl = window.URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = objectUrl;
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(objectUrl);
+        })
+        .catch(() => {
+          const link = document.createElement('a');
+          link.href = url;
+          link.target = '_blank';
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        });
+    } catch (err) {
+      console.error('Error downloading document:', err);
+      window.open(url, '_blank');
+    }
+  };
+
+  const handleDownloadAllCustomerDocuments = (cust: UserProfile) => {
+    const cleanName = (cust.kycFullName || `${cust.firstName}_${cust.lastName}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+    let delay = 0;
+    if (cust.kycDocumentImage) {
+      setTimeout(() => downloadDocument(cust.kycDocumentImage!, `ID_Front_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    if (cust.kycDocumentBackImage) {
+      setTimeout(() => downloadDocument(cust.kycDocumentBackImage!, `ID_Back_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    if (cust.kycProofOfAddressImage) {
+      setTimeout(() => downloadDocument(cust.kycProofOfAddressImage!, `Address_Proof_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    const selfie = cust.kycLiveSelfieImage || cust.avatarUrl;
+    if (selfie) {
+      setTimeout(() => downloadDocument(selfie, `Selfie_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    if (cust.kycSsnImage) {
+      setTimeout(() => downloadDocument(cust.kycSsnImage!, `SSN_Tax_Card_${cleanName}.jpg`), delay);
+    }
   };
 
   const userTxs = transactions.filter(
@@ -501,21 +566,32 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                       </p>
                     </div>
                   </div>
-                  <span
-                    className={`px-3.5 py-1 rounded-full text-xs font-black border self-start sm:self-auto ${
-                      isKycVerified
-                        ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
-                        : isKycPending
-                        ? 'bg-amber-100 text-amber-950 border-amber-300'
-                        : customer.kycStatus === 'action_required' || customer.kycStatus === 'partially_approved'
-                        ? 'bg-orange-100 text-orange-950 border-orange-300'
-                        : customer.kycStatus === 'rejected'
-                        ? 'bg-rose-100 text-rose-950 border-rose-300'
-                        : 'bg-slate-100 text-slate-800 border-slate-300'
-                    }`}
-                  >
-                    {customer.kycStatus?.toUpperCase() || 'UNVERIFIED'}
-                  </span>
+                  <div className="flex items-center gap-2 self-start sm:self-auto">
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadAllCustomerDocuments(customer)}
+                      className="px-3 py-1.5 rounded-xl bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                      title="Download all customer verification documents"
+                    >
+                      <Download className="w-3.5 h-3.5 text-slate-500" />
+                      <span>Download All Documents</span>
+                    </button>
+                    <span
+                      className={`px-3.5 py-1 rounded-full text-xs font-black border ${
+                        isKycVerified
+                          ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                          : isKycPending
+                          ? 'bg-amber-100 text-amber-950 border-amber-300'
+                          : customer.kycStatus === 'action_required' || customer.kycStatus === 'partially_approved'
+                          ? 'bg-orange-100 text-orange-950 border-orange-300'
+                          : customer.kycStatus === 'rejected'
+                          ? 'bg-rose-100 text-rose-950 border-rose-300'
+                          : 'bg-slate-100 text-slate-800 border-slate-300'
+                      }`}
+                    >
+                      {customer.kycStatus?.toUpperCase() || 'UNVERIFIED'}
+                    </span>
+                  </div>
                 </div>
 
                 {/* Customer KYC Metadata Summary */}
@@ -619,6 +695,16 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                               No front image uploaded
                             </div>
                           )}
+                          {customer.kycDocumentImage && (
+                            <button
+                              type="button"
+                              onClick={() => downloadDocument(customer.kycDocumentImage!, `ID_Front_${(customer.kycFullName || customer.firstName).replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`)}
+                              className="mt-1.5 w-full py-1.5 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                            >
+                              <Download className="w-3.5 h-3.5 text-slate-500" />
+                              <span>Download Front ID</span>
+                            </button>
+                          )}
                         </div>
 
                         <div>
@@ -642,6 +728,16 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                             <div className="h-36 rounded-xl bg-slate-200/80 flex items-center justify-center text-xs text-slate-600 font-bold">
                               {customer.kycDocumentType?.toLowerCase().includes('passport') ? 'Not required for Passport' : 'No back image uploaded'}
                             </div>
+                          )}
+                          {customer.kycDocumentBackImage && (
+                            <button
+                              type="button"
+                              onClick={() => downloadDocument(customer.kycDocumentBackImage!, `ID_Back_${(customer.kycFullName || customer.firstName).replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`)}
+                              className="mt-1.5 w-full py-1.5 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                            >
+                              <Download className="w-3.5 h-3.5 text-slate-500" />
+                              <span>Download Back ID</span>
+                            </button>
                           )}
                         </div>
                       </div>
@@ -745,6 +841,16 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                             No proof of address image uploaded
                           </div>
                         )}
+                        {customer.kycProofOfAddressImage && (
+                          <button
+                            type="button"
+                            onClick={() => downloadDocument(customer.kycProofOfAddressImage!, `Address_Proof_${(customer.kycFullName || customer.firstName).replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`)}
+                            className="mt-1.5 max-w-md py-1.5 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5 text-slate-500" />
+                            <span>Download Address Document</span>
+                          </button>
+                        )}
                       </div>
 
                       {/* Granular item actions */}
@@ -819,18 +925,31 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
 
                       <div className="flex items-center gap-6">
                         {customer.kycLiveSelfieImage || customer.avatarUrl ? (
-                          <div className="relative group rounded-full overflow-hidden border-2 border-slate-300 bg-white w-28 h-28 shrink-0">
-                            <img
-                              src={customer.kycLiveSelfieImage || customer.avatarUrl}
-                              alt="Biometric Selfie"
-                              className="w-full h-full object-cover"
-                            />
+                          <div className="flex flex-col items-center">
+                            <div className="relative group rounded-full overflow-hidden border-2 border-slate-300 bg-white w-28 h-28 shrink-0">
+                              <img
+                                src={customer.kycLiveSelfieImage || customer.avatarUrl}
+                                alt="Biometric Selfie"
+                                className="w-full h-full object-cover"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setZoomedImage({ src: (customer.kycLiveSelfieImage || customer.avatarUrl)!, title: 'Biometric Facial Selfie' })}
+                                className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white text-[11px] font-bold transition-opacity cursor-pointer"
+                              >
+                                Inspect
+                              </button>
+                            </div>
                             <button
                               type="button"
-                              onClick={() => setZoomedImage({ src: (customer.kycLiveSelfieImage || customer.avatarUrl)!, title: 'Biometric Facial Selfie' })}
-                              className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white text-[11px] font-bold transition-opacity cursor-pointer"
+                              onClick={() => {
+                                const selfie = customer.kycLiveSelfieImage || customer.avatarUrl;
+                                downloadDocument(selfie!, `Selfie_${(customer.kycFullName || customer.firstName).replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`);
+                              }}
+                              className="mt-2 py-1 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
                             >
-                              Inspect
+                              <Download className="w-3.5 h-3.5 text-slate-500" />
+                              <span>Download</span>
                             </button>
                           </div>
                         ) : (
@@ -954,6 +1073,14 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                               <Eye className="w-4 h-4" /> Inspect SSN Card
                             </button>
                           </div>
+                          <button
+                            type="button"
+                            onClick={() => downloadDocument(customer.kycSsnImage!, `SSN_Card_${(customer.kycFullName || customer.firstName).replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`)}
+                            className="mt-1.5 max-w-sm py-1.5 px-3 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5 text-slate-500" />
+                            <span>Download SSN Card</span>
+                          </button>
                         </div>
                       )}
 
@@ -1140,13 +1267,23 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
           <div className="bg-slate-900 border border-slate-700 rounded-3xl max-w-4xl w-full max-h-[90vh] flex flex-col overflow-hidden shadow-2xl">
             <div className="p-4 sm:p-5 bg-slate-850 border-b border-slate-700 flex items-center justify-between">
               <h4 className="text-base font-black text-white">{zoomedImage.title}</h4>
-              <button
-                type="button"
-                onClick={() => setZoomedImage(null)}
-                className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
-              >
-                <X className="w-5 h-5 stroke-[2.5]" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => downloadDocument(zoomedImage.src, `${zoomedImage.title.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-colors cursor-pointer shadow-xs"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Document</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setZoomedImage(null)}
+                  className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5 stroke-[2.5]" />
+                </button>
+              </div>
             </div>
             <div className="p-4 sm:p-6 overflow-auto flex items-center justify-center bg-slate-950 flex-1 min-h-[300px]">
               <img

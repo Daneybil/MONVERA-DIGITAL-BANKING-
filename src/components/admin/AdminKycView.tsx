@@ -21,6 +21,7 @@ import {
   Building2,
   Check,
   CreditCard,
+  Download,
 } from 'lucide-react';
 import { AdminConfirmationModal } from './AdminConfirmationModal';
 
@@ -78,6 +79,70 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
       ...prev,
       [userId]: !prev[userId],
     }));
+  };
+
+  const downloadDocument = (url: string, filename: string) => {
+    if (!url) return;
+    try {
+      if (url.startsWith('data:')) {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return;
+      }
+      fetch(url)
+        .then((res) => res.blob())
+        .then((blob) => {
+          const objectUrl = window.URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = objectUrl;
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(objectUrl);
+        })
+        .catch(() => {
+          const link = document.createElement('a');
+          link.href = url;
+          link.target = '_blank';
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        });
+    } catch (err) {
+      console.error('Error downloading document:', err);
+      window.open(url, '_blank');
+    }
+  };
+
+  const handleDownloadAllDocuments = (applicant: UserProfile) => {
+    const cleanName = (applicant.kycFullName || `${applicant.firstName}_${applicant.lastName}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+    let delay = 0;
+    if (applicant.kycDocumentImage) {
+      setTimeout(() => downloadDocument(applicant.kycDocumentImage!, `ID_Front_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    if (applicant.kycDocumentBackImage) {
+      setTimeout(() => downloadDocument(applicant.kycDocumentBackImage!, `ID_Back_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    if (applicant.kycProofOfAddressImage) {
+      setTimeout(() => downloadDocument(applicant.kycProofOfAddressImage!, `Address_Proof_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    const selfie = applicant.kycLiveSelfieImage || applicant.avatarUrl;
+    if (selfie) {
+      setTimeout(() => downloadDocument(selfie, `Selfie_${cleanName}.jpg`), delay);
+      delay += 300;
+    }
+    if (applicant.kycSsnImage) {
+      setTimeout(() => downloadDocument(applicant.kycSsnImage!, `SSN_Tax_Card_${cleanName}.jpg`), delay);
+    }
   };
 
   const pending = customers.filter((c) => c.kycStatus === 'pending');
@@ -370,6 +435,15 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                   {/* Overall Quick Actions */}
                   <div className="flex items-center gap-2 self-end md:self-center">
                     <button
+                      type="button"
+                      onClick={() => handleDownloadAllDocuments(applicant)}
+                      className="px-3 py-1.5 text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl transition-colors cursor-pointer flex items-center gap-1.5 shadow-xs"
+                      title="Download all uploaded verification documents"
+                    >
+                      <Download className="w-3.5 h-3.5 text-slate-600" />
+                      <span>Download All Files</span>
+                    </button>
+                    <button
                       onClick={() => onSelectCustomer(applicant)}
                       className="px-3 py-1.5 text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl transition-colors cursor-pointer flex items-center gap-1.5"
                     >
@@ -522,75 +596,105 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
 
                         <div className="grid grid-cols-2 gap-2 mt-3">
                           {/* Front Photo */}
-                          <div
-                            onClick={() => {
-                              if (applicant.kycDocumentImage) {
-                                setZoomedImage({
-                                  src: applicant.kycDocumentImage,
-                                  title: `Government ID (Front) - ${fullLegalName}`,
-                                });
-                              }
-                            }}
-                            className={`group relative h-28 rounded-xl border border-slate-200 overflow-hidden bg-slate-100 flex flex-col items-center justify-center ${
-                              applicant.kycDocumentImage ? 'cursor-pointer hover:border-slate-400' : 'opacity-70 cursor-default'
-                            }`}
-                          >
-                            {applicant.kycDocumentImage ? (
-                              <>
-                                <img
-                                  src={applicant.kycDocumentImage}
-                                  alt="ID Front"
-                                  className="w-full h-full object-cover group-hover:scale-105 transition-transform"
-                                />
-                                <div className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-[10px] font-bold gap-1">
-                                  <Eye className="w-3.5 h-3.5" /> Inspect Front
+                          <div>
+                            <div
+                              onClick={() => {
+                                if (applicant.kycDocumentImage) {
+                                  setZoomedImage({
+                                    src: applicant.kycDocumentImage,
+                                    title: `Government ID (Front) - ${fullLegalName}`,
+                                  });
+                                }
+                              }}
+                              className={`group relative h-28 rounded-xl border border-slate-200 overflow-hidden bg-slate-100 flex flex-col items-center justify-center ${
+                                applicant.kycDocumentImage ? 'cursor-pointer hover:border-slate-400' : 'opacity-70 cursor-default'
+                              }`}
+                            >
+                              {applicant.kycDocumentImage ? (
+                                <>
+                                  <img
+                                    src={applicant.kycDocumentImage}
+                                    alt="ID Front"
+                                    className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                                  />
+                                  <div className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-[10px] font-bold gap-1">
+                                    <Eye className="w-3.5 h-3.5" /> Inspect Front
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="text-center p-2 text-slate-400 text-[10px]">
+                                  <FileText className="w-5 h-5 mx-auto mb-1 text-slate-300" />
+                                  No Front Photo
                                 </div>
-                              </>
-                            ) : (
-                              <div className="text-center p-2 text-slate-400 text-[10px]">
-                                <FileText className="w-5 h-5 mx-auto mb-1 text-slate-300" />
-                                No Front Photo
-                              </div>
+                              )}
+                              <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/70 text-white text-[9px] font-black">
+                                Front
+                              </span>
+                            </div>
+                            {applicant.kycDocumentImage && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  downloadDocument(applicant.kycDocumentImage!, `ID_Front_${fullLegalName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`);
+                                }}
+                                className="mt-1.5 w-full py-1 px-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[10px] font-bold flex items-center justify-center gap-1 shadow-xs transition-colors cursor-pointer"
+                              >
+                                <Download className="w-3 h-3 text-slate-500" />
+                                Download Front
+                              </button>
                             )}
-                            <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/70 text-white text-[9px] font-black">
-                              Front
-                            </span>
                           </div>
 
                           {/* Back Photo */}
-                          <div
-                            onClick={() => {
-                              if (applicant.kycDocumentBackImage) {
-                                setZoomedImage({
-                                  src: applicant.kycDocumentBackImage,
-                                  title: `Government ID (Back) - ${fullLegalName}`,
-                                });
-                              }
-                            }}
-                            className={`group relative h-28 rounded-xl border border-slate-200 overflow-hidden bg-slate-100 flex flex-col items-center justify-center ${
-                              applicant.kycDocumentBackImage ? 'cursor-pointer hover:border-slate-400' : 'opacity-70 cursor-default'
-                            }`}
-                          >
-                            {applicant.kycDocumentBackImage ? (
-                              <>
-                                <img
-                                  src={applicant.kycDocumentBackImage}
-                                  alt="ID Back"
-                                  className="w-full h-full object-cover group-hover:scale-105 transition-transform"
-                                />
-                                <div className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-[10px] font-bold gap-1">
-                                  <Eye className="w-3.5 h-3.5" /> Inspect Back
+                          <div>
+                            <div
+                              onClick={() => {
+                                if (applicant.kycDocumentBackImage) {
+                                  setZoomedImage({
+                                    src: applicant.kycDocumentBackImage,
+                                    title: `Government ID (Back) - ${fullLegalName}`,
+                                  });
+                                }
+                              }}
+                              className={`group relative h-28 rounded-xl border border-slate-200 overflow-hidden bg-slate-100 flex flex-col items-center justify-center ${
+                                applicant.kycDocumentBackImage ? 'cursor-pointer hover:border-slate-400' : 'opacity-70 cursor-default'
+                              }`}
+                            >
+                              {applicant.kycDocumentBackImage ? (
+                                <>
+                                  <img
+                                    src={applicant.kycDocumentBackImage}
+                                    alt="ID Back"
+                                    className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                                  />
+                                  <div className="absolute inset-0 bg-slate-950/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-[10px] font-bold gap-1">
+                                    <Eye className="w-3.5 h-3.5" /> Inspect Back
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="text-center p-2 text-slate-400 text-[10px]">
+                                  <FileText className="w-5 h-5 mx-auto mb-1 text-slate-300" />
+                                  {isPassport ? 'Passport (No back)' : 'No Back Photo'}
                                 </div>
-                              </>
-                            ) : (
-                              <div className="text-center p-2 text-slate-400 text-[10px]">
-                                <FileText className="w-5 h-5 mx-auto mb-1 text-slate-300" />
-                                {isPassport ? 'Passport (No back)' : 'No Back Photo'}
-                              </div>
+                              )}
+                              <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/70 text-white text-[9px] font-black">
+                                Back
+                              </span>
+                            </div>
+                            {applicant.kycDocumentBackImage && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  downloadDocument(applicant.kycDocumentBackImage!, `ID_Back_${fullLegalName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`);
+                                }}
+                                className="mt-1.5 w-full py-1 px-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[10px] font-bold flex items-center justify-center gap-1 shadow-xs transition-colors cursor-pointer"
+                              >
+                                <Download className="w-3 h-3 text-slate-500" />
+                                Download Back
+                              </button>
                             )}
-                            <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/70 text-white text-[9px] font-black">
-                              Back
-                            </span>
                           </div>
                         </div>
                       </div>
@@ -684,6 +788,20 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                               Face Match
                             </span>
                           </div>
+                          {(applicant.kycLiveSelfieImage || applicant.avatarUrl) && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const selfieSrc = applicant.kycLiveSelfieImage || applicant.avatarUrl;
+                                downloadDocument(selfieSrc!, `Selfie_${fullLegalName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`);
+                              }}
+                              className="mt-1.5 w-full py-1 px-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[10px] font-bold flex items-center justify-center gap-1 shadow-xs transition-colors cursor-pointer"
+                            >
+                              <Download className="w-3 h-3 text-slate-500" />
+                              Download Selfie
+                            </button>
+                          )}
                         </div>
                       </div>
 
@@ -775,6 +893,19 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                               Utility / Statement
                             </span>
                           </div>
+                          {applicant.kycProofOfAddressImage && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                downloadDocument(applicant.kycProofOfAddressImage!, `Address_Proof_${fullLegalName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`);
+                              }}
+                              className="mt-1.5 w-full py-1 px-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[10px] font-bold flex items-center justify-center gap-1 shadow-xs transition-colors cursor-pointer"
+                            >
+                              <Download className="w-3 h-3 text-slate-500" />
+                              Download Address Doc
+                            </button>
+                          )}
                         </div>
                       </div>
 
@@ -842,7 +973,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                               }}
                               className={`group relative h-28 rounded-xl border border-slate-200 overflow-hidden bg-slate-100 flex flex-col items-center justify-center ${
                                 applicant.kycSsnImage
-                                  ? 'cursor-pointer hover:border-slate-400'
+                                    ? 'cursor-pointer hover:border-slate-400'
                                   : 'opacity-70 cursor-default'
                               }`}
                             >
@@ -870,6 +1001,19 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                                 Tax ID Card
                               </span>
                             </div>
+                            {applicant.kycSsnImage && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  downloadDocument(applicant.kycSsnImage!, `SSN_Tax_Card_${fullLegalName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`);
+                                }}
+                                className="mt-1.5 w-full py-1 px-2 rounded-lg bg-white hover:bg-slate-50 border border-slate-200 text-slate-700 text-[10px] font-bold flex items-center justify-center gap-1 shadow-xs transition-colors cursor-pointer"
+                              >
+                                <Download className="w-3 h-3 text-slate-500" />
+                                Download SSN Card
+                              </button>
+                            )}
                           </div>
                         </div>
 
@@ -996,12 +1140,22 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
           <div className="bg-white rounded-3xl max-w-3xl w-full p-5 shadow-2xl border-2 border-slate-200 animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-3">
               <h4 className="text-sm font-black text-slate-900">{zoomedImage.title}</h4>
-              <button
-                onClick={() => setZoomedImage(null)}
-                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => downloadDocument(zoomedImage.src, `${zoomedImage.title.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-colors cursor-pointer shadow-xs"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Document</span>
+                </button>
+                <button
+                  onClick={() => setZoomedImage(null)}
+                  className="p-1.5 text-slate-400 hover:text-slate-600 rounded-xl hover:bg-slate-100 cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
             <div className="max-h-[75vh] overflow-hidden rounded-2xl bg-slate-950 flex items-center justify-center p-2">
               <img

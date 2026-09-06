@@ -48,6 +48,49 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   return errInfo;
 }
 
+export const FAKE_ACCOUNT_IDS = new Set([
+  'usr_eleanor',
+  'usr_marcus',
+  'usr_sophia',
+  'usr_alexander',
+  'usr_isabella',
+  'usr_lucas',
+  'usr_clara',
+  'usr_tariq',
+  'usr_elena',
+  'usr_william',
+  'usr_amara',
+  'usr_julian',
+]);
+
+export function isNonExistentAccount(user: { id?: string; email?: string; firstName?: string; lastName?: string; role?: string }): boolean {
+  if (!user) return true;
+  if (user.id && FAKE_ACCOUNT_IDS.has(user.id)) return true;
+  if (user.id === 'usr_admin' || user.role === 'super_admin') return true;
+  if (user.email) {
+    const em = user.email.toLowerCase().trim();
+    if (
+      em.endsWith('@vanceholdings.com') ||
+      em.endsWith('@sterlingtech.io') ||
+      em.endsWith('@falconcap.ae') ||
+      em.endsWith('@apexventures.sg') ||
+      em.endsWith('@milanolux.it') ||
+      em.endsWith('@vanderbiltmaritime.nl') ||
+      em.endsWith('@oswaldresearch.org') ||
+      em.endsWith('@gulfenergyholdings.com') ||
+      em.endsWith('@auroraglobal.ch') ||
+      em.endsWith('@thornepartners.co.uk') ||
+      em.endsWith('@lagosfin.ng') ||
+      em.endsWith('@delacroixequity.fr') ||
+      em.endsWith('@monvera.internal')
+    ) {
+      return true;
+    }
+  }
+  if (user.firstName === 'Monvera' && user.lastName === 'Client') return true;
+  return false;
+}
+
 export const firestoreSync = {
   /**
    * Save or update Customer Profile in Firestore under users/{uid}
@@ -954,9 +997,61 @@ export const firestoreSync = {
         });
       });
 
-      return userList;
+      // Filter only real registered users from Firestore (excluding admin and non-existent accounts)
+      const realUsers = userList.filter((u) => !isNonExistentAccount(u));
+
+      // Synchronize with local storage safely without injecting any non-existent accounts
+      if (typeof window !== 'undefined') {
+        try {
+          // Check local directory cache and sanitize it
+          const localRaw = localStorage.getItem('monvera_accounts_directory');
+          if (localRaw) {
+            const localList: UserProfile[] = JSON.parse(localRaw);
+            for (const lu of localList) {
+              if (!lu || !lu.id || isNonExistentAccount(lu)) continue;
+              const existingIdx = realUsers.findIndex(
+                (u) =>
+                  u.id === lu.id ||
+                  (u.permanentAccountNumber && lu.permanentAccountNumber && u.permanentAccountNumber === lu.permanentAccountNumber)
+              );
+              if (existingIdx >= 0) {
+                realUsers[existingIdx] = { ...realUsers[existingIdx], ...lu };
+              } else {
+                realUsers.push(lu);
+                if (db) {
+                  setDoc(doc(db, 'users', lu.id), lu, { merge: true }).catch(() => {});
+                }
+              }
+            }
+          }
+
+          // Check if current user is logged in and not yet recorded
+          const curUserRaw = localStorage.getItem('monvera_current_user');
+          if (curUserRaw) {
+            const cu = JSON.parse(curUserRaw);
+            if (cu && cu.id && !isNonExistentAccount(cu)) {
+              if (!realUsers.some((u) => u.id === cu.id || (u.permanentAccountNumber && u.permanentAccountNumber === cu.permanentAccountNumber))) {
+                realUsers.push(cu);
+              }
+            }
+          }
+
+          // Persist the clean list of real accounts
+          localStorage.setItem('monvera_accounts_directory', JSON.stringify(realUsers));
+        } catch {}
+      }
+
+      return realUsers;
     } catch (err) {
       console.warn('[Firestore] Error fetching all users:', err);
+      // Fallback to sanitized local accounts directory if Firestore network fails
+      try {
+        const localRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_accounts_directory') : null;
+        if (localRaw) {
+          const parsed: UserProfile[] = JSON.parse(localRaw);
+          return parsed.filter((u) => !isNonExistentAccount(u));
+        }
+      } catch {}
       return [];
     }
   },
@@ -1047,7 +1142,24 @@ export const firestoreSync = {
     const results: (UserProfile & { balanceMetrics?: BalanceMetrics })[] = [];
 
     for (const user of users) {
-      const balances = await this.getAccountBalances(user.id);
+      let balances = await this.getAccountBalances(user.id, user.permanentAccountNumber);
+      if (!balances || balances.totalBalance === 0) {
+        // Hydrate from localStorage cached balances if available
+        if (typeof window !== 'undefined') {
+          try {
+            const raw =
+              localStorage.getItem(`monvera_balances_${user.id}`) ||
+              (user.permanentAccountNumber ? localStorage.getItem(`monvera_balances_${user.permanentAccountNumber}`) : null);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (parsed && (Number(parsed.totalBalance || 0) > 0 || Number(parsed.checkingBalance || 0) > 0)) {
+                balances = parsed;
+              }
+            }
+          } catch {}
+        }
+      }
+
       const metrics: BalanceMetrics = balances || {
         checkingBalance: 0,
         savingsBalance: 0,
@@ -1134,6 +1246,8 @@ export const firestoreSync = {
               emailVerified: data.emailVerified ?? false,
               dailyTransactionLimit: data.dailyTransactionLimit || 1000000,
             };
+
+            if (isNonExistentAccount(profile)) continue;
 
             const balances = await this.getAccountBalances(uid, cleanAcc);
             const metrics: BalanceMetrics = balances || {
@@ -1542,19 +1656,43 @@ export const firestoreSync = {
   },
 
   /**
-   * Save a WhatsApp Live Chat Message to Firestore and local backup
+   * Save a WhatsApp Live Chat Message to Firestore, backend API, and local backup
    */
   async saveChatMessage(msg: ChatMessage): Promise<boolean> {
     if (!msg || !msg.userId) return false;
-    // Local backup
+    // 1. Local backup for specific user
     try {
       const localKey = `monvera_chat_${msg.userId}`;
       const existingStr = localStorage.getItem(localKey);
       const list: ChatMessage[] = existingStr ? JSON.parse(existingStr) : [];
       const updated = [...list.filter((m) => m.id !== msg.id), msg];
-      localStorage.setItem(localKey, JSON.stringify(updated.slice(-100)));
+      localStorage.setItem(localKey, JSON.stringify(updated.slice(-300)));
+
+      // Also append to global admin live messages cache
+      const globalKey = 'monvera_all_chat_messages';
+      const gRaw = localStorage.getItem(globalKey);
+      const gList: ChatMessage[] = gRaw ? JSON.parse(gRaw) : [];
+      const gUpdated = [...gList.filter((m) => m.id !== msg.id), msg];
+      localStorage.setItem(globalKey, JSON.stringify(gUpdated.slice(-1000)));
+
+      // Instant 0ms cross-tab and cross-component broadcast
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('monvera_chat_update', { detail: msg }));
+      }
     } catch {}
 
+    // 2. Server API persistence
+    try {
+      if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
+        fetch('/api/support/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(msg),
+        }).catch(() => {});
+      }
+    } catch {}
+
+    // 3. Firestore Cloud Persistence
     if (!db) return true;
     const path = `support_messages/${msg.id}`;
     try {
@@ -1571,35 +1709,115 @@ export const firestoreSync = {
   },
 
   /**
-   * Fetch all WhatsApp Live Chat messages for a user
+   * Permanently update a user's account status (active vs frozen) across Firestore & localStorage
+   */
+  async updateUserStatus(userId: string, status: 'active' | 'frozen'): Promise<boolean> {
+    if (!userId) return false;
+    try {
+      // 1. Update localStorage accounts directory
+      if (typeof window !== 'undefined') {
+        const localDirRaw = localStorage.getItem('monvera_accounts_directory');
+        if (localDirRaw) {
+          const list: UserProfile[] = JSON.parse(localDirRaw);
+          const updated = list.map((u) => (u.id === userId || u.email === userId ? { ...u, status } : u));
+          localStorage.setItem('monvera_accounts_directory', JSON.stringify(updated));
+        }
+
+        // 2. Update persistent frozen accounts registry
+        const frozenRaw = localStorage.getItem('monvera_frozen_accounts');
+        const frozenSet = new Set<string>(frozenRaw ? JSON.parse(frozenRaw) : []);
+        if (status === 'frozen') {
+          frozenSet.add(userId);
+        } else {
+          frozenSet.delete(userId);
+        }
+        localStorage.setItem('monvera_frozen_accounts', JSON.stringify(Array.from(frozenSet)));
+
+        // 3. Update current user in session if matches
+        const currRaw = localStorage.getItem('monvera_current_user');
+        if (currRaw) {
+          const curr = JSON.parse(currRaw);
+          if (curr.id === userId || curr.email === userId) {
+            localStorage.setItem('monvera_current_user', JSON.stringify({ ...curr, status }));
+          }
+        }
+
+        // 4. Notify all components immediately
+        window.dispatchEvent(new CustomEvent('monvera_user_status_changed', { detail: { userId, status } }));
+      }
+
+      // 5. Update Firestore
+      if (db) {
+        const userRef = doc(db, 'users', userId);
+        await setDoc(userRef, { status, statusUpdatedAt: new Date().toISOString() }, { merge: true });
+      }
+      return true;
+    } catch (err) {
+      console.error('[FirestoreSync] Failed to update user status:', err);
+      return false;
+    }
+  },
+
+  /**
+   * Fetch all WhatsApp Live Chat messages for a user with 3-tier persistence (LocalStorage + Server API + Firestore)
    */
   async getChatMessagesForUser(userId: string): Promise<ChatMessage[]> {
     if (!userId) return [];
-    let localList: ChatMessage[] = [];
+    const map = new Map<string, ChatMessage>();
+
+    // 1. Read from localStorage first
     try {
       const localStr = localStorage.getItem(`monvera_chat_${userId}`);
-      if (localStr) localList = JSON.parse(localStr);
+      if (localStr) {
+        const localList: ChatMessage[] = JSON.parse(localStr);
+        localList.forEach((m) => {
+          if (m && m.id) map.set(m.id, m);
+        });
+      }
     } catch {}
 
-    if (!db) return localList.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
+    // 2. Fetch from backend API
     try {
-      const msgCol = collection(db, 'support_messages');
-      const q = query(msgCol, where('userId', '==', userId));
-      const snap = await getDocs(q);
-      const map = new Map<string, ChatMessage>();
-      localList.forEach((m) => map.set(m.id, m));
-      snap.forEach((d) => {
-        const item = d.data() as ChatMessage;
-        map.set(item.id || d.id, item);
-      });
-      return Array.from(map.values()).sort(
-        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-      );
-    } catch (err) {
-      console.warn('[Firestore] Error loading chat messages:', err);
-      return localList.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
+        const res = await fetch(`/api/support/messages?userId=${encodeURIComponent(userId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.messages)) {
+            data.messages.forEach((m: ChatMessage) => {
+              if (m && m.id) map.set(m.id, m);
+            });
+          }
+        }
+      }
+    } catch {}
+
+    // 3. Fetch from Firestore if available
+    if (db) {
+      try {
+        const msgCol = collection(db, 'support_messages');
+        const q = query(msgCol, where('userId', '==', userId));
+        const snap = await getDocs(q);
+        snap.forEach((d) => {
+          const item = d.data() as ChatMessage;
+          if (item && (item.id || d.id)) {
+            map.set(item.id || d.id, item);
+          }
+        });
+      } catch (err) {
+        console.warn('[Firestore] Error loading chat messages:', err);
+      }
     }
+
+    const merged = Array.from(map.values()).sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
+    // Save back to local cache
+    try {
+      localStorage.setItem(`monvera_chat_${userId}`, JSON.stringify(merged));
+    } catch {}
+
+    return merged;
   },
 
   /**
@@ -1607,32 +1825,312 @@ export const firestoreSync = {
    */
   subscribeToChatMessages(userId: string, onUpdate: (messages: ChatMessage[]) => void): () => void {
     if (!userId) return () => {};
-    if (!db) {
+
+    // 1. Synchronous 0ms immediate emission from local cache so the user sees past chats instantly
+    try {
+      const localStr = localStorage.getItem(`monvera_chat_${userId}`);
+      if (localStr) {
+        const cached: ChatMessage[] = JSON.parse(localStr);
+        if (cached && cached.length > 0) {
+          onUpdate(cached.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()));
+        }
+      }
+    } catch {}
+
+    // 2. Async full multi-source refresh
+    this.getChatMessagesForUser(userId).then((list) => {
+      if (list && list.length > 0) onUpdate(list);
+    });
+
+    const handleLocalBroadcast = () => {
       this.getChatMessagesForUser(userId).then(onUpdate);
-      return () => {};
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_chat_update', handleLocalBroadcast);
+      window.addEventListener('storage', handleLocalBroadcast);
     }
+
+    if (!db) {
+      return () => {
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+          window.removeEventListener('storage', handleLocalBroadcast);
+        }
+      };
+    }
+
     try {
       const msgCol = collection(db, 'support_messages');
       const q = query(msgCol, where('userId', '==', userId));
       const unsubscribe = onSnapshot(
         q,
         (snap) => {
-          const list: ChatMessage[] = [];
+          const map = new Map<string, ChatMessage>();
+          // Preserve all known local messages
+          try {
+            const raw = localStorage.getItem(`monvera_chat_${userId}`);
+            if (raw) {
+              const localList: ChatMessage[] = JSON.parse(raw);
+              localList.forEach((m) => {
+                if (m && m.id) map.set(m.id, m);
+              });
+            }
+          } catch {}
+
+          // Merge live snapshot messages
           snap.forEach((d) => {
-            list.push(d.data() as ChatMessage);
+            const item = d.data() as ChatMessage;
+            if (item && (item.id || d.id)) {
+              map.set(item.id || d.id, item);
+            }
           });
-          list.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+          const list = Array.from(map.values()).sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+          );
+
+          try {
+            localStorage.setItem(`monvera_chat_${userId}`, JSON.stringify(list));
+          } catch {}
+
           onUpdate(list);
         },
         (error) => {
           console.warn('[Firestore live chat subscription notice]:', error);
         }
       );
-      return unsubscribe;
+      return () => {
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+          window.removeEventListener('storage', handleLocalBroadcast);
+        }
+        if (typeof unsubscribe === 'function') unsubscribe();
+      };
     } catch (err) {
       console.warn('[Firestore] Error subscribing to live chat:', err);
+      return () => {
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+          window.removeEventListener('storage', handleLocalBroadcast);
+        }
+      };
+    }
+  },
+
+  /**
+   * Subscribe to ALL WhatsApp Live Chat messages across all customers (For Admin Dashboard)
+   */
+  subscribeToAllChatMessages(onUpdate: (messages: ChatMessage[]) => void): () => void {
+    const getLocalAll = (): ChatMessage[] => {
+      try {
+        const map = new Map<string, ChatMessage>();
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && (key.startsWith('monvera_chat_') || key === 'monvera_all_chat_messages')) {
+            const raw = localStorage.getItem(key);
+            if (raw) {
+              const msgs: ChatMessage[] = JSON.parse(raw);
+              msgs.forEach((m) => {
+                if (m && m.id) map.set(m.id, m);
+              });
+            }
+          }
+        }
+        return Array.from(map.values()).sort(
+          (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+        );
+      } catch {
+        return [];
+      }
+    };
+
+    const handleLocalBroadcast = () => {
+      onUpdate(getLocalAll());
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_chat_update', handleLocalBroadcast);
+      window.addEventListener('storage', handleLocalBroadcast);
+    }
+
+    if (!db) {
+      onUpdate(getLocalAll());
+      return () => {
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+          window.removeEventListener('storage', handleLocalBroadcast);
+        }
+      };
+    }
+
+    try {
+      const msgCol = collection(db, 'support_messages');
+      const unsubscribe = onSnapshot(
+        msgCol,
+        (snap) => {
+          const map = new Map<string, ChatMessage>();
+          // 1. Add local fallback messages
+          getLocalAll().forEach((m) => map.set(m.id, m));
+          // 2. Add live Firestore docs
+          snap.forEach((d) => {
+            const m = d.data() as ChatMessage;
+            if (m && m.id) map.set(m.id, m);
+          });
+
+          const list = Array.from(map.values()).sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+          );
+          onUpdate(list);
+        },
+        (error) => {
+          console.warn('[Firestore all chat messages subscription note]:', error);
+          onUpdate(getLocalAll());
+        }
+      );
+      return () => {
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+          window.removeEventListener('storage', handleLocalBroadcast);
+        }
+        if (typeof unsubscribe === 'function') unsubscribe();
+      };
+    } catch (err) {
+      console.warn('[Firestore] Error subscribing to all chat messages:', err);
+      onUpdate(getLocalAll());
+      return () => {
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+          window.removeEventListener('storage', handleLocalBroadcast);
+        }
+      };
+    }
+  },
+
+  /**
+   * Update real-time typing status in Firestore & Local storage
+   */
+  async setTypingStatus(userId: string, isTyping: boolean, role: 'user' | 'admin'): Promise<void> {
+    if (!userId) return;
+    const nowIso = new Date().toISOString();
+    try {
+      const localKey = `monvera_typing_${userId}`;
+      const existing = localStorage.getItem(localKey);
+      const parsed = existing ? JSON.parse(existing) : {};
+      if (role === 'admin') {
+        parsed.adminTyping = isTyping;
+        parsed.lastAdminTyping = nowIso;
+      } else {
+        parsed.userTyping = isTyping;
+        parsed.lastUserTyping = nowIso;
+      }
+      localStorage.setItem(localKey, JSON.stringify(parsed));
+    } catch {}
+
+    if (!db) return;
+    try {
+      const typeRef = doc(db, 'support_typing', userId);
+      const payload: Record<string, any> = role === 'admin'
+        ? { adminTyping: isTyping, lastAdminTyping: nowIso }
+        : { userTyping: isTyping, lastUserTyping: nowIso };
+      await setDoc(typeRef, payload, { merge: true });
+    } catch (err) {
+      // Non-blocking typing update
+    }
+  },
+
+  /**
+   * Subscribe to typing indicators for a specific conversation
+   */
+  subscribeToTypingStatus(
+    userId: string,
+    onUpdate: (status: { adminTyping: boolean; userTyping: boolean }) => void
+  ): () => void {
+    if (!userId) return () => {};
+
+    const checkLocal = () => {
+      try {
+        const raw = localStorage.getItem(`monvera_typing_${userId}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const now = Date.now();
+          const lastA = parsed.lastAdminTyping ? new Date(parsed.lastAdminTyping).getTime() : 0;
+          const lastU = parsed.lastUserTyping ? new Date(parsed.lastUserTyping).getTime() : 0;
+          return {
+            adminTyping: Boolean(parsed.adminTyping && now - lastA < 7000),
+            userTyping: Boolean(parsed.userTyping && now - lastU < 7000),
+          };
+        }
+      } catch {}
+      return { adminTyping: false, userTyping: false };
+    };
+
+    if (!db) {
+      onUpdate(checkLocal());
+      const interval = setInterval(() => onUpdate(checkLocal()), 1500);
+      return () => clearInterval(interval);
+    }
+
+    try {
+      const typeRef = doc(db, 'support_typing', userId);
+      const unsubscribe = onSnapshot(
+        typeRef,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            const now = Date.now();
+            const lastA = data.lastAdminTyping ? new Date(data.lastAdminTyping).getTime() : 0;
+            const lastU = data.lastUserTyping ? new Date(data.lastUserTyping).getTime() : 0;
+            onUpdate({
+              adminTyping: Boolean(data.adminTyping && now - lastA < 7000),
+              userTyping: Boolean(data.userTyping && now - lastU < 7000),
+            });
+          } else {
+            onUpdate(checkLocal());
+          }
+        },
+        () => {
+          onUpdate(checkLocal());
+        }
+      );
+      return unsubscribe;
+    } catch (err) {
       return () => {};
     }
+  },
+
+  /**
+   * Mark messages as read for a customer conversation
+   */
+  async markChatMessagesAsRead(userId: string, reader: 'admin' | 'user'): Promise<void> {
+    if (!userId) return;
+    try {
+      const localKey = `monvera_chat_${userId}`;
+      const raw = localStorage.getItem(localKey);
+      if (raw) {
+        const list: ChatMessage[] = JSON.parse(raw);
+        const updated = list.map((m) => {
+          if (reader === 'admin' && m.sender === 'user') return { ...m, status: 'read' as const };
+          if (reader === 'user' && m.sender === 'support') return { ...m, status: 'read' as const };
+          return m;
+        });
+        localStorage.setItem(localKey, JSON.stringify(updated));
+      }
+    } catch {}
+
+    if (!db) return;
+    try {
+      const msgCol = collection(db, 'support_messages');
+      const targetSender = reader === 'admin' ? 'user' : 'support';
+      const q = query(msgCol, where('userId', '==', userId), where('sender', '==', targetSender));
+      const snap = await getDocs(q);
+      snap.forEach((d) => {
+        const data = d.data() as ChatMessage;
+        if (data.status !== 'read') {
+          setDoc(d.ref, { status: 'read' }, { merge: true }).catch(() => {});
+        }
+      });
+    } catch {}
   },
 
   /**

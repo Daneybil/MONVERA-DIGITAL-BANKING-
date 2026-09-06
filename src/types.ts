@@ -293,11 +293,15 @@ export interface ChatMessage {
   senderName: string;
   senderRole?: string;
   senderAvatar?: string;
+  userEmail?: string;
+  userAccountNumber?: string;
   message: string;
   timestamp: string;
   status: 'sent' | 'delivered' | 'read';
   attachmentUrl?: string;
   attachmentType?: 'image' | 'document' | 'receipt';
+  attachmentName?: string;
+  attachmentSize?: number;
   quickAction?: string;
 }
 

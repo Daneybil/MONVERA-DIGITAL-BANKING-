@@ -195,6 +195,7 @@ export const api = {
     autoApprove?: boolean;
     reviewDurationMinutes?: number;
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
+    let serverUser: UserProfile | undefined;
     try {
       const res = await fetch('/api/kyc/submit', {
         method: 'POST',
@@ -203,17 +204,16 @@ export const api = {
       });
       const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
       if (parsed.success && parsed.user) {
-        return parsed;
-      }
-      if (parsed.error && parsed.error !== 'Authentication service offline' && !parsed.error.includes('offline')) {
+        serverUser = parsed.user;
+      } else if (parsed.error && parsed.error !== 'Authentication service offline' && !parsed.error.includes('offline')) {
         // Explicit rejection error from server
         return parsed;
       }
     } catch (fetchErr) {
-      console.warn('[API] /api/kyc/submit endpoint unreachable, falling back to direct persistence:', fetchErr);
+      console.warn('[API] /api/kyc/submit endpoint unreachable, saving to Firestore & local storage:', fetchErr);
     }
 
-    // Direct Firestore and Local persistence fallback for serverless/static web environments
+    // Direct Firestore and Local persistence: Guarantees KYC never disappears
     try {
       const now = new Date().toISOString();
       const cleanFullName = data.fullName?.trim() || `${data.firstName || ''} ${data.lastName || ''}`.trim();
@@ -221,7 +221,7 @@ export const api = {
       const derivedFirstName = data.firstName || nameParts[0] || '';
       const derivedLastName = data.lastName || nameParts.slice(1).join(' ') || '';
 
-      const fallbackUser: Partial<UserProfile> = {
+      const kycDataToSave: Partial<UserProfile> = {
         id: data.userId,
         kycStatus: data.autoApprove ? 'verified' : 'pending',
         kycFullName: cleanFullName,
@@ -256,11 +256,32 @@ export const api = {
         },
       };
 
-      await firestoreSync.saveUserProfile(data.userId, fallbackUser);
+      const finalUser = {
+        ...(serverUser || {}),
+        ...kycDataToSave,
+      } as UserProfile;
+
+      // Persist to Firestore cloud database
+      await firestoreSync.saveUserProfile(data.userId, finalUser);
+
+      // Persist to local accounts directory
+      try {
+        const dirRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_accounts_directory') : null;
+        if (dirRaw) {
+          const dirList: UserProfile[] = JSON.parse(dirRaw);
+          const idx = dirList.findIndex((u) => u.id === data.userId);
+          if (idx >= 0) {
+            dirList[idx] = { ...dirList[idx], ...finalUser };
+          } else {
+            dirList.push(finalUser);
+          }
+          localStorage.setItem('monvera_accounts_directory', JSON.stringify(dirList));
+        }
+      } catch {}
 
       return {
         success: true,
-        user: fallbackUser as UserProfile,
+        user: finalUser,
       };
     } catch (fallbackErr: any) {
       console.error('[API] Failed to submit KYC via fallback:', fallbackErr);
@@ -1440,16 +1461,46 @@ export const api = {
     }
   },
 
-  async toggleCustomerStatus(id: string, data: { adminId?: string; reason?: string }): Promise<{ success: boolean; user?: UserProfile }> {
+  async toggleCustomerStatus(id: string, data: { adminId?: string; reason?: string; targetStatus?: 'active' | 'frozen' }): Promise<{ success: boolean; user?: UserProfile }> {
     try {
+      // 1. Determine target status
+      let determinedStatus: 'active' | 'frozen' = data.targetStatus || 'frozen';
+      if (!data.targetStatus) {
+        const frozenRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_frozen_accounts') : null;
+        const isCurrentlyFrozen = frozenRaw && JSON.parse(frozenRaw).includes(id);
+        determinedStatus = isCurrentlyFrozen ? 'active' : 'frozen';
+      }
+
+      // 2. Persist to Firestore and local registry immediately
+      await firestoreSync.updateUserStatus(id, determinedStatus);
+
+      // 3. Call server endpoint to update backend state & audit logs
       const res = await fetch(`/api/admin/customers/${encodeURIComponent(id)}/toggle-status`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
+        body: JSON.stringify({ ...data, targetStatus: determinedStatus }),
       });
-      return await parseJsonResponse(res, { success: false });
+      const parsed = await parseJsonResponse<any>(res, { success: true });
+      return {
+        success: true,
+        user: parsed?.user || ({ id, status: determinedStatus } as UserProfile),
+      };
     } catch {
       return { success: false };
+    }
+  },
+
+  async unfreezeUserAccount(userId: string, data: { pinOrPassword?: string; reason?: string }): Promise<{ success: boolean; error?: string }> {
+    try {
+      await firestoreSync.updateUserStatus(userId, 'active');
+      const res = await fetch(`/api/user/unfreeze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, ...data }),
+      });
+      return await parseJsonResponse(res, { success: true });
+    } catch {
+      return { success: false, error: 'Failed to unfreeze account.' };
     }
   },
 

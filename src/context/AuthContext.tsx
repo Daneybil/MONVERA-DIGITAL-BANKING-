@@ -327,6 +327,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const detail = e.detail;
       if (!detail) return;
       if (currentUser?.id && detail.userId === currentUser.id) {
+        refreshNotifications();
         if (detail.user) {
           setCurrentUser((prev) => ({
             ...(prev || {}),
