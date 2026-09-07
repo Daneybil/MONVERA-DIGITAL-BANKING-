@@ -39,6 +39,9 @@ export const SecuritySection: React.FC = () => {
           <div className="relative rounded-3xl overflow-hidden border-2 border-emerald-500 shadow-2xl shadow-emerald-950/20 group">
             <img
               src={monveraBankHqImage}
+              onError={(e) => {
+                (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?w=1600&auto=format&fit=crop&q=80';
+              }}
               alt="Monvera Digital Bank Global Headquarters"
               className="w-full h-64 sm:h-80 md:h-[450px] object-cover object-center group-hover:scale-105 transition-transform duration-700"
               referrerPolicy="no-referrer"

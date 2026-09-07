@@ -248,37 +248,54 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const refreshProfile = useCallback(async () => {
     if (!currentUser?.id) return;
     try {
-      // 1. Authoritative Firestore document read
+      // 1. Authoritative Firestore document read (Firestore is the single source of truth)
       const fsProfile = await firestoreSync.getUserProfile(currentUser.id);
       if (fsProfile) {
-        if (
-          fsProfile.kycStatus !== currentUser.kycStatus ||
-          fsProfile.dailyTransactionLimit !== currentUser.dailyTransactionLimit ||
-          fsProfile.status !== currentUser.status
-        ) {
+        // Strict protection: verified status can NEVER be downgraded to pending or unverified
+        const effectiveKycStatus = (currentUser.kycStatus === 'verified' && fsProfile.kycStatus !== 'verified')
+          ? 'verified'
+          : (fsProfile.kycStatus || currentUser.kycStatus);
+
+        const hasChanges =
+          effectiveKycStatus !== currentUser.kycStatus ||
+          (effectiveKycStatus === 'verified' && currentUser.dailyTransactionLimit !== 1000000) ||
+          (fsProfile.status && fsProfile.status !== currentUser.status);
+
+        if (hasChanges) {
           setCurrentUser((prev) => {
             if (!prev) return fsProfile;
             return {
               ...prev,
               ...fsProfile,
+              kycStatus: effectiveKycStatus,
+              dailyTransactionLimit: effectiveKycStatus === 'verified' ? 1000000 : (fsProfile.dailyTransactionLimit || prev.dailyTransactionLimit),
               avatarUrl: getPersistedAvatar(fsProfile.id, fsProfile.avatarUrl || prev.avatarUrl),
             };
           });
-          return;
         }
+        // Authoritative return: when Firestore document exists, NEVER query backend server which may have stale in-memory state!
+        return;
       }
 
-      // 2. Also check backend server state
+      // 2. Only check backend server state if Firestore profile is not found
       const backendRes = await api.getCurrentUser(currentUser.id);
-      if (backendRes?.user && (backendRes.user.kycStatus !== currentUser.kycStatus || backendRes.user.dailyTransactionLimit !== currentUser.dailyTransactionLimit)) {
-        setCurrentUser((prev) => {
-          if (!prev) return backendRes.user;
-          return {
-            ...prev,
-            ...backendRes.user,
-            avatarUrl: getPersistedAvatar(backendRes.user.id, backendRes.user.avatarUrl || prev.avatarUrl),
-          };
-        });
+      if (backendRes?.user) {
+        const backendKyc = (currentUser.kycStatus === 'verified' && backendRes.user.kycStatus !== 'verified')
+          ? 'verified'
+          : (backendRes.user.kycStatus || currentUser.kycStatus);
+
+        if (backendKyc !== currentUser.kycStatus || backendRes.user.dailyTransactionLimit !== currentUser.dailyTransactionLimit) {
+          setCurrentUser((prev) => {
+            if (!prev) return backendRes.user;
+            return {
+              ...prev,
+              ...backendRes.user,
+              kycStatus: backendKyc,
+              dailyTransactionLimit: backendKyc === 'verified' ? 1000000 : (backendRes.user.dailyTransactionLimit || prev.dailyTransactionLimit),
+              avatarUrl: getPersistedAvatar(backendRes.user.id, backendRes.user.avatarUrl || prev.avatarUrl),
+            };
+          });
+        }
       }
     } catch {}
   }, [currentUser?.id, currentUser?.kycStatus, currentUser?.dailyTransactionLimit, currentUser?.status]);
@@ -305,9 +322,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (updatedProfile) {
           setCurrentUser((prev) => {
             if (!prev) return updatedProfile;
+            const effectiveKyc = (prev.kycStatus === 'verified' && updatedProfile.kycStatus !== 'verified')
+              ? 'verified'
+              : (updatedProfile.kycStatus || prev.kycStatus);
             return {
               ...prev,
               ...updatedProfile,
+              kycStatus: effectiveKyc,
+              dailyTransactionLimit: effectiveKyc === 'verified' ? 1000000 : (updatedProfile.dailyTransactionLimit || prev.dailyTransactionLimit),
               avatarUrl: getPersistedAvatar(updatedProfile.id, updatedProfile.avatarUrl || prev.avatarUrl),
             };
           });
@@ -676,9 +698,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ]);
 
       if (backendSync?.user) {
+        const isVerified = userProfile.kycStatus === 'verified' || backendSync.user.kycStatus === 'verified';
         const mergedUser: UserProfile = {
           ...backendSync.user,
           ...userProfile, // Firestore is the single source of truth for customer profile & KYC status
+          kycStatus: isVerified ? 'verified' : (userProfile.kycStatus || backendSync.user.kycStatus),
+          dailyTransactionLimit: isVerified ? 1000000 : (userProfile.dailyTransactionLimit || backendSync.user.dailyTransactionLimit),
           avatarUrl: persistedAvatar,
         };
         setCurrentUser(mergedUser);

@@ -9,6 +9,7 @@ import {
   AdminAuditLog,
   AdminSystemOverview,
   TransactionStatus,
+  LoanApplication,
 } from '../../types';
 import {
   Shield,
@@ -64,6 +65,7 @@ export const AdminDashboard: React.FC = () => {
   const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<(UserProfile & { balanceMetrics?: any }) | null>(null);
   const [pendingLiveChatsCount, setPendingLiveChatsCount] = useState<number>(0);
+  const [adminLoans, setAdminLoans] = useState<LoanApplication[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
 
@@ -243,18 +245,20 @@ export const AdminDashboard: React.FC = () => {
   const loadAllAdminData = async () => {
     setIsLoading(true);
     try {
-      const [overviewRes, custRes, txRes, logsRes, firestoreUsers, tickets] = await Promise.all([
+      const [overviewRes, custRes, txRes, logsRes, firestoreUsers, tickets, loansRes] = await Promise.all([
         api.getAdminOverview(),
         api.getAdminCustomers(),
         api.getTransactions(),
         api.getAdminAuditLogs(),
         firestoreSync.getAllUsersWithBalances(),
         firestoreSync.getAllSupportTickets(),
+        api.getLoans().catch(() => ({ loans: [] })),
       ]);
 
       const merged = mergeCustomers(firestoreUsers || [], custRes.customers || [], currentUser);
       setCustomers(merged);
       setSupportTickets(tickets || []);
+      if (loansRes?.loans) setAdminLoans(loansRes.loans);
 
       const totalUserDeposits = merged.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0);
 
@@ -332,10 +336,18 @@ export const AdminDashboard: React.FC = () => {
       }
     });
 
+    // Subscribe to Loans (alerts admin with a blinking notification when loans arrive)
+    const unsubscribeLoans = firestoreSync.subscribeToLoans((liveLoans) => {
+      if (liveLoans) {
+        setAdminLoans(liveLoans);
+      }
+    });
+
     return () => {
       if (unsubscribeUsers) unsubscribeUsers();
       if (unsubscribeTickets) unsubscribeTickets();
       if (unsubscribeChats) unsubscribeChats();
+      if (unsubscribeLoans) unsubscribeLoans();
     };
   }, []);
 
@@ -609,6 +621,8 @@ export const AdminDashboard: React.FC = () => {
   const pendingKycCount = customers.filter((c) => c.kycStatus === 'pending').length;
   const pendingTxCount = transactions.filter((t) => t.status === 'PENDING').length;
   const openTicketsCount = supportTickets.filter((t) => t.supportStatus === 'OPEN' || !t.supportStatus).length;
+  const pendingLoansCount = adminLoans.filter((l) => l.status === 'PENDING').length;
+  const totalLoansCount = adminLoans.length;
 
   const navTabs = [
     { id: 'overview', label: 'Overview', icon: Building },
@@ -619,7 +633,14 @@ export const AdminDashboard: React.FC = () => {
     { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
     { id: 'transfers', label: 'Transfers', icon: Zap },
-    { id: 'loans', label: 'Loan Monvera', icon: Banknote },
+    {
+      id: 'loans',
+      label: 'Loan Monvera',
+      icon: Banknote,
+      alertBadge: pendingLoansCount > 0 ? pendingLoansCount : undefined,
+      hasBlinkingAlert: pendingLoansCount > 0 || totalLoansCount > 0,
+      blinkingText: pendingLoansCount > 0 ? `${pendingLoansCount} NEW` : (totalLoansCount > 0 ? `${totalLoansCount} LOANS` : undefined),
+    },
     { id: 'demo_funds', label: 'Sandbox Test Funds', icon: Coins },
     { id: 'notifications', label: 'Sentinel Alerts', icon: Bell },
     { id: 'audit', label: 'Audit Trail', icon: FileText },
@@ -724,7 +745,20 @@ export const AdminDashboard: React.FC = () => {
                   <Icon className={`w-4.5 h-4.5 ${isActive ? 'text-slate-950 stroke-[2.5]' : 'text-slate-400 stroke-[2]'}`} />
                   <span>{tab.label}</span>
 
-                  {tab.alertBadge !== undefined && tab.alertBadge > 0 && (
+                  {tab.hasBlinkingAlert && (
+                    <span
+                      className="relative inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-600 text-white shadow-md animate-pulse ml-0.5"
+                      title="New loan activity / messages"
+                    >
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-200 opacity-90"></span>
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-white"></span>
+                      </span>
+                      <span>{tab.blinkingText || 'ALERT'}</span>
+                    </span>
+                  )}
+
+                  {tab.alertBadge !== undefined && tab.alertBadge > 0 && !tab.hasBlinkingAlert && (
                     <span
                       className={`px-2 py-0.5 rounded-full text-xs font-black ${
                         isActive
@@ -736,7 +770,7 @@ export const AdminDashboard: React.FC = () => {
                     </span>
                   )}
 
-                  {tab.badge !== undefined && tab.alertBadge === undefined && (
+                  {tab.badge !== undefined && tab.alertBadge === undefined && !tab.hasBlinkingAlert && (
                     <span
                       className={`px-2 py-0.5 rounded-full text-xs font-extrabold ${
                         isActive

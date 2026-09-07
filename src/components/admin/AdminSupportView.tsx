@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   MessageSquare,
   Send,
@@ -13,9 +13,15 @@ import {
   RefreshCw,
   ExternalLink,
   ChevronRight,
+  ChevronLeft,
+  ChevronDown,
   CheckCheck,
   Mail,
   Phone,
+  Video,
+  Smartphone,
+  Laptop,
+  MoreVertical,
   ShieldCheck,
   Building,
   Lock,
@@ -64,6 +70,15 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
   const [isUploadingProof, setIsUploadingProof] = useState(false);
   const [isExpandedChat, setIsExpandedChat] = useState(false);
   const [isProofModalOpen, setIsProofModalOpen] = useState(false);
+  const [phoneViewMode, setPhoneViewMode] = useState<'iphone' | 'wide'>('iphone');
+  const [mobileShowPhoneChat, setMobileShowPhoneChat] = useState(false);
+
+  // Dedicated refs & state for smooth scrolling without scroll hijacking
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  const isUserScrolledUpRef = useRef<boolean>(false);
+  const [showScrollBottomBtn, setShowScrollBottomBtn] = useState(false);
+  const lastMessageIdRef = useRef<string | null>(null);
+  const prevCustomerIdRef = useRef<string | null>(null);
 
   // Keyboard shortcut: Esc to exit expanded view
   useEffect(() => {
@@ -303,14 +318,70 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
   const selectedCustomerThread = chatThreads.find((t) => t.userId === selectedCustomerId);
   const selectedCustomer = selectedCustomerThread?.customer || customers.find((c) => c.id === selectedCustomerId);
 
-  const activeCustomerMessages = allChatMessages
-    .filter((m) => m.userId === selectedCustomerId)
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  // Memoize active customer messages so reference remains stable across renders unless messages change
+  const activeCustomerMessages = useMemo(() => {
+    if (!selectedCustomerId) return [];
+    return allChatMessages
+      .filter((m) => m.userId === selectedCustomerId)
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  }, [allChatMessages, selectedCustomerId]);
 
-  // Scroll to bottom when new message arrives or selected customer changes
+  // Smooth scroll helper strictly contained to the messages div
+  const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior,
+    });
+    isUserScrolledUpRef.current = false;
+    setShowScrollBottomBtn(false);
+  };
+
+  // Track user scroll position manually: detects if user is reading previous messages
+  const handleMessagesScroll = () => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    // If distance from bottom is greater than 90px, admin is actively scrolling/reading earlier history
+    const isScrolledUp = distanceFromBottom > 90;
+    isUserScrolledUpRef.current = isScrolledUp;
+    setShowScrollBottomBtn(isScrolledUp);
+  };
+
+  // Safe auto-scroll:
+  // - Customer switched: immediately reset and jump to the latest messages
+  // - New message arrived: only scroll down if sent by support OR user hasn't scrolled up to read history
   useEffect(() => {
-    chatMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeCustomerMessages, customerIsTyping, selectedCustomerId]);
+    if (!selectedCustomerId) return;
+
+    if (selectedCustomerId !== prevCustomerIdRef.current) {
+      prevCustomerIdRef.current = selectedCustomerId;
+      isUserScrolledUpRef.current = false;
+      setShowScrollBottomBtn(false);
+      lastMessageIdRef.current = activeCustomerMessages[activeCustomerMessages.length - 1]?.id || null;
+
+      // Small delay to let DOM render new customer messages, then instant jump to bottom
+      const timer = setTimeout(() => {
+        const el = messagesContainerRef.current;
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+
+    const latestMsg = activeCustomerMessages[activeCustomerMessages.length - 1];
+    const latestId = latestMsg?.id || null;
+
+    if (latestId && latestId !== lastMessageIdRef.current) {
+      lastMessageIdRef.current = latestId;
+      // If admin sent message OR admin is already near bottom, scroll down naturally
+      if (latestMsg.sender === 'support' || !isUserScrolledUpRef.current) {
+        setTimeout(() => scrollToBottom('smooth'), 50);
+      }
+    }
+  }, [selectedCustomerId, activeCustomerMessages]);
 
   // Admin typing handler: notifies user's widget that "Monvera Support is typing..."
   const handleAdminInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -353,6 +424,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     await firestoreSync.saveChatMessage(supportMsg);
     // Mark customer's prior messages as read
     await firestoreSync.markChatMessagesAsRead(selectedCustomerId, 'admin');
+    setTimeout(() => scrollToBottom('smooth'), 50);
   };
 
   // Admin upload proof/document to customer
@@ -386,6 +458,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
 
         await firestoreSync.saveChatMessage(fileMsg);
         await firestoreSync.markChatMessagesAsRead(selectedCustomerId, 'admin');
+        setTimeout(() => scrollToBottom('smooth'), 50);
       } catch (err) {
         console.error('Failed to send admin attachment:', err);
       } finally {
@@ -614,7 +687,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
 
           <div className={isExpandedChat ? 'grid grid-cols-1 lg:grid-cols-12 gap-5 h-full flex-1 min-h-0 overflow-hidden' : 'contents'}>
             {/* Left Column: Customer Conversation Threads List */}
-            <div className="lg:col-span-4 xl:col-span-4 bg-white rounded-2xl border border-slate-200 shadow-xs flex flex-col overflow-hidden">
+            <div className={`lg:col-span-4 xl:col-span-4 bg-white rounded-2xl border border-slate-200 shadow-xs flex flex-col overflow-hidden ${mobileShowPhoneChat ? 'hidden lg:flex' : 'flex'}`}>
             {/* Thread Header & Search */}
             <div className="p-4 border-b border-slate-200 space-y-3 bg-slate-50/50">
               <div className="flex items-center justify-between">
@@ -698,7 +771,10 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                   return (
                     <div
                       key={thread.userId}
-                      onClick={() => setSelectedCustomerId(thread.userId)}
+                      onClick={() => {
+                        setSelectedCustomerId(thread.userId);
+                        setMobileShowPhoneChat(true);
+                      }}
                       className={`p-3.5 flex items-start gap-3 transition-colors cursor-pointer ${
                         isSelected
                           ? 'bg-emerald-50/80 border-l-4 border-emerald-600'
@@ -775,76 +851,87 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
           </div>
 
           {/* Right Column: Active Live Chat Window */}
-          <div className="lg:col-span-8 xl:col-span-8 bg-white rounded-2xl border border-slate-200 shadow-xs flex flex-col overflow-hidden">
+          <div className={`lg:col-span-8 xl:col-span-8 flex flex-col min-h-0 overflow-hidden ${mobileShowPhoneChat ? 'flex' : 'hidden lg:flex'}`}>
             {selectedCustomer ? (
               <>
-                {/* Active Chat Header */}
-                <div className="p-4 bg-slate-900 text-white flex items-center justify-between shadow-sm shrink-0">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="relative">
-                      <div className="w-11 h-11 rounded-full bg-amber-400 text-slate-950 font-black text-sm flex items-center justify-center border-2 border-emerald-400 shadow-xs">
-                        {selectedCustomer.avatarUrl ? (
-                          <img
-                            src={selectedCustomer.avatarUrl}
-                            alt={selectedCustomer.firstName}
-                            className="w-full h-full rounded-full object-cover"
-                          />
-                        ) : (
-                          <span>{selectedCustomer.firstName?.slice(0, 1) || 'C'}</span>
-                        )}
-                      </div>
-                      <span className="absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full bg-emerald-400 border-2 border-slate-900" />
-                    </div>
-
+                {/* Top Control Bar with View Mode Switcher */}
+                <div className="bg-slate-900 text-white px-4 py-2.5 rounded-2xl border border-slate-800 flex flex-wrap items-center justify-between gap-2.5 shadow-sm mb-3 shrink-0">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <button
+                      onClick={() => setMobileShowPhoneChat(false)}
+                      className="p-1 -ml-1 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg lg:hidden cursor-pointer"
+                      title="Back to conversation list"
+                    >
+                      <ChevronLeft className="w-5 h-5" />
+                    </button>
+                    <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm sm:text-base font-black text-white truncate">
+                        <span className="text-xs sm:text-sm font-black text-white truncate">
                           {selectedCustomer.firstName} {selectedCustomer.lastName}
                         </span>
-                        <span
-                          className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider ${
-                            selectedCustomer.kycStatus === 'verified'
-                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                              : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                          }`}
-                        >
-                          {selectedCustomer.kycStatus === 'verified' ? 'Verified Client' : 'Pending KYC'}
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-slate-300 flex items-center gap-2 mt-0.5 truncate">
-                        <span>{selectedCustomer.email}</span>
-                        <span>•</span>
-                        <span className="font-mono">
+                        <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-800 hidden sm:inline">
                           MVB •••• {selectedCustomer.permanentAccountNumber?.slice(-4) || '1000'}
                         </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400 truncate">
+                        {selectedCustomer.email}
                       </div>
                     </div>
                   </div>
 
-                  {/* Actions: Request Proof, View customer profile, Expand/Minimize screen */}
-                  <div className="flex items-center gap-2">
+                  {/* View Switcher & Action Controls */}
+                  <div className="flex items-center gap-1.5 sm:gap-2">
+                    {/* Phone vs Desk View Toggle */}
+                    <div className="flex items-center gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                      <button
+                        onClick={() => setPhoneViewMode('iphone')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-black flex items-center gap-1.5 transition-all cursor-pointer ${
+                          phoneViewMode === 'iphone'
+                            ? 'bg-emerald-600 text-white shadow-xs'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                        title="iPhone 17 Pro Max WhatsApp interface"
+                      >
+                        <Smartphone className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">iPhone 17 Pro Max</span>
+                      </button>
+                      <button
+                        onClick={() => setPhoneViewMode('wide')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-black flex items-center gap-1.5 transition-all cursor-pointer ${
+                          phoneViewMode === 'wide'
+                            ? 'bg-slate-700 text-white shadow-xs'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                        title="Desk View"
+                      >
+                        <Laptop className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">Desk View</span>
+                      </button>
+                    </div>
+
                     <button
                       onClick={() => setIsProofModalOpen(true)}
-                      className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                      title="Ask user to send proof of their issue or verification documents"
+                      className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs shrink-0"
+                      title="Request proof or screenshots from client"
                     >
                       <Camera className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">Request Proof</span>
+                      <span className="hidden md:inline">Request Proof</span>
                     </button>
 
                     {onSelectCustomer && (
                       <button
                         onClick={() => onSelectCustomer(selectedCustomer)}
-                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold border border-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
+                        className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold border border-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0"
                       >
                         <User className="w-3.5 h-3.5 text-amber-400" />
-                        <span className="hidden md:inline">Inspect Profile</span>
+                        <span className="hidden xl:inline">Profile</span>
                       </button>
                     )}
 
                     <button
                       onClick={() => setIsExpandedChat(!isExpandedChat)}
-                      className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white hover:text-amber-400 text-xs font-black border border-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
+                      className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white hover:text-amber-400 text-xs font-black border border-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0"
                       title={isExpandedChat ? 'Collapse screen' : 'Expand full screen'}
                     >
                       {isExpandedChat ? (
@@ -862,305 +949,701 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                   </div>
                 </div>
 
-                {/* Messages Stream Canvas */}
-                <div
-                  className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-3.5 custom-scrollbar"
-                  style={{
-                    backgroundColor: '#F8FAFC',
-                    backgroundImage: `radial-gradient(#e2e8f0 0.8px, transparent 0.8px)`,
-                    backgroundSize: '16px 16px',
-                  }}
-                >
-                  {/* Security Notice */}
-                  <div className="mx-auto max-w-lg p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-950 text-xs font-bold text-center shadow-2xs flex items-center justify-center gap-2">
-                    <Lock className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                    <span>
-                      256-Bit Encrypted Session • Real-time synchronization active with client's WhatsApp widget.
-                    </span>
-                  </div>
+                {/* ========================================================= */}
+                {/* OPTION A: iPHONE 17 PRO MAX WHATSAPP PHONE INTERFACE (DEFAULT) */}
+                {/* ========================================================= */}
+                {phoneViewMode === 'iphone' ? (
+                  <div className="flex-1 flex flex-col items-center justify-center p-2 sm:p-4 bg-gradient-to-b from-slate-950/80 via-slate-900/60 to-slate-950/80 rounded-2xl border border-slate-800/80 overflow-y-auto custom-scrollbar min-h-0">
+                    {/* iPhone 17 Pro Max Hardware Chassis */}
+                    <div className="relative w-full max-w-[430px] h-[720px] sm:h-[760px] md:h-[780px] max-h-full rounded-[52px] p-3 bg-gradient-to-b from-[#2e3035] via-[#1c1d21] to-[#121316] border-[5px] border-[#44464e] shadow-[0_25px_60px_-15px_rgba(0,0,0,0.9),0_0_0_1px_rgba(255,255,255,0.12)] flex flex-col select-none overflow-hidden my-auto shrink-0">
+                      {/* Hardware Notches / Side Buttons */}
+                      <div className="absolute -left-[9px] top-24 w-[4px] h-8 bg-slate-600 rounded-l-md pointer-events-none" />
+                      <div className="absolute -left-[9px] top-36 w-[4px] h-12 bg-slate-600 rounded-l-md pointer-events-none" />
+                      <div className="absolute -left-[9px] top-52 w-[4px] h-12 bg-slate-600 rounded-l-md pointer-events-none" />
+                      <div className="absolute -right-[9px] top-36 w-[4px] h-16 bg-slate-600 rounded-r-md pointer-events-none" />
 
-                  {activeCustomerMessages.map((msg) => {
-                    const isSupport = msg.sender === 'support';
+                      {/* iPhone 17 Pro Max Screen Glass */}
+                      <div className="rounded-[40px] overflow-hidden flex flex-col flex-1 bg-[#EFEAE2] relative shadow-inner min-h-0 border border-black/40">
+                        {/* iOS Status Bar + Dynamic Island */}
+                        <div className="bg-[#075E54] pt-1 pb-1 px-5 flex flex-col shrink-0 text-white select-none z-30">
+                          <div className="flex items-center justify-between text-[11px] font-semibold">
+                            <span>{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
 
-                    if (isSupport) {
-                      // Support / Admin Reply (Right aligned, balanced)
-                      return (
-                        <div
-                          key={msg.id}
-                          className="flex items-end justify-end gap-2.5 max-w-[88%] sm:max-w-[78%] md:max-w-[70%] ml-auto animate-in fade-in"
-                        >
-                          <div className="bg-gradient-to-br from-emerald-800 to-emerald-900 text-white border border-emerald-700/80 rounded-2xl rounded-br-xs shadow-xs px-4 py-3 space-y-1.5 min-w-[180px]">
-                            {/* Header */}
-                            <div className="flex items-center justify-end gap-2 pb-1 border-b border-emerald-700/60">
-                              <span className="text-xs font-extrabold text-white truncate">
-                                Specialist
-                              </span>
+                            {/* Dynamic Island Pill */}
+                            <div className="w-28 h-6 bg-black rounded-full flex items-center justify-between px-2.5 shadow-sm border border-white/10 -mt-0.5">
+                              <div className="w-2.5 h-2.5 rounded-full bg-[#0a101f] border border-blue-950/60 flex items-center justify-center">
+                                <div className="w-1 h-1 rounded-full bg-blue-900/40" />
+                              </div>
+                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/80 animate-pulse" />
                             </div>
 
-                            {/* Message Body */}
-                            {msg.message && (
-                              <div className="text-xs sm:text-[13px] font-semibold text-white leading-relaxed whitespace-pre-wrap break-words">
-                                {msg.message}
+                            <div className="flex items-center gap-1.5 text-xs">
+                              <span className="text-[10px] font-bold tracking-tighter">5G</span>
+                              <svg className="w-3 h-3 fill-current" viewBox="0 0 24 24">
+                                <path d="M12 4C7.31 4 3.07 5.9 0 8.98L12 21 24 8.98C20.93 5.9 16.69 4 12 4zm0 3.27c3.78 0 7.21 1.48 9.77 3.91L12 18.99 2.23 11.18C4.79 8.75 8.22 7.27 12 7.27z"/>
+                              </svg>
+                              <div className="w-4 h-2 rounded-[3px] border border-white/90 p-0.5 flex items-center">
+                                <div className="h-full w-full bg-emerald-400 rounded-[1.5px]" />
                               </div>
-                            )}
+                            </div>
+                          </div>
+                        </div>
 
-                            {/* Image Attachment */}
-                            {msg.attachmentUrl && msg.attachmentType === 'image' && (
-                              <div className="mt-2 space-y-1.5">
-                                <div
-                                  onClick={() => setZoomedImage({ src: msg.attachmentUrl!, name: msg.attachmentName || 'Proof' })}
-                                  className="relative rounded-xl overflow-hidden border border-emerald-600/60 max-h-52 bg-slate-950 cursor-pointer group"
-                                >
+                        {/* WhatsApp Navigation Header */}
+                        <div className="bg-[#075E54] text-white px-3 py-2 flex items-center justify-between shadow-md shrink-0 z-20 border-t border-emerald-700/40">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <button
+                              onClick={() => setMobileShowPhoneChat(false)}
+                              className="p-1 -ml-1 text-white hover:bg-emerald-800 rounded-full transition-colors cursor-pointer lg:hidden"
+                              title="Back to conversations"
+                            >
+                              <ChevronLeft className="w-5 h-5" />
+                            </button>
+
+                            <div className="relative shrink-0">
+                              <div className="w-9 h-9 rounded-full bg-amber-400 text-slate-950 font-black text-xs flex items-center justify-center border-2 border-emerald-400 shadow-xs overflow-hidden">
+                                {selectedCustomer.avatarUrl ? (
                                   <img
-                                    src={msg.attachmentUrl}
-                                    alt={msg.attachmentName || 'Attachment'}
-                                    className="w-full h-auto object-cover max-h-48 group-hover:opacity-90 transition-opacity"
+                                    src={selectedCustomer.avatarUrl}
+                                    alt={selectedCustomer.firstName}
+                                    className="w-full h-full object-cover"
                                   />
-                                  <div className="absolute inset-0 bg-slate-950/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
-                                    <Eye className="w-5 h-5 drop-shadow-md" />
-                                  </div>
-                                </div>
-                                <button
-                                  onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'proof.jpg')}
-                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-black bg-emerald-900/80 hover:bg-emerald-950 text-amber-300 border border-emerald-600/50 transition-colors cursor-pointer"
-                                >
-                                  <Download className="w-3.5 h-3.5" />
-                                  <span>Download File</span>
-                                </button>
+                                ) : (
+                                  <span>{selectedCustomer.firstName?.slice(0, 1) || 'C'}</span>
+                                )}
                               </div>
-                            )}
+                              <span className="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-emerald-400 border-2 border-[#075E54]" />
+                            </div>
 
-                            {/* Document Attachment */}
-                            {msg.attachmentUrl && msg.attachmentType === 'document' && (
-                              <div className="mt-2 p-2.5 rounded-xl border border-emerald-600/60 bg-emerald-950/60 text-white flex items-center justify-between gap-3 text-xs font-bold">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <div className="p-2 rounded-lg bg-emerald-900 text-amber-300 shrink-0">
-                                    <FileText className="w-4 h-4 stroke-[2.5]" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="truncate font-black">{msg.attachmentName || 'Document'}</div>
-                                    <div className="text-[10px] font-mono text-emerald-300">{formatSize(msg.attachmentSize)}</div>
-                                  </div>
-                                </div>
-                                <button
-                                  onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'document.pdf')}
-                                  className="p-1.5 rounded-lg border border-emerald-500 bg-emerald-800 hover:bg-emerald-700 text-white shadow-2xs transition-colors shrink-0 cursor-pointer"
-                                  title="Download Document"
-                                >
-                                  <Download className="w-4 h-4" />
-                                </button>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs sm:text-sm font-extrabold text-white truncate">
+                                  {selectedCustomer.firstName} {selectedCustomer.lastName}
+                                </span>
+                                {selectedCustomer.kycStatus === 'verified' && (
+                                  <span className="px-1 py-0.2 rounded bg-emerald-400 text-slate-950 text-[9px] font-black shrink-0">
+                                    Verified
+                                  </span>
+                                )}
                               </div>
-                            )}
-
-                            {/* Footer Timestamp & Status */}
-                            <div className="flex items-center justify-end gap-1.5 text-[10px] text-emerald-200 font-bold pt-1">
-                              <span>
-                                {new Date(msg.timestamp).toLocaleTimeString([], {
-                                  hour: '2-digit',
-                                  minute: '2-digit',
-                                })}
-                              </span>
-                              <CheckCheck className="w-3.5 h-3.5 text-amber-300" />
+                              <div className="text-[10px] text-emerald-100 flex items-center gap-1 truncate">
+                                {customerIsTyping ? (
+                                  <span className="text-amber-300 font-bold animate-pulse">typing...</span>
+                                ) : (
+                                  <span>online • MVB •••• {selectedCustomer.permanentAccountNumber?.slice(-4) || '1000'}</span>
+                                )}
+                              </div>
                             </div>
                           </div>
 
-                          {/* Admin Avatar */}
-                          <div className="w-8 h-8 rounded-full bg-slate-900 text-amber-400 text-xs font-black flex items-center justify-center shrink-0 mb-1 border border-emerald-500 shadow-2xs overflow-hidden">
-                            {currentUser?.avatarUrl ? (
-                              <img src={currentUser.avatarUrl} alt="" className="w-full h-full object-cover" />
-                            ) : (
-                              <span>AD</span>
-                            )}
+                          <div className="flex items-center gap-1 text-white">
+                            <button
+                              onClick={() => setIsProofModalOpen(true)}
+                              className="p-1.5 hover:bg-emerald-800 rounded-full transition-colors text-amber-300 cursor-pointer"
+                              title="Request verification proof or error screenshot"
+                            >
+                              <Camera className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => {}}
+                              className="p-1.5 hover:bg-emerald-800 rounded-full transition-colors text-emerald-100 cursor-pointer"
+                              title="WhatsApp Video Call"
+                            >
+                              <Video className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => {}}
+                              className="p-1.5 hover:bg-emerald-800 rounded-full transition-colors text-emerald-100 cursor-pointer"
+                              title="WhatsApp Voice Call"
+                            >
+                              <Phone className="w-3.5 h-3.5" />
+                            </button>
                           </div>
                         </div>
-                      );
-                    }
 
-                    // Customer Message (Left aligned, balanced)
-                    return (
-                      <div
-                        key={msg.id}
-                        className="flex items-end justify-start gap-2.5 max-w-[88%] sm:max-w-[78%] md:max-w-[70%] animate-in fade-in"
-                      >
-                        {/* Customer Avatar */}
-                        <div className="w-8 h-8 rounded-full bg-slate-200 text-slate-800 text-xs font-black flex items-center justify-center shrink-0 mb-1 border border-slate-300 shadow-2xs overflow-hidden">
-                          {selectedCustomer.avatarUrl ? (
-                            <img src={selectedCustomer.avatarUrl} alt="" className="w-full h-full object-cover" />
-                          ) : (
-                            <span>{selectedCustomer.firstName?.slice(0, 1) || 'C'}</span>
+                        {/* Smooth Messages Stream Canvas */}
+                        <div
+                          ref={messagesContainerRef}
+                          onScroll={handleMessagesScroll}
+                          className="flex-1 overflow-y-auto px-3 py-3 space-y-2.5 custom-scrollbar overscroll-contain min-h-0 relative"
+                          style={{
+                            backgroundColor: '#EFEAE2',
+                            backgroundImage: `radial-gradient(#d3cdc3 0.8px, transparent 0.8px)`,
+                            backgroundSize: '14px 14px',
+                            scrollBehavior: 'smooth',
+                            WebkitOverflowScrolling: 'touch',
+                          }}
+                        >
+                          {/* End to End Encryption Notice */}
+                          <div className="mx-auto max-w-[280px] p-2 rounded-lg bg-[#FFEECD] text-[#54656F] text-[10px] font-semibold text-center shadow-2xs border border-[#F5D8A0]/60 flex items-center justify-center gap-1.5 my-1">
+                            <Lock className="w-3 h-3 text-[#7E6000] shrink-0" />
+                            <span>Messages are end-to-end encrypted. No one outside of this chat can read them.</span>
+                          </div>
+
+                          {/* Messages */}
+                          {activeCustomerMessages.map((msg) => {
+                            const isSupport = msg.sender === 'support';
+                            if (isSupport) {
+                              return (
+                                <div key={msg.id} className="flex justify-end max-w-[85%] ml-auto animate-in fade-in">
+                                  <div className="bg-[#DCF8C6] text-[#111B21] rounded-2xl rounded-tr-xs shadow-xs px-3 py-2 space-y-1 min-w-[120px] border border-[#c4eab0]">
+                                    {msg.message && (
+                                      <div className="text-[12px] font-medium leading-relaxed whitespace-pre-wrap break-words">
+                                        {msg.message}
+                                      </div>
+                                    )}
+                                    {/* Image Attachment */}
+                                    {msg.attachmentUrl && msg.attachmentType === 'image' && (
+                                      <div className="mt-1.5 space-y-1">
+                                        <div
+                                          onClick={() => setZoomedImage({ src: msg.attachmentUrl!, name: msg.attachmentName || 'Proof' })}
+                                          className="relative rounded-lg overflow-hidden border border-emerald-600/40 max-h-48 bg-slate-900 cursor-pointer group"
+                                        >
+                                          <img
+                                            src={msg.attachmentUrl}
+                                            alt={msg.attachmentName || 'Attachment'}
+                                            className="w-full h-auto object-cover max-h-44 group-hover:opacity-90 transition-opacity"
+                                          />
+                                          <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                            <Eye className="w-4 h-4 drop-shadow-md" />
+                                          </div>
+                                        </div>
+                                        <button
+                                          onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'file.jpg')}
+                                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-800 text-white hover:bg-emerald-900 cursor-pointer"
+                                        >
+                                          <Download className="w-3 h-3" />
+                                          <span>Download</span>
+                                        </button>
+                                      </div>
+                                    )}
+                                    {/* Document Attachment */}
+                                    {msg.attachmentUrl && msg.attachmentType === 'document' && (
+                                      <div className="mt-1.5 p-2 rounded-lg border border-emerald-300 bg-white/80 text-slate-800 flex items-center justify-between gap-2 text-[11px] font-bold">
+                                        <div className="flex items-center gap-1.5 min-w-0">
+                                          <FileText className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                                          <span className="truncate">{msg.attachmentName || 'Document'}</span>
+                                        </div>
+                                        <button
+                                          onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'doc.pdf')}
+                                          className="p-1 rounded bg-emerald-700 text-white hover:bg-emerald-800 shrink-0 cursor-pointer"
+                                        >
+                                          <Download className="w-3 h-3" />
+                                        </button>
+                                      </div>
+                                    )}
+                                    <div className="flex items-center justify-end gap-1 text-[9px] text-[#667781] font-semibold pt-0.5">
+                                      <span>
+                                        {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                      </span>
+                                      <CheckCheck className="w-3.5 h-3.5 text-[#53bdeb]" />
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            }
+
+                            // Customer message
+                            return (
+                              <div key={msg.id} className="flex justify-start max-w-[85%] mr-auto animate-in fade-in">
+                                <div className="bg-white text-[#111B21] rounded-2xl rounded-tl-xs shadow-xs px-3 py-2 space-y-1 min-w-[120px] border border-slate-200">
+                                  {msg.message && (
+                                    <div className="text-[12px] font-medium leading-relaxed whitespace-pre-wrap break-words">
+                                      {msg.message}
+                                    </div>
+                                  )}
+                                  {/* Image Attachment */}
+                                  {msg.attachmentUrl && msg.attachmentType === 'image' && (
+                                    <div className="mt-1.5 space-y-1">
+                                      <div
+                                        onClick={() => setZoomedImage({ src: msg.attachmentUrl!, name: msg.attachmentName || 'Proof' })}
+                                        className="relative rounded-lg overflow-hidden border border-slate-200 max-h-48 bg-slate-900 cursor-pointer group"
+                                      >
+                                        <img
+                                          src={msg.attachmentUrl}
+                                          alt={msg.attachmentName || 'Attachment'}
+                                          className="w-full h-auto object-cover max-h-44 group-hover:opacity-90 transition-opacity"
+                                        />
+                                        <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                          <Eye className="w-4 h-4 drop-shadow-md" />
+                                        </div>
+                                      </div>
+                                      <button
+                                        onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'proof.jpg')}
+                                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-300 cursor-pointer"
+                                      >
+                                        <Download className="w-3 h-3" />
+                                        <span>Download Proof</span>
+                                      </button>
+                                    </div>
+                                  )}
+                                  {/* Document Attachment */}
+                                  {msg.attachmentUrl && msg.attachmentType === 'document' && (
+                                    <div className="mt-1.5 p-2 rounded-lg border border-slate-200 bg-slate-50 text-slate-800 flex items-center justify-between gap-2 text-[11px] font-bold">
+                                      <div className="flex items-center gap-1.5 min-w-0">
+                                        <FileText className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                                        <span className="truncate">{msg.attachmentName || 'Document'}</span>
+                                      </div>
+                                      <button
+                                        onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'doc.pdf')}
+                                        className="p-1 rounded bg-slate-200 text-slate-800 hover:bg-slate-300 shrink-0 cursor-pointer"
+                                      >
+                                        <Download className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  )}
+                                  <div className="flex items-center justify-end text-[9px] text-[#667781] font-semibold pt-0.5">
+                                    <span>
+                                      {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {/* Customer typing indicator */}
+                          {customerIsTyping && (
+                            <div className="flex items-center gap-1.5 p-2.5 rounded-2xl bg-white max-w-[180px] rounded-tl-xs shadow-xs border border-slate-200 animate-in fade-in">
+                              <span className="text-[11px] font-bold text-slate-600">{selectedCustomer.firstName} is typing</span>
+                              <div className="flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#00A884] animate-bounce" />
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#00A884] animate-bounce [animation-delay:0.2s]" />
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#00A884] animate-bounce [animation-delay:0.4s]" />
+                              </div>
+                            </div>
+                          )}
+
+                          <div ref={chatMessagesEndRef} />
+
+                          {/* Floating Jump to bottom Button */}
+                          {showScrollBottomBtn && (
+                            <button
+                              onClick={() => scrollToBottom('smooth')}
+                              className="sticky bottom-3 right-3 ml-auto w-8 h-8 rounded-full bg-white/95 text-slate-700 shadow-md border border-slate-300 flex items-center justify-center hover:bg-slate-100 transition-all active:scale-95 z-30 cursor-pointer"
+                              title="Scroll down to newest messages"
+                            >
+                              <ChevronDown className="w-4 h-4 text-emerald-700" />
+                            </button>
                           )}
                         </div>
 
-                        <div className="bg-white text-slate-900 border border-slate-200/90 rounded-2xl rounded-bl-xs shadow-xs px-4 py-3 space-y-1.5 min-w-[180px]">
-                          {/* Header */}
-                          <div className="flex items-center gap-2 pb-1 border-b border-slate-100">
-                            <span className="text-xs font-extrabold text-slate-900 truncate">
-                              {msg.senderName || `${selectedCustomer.firstName} ${selectedCustomer.lastName}`}
-                            </span>
-                            <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-mono tracking-wider">
-                              Customer
-                            </span>
-                          </div>
-
-                          {/* Message Body */}
-                          {msg.message && (
-                            <div className="text-xs sm:text-[13px] font-semibold text-slate-800 leading-relaxed whitespace-pre-wrap break-words">
-                              {msg.message}
-                            </div>
-                          )}
-
-                          {/* Image Attachment */}
-                          {msg.attachmentUrl && msg.attachmentType === 'image' && (
-                            <div className="mt-2 space-y-1.5">
-                              <div
-                                onClick={() => setZoomedImage({ src: msg.attachmentUrl!, name: msg.attachmentName || 'Proof' })}
-                                className="relative rounded-xl overflow-hidden border border-slate-300 max-h-52 bg-slate-950 cursor-pointer group"
-                              >
-                                <img
-                                  src={msg.attachmentUrl}
-                                  alt={msg.attachmentName || 'Attachment'}
-                                  className="w-full h-auto object-cover max-h-48 group-hover:opacity-90 transition-opacity"
-                                />
-                                <div className="absolute inset-0 bg-slate-950/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
-                                  <Eye className="w-5 h-5 drop-shadow-md" />
-                                </div>
-                              </div>
-                              <button
-                                onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'proof.jpg')}
-                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-black bg-slate-100 hover:bg-slate-200 text-slate-800 transition-colors cursor-pointer border border-slate-200"
-                              >
-                                <Download className="w-3.5 h-3.5" />
-                                <span>Download Proof Photo</span>
-                              </button>
-                            </div>
-                          )}
-
-                          {/* Document Attachment */}
-                          {msg.attachmentUrl && msg.attachmentType === 'document' && (
-                            <div className="mt-2 p-2.5 rounded-xl border border-slate-200 bg-slate-50 text-slate-900 flex items-center justify-between gap-3 text-xs font-bold">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <div className="p-2 rounded-lg bg-emerald-100 text-emerald-700 shrink-0">
-                                  <FileText className="w-4 h-4 stroke-[2.5]" />
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="truncate font-black">{msg.attachmentName || 'Document'}</div>
-                                  <div className="text-[10px] font-mono text-slate-500">{formatSize(msg.attachmentSize)}</div>
-                                </div>
-                              </div>
-                              <button
-                                onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'document.pdf')}
-                                className="p-1.5 rounded-lg border border-slate-300 bg-white hover:bg-emerald-50 text-slate-800 shadow-2xs transition-colors shrink-0 cursor-pointer"
-                                title="Download Document"
-                              >
-                                <Download className="w-4 h-4" />
-                              </button>
-                            </div>
-                          )}
-
-                          {/* Footer Timestamp */}
-                          <div className="flex items-center justify-end text-[10px] text-slate-400 font-bold pt-1">
-                            <span>
-                              {new Date(msg.timestamp).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
-                            </span>
-                          </div>
+                        {/* Quick Responses Bar */}
+                        <div className="px-2.5 py-1.5 bg-[#F0F2F5] border-t border-slate-200/80 flex items-center gap-1.5 overflow-x-auto whitespace-nowrap custom-scrollbar shrink-0">
+                          <button
+                            onClick={() => setIsProofModalOpen(true)}
+                            className="px-2 py-0.5 rounded-full bg-amber-400 hover:bg-amber-500 text-slate-950 font-black text-[10px] flex items-center gap-1 shrink-0 cursor-pointer"
+                          >
+                            <Camera className="w-3 h-3" />
+                            <span>Request Proof</span>
+                          </button>
+                          {chatQuickReplies.map((qr, idx) => (
+                            <button
+                              key={idx}
+                              onClick={() => handleSendLiveReply(qr)}
+                              className="px-2 py-0.5 rounded-full bg-white hover:bg-emerald-50 text-slate-700 hover:text-emerald-900 border border-slate-300 text-[10px] font-bold shrink-0 transition-colors cursor-pointer"
+                            >
+                              {qr.slice(0, 24)}...
+                            </button>
+                          ))}
                         </div>
-                      </div>
-                    );
-                  })}
 
-                  {/* Customer typing indicator */}
-                  {customerIsTyping && (
-                    <div className="flex items-center gap-2 p-3 rounded-2xl bg-white max-w-[220px] rounded-tl-xs shadow-2xs border border-slate-200 animate-in fade-in">
-                      <span className="text-xs font-black text-slate-700">
-                        {selectedCustomer.firstName} is typing
-                      </span>
-                      <div className="flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:0.2s]" />
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:0.4s]" />
+                        {/* WhatsApp Input Field Bar */}
+                        <div className="p-2 bg-[#F0F2F5] border-t border-slate-300/80 flex items-center gap-1.5 shrink-0 z-20">
+                          <button
+                            onClick={() => fileUploadInputRef.current?.click()}
+                            disabled={isUploadingProof}
+                            className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-200 rounded-full transition-colors shrink-0 cursor-pointer"
+                            title="Attach clearance photo or document"
+                          >
+                            <Paperclip className="w-4 h-4" />
+                          </button>
+
+                          <input
+                            type="text"
+                            placeholder="Type a message..."
+                            value={chatReplyInput}
+                            onChange={handleAdminInputChange}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                handleSendLiveReply();
+                              }
+                            }}
+                            className="flex-1 px-3.5 py-2 rounded-full bg-white text-xs font-semibold text-slate-900 placeholder:text-slate-400 border border-slate-300/80 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                          />
+
+                          <button
+                            onClick={() => handleSendLiveReply()}
+                            disabled={!chatReplyInput.trim()}
+                            className="w-8 h-8 rounded-full bg-[#00A884] hover:bg-[#008f6f] disabled:opacity-40 text-white flex items-center justify-center shadow-xs transition-transform active:scale-95 shrink-0 cursor-pointer"
+                            title="Send message"
+                          >
+                            <Send className="w-3.5 h-3.5 ml-0.5" />
+                          </button>
+                        </div>
+
+                        {/* iPhone Home Indicator Bar */}
+                        <div className="w-32 h-1 bg-slate-400/80 rounded-full mx-auto my-1.5 shrink-0 select-none" />
                       </div>
                     </div>
-                  )}
+                  </div>
+                ) : (
+                  /* ========================================================= */
+                  /* OPTION B: WIDE DESK VIEW (DESKTOP MODE)                   */
+                  /* ========================================================= */
+                  <div className="bg-white rounded-2xl border border-slate-200 shadow-xs flex flex-col flex-1 min-h-0 overflow-hidden">
+                    {/* Active Chat Desk Header */}
+                    <div className="p-3.5 bg-slate-900 text-white flex items-center justify-between shadow-sm shrink-0">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="relative">
+                          <div className="w-10 h-10 rounded-full bg-amber-400 text-slate-950 font-black text-sm flex items-center justify-center border-2 border-emerald-400 shadow-xs overflow-hidden">
+                            {selectedCustomer.avatarUrl ? (
+                              <img
+                                src={selectedCustomer.avatarUrl}
+                                alt={selectedCustomer.firstName}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <span>{selectedCustomer.firstName?.slice(0, 1) || 'C'}</span>
+                            )}
+                          </div>
+                          <span className="absolute bottom-0 right-0 w-3 h-3 rounded-full bg-emerald-400 border-2 border-slate-900" />
+                        </div>
 
-                  <div ref={chatMessagesEndRef} />
-                </div>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-black text-white truncate">
+                              {selectedCustomer.firstName} {selectedCustomer.lastName}
+                            </span>
+                            <span
+                              className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wider ${
+                                selectedCustomer.kycStatus === 'verified'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                  : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                              }`}
+                            >
+                              {selectedCustomer.kycStatus === 'verified' ? 'Verified Client' : 'Pending KYC'}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-slate-300 flex items-center gap-2 mt-0.5 truncate">
+                            <span>{selectedCustomer.email}</span>
+                            <span>•</span>
+                            <span className="font-mono">
+                              MVB •••• {selectedCustomer.permanentAccountNumber?.slice(-4) || '1000'}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
 
-                {/* Quick Presets Bar */}
-                <div className="px-4 py-2 bg-slate-100 border-t border-slate-200 flex items-center gap-2 overflow-x-auto whitespace-nowrap custom-scrollbar">
-                  <button
-                    onClick={() => setIsProofModalOpen(true)}
-                    className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs flex items-center gap-1.5 transition-all shadow-2xs cursor-pointer shrink-0"
-                    title="Request proof of issue from client"
-                  >
-                    <Camera className="w-3.5 h-3.5" />
-                    <span>Request Proof</span>
-                  </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setIsProofModalOpen(true)}
+                          className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                          title="Ask user to send proof"
+                        >
+                          <Camera className="w-3.5 h-3.5" />
+                          <span>Request Proof</span>
+                        </button>
+                      </div>
+                    </div>
 
-                  <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider shrink-0 pl-1">
-                    Quick Responses:
-                  </span>
-                  {chatQuickReplies.map((qr, idx) => (
-                    <button
-                      key={idx}
-                      onClick={() => handleSendLiveReply(qr)}
-                      className="px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 text-slate-800 hover:text-emerald-900 border border-slate-300 text-xs font-bold transition-all cursor-pointer shrink-0"
+                    {/* Wide Messages Stream Canvas */}
+                    <div
+                      ref={messagesContainerRef}
+                      onScroll={handleMessagesScroll}
+                      className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-3.5 custom-scrollbar overscroll-contain min-h-0 relative"
+                      style={{
+                        backgroundColor: '#EFEAE2',
+                        backgroundImage: `radial-gradient(#d1d5db 0.8px, transparent 0.8px)`,
+                        backgroundSize: '16px 16px',
+                        scrollBehavior: 'smooth',
+                        WebkitOverflowScrolling: 'touch',
+                      }}
                     >
-                      {qr.slice(0, 32)}...
-                    </button>
-                  ))}
-                </div>
+                      {/* Security Notice */}
+                      <div className="mx-auto max-w-sm p-2 rounded-xl bg-amber-100/90 border border-amber-300/80 text-amber-950 text-center shadow-2xs text-xs font-bold flex items-center justify-center gap-2">
+                        <Lock className="w-3.5 h-3.5 text-amber-800" />
+                        <span>End-to-End Encrypted Private Wealth Concierge Session</span>
+                      </div>
 
-                {/* Reply Footer Input */}
-                <div className="p-3.5 bg-white border-t border-slate-200 flex items-center gap-2 shrink-0">
-                  {/* Proof Attachment Button */}
-                  <button
-                    onClick={() => fileUploadInputRef.current?.click()}
-                    disabled={isUploadingProof}
-                    className="p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer shrink-0 border border-slate-200"
-                    title="Upload Proof Document / Image to Client"
-                  >
-                    <Paperclip className="w-4 h-4" />
-                  </button>
+                      {activeCustomerMessages.map((msg) => {
+                        const isSupport = msg.sender === 'support';
 
-                  {/* Ask for Proof Button */}
-                  <button
-                    onClick={() => setIsProofModalOpen(true)}
-                    className="px-3 py-2.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 font-black text-xs flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 shadow-2xs"
-                    title="Tell user to send proof of their issue"
-                  >
-                    <Camera className="w-4 h-4 text-amber-700" />
-                    <span className="hidden sm:inline">Ask for Proof</span>
-                  </button>
+                        if (isSupport) {
+                          return (
+                            <div
+                              key={msg.id}
+                              className="flex items-end justify-end gap-2.5 max-w-[88%] sm:max-w-[78%] md:max-w-[70%] ml-auto animate-in fade-in"
+                            >
+                              <div className="bg-gradient-to-br from-emerald-800 to-emerald-900 text-white border border-emerald-700/80 rounded-2xl rounded-br-xs shadow-xs px-4 py-3 space-y-1.5 min-w-[180px]">
+                                <div className="flex items-center justify-end gap-2 pb-1 border-b border-emerald-700/60">
+                                  <span className="text-xs font-extrabold text-white truncate">
+                                    Specialist
+                                  </span>
+                                </div>
 
-                  <input
-                    type="text"
-                    placeholder={`Reply directly to ${selectedCustomer.firstName}...`}
-                    value={chatReplyInput}
-                    onChange={handleAdminInputChange}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        handleSendLiveReply();
-                      }
-                    }}
-                    className="flex-1 px-4 py-2.5 rounded-xl bg-slate-50 border border-slate-300 text-xs sm:text-sm font-bold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
-                  />
+                                {msg.message && (
+                                  <div className="text-xs sm:text-[13px] font-semibold text-white leading-relaxed whitespace-pre-wrap break-words">
+                                    {msg.message}
+                                  </div>
+                                )}
 
-                  <button
-                    onClick={() => handleSendLiveReply()}
-                    disabled={!chatReplyInput.trim()}
-                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs sm:text-sm flex items-center gap-1.5 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shadow-xs shrink-0"
-                  >
-                    <Send className="w-4 h-4" />
-                    <span>Send Reply</span>
-                  </button>
-                </div>
+                                {msg.attachmentUrl && msg.attachmentType === 'image' && (
+                                  <div className="mt-2 space-y-1.5">
+                                    <div
+                                      onClick={() => setZoomedImage({ src: msg.attachmentUrl!, name: msg.attachmentName || 'Proof' })}
+                                      className="relative rounded-xl overflow-hidden border border-emerald-600/60 max-h-52 bg-slate-950 cursor-pointer group"
+                                    >
+                                      <img
+                                        src={msg.attachmentUrl}
+                                        alt={msg.attachmentName || 'Attachment'}
+                                        className="w-full h-auto object-cover max-h-48 group-hover:opacity-90 transition-opacity"
+                                      />
+                                      <div className="absolute inset-0 bg-slate-950/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                        <Eye className="w-5 h-5 drop-shadow-md" />
+                                      </div>
+                                    </div>
+                                    <button
+                                      onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'proof.jpg')}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-black bg-emerald-900/80 hover:bg-emerald-950 text-amber-300 border border-emerald-600/50 transition-colors cursor-pointer"
+                                    >
+                                      <Download className="w-3.5 h-3.5" />
+                                      <span>Download File</span>
+                                    </button>
+                                  </div>
+                                )}
+
+                                {msg.attachmentUrl && msg.attachmentType === 'document' && (
+                                  <div className="mt-2 p-2.5 rounded-xl border border-emerald-600/60 bg-emerald-950/60 text-white flex items-center justify-between gap-3 text-xs font-bold">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <div className="p-2 rounded-lg bg-emerald-900 text-amber-300 shrink-0">
+                                        <FileText className="w-4 h-4 stroke-[2.5]" />
+                                      </div>
+                                      <div className="min-w-0">
+                                        <div className="truncate font-black">{msg.attachmentName || 'Document'}</div>
+                                        <div className="text-[10px] font-mono text-emerald-300">{formatSize(msg.attachmentSize)}</div>
+                                      </div>
+                                    </div>
+                                    <button
+                                      onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'document.pdf')}
+                                      className="p-1.5 rounded-lg border border-emerald-500 bg-emerald-800 hover:bg-emerald-700 text-white shadow-2xs transition-colors shrink-0 cursor-pointer"
+                                      title="Download Document"
+                                    >
+                                      <Download className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                )}
+
+                                <div className="flex items-center justify-end gap-1.5 text-[10px] text-emerald-200 font-bold pt-1">
+                                  <span>
+                                    {new Date(msg.timestamp).toLocaleTimeString([], {
+                                      hour: '2-digit',
+                                      minute: '2-digit',
+                                    })}
+                                  </span>
+                                  <CheckCheck className="w-3.5 h-3.5 text-amber-300" />
+                                </div>
+                              </div>
+
+                              <div className="w-8 h-8 rounded-full bg-slate-900 text-amber-400 text-xs font-black flex items-center justify-center shrink-0 mb-1 border border-emerald-500 shadow-2xs overflow-hidden">
+                                {currentUser?.avatarUrl ? (
+                                  <img src={currentUser.avatarUrl} alt="" className="w-full h-full object-cover" />
+                                ) : (
+                                  <span>AD</span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <div
+                            key={msg.id}
+                            className="flex items-end justify-start gap-2.5 max-w-[88%] sm:max-w-[78%] md:max-w-[70%] animate-in fade-in"
+                          >
+                            <div className="w-8 h-8 rounded-full bg-slate-200 text-slate-800 text-xs font-black flex items-center justify-center shrink-0 mb-1 border border-slate-300 shadow-2xs overflow-hidden">
+                              {selectedCustomer.avatarUrl ? (
+                                <img src={selectedCustomer.avatarUrl} alt="" className="w-full h-full object-cover" />
+                              ) : (
+                                <span>{selectedCustomer.firstName?.slice(0, 1) || 'C'}</span>
+                              )}
+                            </div>
+
+                            <div className="bg-white text-slate-900 border border-slate-200/90 rounded-2xl rounded-bl-xs shadow-xs px-4 py-3 space-y-1.5 min-w-[180px]">
+                              <div className="flex items-center gap-2 pb-1 border-b border-slate-100">
+                                <span className="text-xs font-extrabold text-slate-900 truncate">
+                                  {msg.senderName || `${selectedCustomer.firstName} ${selectedCustomer.lastName}`}
+                                </span>
+                                <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-mono tracking-wider">
+                                  Customer
+                                </span>
+                              </div>
+
+                              {msg.message && (
+                                <div className="text-xs sm:text-[13px] font-semibold text-slate-800 leading-relaxed whitespace-pre-wrap break-words">
+                                  {msg.message}
+                                </div>
+                              )}
+
+                              {msg.attachmentUrl && msg.attachmentType === 'image' && (
+                                <div className="mt-2 space-y-1.5">
+                                  <div
+                                    onClick={() => setZoomedImage({ src: msg.attachmentUrl!, name: msg.attachmentName || 'Proof' })}
+                                    className="relative rounded-xl overflow-hidden border border-slate-300 max-h-52 bg-slate-950 cursor-pointer group"
+                                  >
+                                    <img
+                                      src={msg.attachmentUrl}
+                                      alt={msg.attachmentName || 'Attachment'}
+                                      className="w-full h-auto object-cover max-h-48 group-hover:opacity-90 transition-opacity"
+                                    />
+                                    <div className="absolute inset-0 bg-slate-950/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                      <Eye className="w-5 h-5 drop-shadow-md" />
+                                    </div>
+                                  </div>
+                                  <button
+                                    onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'proof.jpg')}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-black bg-slate-100 hover:bg-slate-200 text-slate-800 transition-colors cursor-pointer border border-slate-200"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                    <span>Download Proof Photo</span>
+                                  </button>
+                                </div>
+                              )}
+
+                              {msg.attachmentUrl && msg.attachmentType === 'document' && (
+                                <div className="mt-2 p-2.5 rounded-xl border border-slate-200 bg-slate-50 text-slate-900 flex items-center justify-between gap-3 text-xs font-bold">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <div className="p-2 rounded-lg bg-emerald-100 text-emerald-700 shrink-0">
+                                      <FileText className="w-4 h-4 stroke-[2.5]" />
+                                    </div>
+                                    <div className="min-w-0">
+                                      <div className="truncate font-black">{msg.attachmentName || 'Document'}</div>
+                                      <div className="text-[10px] font-mono text-slate-500">{formatSize(msg.attachmentSize)}</div>
+                                    </div>
+                                  </div>
+                                  <button
+                                    onClick={() => handleDownloadFile(msg.attachmentUrl!, msg.attachmentName || 'document.pdf')}
+                                    className="p-1.5 rounded-lg border border-slate-300 bg-white hover:bg-emerald-50 text-slate-800 shadow-2xs transition-colors shrink-0 cursor-pointer"
+                                    title="Download Document"
+                                  >
+                                    <Download className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              )}
+
+                              <div className="flex items-center justify-end text-[10px] text-slate-400 font-bold pt-1">
+                                <span>
+                                  {new Date(msg.timestamp).toLocaleTimeString([], {
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  })}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      {customerIsTyping && (
+                        <div className="flex items-center gap-2 p-3 rounded-2xl bg-white max-w-[220px] rounded-tl-xs shadow-2xs border border-slate-200 animate-in fade-in">
+                          <span className="text-xs font-black text-slate-700">
+                            {selectedCustomer.firstName} is typing
+                          </span>
+                          <div className="flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce" />
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:0.2s]" />
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-bounce [animation-delay:0.4s]" />
+                          </div>
+                        </div>
+                      )}
+
+                      <div ref={chatMessagesEndRef} />
+
+                      {showScrollBottomBtn && (
+                        <button
+                          onClick={() => scrollToBottom('smooth')}
+                          className="sticky bottom-3 right-3 ml-auto w-9 h-9 rounded-full bg-white text-slate-700 shadow-md border border-slate-300 flex items-center justify-center hover:bg-slate-100 transition-all active:scale-95 z-30 cursor-pointer"
+                          title="Scroll down to newest messages"
+                        >
+                          <ChevronDown className="w-4 h-4 text-emerald-700" />
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Quick Presets Bar */}
+                    <div className="px-4 py-2 bg-slate-100 border-t border-slate-200 flex items-center gap-2 overflow-x-auto whitespace-nowrap custom-scrollbar shrink-0">
+                      <button
+                        onClick={() => setIsProofModalOpen(true)}
+                        className="px-3 py-1 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-xs flex items-center gap-1.5 transition-all shadow-2xs cursor-pointer shrink-0"
+                        title="Request proof of issue from client"
+                      >
+                        <Camera className="w-3.5 h-3.5" />
+                        <span>Request Proof</span>
+                      </button>
+
+                      <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider shrink-0 pl-1">
+                        Quick Responses:
+                      </span>
+                      {chatQuickReplies.map((qr, idx) => (
+                        <button
+                          key={idx}
+                          onClick={() => handleSendLiveReply(qr)}
+                          className="px-2.5 py-1 rounded-lg bg-white hover:bg-emerald-50 text-slate-800 hover:text-emerald-900 border border-slate-300 text-xs font-bold transition-all cursor-pointer shrink-0"
+                        >
+                          {qr.slice(0, 32)}...
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Reply Footer Input */}
+                    <div className="p-3.5 bg-white border-t border-slate-200 flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => fileUploadInputRef.current?.click()}
+                        disabled={isUploadingProof}
+                        className="p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer shrink-0 border border-slate-200"
+                        title="Upload Proof Document / Image to Client"
+                      >
+                        <Paperclip className="w-4 h-4" />
+                      </button>
+
+                      <button
+                        onClick={() => setIsProofModalOpen(true)}
+                        className="px-3 py-2.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 font-black text-xs flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 shadow-2xs"
+                        title="Tell user to send proof of their issue"
+                      >
+                        <Camera className="w-4 h-4 text-amber-700" />
+                        <span className="hidden sm:inline">Ask for Proof</span>
+                      </button>
+
+                      <input
+                        type="text"
+                        placeholder={`Reply directly to ${selectedCustomer.firstName}...`}
+                        value={chatReplyInput}
+                        onChange={handleAdminInputChange}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleSendLiveReply();
+                          }
+                        }}
+                        className="flex-1 px-4 py-2.5 rounded-xl bg-slate-50 border border-slate-300 text-xs sm:text-sm font-bold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+                      />
+
+                      <button
+                        onClick={() => handleSendLiveReply()}
+                        disabled={!chatReplyInput.trim()}
+                        className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs sm:text-sm flex items-center gap-1.5 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shadow-xs shrink-0"
+                      >
+                        <Send className="w-4 h-4" />
+                        <span>Send Reply</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
               </>
             ) : (
-              <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-3">
+              <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-3 bg-white rounded-2xl border border-slate-200">
                 <MessageSquare className="w-12 h-12 text-slate-300" />
                 <h3 className="text-base font-black text-slate-800">No Customer Selected</h3>
                 <p className="text-xs font-medium text-slate-500 max-w-sm">

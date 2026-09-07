@@ -91,6 +91,10 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
     // If it was another user ID, update ID to Firebase UID
     db.users.delete(existingByEmail.id);
     existingByEmail.id = userId;
+    if (req.body.kycStatus) existingByEmail.kycStatus = req.body.kycStatus;
+    if (req.body.kycDocumentType) existingByEmail.kycDocumentType = req.body.kycDocumentType;
+    if (req.body.kycDocumentNumber) existingByEmail.kycDocumentNumber = req.body.kycDocumentNumber;
+    if (req.body.kycVerifiedAt) existingByEmail.kycVerifiedAt = req.body.kycVerifiedAt;
     db.users.set(userId, existingByEmail);
     const balanceMetrics = db.getUserBalanceMetrics(userId);
     return res.json({ success: true, user: existingByEmail, balanceMetrics });

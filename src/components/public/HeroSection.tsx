@@ -67,7 +67,7 @@ export const HeroSection: React.FC = () => {
           <img
             src={officeHeroImage}
             onError={(e) => {
-              (e.target as HTMLImageElement).src = '/assets/images/monvera_office_hero_1787152640128.jpg';
+              (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1497366216548-37526070297c?w=1600&auto=format&fit=crop&q=80';
             }}
             alt="Monvera Bank Executive Office Suite"
             className="w-full h-72 sm:h-96 md:h-[430px] object-cover transition-transform duration-700 group-hover:scale-102"
@@ -221,7 +221,7 @@ export const HeroSection: React.FC = () => {
                 <img
                   src={dualCardsLamborghiniImage}
                   onError={(e) => {
-                    (e.target as HTMLImageElement).src = '/assets/images/monvera_cards_lambo_wide_1787576194809.jpg';
+                    (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1559526324-4b87b5e36e44?w=1600&auto=format&fit=crop&q=80';
                   }}
                   alt="Monvera Visa Debit & Mastercard Credit Cards - Luxury Lifestyle"
                   className="w-full aspect-[16/9] sm:aspect-[21/9] md:aspect-[16/8] lg:h-[500px] object-cover transition-transform duration-700 group-hover:scale-102"

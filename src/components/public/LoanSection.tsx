@@ -16,7 +16,6 @@ import {
   Gavel,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import executiveLoanGrowthImage from '../../assets/images/monvera_executive_loan_growth_1787939265899.jpg';
 
 export const LoanSection: React.FC = () => {
   const { openModal, currentUser, setCurrentView } = useAuth();
@@ -330,9 +329,9 @@ export const LoanSection: React.FC = () => {
           <div className="grid grid-cols-1 lg:grid-cols-12 items-center">
             <div className="lg:col-span-7 relative h-72 sm:h-96 lg:h-[460px] w-full overflow-hidden">
               <img
-                src={executiveLoanGrowthImage}
+                src="https://images.unsplash.com/photo-1507679799987-c73779587ccf?w=1600&auto=format&fit=crop&q=80"
                 onError={(e) => {
-                  (e.target as HTMLImageElement).src = '/assets/images/monvera_executive_loan_growth_1787939265899.jpg';
+                  (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?w=1600&auto=format&fit=crop&q=80';
                 }}
                 alt="Monvera Executive Commercial Loan Growth & Private Credit"
                 className="w-full h-full object-cover object-center"
