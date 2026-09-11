@@ -259,6 +259,46 @@ export interface NotificationItem {
   supportRepAvatar?: string;
   supportStatus?: 'OPEN' | 'IN_PROGRESS' | 'RESOLVED' | 'CLOSED' | string;
   replies?: NotificationReply[];
+  deliveryChannels?: {
+    push?: 'SENT' | 'FAILED' | 'DISABLED' | 'PENDING' | 'UNCONFIGURED';
+    sms?: 'SENT' | 'FAILED' | 'DISABLED' | 'PENDING' | 'UNCONFIGURED';
+    email?: 'SENT' | 'FAILED' | 'DISABLED' | 'PENDING' | 'UNCONFIGURED';
+  };
+}
+
+export interface NotificationPreferences {
+  userId: string;
+  pushEnabled: boolean;
+  smsEnabled: boolean;
+  emailEnabled: boolean;
+  transactionAlerts: boolean;
+  securityAlerts: boolean;
+  updatedAt?: string;
+}
+
+export interface PushNotificationToken {
+  id: string;
+  userId: string;
+  token: string;
+  platform: 'web' | 'mobile' | string;
+  userAgent?: string;
+  createdAt: string;
+  lastUsedAt?: string;
+}
+
+export interface NotificationDispatchPayload {
+  eventId: string;
+  userId: string;
+  recipientName?: string;
+  recipientEmail?: string;
+  recipientPhone?: string;
+  title: string;
+  message: string;
+  type: 'TRANSACTION' | 'SECURITY' | 'INVESTMENT' | 'SYSTEM' | 'SUPPORT';
+  referenceId?: string;
+  amount?: number;
+  senderName?: string;
+  timestamp?: string;
 }
 
 export interface AdminAuditLog {
@@ -326,6 +366,18 @@ export interface LoanEligibilityTier {
   interestRateAPR: number;
   minRequiredVolume?: number;
   description: string;
+}
+
+export interface BalanceMetrics {
+  checkingBalance: number;
+  savingsBalance: number;
+  investedBalance: number;
+  accruedEarnings: number;
+  totalBalance: number;
+  availableBalance: number;
+  pendingBalance: number;
+  loanBalance?: number;
+  accounts: BankAccount[];
 }
 
 

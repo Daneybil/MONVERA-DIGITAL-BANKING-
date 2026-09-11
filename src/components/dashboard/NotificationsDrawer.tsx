@@ -21,8 +21,10 @@ import {
   Landmark,
   TrendingUp,
   DollarSign,
+  Sliders,
 } from 'lucide-react';
 import { NotificationItem } from '../../types';
+import { NotificationSettingsModal } from './NotificationSettingsModal';
 
 interface NotificationsDrawerProps {
   isOpen: boolean;
@@ -36,6 +38,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
   const [selectedNotification, setSelectedNotification] = useState<NotificationItem | null>(null);
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [isSubmittingReply, setIsSubmittingReply] = useState<Record<string, boolean>>({});
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
 
   if (!isOpen) return null;
 
@@ -130,6 +133,14 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
             )}
 
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowSettingsModal(true)}
+                className="text-xs font-extrabold text-slate-800 hover:text-slate-950 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border-2 border-slate-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                title="Notification Preferences"
+              >
+                <Sliders className="w-3.5 h-3.5 stroke-[2.5]" />
+                <span className="hidden sm:inline">Preferences</span>
+              </button>
               {!selectedNotification && unreadNotifsCount > 0 && (
                 <button
                   onClick={markAllNotificationsAsRead}
@@ -397,6 +408,11 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
           )}
         </div>
       </div>
+
+      <NotificationSettingsModal
+        isOpen={showSettingsModal}
+        onClose={() => setShowSettingsModal(false)}
+      />
     </div>
   );
 };

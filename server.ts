@@ -2,12 +2,23 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
+import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
 import { UserProfile, InvestmentTermDays } from './src/types';
+import { getStripe, isStripeConfigured } from './server/stripe';
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '50mb' }));
+app.use(
+  express.json({
+    limit: '50mb',
+    verify: (req: any, _res, buf) => {
+      if (req.originalUrl && req.originalUrl.startsWith('/api/stripe/webhook')) {
+        req.rawBody = buf;
+      }
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Request logging middleware
@@ -472,6 +483,39 @@ app.post('/api/transfers/monvera', (req: Request, res: Response) => {
 
   const senderMetrics = db.getUserBalanceMetrics(senderUserId);
   res.json({ success: true, transaction: result.transaction, balanceMetrics: senderMetrics });
+
+  // Asynchronous multi-channel alerts (Push, SMS, Email)
+  const senderUser = db.users.get(senderUserId);
+  if (result.transaction) {
+    const tx = result.transaction;
+    // Notify Recipient
+    serverNotificationDispatcher.dispatch({
+      transactionId: tx.id,
+      referenceNumber: tx.referenceNumber,
+      type: 'MONEY_RECEIVED',
+      userId: recipient.id,
+      recipientName: `${recipient.firstName} ${recipient.lastName}`,
+      recipientEmail: recipient.email,
+      recipientPhone: recipient.phone,
+      amount: Number(amount),
+      currency: tx.currency || 'USD',
+      senderName: senderUser ? `${senderUser.firstName} ${senderUser.lastName}` : 'Monvera Member',
+      accountMasked: 'Monvera Checking',
+    }).catch((err) => console.warn('[ServerDispatcher] Transfer recipient dispatch note:', err?.message || err));
+
+    // Notify Sender
+    serverNotificationDispatcher.dispatch({
+      transactionId: tx.id,
+      referenceNumber: tx.referenceNumber,
+      type: 'MONEY_SENT',
+      userId: senderUserId,
+      recipientName: `${recipient.firstName} ${recipient.lastName}`,
+      amount: Number(amount),
+      currency: tx.currency || 'USD',
+      senderName: senderUser ? `${senderUser.firstName} ${senderUser.lastName}` : 'You',
+      accountMasked: 'Monvera Checking',
+    }).catch((err) => console.warn('[ServerDispatcher] Transfer sender dispatch note:', err?.message || err));
+  }
 });
 
 // Internal Transfer (between Checking & Savings)
@@ -528,6 +572,185 @@ app.post('/api/deposits/create', (req: Request, res: Response) => {
   res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
 
+// --- STRIPE INTEGRATION (DEPOSITS) ---
+app.post('/api/stripe/create-checkout-session', async (req: Request, res: Response) => {
+  const { userId, amount, destinationAccountType, origin: clientOrigin } = req.body;
+
+  if (!userId || !amount || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Valid user ID and deposit amount are required.' });
+  }
+
+  const numAmount = Number(amount);
+  const stripe = getStripe();
+
+  if (!stripe) {
+    return res.status(200).json({
+      success: false,
+      configured: false,
+      error: 'Stripe Secret Key is not configured on this server. Please set STRIPE_SECRET_KEY in your environment variables.',
+    });
+  }
+
+  try {
+    const origin = clientOrigin || req.headers.origin || `http://localhost:${PORT}`;
+    const user = db.users.get(userId);
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'Monvera Premier Account Deposit',
+              description: `Direct liquid balance deposit to ${
+                destinationAccountType === 'SAVINGS' ? 'Treasury Savings' : 'Premier Checking'
+              } account (${user?.permanentAccountNumber ? `•••• ${user.permanentAccountNumber.slice(-4)}` : 'Institutional'})`,
+            },
+            unit_amount: Math.round(numAmount * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      customer_email: user?.email,
+      client_reference_id: userId,
+      metadata: {
+        userId,
+        amount: String(numAmount),
+        destinationAccountType: destinationAccountType || 'CHECKING',
+        customerAccountNumber: user?.permanentAccountNumber || '',
+      },
+      success_url: `${origin}/?deposit_status=success&session_id={CHECKOUT_SESSION_ID}&amount=${numAmount}`,
+      cancel_url: `${origin}/?deposit_status=cancelled`,
+    });
+
+    res.json({
+      success: true,
+      configured: true,
+      url: session.url,
+      sessionId: session.id,
+    });
+  } catch (stripeErr: any) {
+    console.error('[Stripe] Checkout Session Creation Error:', stripeErr);
+    res.status(500).json({
+      success: false,
+      error: stripeErr.message || 'Failed to initialize Stripe Checkout Session.',
+    });
+  }
+});
+
+// Stripe Webhook handler
+app.post('/api/stripe/webhook', async (req: Request, res: Response) => {
+  const stripe = getStripe();
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event: any = req.body;
+
+  if (stripe && webhookSecret) {
+    const sig = req.headers['stripe-signature'];
+    const rawBody = (req as any).rawBody;
+    if (sig && rawBody) {
+      try {
+        event = stripe.webhooks.constructEvent(rawBody, sig as string, webhookSecret);
+      } catch (err: any) {
+        console.error(`[Stripe Webhook] Signature verification failed: ${err.message}`);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+      }
+    }
+  }
+
+  // Process checkout.session.completed or payment_intent.succeeded
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.client_reference_id || session.metadata?.userId;
+    const amountStr = session.metadata?.amount;
+    const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
+    const destinationAccountType = session.metadata?.destinationAccountType || 'CHECKING';
+
+    if (userId && amount > 0) {
+      console.log(`[Stripe Webhook] Crediting deposit of $${amount} for user ${userId}`);
+      const depResult = db.processDeposit({
+        userId,
+        amount,
+        method: 'CARD',
+        destinationAccountType,
+        providerPaymentId: `STRIPE-${session.id}`,
+        metadata: {
+          stripeSessionId: session.id,
+          stripePaymentStatus: session.payment_status,
+          currency: session.currency,
+        },
+      });
+
+      if (depResult.success) {
+        serverNotificationDispatcher.dispatchNotification({
+          userId,
+          title: 'Deposit Settled via Stripe',
+          message: `+$${amount.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })} has been credited to your Monvera Checking Account from your debit card.`,
+          type: 'TRANSACTION',
+          severity: 'success',
+        });
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// Confirm session callback endpoint for client return
+app.get('/api/stripe/confirm-session', async (req: Request, res: Response) => {
+  const sessionId = req.query.session_id as string;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'Session ID is required.' });
+  }
+
+  const stripe = getStripe();
+  if (!stripe) {
+    return res.status(400).json({ error: 'Stripe is not configured.' });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status === 'paid') {
+      const userId = session.client_reference_id || session.metadata?.userId;
+      const amountStr = session.metadata?.amount;
+      const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
+      const destinationAccountType = session.metadata?.destinationAccountType || 'CHECKING';
+
+      if (userId && amount > 0) {
+        // Check if already deposited
+        const existingTx = Array.from(db.transactions.values()).find(
+          (t) => t.paymentProviderRef === `STRIPE-${session.id}`
+        );
+
+        if (!existingTx) {
+          db.processDeposit({
+            userId,
+            amount,
+            method: 'CARD',
+            destinationAccountType,
+            providerPaymentId: `STRIPE-${session.id}`,
+            metadata: {
+              stripeSessionId: session.id,
+              stripePaymentStatus: session.payment_status,
+            },
+          });
+        }
+
+        const metrics = db.getUserBalanceMetrics(userId);
+        return res.json({ success: true, balanceMetrics: metrics });
+      }
+    }
+
+    res.json({ success: false, status: session.payment_status });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to verify session' });
+  }
+});
+
 // --- WITHDRAWALS ---
 app.post('/api/withdrawals/create', (req: Request, res: Response) => {
   const {
@@ -550,7 +773,7 @@ app.post('/api/withdrawals/create', (req: Request, res: Response) => {
   const result = db.processWithdrawal({
     userId,
     amount: Number(amount),
-    destinationType: destinationType || 'ACH_BANK',
+    destinationType: destinationType || 'CARD',
     destinationLabel,
     accountOrIban,
     sourceAccountType: sourceAccountType || 'CHECKING',
@@ -567,6 +790,35 @@ app.post('/api/withdrawals/create', (req: Request, res: Response) => {
   const metrics = db.getUserBalanceMetrics(userId);
   res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
+
+// Reverse pending withdrawal
+app.post('/api/withdrawals/reverse', (req: Request, res: Response) => {
+  const { transactionId, userId } = req.body;
+  if (!transactionId) {
+    return res.status(400).json({ error: 'Transaction ID is required.' });
+  }
+
+  const result = db.reverseWithdrawal(transactionId);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  const effectiveUserId = userId || result.transaction?.userId || 'usr_eleanor';
+  const metrics = db.getUserBalanceMetrics(effectiveUserId);
+  res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
+});
+
+// Automatic 30-minute withdrawal reversal interval scheduler (runs every 15 seconds)
+setInterval(() => {
+  try {
+    const reversed = db.checkAndExecuteScheduledReversals();
+    if (reversed > 0) {
+      console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending withdrawal(s) after 30-minute threshold.`);
+    }
+  } catch (e) {
+    console.error('[Auto-Reversal] Error checking scheduled reversals:', e);
+  }
+}, 15000);
 
 // --- TRANSACTIONS EXPLORER ---
 app.get('/api/transactions', (req: Request, res: Response) => {
@@ -657,7 +909,7 @@ app.get('/api/investments', (req: Request, res: Response) => {
 });
 
 app.post('/api/investments/create', (req: Request, res: Response) => {
-  const { userId, termDays, amount } = req.body;
+  const { userId, termDays, amount, userAccountNumber, fallbackBalances, fallbackUser } = req.body;
 
   if (!userId || !termDays || !amount) {
     return res.status(400).json({ error: 'User ID, term duration, and amount are required.' });
@@ -667,13 +919,16 @@ app.post('/api/investments/create', (req: Request, res: Response) => {
     userId,
     termDays: Number(termDays) as InvestmentTermDays,
     amount: Number(amount),
+    userAccountNumber,
+    fallbackBalances,
+    fallbackUser,
   });
 
   if (!result.success) {
     return res.status(400).json({ error: result.error });
   }
 
-  const metrics = db.getUserBalanceMetrics(userId);
+  const metrics = db.getUserBalanceMetrics(result.investment?.userId || userId);
   res.json({ success: true, investment: result.investment, balanceMetrics: metrics });
 });
 
@@ -700,7 +955,20 @@ app.get('/api/cards', (req: Request, res: Response) => {
 });
 
 app.post('/api/cards/create', (req: Request, res: Response) => {
-  const { userId, cardHolderName, phone, cardType, cardTier, brand, spendingLimitMonthly, spendingLimitDaily, colorScheme } = req.body;
+  const {
+    userId,
+    cardHolderName,
+    phone,
+    cardType,
+    cardTier,
+    brand,
+    spendingLimitMonthly,
+    spendingLimitDaily,
+    colorScheme,
+    userAccountNumber,
+    fallbackBalances,
+    fallbackUser,
+  } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
   const result = db.createCard({
@@ -713,13 +981,17 @@ app.post('/api/cards/create', (req: Request, res: Response) => {
     spendingLimitMonthly: spendingLimitMonthly ? Number(spendingLimitMonthly) : 20000,
     spendingLimitDaily: spendingLimitDaily ? Number(spendingLimitDaily) : 20000,
     colorScheme,
+    userAccountNumber,
+    fallbackBalances,
+    fallbackUser,
   });
 
   if (!result.success) {
     return res.status(400).json({ error: result.error });
   }
 
-  const balanceMetrics = db.getUserBalanceMetrics(userId);
+  const targetUserId = result.card?.userId || userId;
+  const balanceMetrics = db.getUserBalanceMetrics(targetUserId);
   res.json({
     success: true,
     card: result.card,
@@ -809,6 +1081,56 @@ app.post('/api/support/reply', (req: Request, res: Response) => {
   }
 
   res.json({ success: true, notification: result.notification });
+});
+
+// Multi-Channel Notification Dispatcher Endpoint (SMS, Email, Push)
+app.post('/api/notifications/dispatch', async (req: Request, res: Response) => {
+  try {
+    const {
+      transactionId,
+      referenceNumber,
+      type,
+      userId,
+      recipientName,
+      recipientEmail,
+      recipientPhone,
+      amount,
+      currency,
+      senderName,
+      accountMasked,
+      preferences,
+    } = req.body;
+
+    if (!userId || !type) {
+      return res.status(400).json({ error: 'userId and notification type are required' });
+    }
+
+    // Try to resolve user contact details from database if not explicitly provided
+    const user = db.users.get(userId);
+    const finalPhone = recipientPhone || user?.phone;
+    const finalEmail = recipientEmail || user?.email;
+    const finalName = recipientName || (user ? `${user.firstName} ${user.lastName}` : undefined);
+
+    const result = await serverNotificationDispatcher.dispatch({
+      transactionId: transactionId || referenceNumber || `tx_${Date.now()}`,
+      referenceNumber: referenceNumber || `MV-${Date.now().toString().slice(-6)}`,
+      type,
+      userId,
+      recipientName: finalName,
+      recipientEmail: finalEmail,
+      recipientPhone: finalPhone,
+      amount: amount !== undefined ? Number(amount) : undefined,
+      currency: currency || 'USD',
+      senderName,
+      accountMasked,
+      preferences,
+    });
+
+    res.json({ success: true, dispatchResult: result });
+  } catch (err: any) {
+    console.error('[API] /api/notifications/dispatch error:', err?.message || err);
+    res.status(500).json({ success: false, error: err?.message || 'Dispatch failed' });
+  }
 });
 
 app.get('/api/security/sessions', (req: Request, res: Response) => {
@@ -1016,6 +1338,25 @@ app.post('/api/admin/transfer', (req: Request, res: Response) => {
     transaction: result.transaction,
     targetBalanceMetrics: targetMetrics,
   });
+
+  // Asynchronously dispatch multi-channel notification for Bennett Johnson admin transfer
+  if (result.transaction) {
+    const tx = result.transaction;
+    const recipientUser = db.users.get(recipientId);
+    serverNotificationDispatcher.dispatch({
+      transactionId: tx.id,
+      referenceNumber: tx.referenceNumber,
+      type: 'MONEY_RECEIVED',
+      userId: recipientId,
+      recipientName: recipientUser ? `${recipientUser.firstName} ${recipientUser.lastName}` : (targetName || 'Monvera Client'),
+      recipientEmail: recipientUser?.email || targetEmail,
+      recipientPhone: recipientUser?.phone,
+      amount: Number(amount),
+      currency: tx.currency || 'USD',
+      senderName: 'Bennett Johnson (Admin)',
+      accountMasked: (tx as any).accountName || 'Monvera Premier Checking',
+    }).catch((err) => console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err));
+  }
 });
 
 // Admin Development Funding System (Isolated for testing/staging)
@@ -1107,9 +1448,9 @@ app.post('/api/loans/apply', (req: Request, res: Response) => {
 });
 
 app.post('/api/admin/loans/approve', (req: Request, res: Response) => {
-  const { loanId, adminId } = req.body;
+  const { loanId, adminId, fallbackLoan, fallbackUser } = req.body;
   if (!loanId) return res.status(400).json({ error: 'loanId is required.' });
-  const result = db.adminApproveLoan({ loanId, adminId: adminId || 'usr_admin' });
+  const result = db.adminApproveLoan({ loanId, adminId: adminId || 'usr_admin', fallbackLoan, fallbackUser });
   if (!result.success) return res.status(400).json({ error: result.error });
   res.json(result);
 });

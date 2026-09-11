@@ -34,6 +34,10 @@ import {
   Info,
   ExternalLink,
   ArrowLeft,
+  Edit3,
+  Save,
+  X,
+  Loader2,
 } from 'lucide-react';
 
 /**
@@ -117,6 +121,20 @@ export const ProfileView: React.FC = () => {
   const [isRequestingReset, setIsRequestingReset] = useState(false);
   const [resetSuccessMsg, setResetSuccessMsg] = useState<string | null>(null);
   const [resetErrorMsg, setResetErrorMsg] = useState<string | null>(null);
+
+  // User Profile Editing State
+  const [isEditingProfile, setIsEditingProfile] = useState(false);
+  const [editFirstName, setEditFirstName] = useState('');
+  const [editLastName, setEditLastName] = useState('');
+  const [editPhone, setEditPhone] = useState('');
+  const [editDateOfBirth, setEditDateOfBirth] = useState('');
+  const [editCountry, setEditCountry] = useState('');
+  const [editStreetAddress, setEditStreetAddress] = useState('');
+  const [editMaritalStatus, setEditMaritalStatus] = useState('');
+  const [editBusinessName, setEditBusinessName] = useState('');
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
+  const [profileSuccessMsg, setProfileSuccessMsg] = useState<string | null>(null);
+  const [profileErrorMsg, setProfileErrorMsg] = useState<string | null>(null);
 
   // KYC Verification Form State
   const [selectedJurisdiction, setSelectedJurisdiction] = useState<'US' | 'INTERNATIONAL'>('US');
@@ -306,6 +324,83 @@ export const ProfileView: React.FC = () => {
       setResetErrorMsg(err?.message || 'A network error occurred while dispatching password reset link.');
     } finally {
       setIsRequestingReset(false);
+    }
+  };
+
+  // Open Edit Profile modal with fresh currentUser values
+  const handleOpenEditProfile = () => {
+    if (!currentUser) return;
+    setEditFirstName(currentUser.firstName || '');
+    setEditLastName(currentUser.lastName || '');
+    setEditPhone(currentUser.phone || '');
+    setEditDateOfBirth(currentUser.dateOfBirth || '');
+    setEditCountry(currentUser.country || 'United States');
+    setEditStreetAddress(currentUser.streetAddress || (currentUser as any).address || '');
+    setEditMaritalStatus(currentUser.maritalStatus || 'Single');
+    setEditBusinessName(currentUser.businessName || '');
+    setProfileSuccessMsg(null);
+    setProfileErrorMsg(null);
+    setIsEditingProfile(true);
+  };
+
+  // Save non-sensitive profile changes safely
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+
+    const trimmedFirst = editFirstName.trim();
+    const trimmedLast = editLastName.trim();
+
+    if (!trimmedFirst || !trimmedLast) {
+      setProfileErrorMsg('Legal First Name and Last Name cannot be empty.');
+      return;
+    }
+
+    setIsSavingProfile(true);
+    setProfileErrorMsg(null);
+    setProfileSuccessMsg(null);
+
+    try {
+      const updatedUser = {
+        ...currentUser,
+        firstName: trimmedFirst,
+        lastName: trimmedLast,
+        name: `${trimmedFirst} ${trimmedLast}`,
+        phone: editPhone.trim(),
+        dateOfBirth: editDateOfBirth.trim(),
+        country: editCountry.trim(),
+        streetAddress: editStreetAddress.trim(),
+        maritalStatus: editMaritalStatus.trim(),
+        businessName: editBusinessName.trim() || undefined,
+      };
+
+      // 1. Immediately update local state
+      updateUser(updatedUser);
+
+      // 2. Persist to Firestore safely
+      const res = await firestoreSync.saveUserProfile(currentUser.id, {
+        firstName: trimmedFirst,
+        lastName: trimmedLast,
+        fullName: `${trimmedFirst} ${trimmedLast}`,
+        phone: editPhone.trim(),
+        dateOfBirth: editDateOfBirth.trim(),
+        country: editCountry.trim(),
+        address: editStreetAddress.trim(),
+        streetAddress: editStreetAddress.trim(),
+        maritalStatus: editMaritalStatus.trim(),
+        businessName: editBusinessName.trim() || undefined,
+      });
+
+      if (res.success) {
+        setProfileSuccessMsg('Personal profile details updated and saved successfully.');
+        setIsEditingProfile(false);
+      } else {
+        setProfileErrorMsg(res.error || 'Failed to persist profile changes to Firestore.');
+      }
+    } catch (err: any) {
+      setProfileErrorMsg(err?.message || 'An unexpected error occurred while saving profile changes.');
+    } finally {
+      setIsSavingProfile(false);
     }
   };
 
@@ -740,15 +835,42 @@ export const ProfileView: React.FC = () => {
 
         {/* Customer Expanded Personal Information */}
         <div className="p-6 sm:p-8 rounded-3xl bg-white border-2 border-slate-200 shadow-sm space-y-6">
-          <div className="flex items-center gap-3 pb-3 border-b-2 border-slate-100">
-            <div className="w-10 h-10 rounded-xl bg-slate-900 text-sky-400 flex items-center justify-center shadow-xs">
-              <User className="w-5 h-5" />
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-3 border-b-2 border-slate-100">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-slate-900 text-sky-400 flex items-center justify-center shadow-xs">
+                <User className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-extrabold text-lg text-slate-900">Personal & Legal Identity</h3>
+                <p className="text-xs font-semibold text-slate-600">Registered Customer Master Record</p>
+              </div>
             </div>
-            <div>
-              <h3 className="font-extrabold text-lg text-slate-900">Personal & Legal Identity</h3>
-              <p className="text-xs font-semibold text-slate-600">Registered Customer Master Record</p>
-            </div>
+
+            <button
+              type="button"
+              onClick={handleOpenEditProfile}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-xs transition-colors cursor-pointer self-start sm:self-auto"
+            >
+              <Edit3 className="w-3.5 h-3.5 text-sky-400" />
+              <span>Edit Profile Details</span>
+            </button>
           </div>
+
+          {profileSuccessMsg && (
+            <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-bold text-emerald-900 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{profileSuccessMsg}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setProfileSuccessMsg(null)}
+                className="text-emerald-700 hover:text-emerald-900 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
             <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1">
@@ -822,20 +944,54 @@ export const ProfileView: React.FC = () => {
                 <span>Residential Address</span>
               </span>
               <span className="font-bold text-slate-950 text-sm block">
-                742 Evergreen Terrace, Suite 400
+                {currentUser.streetAddress || (currentUser as any).address || '742 Evergreen Terrace, Suite 400'}
               </span>
             </div>
 
-            {/* Expanded: City, State & Postal Code */}
+            {/* Expanded: City, State & Postal Code / Country */}
             <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1">
               <span className="text-xs font-extrabold text-slate-700 flex items-center gap-1.5">
                 <Building2 className="w-4 h-4 text-sky-700" />
-                <span>City, State & Postal Code</span>
+                <span>Country & Jurisdiction</span>
               </span>
               <span className="font-bold text-slate-950 text-sm block">
-                New York, NY 10001, United States
+                {currentUser.country || 'United States'}
               </span>
             </div>
+
+            {/* Marital Status */}
+            <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1">
+              <span className="text-xs font-extrabold text-slate-700 flex items-center gap-1.5">
+                <User className="w-4 h-4 text-sky-700" />
+                <span>Marital Status</span>
+              </span>
+              <span className="font-bold text-slate-950 text-sm block">
+                {currentUser.maritalStatus || 'Single'}
+              </span>
+            </div>
+
+            {/* Business Entity Name if applicable */}
+            {currentUser.businessName ? (
+              <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1">
+                <span className="text-xs font-extrabold text-slate-700 flex items-center gap-1.5">
+                  <Building2 className="w-4 h-4 text-sky-700" />
+                  <span>Commercial Entity</span>
+                </span>
+                <span className="font-bold text-slate-950 text-sm block">
+                  {currentUser.businessName}
+                </span>
+              </div>
+            ) : (
+              <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1">
+                <span className="text-xs font-extrabold text-slate-700 flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-sky-700" />
+                  <span>Account Classification</span>
+                </span>
+                <span className="font-bold text-slate-950 text-sm block">
+                  Private Individual Banking
+                </span>
+              </div>
+            )}
 
             {/* Tax Identification / SSN */}
             <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1 sm:col-span-2">
@@ -854,6 +1010,203 @@ export const ProfileView: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {/* Modal: Edit Profile Details */}
+        {isEditingProfile && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs animate-in fade-in">
+            <div className="bg-white rounded-3xl border-2 border-slate-200 shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6 sm:p-8 space-y-6">
+              
+              {/* Modal Header */}
+              <div className="flex items-center justify-between pb-4 border-b border-slate-200">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-slate-900 text-sky-400 flex items-center justify-center font-bold shadow-xs">
+                    <Edit3 className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900">Edit Personal Profile</h3>
+                    <p className="text-xs text-slate-500">Update personal information while protecting account security.</p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setIsEditingProfile(false)}
+                  className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 hover:text-slate-800 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {profileErrorMsg && (
+                <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{profileErrorMsg}</span>
+                </div>
+              )}
+
+              <form onSubmit={handleSaveProfile} className="space-y-6">
+                
+                {/* Editable Fields Section */}
+                <div className="space-y-4">
+                  <h4 className="text-xs font-mono font-bold uppercase text-slate-500 tracking-wider">
+                    General Contact & Identity Information
+                  </h4>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-bold text-slate-700">Legal First Name *</label>
+                      <input
+                        type="text"
+                        required
+                        value={editFirstName}
+                        onChange={(e) => setEditFirstName(e.target.value)}
+                        placeholder="e.g. Eleanor"
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-bold text-slate-700">Legal Last Name *</label>
+                      <input
+                        type="text"
+                        required
+                        value={editLastName}
+                        onChange={(e) => setEditLastName(e.target.value)}
+                        placeholder="e.g. Vance"
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-bold text-slate-700">Phone Number</label>
+                      <input
+                        type="tel"
+                        value={editPhone}
+                        onChange={(e) => setEditPhone(e.target.value)}
+                        placeholder="e.g. +1 (555) 234-8901"
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-bold text-slate-700">Date of Birth</label>
+                      <input
+                        type="date"
+                        value={editDateOfBirth}
+                        onChange={(e) => setEditDateOfBirth(e.target.value)}
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5 sm:col-span-2">
+                      <label className="block text-xs font-bold text-slate-700">Residential Address</label>
+                      <input
+                        type="text"
+                        value={editStreetAddress}
+                        onChange={(e) => setEditStreetAddress(e.target.value)}
+                        placeholder="e.g. 742 Evergreen Terrace, Suite 400"
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-bold text-slate-700">Country of Residence</label>
+                      <input
+                        type="text"
+                        value={editCountry}
+                        onChange={(e) => setEditCountry(e.target.value)}
+                        placeholder="e.g. United States"
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-bold text-slate-700">Marital Status</label>
+                      <select
+                        value={editMaritalStatus}
+                        onChange={(e) => setEditMaritalStatus(e.target.value)}
+                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900 bg-white"
+                      >
+                        <option value="Single">Single</option>
+                        <option value="Married">Married</option>
+                        <option value="Divorced">Divorced</option>
+                        <option value="Widowed">Widowed</option>
+                      </select>
+                    </div>
+
+                    {currentUser.businessName !== undefined && (
+                      <div className="space-y-1.5 sm:col-span-2">
+                        <label className="block text-xs font-bold text-slate-700">Business / Trade Name</label>
+                        <input
+                          type="text"
+                          value={editBusinessName}
+                          onChange={(e) => setEditBusinessName(e.target.value)}
+                          placeholder="Registered Business Name"
+                          className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* System-Controlled & Security Protected Fields (Read-Only) */}
+                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
+                  <div className="flex items-center gap-2 text-xs font-bold text-slate-700">
+                    <Lock className="w-3.5 h-3.5 text-slate-500" />
+                    <span>Protected Banking Information (Governed by Regulatory Treasury)</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                    <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+                      <span className="text-[10px] text-slate-500 block font-medium">Permanent Account Number</span>
+                      <span className="font-mono font-bold text-slate-900">{currentUser.permanentAccountNumber || '1045827391'}</span>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+                      <span className="text-[10px] text-slate-500 block font-medium">Unique Identity (UID)</span>
+                      <span className="font-mono font-bold text-slate-900">{currentUser.id}</span>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+                      <span className="text-[10px] text-slate-500 block font-medium">KYC Clearance</span>
+                      <span className="font-bold text-emerald-800 uppercase text-[11px]">{currentUser.kycStatus || 'verified'}</span>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white border border-slate-200">
+                      <span className="text-[10px] text-slate-500 block font-medium">System Role</span>
+                      <span className="font-bold text-slate-900 uppercase text-[11px]">{currentUser.role}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Modal Actions */}
+                <div className="flex items-center justify-end gap-3 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingProfile(false)}
+                    className="px-5 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 font-bold text-xs cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSavingProfile}
+                    className="px-6 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white font-bold text-xs shadow-md transition-all cursor-pointer flex items-center gap-2"
+                  >
+                    {isSavingProfile ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Saving Changes...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Save className="w-4 h-4 text-sky-400" />
+                        <span>Save Profile Changes</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+              </form>
+            </div>
+          </div>
+        )}
 
       </div>
 

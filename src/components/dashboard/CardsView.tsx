@@ -92,7 +92,7 @@ export const CardsView: React.FC = () => {
 
   const handleToggleFreeze = async (cardId: string) => {
     try {
-      const res = await api.toggleCardFreeze(cardId);
+      const res = await api.toggleCardFreeze(cardId, currentUser.id);
       if (res.success && res.card) {
         setCards((prev) => prev.map((c) => (c.id === cardId ? res.card! : c)));
       }
@@ -109,10 +109,14 @@ export const CardsView: React.FC = () => {
 
   const handleSaveLimit = async (cardId: string) => {
     try {
-      const res = await api.updateCardLimits(cardId, {
-        monthlyLimit: tempLimitValue,
-        dailyLimit: tempLimitValue,
-      });
+      const res = await api.updateCardLimits(
+        cardId,
+        {
+          monthlyLimit: tempLimitValue,
+          dailyLimit: tempLimitValue,
+        },
+        currentUser.id
+      );
       if (res.success && res.card) {
         setCards((prev) => prev.map((c) => (c.id === cardId ? res.card! : c)));
         setEditingLimitCardId(null);
@@ -132,7 +136,7 @@ export const CardsView: React.FC = () => {
     if (feature === 'atm') updates.atm = !targetCard.atmEnabled;
 
     try {
-      const res = await api.updateCardLimits(cardId, updates);
+      const res = await api.updateCardLimits(cardId, updates, currentUser.id);
       if (res.success && res.card) {
         setCards((prev) => prev.map((c) => (c.id === cardId ? res.card! : c)));
       }
@@ -174,6 +178,9 @@ export const CardsView: React.FC = () => {
 
       const res = await api.createCard({
         userId: currentUser.id,
+        userAccountNumber: currentUser.permanentAccountNumber,
+        fallbackBalances: balanceMetrics || undefined,
+        fallbackUser: currentUser,
         cardHolderName: cardHolderName.trim(),
         phone: phoneNumber.trim(),
         cardType,

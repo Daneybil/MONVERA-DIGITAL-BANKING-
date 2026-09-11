@@ -154,6 +154,7 @@ export const AdminLoansView: React.FC = () => {
       const res = await api.adminApproveLoan({
         loanId: approveModalLoan.id,
         adminId: currentUser?.id || 'usr_admin',
+        fallbackLoan: approveModalLoan,
       });
 
       if (res.success && res.loan) {

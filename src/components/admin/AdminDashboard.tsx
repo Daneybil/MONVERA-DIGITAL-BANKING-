@@ -5,6 +5,7 @@ import { firestoreSync, isNonExistentAccount } from '../../services/firestoreSyn
 import {
   UserProfile,
   UserStatus,
+  KycStatus,
   Transaction,
   AdminAuditLog,
   AdminSystemOverview,
@@ -134,11 +135,17 @@ export const AdminDashboard: React.FC = () => {
       };
     };
 
+    const firestoreCustomerIds = new Set<string>();
+
     const registerCustomer = (u: UserProfile & { balanceMetrics?: any }, source: 'firestore' | 'local' | 'auth' | 'server') => {
       if (!u || !u.id) return;
       // Admin is executive staff; customers table displays banking clients
       if (u.id === 'usr_admin' || u.role === 'super_admin') return;
       if (isNonExistentAccount(u)) return;
+
+      if (source === 'firestore') {
+        firestoreCustomerIds.add(u.id);
+      }
 
       const emailKey = (u.email || '').toLowerCase().trim();
       const accKey = (u.permanentAccountNumber || '').replace(/[-\s]/g, '');
@@ -150,12 +157,29 @@ export const AdminDashboard: React.FC = () => {
       // Check if already in map by ID
       if (userMap.has(u.id)) {
         const existing = userMap.get(u.id)!;
+        const isExistingFirestore = firestoreCustomerIds.has(u.id);
+        const isIncomingFirestore = source === 'firestore';
+
+        // Authoritative KYC resolution: Firestore is the single source of truth (KYC FIX #1, #2)
+        let effectiveKycStatus: KycStatus = 'unverified';
+        if (isIncomingFirestore) {
+          effectiveKycStatus = u.kycStatus || 'unverified';
+        } else if (isExistingFirestore) {
+          effectiveKycStatus = existing.kycStatus || 'unverified';
+        } else if (existing.kycStatus === 'verified' || u.kycStatus === 'verified') {
+          effectiveKycStatus = 'verified';
+        } else {
+          effectiveKycStatus = u.kycStatus || existing.kycStatus || 'unverified';
+        }
+
         const mergedObj = {
           ...existing,
           ...u,
           status: ((shouldBeFrozen || existing.status === 'frozen' || u.status === 'frozen') ? 'frozen' : (u.status || existing.status || 'active')) as UserStatus,
-          // Preserve KYC submission data if existing or incoming has it
-          kycStatus: u.kycStatus || existing.kycStatus || 'unverified',
+          kycStatus: effectiveKycStatus,
+          kycVerifiedAt: (effectiveKycStatus === 'verified')
+            ? (u.kycVerifiedAt || existing.kycVerifiedAt || new Date().toISOString())
+            : (u.kycVerifiedAt || existing.kycVerifiedAt),
           kycDocumentImage: u.kycDocumentImage || existing.kycDocumentImage,
           kycDocumentBackImage: u.kycDocumentBackImage || existing.kycDocumentBackImage,
           kycProofOfAddressImage: u.kycProofOfAddressImage || existing.kycProofOfAddressImage,
@@ -175,10 +199,13 @@ export const AdminDashboard: React.FC = () => {
         for (const [id, ex] of userMap.entries()) {
           const exAcc = (ex.permanentAccountNumber || '').replace(/[-\s]/g, '');
           if (exAcc && exAcc === accKey) {
+            const isExFirestore = firestoreCustomerIds.has(id);
+            const resolvedKyc = (isExFirestore ? ex.kycStatus : (ex.kycStatus === 'verified' || u.kycStatus === 'verified' ? 'verified' : (u.kycStatus || ex.kycStatus || 'unverified'))) as KycStatus;
             userMap.set(id, {
               ...ex,
               ...u,
-              kycStatus: u.kycStatus || ex.kycStatus || 'unverified',
+              kycStatus: resolvedKyc,
+              kycVerifiedAt: resolvedKyc === 'verified' ? (ex.kycVerifiedAt || u.kycVerifiedAt) : undefined,
               kycDocumentImage: u.kycDocumentImage || ex.kycDocumentImage,
               kycDocumentBackImage: u.kycDocumentBackImage || ex.kycDocumentBackImage,
               kycProofOfAddressImage: u.kycProofOfAddressImage || ex.kycProofOfAddressImage,
@@ -196,11 +223,7 @@ export const AdminDashboard: React.FC = () => {
       u.balanceMetrics = resolveCustomerBalances(u.id, accKey, u.balanceMetrics);
       userMap.set(u.id, u);
       if (accKey) seenAccountNums.add(accKey);
-
-      // If user came from local accounts directory and was not yet in Firestore, sync to Firestore
-      if (source === 'local') {
-        firestoreSync.saveUserProfile(u.id, u).catch(() => {});
-      }
+      // NOTE: No stale write-backs to Firestore from merge process (KYC FIX #2)
     };
 
     // 1. First add real users from Firestore (authoritative cloud database)
@@ -420,7 +443,7 @@ export const AdminDashboard: React.FC = () => {
     }
 
     try {
-      // 3. Fast non-blocking approval via API service
+      // 3. Authoritative approval via API service (persists directly to Firestore and verifies the write)
       const res = await api.adminApproveKyc(
         { userId, adminId: currentUser?.id || 'usr_admin', userProfile: (existingCust || optimisticVerified) as any }
       );
@@ -432,10 +455,31 @@ export const AdminDashboard: React.FC = () => {
         if (selectedCustomer?.id === userId) {
           setSelectedCustomer((prev) => (prev ? { ...prev, ...res.user } : null));
         }
+      } else {
+        console.error('[AdminDashboard] KYC approval failed:', res.error);
+        // Rollback optimistic update on failure
+        if (existingCust) {
+          setCustomers((prev) => prev.map((c) => (c.id === userId ? existingCust : c)));
+          if (selectedCustomer?.id === userId) {
+            setSelectedCustomer(existingCust);
+          }
+          if (currentUser?.id === userId) {
+            updateUser(existingCust);
+          }
+        }
       }
       refreshNotifications().catch(() => {});
     } catch (err) {
       console.error('Error approving KYC:', err);
+      if (existingCust) {
+        setCustomers((prev) => prev.map((c) => (c.id === userId ? existingCust : c)));
+        if (selectedCustomer?.id === userId) {
+          setSelectedCustomer(existingCust);
+        }
+        if (currentUser?.id === userId) {
+          updateUser(existingCust);
+        }
+      }
     }
   };
 
@@ -488,10 +532,30 @@ export const AdminDashboard: React.FC = () => {
         if (selectedCustomer?.id === userId) {
           setSelectedCustomer((prev) => (prev ? { ...prev, ...res.user } : null));
         }
+      } else {
+        console.error('[AdminDashboard] KYC rejection failed:', res.error);
+        if (existingCust) {
+          setCustomers((prev) => prev.map((c) => (c.id === userId ? existingCust : c)));
+          if (selectedCustomer?.id === userId) {
+            setSelectedCustomer(existingCust);
+          }
+          if (currentUser?.id === userId) {
+            updateUser(existingCust);
+          }
+        }
       }
       refreshNotifications().catch(() => {});
     } catch (err) {
       console.error('Error rejecting KYC:', err);
+      if (existingCust) {
+        setCustomers((prev) => prev.map((c) => (c.id === userId ? existingCust : c)));
+        if (selectedCustomer?.id === userId) {
+          setSelectedCustomer(existingCust);
+        }
+        if (currentUser?.id === userId) {
+          updateUser(existingCust);
+        }
+      }
     }
   };
 

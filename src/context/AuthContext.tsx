@@ -7,11 +7,22 @@ import {
   sendPasswordResetEmail,
   onAuthStateChanged,
   User as FirebaseUser,
+  multiFactor,
+  TotpMultiFactorGenerator,
+  TotpSecret,
+  getMultiFactorResolver,
+  EmailAuthProvider,
+  reauthenticateWithCredential,
+  MultiFactorResolver,
+  MultiFactorInfo,
 } from 'firebase/auth';
 import { auth } from '../services/firebase';
 import { firestoreSync } from '../services/firestoreSync';
+import { pushNotificationService } from '../services/pushNotificationService';
 import { UserProfile, NotificationItem } from '../types';
 import { api, BalanceMetrics } from '../services/api';
+
+export type { MultiFactorResolver, MultiFactorInfo, TotpSecret };
 
 export type AppView =
   | 'home'
@@ -46,7 +57,39 @@ interface AuthContextType {
   setCurrentView: (view: AppView) => void;
   notifications: NotificationItem[];
   unreadNotifsCount: number;
-  login: (identifier: string, password?: string) => Promise<{ success: boolean; error?: string }>;
+  login: (identifier: string, password?: string) => Promise<{
+    success: boolean;
+    error?: string;
+    mfaRequired?: boolean;
+    resolver?: MultiFactorResolver;
+    hint?: MultiFactorInfo;
+  }>;
+  resolveTotpLogin: (
+    resolver: MultiFactorResolver,
+    code: string,
+    hintUid: string,
+    cleanPassword?: string
+  ) => Promise<{ success: boolean; error?: string }>;
+  reauthenticateUser: (password: string) => Promise<{ success: boolean; error?: string }>;
+  getEnrolledTotpFactor: () => MultiFactorInfo | null;
+  startTotpEnrollment: () => Promise<{
+    success: boolean;
+    totpSecret?: TotpSecret;
+    qrCodeUrl?: string;
+    secretKey?: string;
+    error?: string;
+    requiresReauth?: boolean;
+  }>;
+  finishTotpEnrollment: (
+    totpSecret: TotpSecret,
+    verificationCode: string,
+    displayName?: string
+  ) => Promise<{ success: boolean; error?: string }>;
+  unenrollTotpMfa: () => Promise<{
+    success: boolean;
+    error?: string;
+    requiresReauth?: boolean;
+  }>;
   logout: () => void;
   switchUser: (userId: string) => Promise<void>;
   registerUser: (data: {
@@ -344,7 +387,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       refreshProfile();
     }, 3000);
 
-    // 4. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
+    // 4. Silently sync FCM registration token if browser permission is already granted
+    pushNotificationService.syncTokenForUser(currentUser.id).catch(() => {});
+
+    // 5. Listen to foreground push notifications while tab is open
+    const unsubPush = pushNotificationService.listenToForegroundMessages(() => {
+      refreshNotifications();
+      refreshBalance();
+    });
+
+    // 6. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
     const handleKycStatusUpdated = (e: any) => {
       const detail = e.detail;
       if (!detail) return;
@@ -386,7 +438,66 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     };
 
+    const handleBalanceUpdated = (e: any) => {
+      const detail = e.detail;
+      if (!detail) return;
+      if (currentUser?.id && (!detail.userId || detail.userId === currentUser.id)) {
+        if (detail.balanceMetrics) {
+          setBalanceMetrics(detail.balanceMetrics);
+          cacheUserBalances(currentUser.id, detail.balanceMetrics);
+          setLastUpdateTimestamp(Date.now());
+        } else {
+          refreshBalance();
+        }
+      }
+    };
+
+    const handleNotificationCreated = (e: any) => {
+      const detail = e.detail;
+      if (!detail) return;
+      if (currentUser?.id && (!detail.userId || detail.userId === currentUser.id)) {
+        if (detail.notification) {
+          setNotifications((prev) => {
+            const exists = prev.some((n) => n.id === detail.notification.id);
+            if (exists) return prev;
+            return [detail.notification, ...prev];
+          });
+          setLastUpdateTimestamp(Date.now());
+        }
+        refreshNotifications();
+      }
+    };
+
+    let syncChannel: BroadcastChannel | null = null;
+    try {
+      syncChannel = new BroadcastChannel('monvera_sync_channel');
+      syncChannel.onmessage = (event) => {
+        const data = event.data;
+        if (!data) return;
+        if (currentUser?.id && (!data.userId || data.userId === currentUser.id)) {
+          if (data.balanceMetrics) {
+            setBalanceMetrics(data.balanceMetrics);
+            cacheUserBalances(currentUser.id, data.balanceMetrics);
+            setLastUpdateTimestamp(Date.now());
+          } else {
+            refreshBalance();
+          }
+          if (data.notification) {
+            setNotifications((prev) => {
+              const exists = prev.some((n) => n.id === data.notification.id);
+              if (exists) return prev;
+              return [data.notification, ...prev];
+            });
+            setLastUpdateTimestamp(Date.now());
+          }
+          refreshNotifications();
+        }
+      };
+    } catch {}
+
     window.addEventListener('monvera_kyc_status_updated', handleKycStatusUpdated);
+    window.addEventListener('monvera_balance_updated', handleBalanceUpdated);
+    window.addEventListener('monvera_notification_created', handleNotificationCreated);
     window.addEventListener('storage', handleStorageEvent);
     window.addEventListener('focus', refreshProfile);
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -394,8 +505,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => {
       unsubBalance();
       unsubProfile();
+      unsubPush();
       clearInterval(interval);
+      if (syncChannel) {
+        try {
+          syncChannel.close();
+        } catch {}
+      }
       window.removeEventListener('monvera_kyc_status_updated', handleKycStatusUpdated);
+      window.removeEventListener('monvera_balance_updated', handleBalanceUpdated);
+      window.removeEventListener('monvera_notification_created', handleNotificationCreated);
       window.removeEventListener('storage', handleStorageEvent);
       window.removeEventListener('focus', refreshProfile);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -528,7 +647,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (userProfile && isMounted) {
             const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
             const isEmailVerified = !!firebaseUser.emailVerified;
-            const resolvedUser = { ...userProfile, emailVerified: isEmailVerified, avatarUrl: persistedAvatar };
+            let isMfaEnrolled = false;
+            try {
+              const enrolledFactors = multiFactor(firebaseUser).enrolledFactors;
+              isMfaEnrolled = enrolledFactors.some((f) => f.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+            } catch {}
+            const resolvedUser = {
+              ...userProfile,
+              emailVerified: isEmailVerified,
+              avatarUrl: persistedAvatar,
+              twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
+            };
             
             // Concurrently fetch verified balances from Firestore
             const [fsMetrics, notifRes] = await Promise.all([
@@ -579,9 +708,206 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [fetchUsers]);
 
   /**
+   * Internal session hydrator that completes profile synchronization,
+   * ledger verification, and navigation state setup.
+   */
+  const hydrateUserSession = async (
+    firebaseUser: FirebaseUser,
+    cleanPassword?: string,
+    emailFallback?: string
+  ): Promise<UserProfile> => {
+    const uid = firebaseUser.uid;
+    const emailToAuth = firebaseUser.email || emailFallback || '';
+    console.log(`[Auth] Hydrating session for Firebase User UID: ${uid}`);
+
+    // 1. Fetch User Profile from Firestore: users/{uid}
+    let userProfile = await firestoreSync.getUserProfile(uid);
+
+    // If not yet in Firestore, check directory cache or server before creating baseline
+    if (!userProfile) {
+      console.log(`[Auth] Profile not found in direct Firestore lookup for ${uid}. Searching cache...`);
+      let cachedExisting: UserProfile | null = null;
+      if (typeof window !== 'undefined') {
+        try {
+          const raw = localStorage.getItem('monvera_accounts_directory');
+          const directory: any[] = raw ? JSON.parse(raw) : [];
+          cachedExisting = directory.find((u: any) => u.id === uid || u.email?.toLowerCase() === emailToAuth.toLowerCase()) || null;
+        } catch {}
+      }
+
+      if (!cachedExisting) {
+        try {
+          const res = await api.getCurrentUser(uid);
+          if (res?.user) cachedExisting = res.user;
+        } catch {}
+      }
+
+      if (cachedExisting) {
+        userProfile = cachedExisting;
+        firestoreSync.saveUserProfile(uid, cachedExisting).catch(console.error);
+      } else {
+        const fallbackProfile: UserProfile = {
+          id: uid,
+          username: emailToAuth.split('@')[0] || `user_${uid.slice(0, 5)}`,
+          firstName: emailToAuth.split('@')[0] || 'Valued',
+          lastName: 'Customer',
+          email: emailToAuth.toLowerCase(),
+          phone: '+1 (555) 000-0000',
+          permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
+          country: 'United States',
+          status: 'active',
+          role: 'customer',
+          membershipTier: 'Standard',
+          twoFactorEnabled: false,
+          createdAt: new Date().toISOString(),
+          kycStatus: 'unverified',
+          dailyTransactionLimit: 1000000,
+        };
+        firestoreSync.saveUserProfile(uid, fallbackProfile).catch(console.error);
+        userProfile = fallbackProfile;
+      }
+    }
+
+    // Check authoritative enrolled MFA factors in Firebase Auth
+    let isMfaEnrolled = false;
+    try {
+      const enrolled = multiFactor(firebaseUser).enrolledFactors;
+      isMfaEnrolled = enrolled.some((f) => f.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+    } catch {}
+
+    const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
+    const finalUser: UserProfile = {
+      ...userProfile,
+      avatarUrl: persistedAvatar,
+      twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
+    };
+
+    // Instant cache check so balance appears with zero lag
+    const cachedBalances = getCachedUserBalances(uid);
+    if (cachedBalances) {
+      setBalanceMetrics(cachedBalances);
+    }
+
+    // Set user immediately for responsive UI feedback
+    setCurrentUser(finalUser);
+    cacheUserInDirectory(finalUser);
+
+    // Concurrently synchronize ledger and metrics in parallel
+    const [backendSync, notifRes, realFsMetrics] = await Promise.all([
+      api.register({
+        uid,
+        id: uid,
+        firstName: finalUser.firstName,
+        lastName: finalUser.lastName,
+        email: finalUser.email,
+        phone: finalUser.phone,
+        country: finalUser.country,
+        dateOfBirth: finalUser.dateOfBirth,
+        maritalStatus: finalUser.maritalStatus,
+        permanentAccountNumber: finalUser.permanentAccountNumber,
+        kycStatus: finalUser.kycStatus,
+        kycDocumentType: finalUser.kycDocumentType,
+        kycDocumentNumber: finalUser.kycDocumentNumber,
+        kycVerifiedAt: finalUser.kycVerifiedAt,
+        password: cleanPassword,
+      }).catch(() => ({ success: true, user: finalUser, balanceMetrics: null })),
+      api.getNotifications(uid).catch(() => ({ notifications: [] })),
+      firestoreSync.getAccountBalances(uid, finalUser.permanentAccountNumber).catch(() => null)
+    ]);
+
+    if (backendSync?.user) {
+      const isVerified = userProfile.kycStatus === 'verified' || backendSync.user.kycStatus === 'verified';
+      const mergedUser: UserProfile = {
+        ...backendSync.user,
+        ...userProfile, // Firestore is the single source of truth for customer profile & KYC status
+        kycStatus: isVerified ? 'verified' : (userProfile.kycStatus || backendSync.user.kycStatus),
+        dailyTransactionLimit: isVerified ? 1000000 : (userProfile.dailyTransactionLimit || backendSync.user.dailyTransactionLimit),
+        avatarUrl: persistedAvatar,
+        twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
+      };
+      setCurrentUser(mergedUser);
+      cacheUserInDirectory(mergedUser);
+    }
+
+    if (realFsMetrics && realFsMetrics.accounts && realFsMetrics.accounts.length > 0) {
+      setBalanceMetrics(realFsMetrics);
+      cacheUserBalances(uid, realFsMetrics);
+    } else if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts && backendSync.balanceMetrics.accounts.length > 0) {
+      setBalanceMetrics(backendSync.balanceMetrics);
+      cacheUserBalances(uid, backendSync.balanceMetrics);
+    } else if (!cachedBalances) {
+      // Fallback baseline only if user has never transacted
+      const initialZeroMetrics: BalanceMetrics = {
+        checkingBalance: 0,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 0,
+        availableBalance: 0,
+        pendingBalance: 0,
+        accounts: [
+          {
+            id: `acc_chk_${uid}`,
+            userId: uid,
+            type: 'CHECKING',
+            accountNumber: finalUser.permanentAccountNumber || '1048291048',
+            routingNumber: '021000021',
+            currency: 'USD',
+            balance: 0,
+            availableBalance: 0,
+            investedBalance: 0,
+            pendingBalance: 0,
+            interestRateAPY: 0.05,
+            status: 'ACTIVE',
+            nickname: 'Monvera Checking Account',
+          },
+          {
+            id: `acc_svg_${uid}`,
+            userId: uid,
+            type: 'SAVINGS',
+            accountNumber: `20${(finalUser.permanentAccountNumber || '1048291048').slice(2)}`,
+            routingNumber: '021000021',
+            currency: 'USD',
+            balance: 0,
+            availableBalance: 0,
+            investedBalance: 0,
+            pendingBalance: 0,
+            interestRateAPY: 4.85,
+            status: 'ACTIVE',
+            nickname: 'Monvera Savings Account',
+          }
+        ]
+      };
+      setBalanceMetrics(initialZeroMetrics);
+      cacheUserBalances(uid, initialZeroMetrics);
+    }
+
+    if (notifRes?.notifications) {
+      setNotifications(notifRes.notifications);
+    }
+
+    if (finalUser.role === 'super_admin' || finalUser.role === 'admin') {
+      setCurrentView('admin');
+    } else {
+      setCurrentView('dashboard');
+    }
+    setActiveModal(null);
+    return finalUser;
+  };
+
+  /**
    * Real Monvera User Login via Firebase Authentication & Firestore
    */
-  const login = async (identifier: string, password?: string): Promise<{ success: boolean; error?: string }> => {
+  const login = async (
+    identifier: string,
+    password?: string
+  ): Promise<{
+    success: boolean;
+    error?: string;
+    mfaRequired?: boolean;
+    resolver?: MultiFactorResolver;
+    hint?: MultiFactorInfo;
+  }> => {
     setIsLoading(true);
     try {
       const cleanIdentifier = identifier.trim();
@@ -628,160 +954,231 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // 1. Authenticate with Firebase Authentication
       console.log(`[Auth] Authenticating ${emailToAuth} with Firebase Auth...`);
       const userCredential = await signInWithEmailAndPassword(auth, emailToAuth, cleanPassword);
-      const firebaseUser = userCredential.user;
-      const uid = firebaseUser.uid;
-      console.log(`[Auth] Firebase Auth succeeded. UID: ${uid}`);
-
-      // 2. Fetch User Profile from Firestore: users/{uid}
-      let userProfile = await firestoreSync.getUserProfile(uid);
-
-      // If not yet in Firestore (e.g. created previously), create baseline profile
-      if (!userProfile) {
-        console.log(`[Auth] Profile not found in Firestore for ${uid}. Initializing...`);
-        const fallbackProfile: UserProfile = {
-          id: uid,
-          username: emailToAuth.split('@')[0] || `user_${uid.slice(0, 5)}`,
-          firstName: emailToAuth.split('@')[0] || 'Valued',
-          lastName: 'Customer',
-          email: emailToAuth.toLowerCase(),
-          phone: '+1 (555) 000-0000',
-          permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
-          country: 'United States',
-          status: 'active',
-          role: 'customer',
-          membershipTier: 'Standard',
-          twoFactorEnabled: false,
-          createdAt: new Date().toISOString(),
-          kycStatus: 'unverified',
-          dailyTransactionLimit: 1000000,
-        };
-        // Fire-and-forget save in background to not block login speed
-        firestoreSync.saveUserProfile(uid, fallbackProfile).catch(console.error);
-        userProfile = fallbackProfile;
-      }
-
-      // 3. Fast Parallel State Hydration (Optimized for instant login)
-      const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
-      const finalUser: UserProfile = { ...userProfile, avatarUrl: persistedAvatar };
-
-      // Instant cache check so balance appears with zero lag
-      const cachedBalances = getCachedUserBalances(uid);
-      if (cachedBalances) {
-        setBalanceMetrics(cachedBalances);
-      }
-
-      // Set user immediately for responsive UI feedback
-      setCurrentUser(finalUser);
-      cacheUserInDirectory(finalUser);
-
-      // Concurrently synchronize ledger and metrics in parallel
-      const [backendSync, notifRes, realFsMetrics] = await Promise.all([
-        api.register({
-          uid,
-          id: uid,
-          firstName: finalUser.firstName,
-          lastName: finalUser.lastName,
-          email: finalUser.email,
-          phone: finalUser.phone,
-          country: finalUser.country,
-          dateOfBirth: finalUser.dateOfBirth,
-          maritalStatus: finalUser.maritalStatus,
-          permanentAccountNumber: finalUser.permanentAccountNumber,
-          kycStatus: finalUser.kycStatus,
-          kycDocumentType: finalUser.kycDocumentType,
-          kycDocumentNumber: finalUser.kycDocumentNumber,
-          kycVerifiedAt: finalUser.kycVerifiedAt,
-          password: cleanPassword,
-        }).catch(() => ({ success: true, user: finalUser, balanceMetrics: null })),
-        api.getNotifications(uid).catch(() => ({ notifications: [] })),
-        firestoreSync.getAccountBalances(uid, finalUser.permanentAccountNumber).catch(() => null)
-      ]);
-
-      if (backendSync?.user) {
-        const isVerified = userProfile.kycStatus === 'verified' || backendSync.user.kycStatus === 'verified';
-        const mergedUser: UserProfile = {
-          ...backendSync.user,
-          ...userProfile, // Firestore is the single source of truth for customer profile & KYC status
-          kycStatus: isVerified ? 'verified' : (userProfile.kycStatus || backendSync.user.kycStatus),
-          dailyTransactionLimit: isVerified ? 1000000 : (userProfile.dailyTransactionLimit || backendSync.user.dailyTransactionLimit),
-          avatarUrl: persistedAvatar,
-        };
-        setCurrentUser(mergedUser);
-        cacheUserInDirectory(mergedUser);
-      }
-
-      if (realFsMetrics && realFsMetrics.accounts && realFsMetrics.accounts.length > 0) {
-        setBalanceMetrics(realFsMetrics);
-        cacheUserBalances(uid, realFsMetrics);
-      } else if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts && backendSync.balanceMetrics.accounts.length > 0) {
-        setBalanceMetrics(backendSync.balanceMetrics);
-        cacheUserBalances(uid, backendSync.balanceMetrics);
-      } else if (!cachedBalances) {
-        // Fallback baseline only if user has never transacted
-        const initialZeroMetrics: BalanceMetrics = {
-          checkingBalance: 0,
-          savingsBalance: 0,
-          investedBalance: 0,
-          accruedEarnings: 0,
-          totalBalance: 0,
-          availableBalance: 0,
-          pendingBalance: 0,
-          accounts: [
-            {
-              id: `acc_chk_${uid}`,
-              userId: uid,
-              type: 'CHECKING',
-              accountNumber: finalUser.permanentAccountNumber || '1048291048',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: 0,
-              availableBalance: 0,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 0.05,
-              status: 'ACTIVE',
-              nickname: 'Monvera Checking Account',
-            },
-            {
-              id: `acc_svg_${uid}`,
-              userId: uid,
-              type: 'SAVINGS',
-              accountNumber: `20${(finalUser.permanentAccountNumber || '1048291048').slice(2)}`,
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: 0,
-              availableBalance: 0,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 4.85,
-              status: 'ACTIVE',
-              nickname: 'Monvera Savings Account',
-            }
-          ]
-        };
-        setBalanceMetrics(initialZeroMetrics);
-        cacheUserBalances(uid, initialZeroMetrics);
-      }
-
-      if (notifRes?.notifications) {
-        setNotifications(notifRes.notifications);
-      }
-
-      if (finalUser.role === 'super_admin' || finalUser.role === 'admin') {
-        setCurrentView('admin');
-      } else {
-        setCurrentView('dashboard');
-      }
-      setActiveModal(null);
+      await hydrateUserSession(userCredential.user, cleanPassword, emailToAuth);
       return { success: true };
     } catch (err: any) {
       console.error('[Firebase Auth Login Error]', err);
+      if (err?.code === 'auth/multi-factor-auth-required') {
+        const resolver = getMultiFactorResolver(auth, err);
+        const totpHint = resolver.hints.find((h) => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+        return {
+          success: false,
+          mfaRequired: true,
+          resolver,
+          hint: totpHint || (resolver.hints[0] as MultiFactorInfo),
+        };
+      }
       const friendlyMsg = getFirebaseErrorMessage(err);
       return { success: false, error: friendlyMsg };
     } finally {
       setIsLoading(false);
     }
   };
+
+/**
+ * Resolve TOTP MFA Challenge during Sign-In
+ */
+const resolveTotpLogin = async (
+  resolver: MultiFactorResolver,
+  code: string,
+  hintUid: string,
+  cleanPassword?: string
+): Promise<{ success: boolean; error?: string }> => {
+  setIsLoading(true);
+  try {
+    const cleanCode = code.trim().replace(/\D/g, '');
+    if (cleanCode.length !== 6) {
+      return { success: false, error: 'Please enter the 6-digit code from your authenticator app.' };
+    }
+    const assertion = TotpMultiFactorGenerator.assertionForSignIn(hintUid, cleanCode);
+    const userCredential = await resolver.resolveSignIn(assertion);
+    await hydrateUserSession(userCredential.user, cleanPassword);
+    return { success: true };
+  } catch (err: any) {
+    console.error('[MFA Resolve Error]', err);
+    if (err?.code === 'auth/invalid-verification-code' || err?.code === 'auth/invalid-mfa-code') {
+      return { success: false, error: 'Invalid authenticator code. Please check your authenticator app and try again.' };
+    }
+    if (err?.code === 'auth/code-expired') {
+      return { success: false, error: 'The verification code has expired. Please enter the current rolling code.' };
+    }
+    return { success: false, error: err?.message || 'Failed to verify authenticator code.' };
+  } finally {
+    setIsLoading(false);
+  }
+};
+
+/**
+ * Re-authenticate current user with password for sensitive operations (MFA enrollment/unenrollment)
+ */
+const reauthenticateUser = async (password: string): Promise<{ success: boolean; error?: string }> => {
+  try {
+    if (!auth.currentUser || !auth.currentUser.email) {
+      return { success: false, error: 'No active authenticated session.' };
+    }
+    const cred = EmailAuthProvider.credential(auth.currentUser.email, password);
+    await reauthenticateWithCredential(auth.currentUser, cred);
+    return { success: true };
+  } catch (err: any) {
+    console.error('[Reauth Error]', err);
+    if (err?.code === 'auth/wrong-password' || err?.code === 'auth/invalid-credential') {
+      return { success: false, error: 'Incorrect account password.' };
+    }
+    return { success: false, error: err?.message || 'Re-authentication failed. Please check your password.' };
+  }
+};
+
+/**
+ * Check if the active Firebase User has an enrolled TOTP factor
+ */
+const getEnrolledTotpFactor = (): MultiFactorInfo | null => {
+  if (!auth.currentUser) return null;
+  try {
+    const enrolled = multiFactor(auth.currentUser).enrolledFactors;
+    return enrolled.find((f) => f.factorId === TotpMultiFactorGenerator.FACTOR_ID) || null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Begin Real Firebase TOTP Multi-Factor Enrollment
+ */
+const startTotpEnrollment = async (): Promise<{
+  success: boolean;
+  totpSecret?: TotpSecret;
+  qrCodeUrl?: string;
+  secretKey?: string;
+  error?: string;
+  requiresReauth?: boolean;
+}> => {
+  if (!auth.currentUser) {
+    return { success: false, error: 'You must be signed in to configure 2-Factor Authentication.' };
+  }
+  try {
+    const multiFactorSession = await multiFactor(auth.currentUser).getSession();
+    const totpSecret = await TotpMultiFactorGenerator.generateSecret(multiFactorSession);
+    const email = auth.currentUser.email || currentUser?.email || 'customer@monvera.com';
+    const qrCodeUrl = totpSecret.generateQrCodeUrl(email, 'Monvera Bank');
+    return {
+      success: true,
+      totpSecret,
+      qrCodeUrl,
+      secretKey: totpSecret.secretKey,
+    };
+  } catch (err: any) {
+    console.warn('[Firebase TOTP Setup Note]', err);
+    if (err?.code === 'auth/requires-recent-login') {
+      return {
+        success: false,
+        error: 'Recent authentication is required. Please re-enter your password to proceed.',
+        requiresReauth: true,
+      };
+    }
+    return {
+      success: false,
+      error: err?.message || 'Failed to initialize TOTP enrollment with Firebase.',
+    };
+  }
+};
+
+/**
+ * Finalize Real Firebase TOTP Enrollment with verified 6-digit code
+ */
+const finishTotpEnrollment = async (
+  totpSecret: TotpSecret,
+  verificationCode: string,
+  displayName: string = 'Google Authenticator'
+): Promise<{ success: boolean; error?: string }> => {
+  if (!auth.currentUser) {
+    return { success: false, error: 'User is not logged in.' };
+  }
+  try {
+    const cleanCode = verificationCode.replace(/\s+/g, '').trim();
+    if (!cleanCode || cleanCode.length !== 6 || !/^\d{6}$/.test(cleanCode)) {
+      return { success: false, error: 'Please enter a valid 6-digit numeric verification code.' };
+    }
+
+    const assertion = TotpMultiFactorGenerator.assertionForEnrollment(totpSecret, cleanCode);
+    await multiFactor(auth.currentUser).enroll(assertion, displayName);
+
+    if (currentUser) {
+      const updatedUser: UserProfile = {
+        ...currentUser,
+        twoFactorEnabled: true,
+      };
+      setCurrentUser(updatedUser);
+      cacheUserInDirectory(updatedUser);
+      await firestoreSync.saveUserProfile(currentUser.id, { twoFactorEnabled: true }).catch(() => {});
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    console.error('[Firebase TOTP Enrollment Error]', err);
+    if (err?.code === 'auth/invalid-verification-code') {
+      return {
+        success: false,
+        error: 'Invalid 6-digit authentication code. Please check Google Authenticator and try again.',
+      };
+    }
+    if (err?.code === 'auth/requires-recent-login') {
+      return {
+        success: false,
+        error: 'Your session has expired. Please re-enter your password and try again.',
+      };
+    }
+    return {
+      success: false,
+      error: err?.message || 'Failed to complete TOTP enrollment.',
+    };
+  }
+};
+
+/**
+ * Unenroll Real Firebase TOTP Multi-Factor Authentication
+ */
+const unenrollTotpMfa = async (): Promise<{
+  success: boolean;
+  error?: string;
+  requiresReauth?: boolean;
+}> => {
+  if (!auth.currentUser) {
+    return { success: false, error: 'User is not logged in.' };
+  }
+  try {
+    const enrolled = multiFactor(auth.currentUser).enrolledFactors;
+    const totpFactor = enrolled.find((f) => f.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+
+    if (totpFactor) {
+      await multiFactor(auth.currentUser).unenroll(totpFactor);
+    }
+
+    if (currentUser) {
+      const updatedUser: UserProfile = {
+        ...currentUser,
+        twoFactorEnabled: false,
+      };
+      setCurrentUser(updatedUser);
+      cacheUserInDirectory(updatedUser);
+      await firestoreSync.saveUserProfile(currentUser.id, { twoFactorEnabled: false }).catch(() => {});
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    console.error('[Firebase TOTP Unenroll Error]', err);
+    if (err?.code === 'auth/requires-recent-login') {
+      return {
+        success: false,
+        error: 'Recent authentication is required. Please re-enter your password to disable 2FA.',
+        requiresReauth: true,
+      };
+    }
+    return {
+      success: false,
+      error: err?.message || 'Failed to unenroll Two-Factor Authentication.',
+    };
+  }
+};
 
   /**
    * Monvera Sign-Out
@@ -1141,6 +1538,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         notifications,
         unreadNotifsCount,
         login,
+        resolveTotpLogin,
+        reauthenticateUser,
+        getEnrolledTotpFactor,
+        startTotpEnrollment,
+        finishTotpEnrollment,
+        unenrollTotpMfa,
         logout,
         switchUser,
         registerUser,

@@ -14,7 +14,11 @@ import {
   CheckCircle2,
   AlertCircle,
   X,
+  Smartphone,
+  ShieldCheck,
+  ArrowLeft,
 } from 'lucide-react';
+import type { MultiFactorResolver, MultiFactorInfo } from 'firebase/auth';
 
 interface LoginPageProps {
   onSwitchToSignUp?: () => void;
@@ -27,7 +31,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   onClose,
   isModal = false,
 }) => {
-  const { login, setCurrentView, sendPasswordReset } = useAuth();
+  const { login, resolveTotpLogin, setCurrentView, sendPasswordReset } = useAuth();
 
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
@@ -37,6 +41,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [isLangOpen, setIsLangOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // TOTP MFA State
+  const [mfaResolver, setMfaResolver] = useState<MultiFactorResolver | null>(null);
+  const [mfaHint, setMfaHint] = useState<MultiFactorInfo | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [isVerifyingTotp, setIsVerifyingTotp] = useState(false);
+  const [totpError, setTotpError] = useState<string | null>(null);
 
   // Forgot Password Modal State
   const [forgotModalOpen, setForgotModalOpen] = useState(false);
@@ -59,12 +70,133 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     const res = await login(identifier.trim(), password);
     setIsSubmitting(false);
 
+    if (res.mfaRequired && res.resolver) {
+      setMfaResolver(res.resolver);
+      setMfaHint(res.hint || (res.resolver.hints[0] as MultiFactorInfo));
+      setTotpCode('');
+      setTotpError(null);
+      return;
+    }
+
     if (!res.success) {
       setErrorMessage(res.error || 'Invalid credentials. Please verify your details.');
     } else {
       if (onClose) onClose();
     }
   };
+
+  const handleTotpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mfaResolver) return;
+    const cleanCode = totpCode.trim().replace(/\D/g, '');
+    if (cleanCode.length !== 6) {
+      setTotpError('Please enter the 6-digit verification code from your authenticator app.');
+      return;
+    }
+    setTotpError(null);
+    setIsVerifyingTotp(true);
+
+    const hintUid = mfaHint?.uid || mfaResolver.hints[0]?.uid;
+    const res = await resolveTotpLogin(mfaResolver, cleanCode, hintUid, password);
+    setIsVerifyingTotp(false);
+
+    if (!res.success) {
+      setTotpError(res.error || 'Invalid verification code. Please check your authenticator app and try again.');
+    } else {
+      setMfaResolver(null);
+      setMfaHint(null);
+      if (onClose) onClose();
+    }
+  };
+
+  const handleCancelMfa = () => {
+    setMfaResolver(null);
+    setMfaHint(null);
+    setTotpCode('');
+    setTotpError(null);
+  };
+
+  const renderMfaChallengeContent = () => (
+    <div className="space-y-5 animate-in fade-in duration-200">
+      <div className="text-center space-y-2">
+        <div className="w-14 h-14 rounded-2xl bg-amber-50 text-amber-600 border border-amber-200/80 flex items-center justify-center mx-auto shadow-xs">
+          <ShieldCheck className="w-7 h-7" />
+        </div>
+        <h2 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight font-sans">
+          Security Verification
+        </h2>
+        <p className="text-xs sm:text-sm text-slate-500 font-medium max-w-sm mx-auto">
+          Two-Factor Authentication is active on your Monvera account. Please enter the 6-digit code from Google Authenticator or your authenticator app.
+        </p>
+      </div>
+
+      {totpError && (
+        <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs sm:text-sm text-red-700 flex items-start gap-2.5">
+          <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+          <span className="font-semibold">{totpError}</span>
+        </div>
+      )}
+
+      <form onSubmit={handleTotpSubmit} className="space-y-4">
+        <div className="space-y-2">
+          <label className="block text-xs font-bold text-slate-700 text-center uppercase tracking-wider">
+            6-Digit Authenticator Code
+          </label>
+          <div className="relative max-w-xs mx-auto">
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              autoFocus
+              maxLength={6}
+              value={totpCode}
+              onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ''))}
+              placeholder="000000"
+              id="mfa-totp-verification-input"
+              className="w-full py-3.5 px-4 text-center font-mono text-2xl sm:text-3xl font-black tracking-widest text-slate-950 bg-slate-50 hover:bg-slate-100/60 focus:bg-white border-2 border-slate-300 focus:border-slate-900 rounded-2xl focus:outline-hidden transition-all shadow-inner placeholder:text-slate-300"
+            />
+          </div>
+          <p className="text-[11px] text-center text-slate-400 font-medium">
+            Codes regenerate automatically every 30 seconds
+          </p>
+        </div>
+
+        <button
+          type="submit"
+          disabled={isVerifyingTotp || totpCode.trim().length !== 6}
+          id="mfa-totp-verify-btn"
+          className={`w-full py-3.5 px-4 rounded-xl font-extrabold text-sm sm:text-base flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md ${
+            isVerifyingTotp || totpCode.trim().length !== 6
+              ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300'
+              : 'bg-slate-900 hover:bg-slate-850 active:scale-[0.99] text-white shadow-slate-900/20'
+          }`}
+        >
+          {isVerifyingTotp ? (
+            <>
+              <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              <span>Verifying Authenticator Code...</span>
+            </>
+          ) : (
+            <>
+              <ShieldCheck className="w-4 h-4 text-amber-400" />
+              <span>Verify & Continue to Account</span>
+            </>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={handleCancelMfa}
+          disabled={isVerifyingTotp}
+          id="mfa-cancel-btn"
+          className="w-full py-2 text-xs font-bold text-slate-500 hover:text-slate-900 transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+        >
+          <ArrowLeft className="w-3.5 h-3.5" />
+          <span>Back to Password Sign In</span>
+        </button>
+      </form>
+    </div>
+  );
 
   const handleSendPasswordReset = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -205,8 +337,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           )}
         </div>
 
-        {/* Quick Switcher */}
-        <div className="flex rounded-2xl bg-slate-100 p-1.5 mb-5 border border-slate-200 shadow-inner">
+        {mfaResolver ? (
+          renderMfaChallengeContent()
+        ) : (
+          <>
+            {/* Quick Switcher */}
+            <div className="flex rounded-2xl bg-slate-100 p-1.5 mb-5 border border-slate-200 shadow-inner">
           <button
             type="button"
             className="flex-1 py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold text-slate-950 bg-white shadow-xs transition-all flex items-center justify-center gap-1.5 select-none"
@@ -325,6 +461,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
             <span>{isSubmitting ? 'Authenticating...' : 'Sign In to Account'}</span>
           </button>
         </form>
+        </>
+        )}
 
         {renderForgotModal()}
       </div>
@@ -458,7 +596,11 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           id="login-card-container"
           className="w-full max-w-[480px] sm:max-w-[500px] bg-white rounded-[28px] sm:rounded-[32px] p-7 sm:p-10 shadow-2xl border border-slate-100 relative overflow-hidden"
         >
-          {/* Desktop & Mobile Quick Switcher Bar */}
+          {mfaResolver ? (
+            renderMfaChallengeContent()
+          ) : (
+            <>
+              {/* Desktop & Mobile Quick Switcher Bar */}
           <div className="flex rounded-2xl bg-slate-100 p-1.5 mb-6 border border-slate-200 shadow-inner">
             <button
               type="button"
@@ -586,6 +728,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               </button>
             </div>
           </form>
+          </>
+          )}
         </div>
       </main>
 

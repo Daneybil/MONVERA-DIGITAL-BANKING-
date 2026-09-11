@@ -8,10 +8,14 @@ import {
   getDocs,
   onSnapshot,
   serverTimestamp,
+  runTransaction,
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
-import { UserProfile, Transaction, InvestmentPlan, LoanApplication, CardItem, NotificationItem, ChatMessage } from '../types';
+import { UserProfile, Transaction, InvestmentPlan, InvestmentTermDays, LoanApplication, CardItem, NotificationItem, NotificationPreferences, ChatMessage } from '../types';
 import type { BalanceMetrics } from './api';
+
+// Double-investment prevention lock for concurrent clicks/requests
+const inFlightInvestmentLocks = new Set<string>();
 
 export enum OperationType {
   CREATE = 'create',
@@ -338,10 +342,18 @@ export const firestoreSync = {
   },
 
   /**
-   * Save Card into Firestore
+   * Save Card into Firestore and local cache
    */
-  async saveCard(card: CardItem): Promise<boolean> {
-    if (!db) return false;
+  async saveCard(card: CardItem): Promise<{ success: boolean; error?: string }> {
+    if (!card || !card.id || !card.userId) return { success: false, error: 'Invalid card payload' };
+    try {
+      const raw = localStorage.getItem(`monvera_cards_${card.userId}`);
+      const list: CardItem[] = raw ? JSON.parse(raw) : [];
+      const updated = [card, ...list.filter((c) => c.id !== card.id)];
+      localStorage.setItem(`monvera_cards_${card.userId}`, JSON.stringify(updated));
+    } catch {}
+
+    if (!db) return { success: true };
     const path = `cards/${card.id}`;
     try {
       const cardRef = doc(db, 'cards', card.id);
@@ -349,10 +361,10 @@ export const firestoreSync = {
         ...card,
         syncedAt: new Date().toISOString(),
       }, { merge: true });
-      return true;
-    } catch (err) {
+      return { success: true };
+    } catch (err: any) {
       handleFirestoreError(err, OperationType.WRITE, path);
-      return false;
+      return { success: false, error: err?.message || 'Failed to save card' };
     }
   },
 
@@ -392,10 +404,173 @@ export const firestoreSync = {
           ...item,
         });
       });
+
+      // Auto-reconcile notifications for active loans if missing
+      try {
+        const loansCol = collection(db, 'loans');
+        const qLoans = query(loansCol, where('userId', '==', userId));
+        const loansSnap = await getDocs(qLoans);
+        loansSnap.forEach((lDoc) => {
+          const lData = lDoc.data() as LoanApplication;
+          if (lData.status === 'ACTIVE' || lData.status === 'APPROVED') {
+            const hasLoanNotif = notifs.some(
+              (n) =>
+                n.referenceId === lData.id ||
+                n.id.includes(lData.id) ||
+                (n.title && n.title.includes('Loan Approved') && n.message?.includes(lData.amount?.toString()))
+            );
+            if (!hasLoanNotif) {
+              const loanNotif: NotificationItem = {
+                id: `notif_loan_appr_${lData.id}`,
+                userId,
+                title: '🎉 Loan Approved & Disbursed!',
+                message: `Congratulations! Your loan application for $${Number(lData.amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} has been approved and the capital has been credited directly into your Checking Account.`,
+                type: 'TRANSACTION',
+                severity: 'success',
+                read: false,
+                createdAt: lData.approvedAt || lData.updatedAt || new Date().toISOString(),
+                referenceId: lData.id,
+              };
+              notifs.unshift(loanNotif);
+              this.saveNotification(loanNotif).catch(() => {});
+            }
+          }
+        });
+      } catch (errNotifLoans) {
+        console.warn('[Firestore] Note checking loan notifications:', errNotifLoans);
+      }
+
       return notifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     } catch (err) {
       console.warn('[Firestore] Error fetching user notifications:', err);
       return [];
+    }
+  },
+
+  /**
+   * Default notification preferences for new users
+   */
+  getDefaultNotificationPreferences(userId: string): NotificationPreferences {
+    return {
+      userId,
+      pushEnabled: true,
+      smsEnabled: true,
+      emailEnabled: true,
+      transactionAlerts: true,
+      securityAlerts: true,
+      updatedAt: new Date().toISOString(),
+    };
+  },
+
+  /**
+   * Fetch notification preferences for user
+   */
+  async getNotificationPreferences(userId: string): Promise<NotificationPreferences> {
+    if (!userId) return this.getDefaultNotificationPreferences('');
+    try {
+      const cached = localStorage.getItem(`monvera_notif_prefs_${userId}`);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch {}
+
+    if (!db) return this.getDefaultNotificationPreferences(userId);
+
+    try {
+      // Check users/{userId}/notificationPreferences/settings
+      const prefRef = doc(db, 'users', userId, 'notificationPreferences', 'settings');
+      const snap = await getDoc(prefRef);
+      if (snap.exists()) {
+        const data = snap.data() as NotificationPreferences;
+        try {
+          localStorage.setItem(`monvera_notif_prefs_${userId}`, JSON.stringify(data));
+        } catch {}
+        return data;
+      }
+
+      // Check root fallback notification_preferences/{userId}
+      const rootRef = doc(db, 'notification_preferences', userId);
+      const rootSnap = await getDoc(rootRef);
+      if (rootSnap.exists()) {
+        const data = rootSnap.data() as NotificationPreferences;
+        try {
+          localStorage.setItem(`monvera_notif_prefs_${userId}`, JSON.stringify(data));
+        } catch {}
+        return data;
+      }
+    } catch (err) {
+      console.warn('[Firestore] Error fetching notification preferences:', err);
+    }
+
+    const defaultPrefs = this.getDefaultNotificationPreferences(userId);
+    this.saveNotificationPreferences(userId, defaultPrefs).catch(() => {});
+    return defaultPrefs;
+  },
+
+  /**
+   * Save notification preferences for user
+   */
+  async saveNotificationPreferences(userId: string, prefs: Partial<NotificationPreferences>): Promise<boolean> {
+    if (!userId) return false;
+    const current = await this.getNotificationPreferences(userId);
+    const updated: NotificationPreferences = {
+      ...current,
+      ...prefs,
+      userId,
+      securityAlerts: true, // Security alerts are mandatory and cannot be disabled
+      updatedAt: new Date().toISOString(),
+    };
+
+    try {
+      localStorage.setItem(`monvera_notif_prefs_${userId}`, JSON.stringify(updated));
+    } catch {}
+
+    if (!db) return true;
+
+    try {
+      const prefRef = doc(db, 'users', userId, 'notificationPreferences', 'settings');
+      await setDoc(prefRef, updated, { merge: true });
+
+      const rootRef = doc(db, 'notification_preferences', userId);
+      await setDoc(rootRef, updated, { merge: true });
+
+      return true;
+    } catch (err) {
+      console.warn('[Firestore] Error saving notification preferences:', err);
+      return false;
+    }
+  },
+
+  /**
+   * Real-time subscription to user's notification preferences
+   */
+  subscribeToNotificationPreferences(userId: string, callback: (prefs: NotificationPreferences) => void): () => void {
+    if (!userId || !db) {
+      callback(this.getDefaultNotificationPreferences(userId || ''));
+      return () => {};
+    }
+
+    try {
+      const prefRef = doc(db, 'users', userId, 'notificationPreferences', 'settings');
+      const unsubscribe = onSnapshot(prefRef, (snap) => {
+        if (snap.exists()) {
+          const data = snap.data() as NotificationPreferences;
+          try {
+            localStorage.setItem(`monvera_notif_prefs_${userId}`, JSON.stringify(data));
+          } catch {}
+          callback(data);
+        } else {
+          callback(this.getDefaultNotificationPreferences(userId));
+        }
+      }, (err) => {
+        console.warn('[Firestore] Preferences subscription note:', err);
+      });
+
+      return unsubscribe;
+    } catch (err) {
+      console.warn('[Firestore] Preferences listener setup note:', err);
+      callback(this.getDefaultNotificationPreferences(userId));
+      return () => {};
     }
   },
 
@@ -471,13 +646,15 @@ export const firestoreSync = {
         }
       } else if (tx.type === 'TRANSFER') {
         if (isSender && isRecipient) {
-          // Internal account movement
+          // Internal account movement or loan disbursement
           const desc = (tx.description || '').toLowerCase();
           if (desc.includes('checking to savings') || desc.includes('chk to sav')) {
             checking = Math.max(0, checking - amount);
             savings += amount;
           } else if (desc.includes('savings to checking') || desc.includes('sav to chk')) {
             savings = Math.max(0, savings - amount);
+            checking += amount;
+          } else if (desc.includes('loan') || desc.includes('disburs') || desc.includes('credit')) {
             checking += amount;
           }
         } else if (isRecipient) {
@@ -503,8 +680,19 @@ export const firestoreSync = {
         const desc = (tx.description || '').toLowerCase();
         if (desc.includes('maturity') || desc.includes('payout') || desc.includes('profit')) {
           checking += amount;
+          const principal = Number(tx.metadata?.principal || 0);
+          if (principal > 0) {
+            invested = Math.max(0, invested - principal);
+          }
         } else if (isSender || isRecipient) {
+          checking = Math.max(0, checking - amount);
           invested += amount;
+        }
+      } else if (tx.type === 'INVESTMENT_MATURITY') {
+        checking += amount;
+        const principal = Number(tx.metadata?.principal || 0);
+        if (principal > 0) {
+          invested = Math.max(0, invested - principal);
         }
       }
     }
@@ -612,14 +800,89 @@ export const firestoreSync = {
       }
 
       if (data) {
-        const chk = Number(data.checkingBalance ?? 0);
-        const sav = Number(data.savingsBalance ?? data.savings ?? 0);
-        const inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
-        const accrued = Number(data.accruedEarnings ?? 0);
-        const total = Number(
-          data.totalBalance ?? (chk + sav + inv + accrued)
-        );
-        const avail = Number(data.availableBalance ?? chk);
+        let chk = Number(data.checkingBalance ?? 0);
+        let sav = Number(data.savingsBalance ?? data.savings ?? 0);
+        let inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
+        let accrued = Number(data.accruedEarnings ?? 0);
+        let avail = Number(data.availableBalance ?? chk);
+        let total = Number(data.totalBalance ?? (chk + sav + inv + accrued));
+        let loanBal = Number(data.loanBalance ?? 0);
+
+        // Reconciliation check: ensure all active approved loans for this user are credited
+        try {
+          const loansCol = collection(db, 'loans');
+          const qLoans = query(loansCol, where('userId', '==', userId));
+          const loansSnap = await getDocs(qLoans);
+          if (!loansSnap.empty) {
+            let uncreditedLoanSum = 0;
+            let activeLoansTotal = 0;
+            const creditedLoans: string[] = Array.isArray(data.creditedLoans) ? [...data.creditedLoans] : [];
+            let needsSync = false;
+
+            loansSnap.forEach((lDoc) => {
+              const l = lDoc.data() as LoanApplication;
+              if (l.status === 'ACTIVE' || l.status === 'APPROVED') {
+                const repBal = Number(l.remainingBalance ?? l.totalRepaymentAmount ?? (l.amount * 1.20));
+                activeLoansTotal += repBal;
+
+                if (!creditedLoans.includes(l.id)) {
+                  uncreditedLoanSum += Number(l.disbursedAmount || l.amount || 0);
+                  creditedLoans.push(l.id);
+                  needsSync = true;
+                }
+              }
+            });
+
+            if (activeLoansTotal !== loanBal && activeLoansTotal > 0) {
+              loanBal = activeLoansTotal;
+              needsSync = true;
+            }
+
+            if (uncreditedLoanSum > 0) {
+              chk += uncreditedLoanSum;
+              avail += uncreditedLoanSum;
+              total += uncreditedLoanSum;
+            }
+
+            if (needsSync) {
+              const updatedAccountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
+                ? data.accounts.map((a: any) => {
+                    if (a.type === 'CHECKING') {
+                      return { ...a, balance: chk, availableBalance: avail };
+                    }
+                    if (a.type === 'SAVINGS') {
+                      return { ...a, balance: sav, availableBalance: sav };
+                    }
+                    if (a.type === 'INVESTMENT') {
+                      return { ...a, balance: inv, investedBalance: inv };
+                    }
+                    return a;
+                  })
+                : undefined;
+
+              const syncedMetrics = {
+                userId,
+                checkingBalance: chk,
+                savingsBalance: sav,
+                investedBalance: inv,
+                accruedEarnings: accrued,
+                totalBalance: total,
+                availableBalance: avail,
+                loanBalance: loanBal,
+                pendingBalance: Number(data.pendingBalance ?? 0),
+                ...(updatedAccountsList ? { accounts: updatedAccountsList } : {}),
+                creditedLoans,
+                updatedAt: new Date().toISOString(),
+              };
+
+              // Background non-blocking persistence back to Firestore accounts/{userId}
+              setDoc(accRef, syncedMetrics, { merge: true }).catch(() => {});
+            }
+          }
+        } catch (loanSyncErr) {
+          console.warn('[Firestore] Loan balance reconciliation note:', loanSyncErr);
+        }
+
         const accountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
           ? data.accounts.map((a: any) => {
               if (a.type === 'CHECKING') {
@@ -674,6 +937,7 @@ export const firestoreSync = {
           totalBalance: total,
           availableBalance: avail,
           pendingBalance: Number(data.pendingBalance ?? 0),
+          loanBalance: loanBal,
           accounts: accountsList,
         };
 
@@ -2276,5 +2540,832 @@ export const firestoreSync = {
       console.warn('[Firestore] Error subscribing to loans:', err);
       return () => {};
     }
+  },
+
+  /**
+   * Fetch authenticated user's investments strictly isolated by userId
+   */
+  async getUserInvestments(userId: string): Promise<InvestmentPlan[]> {
+    if (!userId) return [];
+    let localList: InvestmentPlan[] = [];
+    try {
+      const localStr = localStorage.getItem(`monvera_investments_${userId}`);
+      if (localStr) localList = JSON.parse(localStr);
+    } catch {}
+
+    if (!db) return localList;
+
+    const path = 'investments';
+    try {
+      const colRef = collection(db, 'investments');
+      const q = query(colRef, where('userId', '==', userId));
+      const snap = await getDocs(q);
+      const list: InvestmentPlan[] = [];
+      snap.forEach((d) => {
+        const item = d.data() as InvestmentPlan;
+        list.push({ ...item, id: item.id || d.id });
+      });
+
+      list.sort((a, b) => new Date(b.createdAt || b.startDate).getTime() - new Date(a.createdAt || a.startDate).getTime());
+      try {
+        localStorage.setItem(`monvera_investments_${userId}`, JSON.stringify(list));
+      } catch {}
+      return list;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, path);
+      return localList;
+    }
+  },
+
+  /**
+   * Real-time subscription to user's investments
+   */
+  subscribeToUserInvestments(userId: string, callback: (investments: InvestmentPlan[]) => void): () => void {
+    if (!userId || !db) {
+      this.getUserInvestments(userId).then(callback);
+      return () => {};
+    }
+
+    try {
+      const colRef = collection(db, 'investments');
+      const q = query(colRef, where('userId', '==', userId));
+      const unsubscribe = onSnapshot(
+        q,
+        (snap) => {
+          const list: InvestmentPlan[] = [];
+          snap.forEach((d) => {
+            const item = d.data() as InvestmentPlan;
+            list.push({ ...item, id: item.id || d.id });
+          });
+          list.sort((a, b) => new Date(b.createdAt || b.startDate).getTime() - new Date(a.createdAt || a.startDate).getTime());
+          try {
+            localStorage.setItem(`monvera_investments_${userId}`, JSON.stringify(list));
+          } catch {}
+          callback(list);
+        },
+        (err) => {
+          console.warn('[Firestore] Investment subscription note:', err);
+        }
+      );
+      return unsubscribe;
+    } catch (err) {
+      console.warn('[Firestore] Investment listener setup error:', err);
+      this.getUserInvestments(userId).then(callback);
+      return () => {};
+    }
+  },
+
+  /**
+   * Atomic Firestore Term Investment Creation Engine
+   * Atomically reads balance, verifies sufficient funds, deducts checking, creates investment & ledger records
+   */
+  async createTermInvestmentDirect(params: {
+    userId: string;
+    termDays: InvestmentTermDays;
+    amount: number;
+    clientRequestId?: string;
+    userAccountNumber?: string;
+    fallbackBalances?: BalanceMetrics;
+    fallbackUser?: any;
+  }): Promise<{
+    success: boolean;
+    investment?: InvestmentPlan;
+    balanceMetrics?: BalanceMetrics;
+    error?: string;
+  }> {
+    const { userId, termDays, amount, clientRequestId, fallbackBalances } = params;
+
+    // 1. Validate inputs
+    if (!userId) {
+      return { success: false, error: 'Customer ID is required.' };
+    }
+
+    const validTerms: InvestmentTermDays[] = [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360];
+    if (!validTerms.includes(Number(termDays) as InvestmentTermDays)) {
+      return {
+        success: false,
+        error: `Invalid investment term. Supported Monvera terms are 60 to 360 days (${validTerms.join(', ')} days).`,
+      };
+    }
+
+    const principal = Number(amount);
+    if (isNaN(principal) || principal < 100) {
+      return { success: false, error: 'Minimum term investment amount is $100.00.' };
+    }
+
+    // 2. Authentication check: if Firebase Auth user is present, ensure identity matches
+    if (auth?.currentUser && auth.currentUser.uid !== userId) {
+      return { success: false, error: 'Unauthorized: User identity does not match authenticated credentials.' };
+    }
+
+    // 3. Idempotency / Double-investment prevention (INVESTMENT FIX #4)
+    const idempotencyKey = clientRequestId || `inv_req_${userId}_${termDays}_${principal}_${Math.floor(Date.now() / 15000)}`;
+    if (inFlightInvestmentLocks.has(idempotencyKey)) {
+      return { success: false, error: 'An investment request is already processing. Please wait.' };
+    }
+    inFlightInvestmentLocks.add(idempotencyKey);
+
+    try {
+      if (!db) {
+        throw new Error('Firestore database instance is not available.');
+      }
+
+      const accRef = doc(db, 'accounts', userId);
+      const invId = `inv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      const invRef = doc(db, 'investments', invId);
+
+      const txId = `tx_inv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      const txRef = doc(db, 'transactions', txId);
+
+      const notifId = `notif_inv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      const notifRef = doc(db, 'notifications', notifId);
+
+      // Financial calculations (Fixed 4.50% interest every 24 hours across 60-360 days)
+      const fixedDailyRate = 4.5;
+      const expectedYield = Number((principal * (fixedDailyRate / 100) * termDays).toFixed(2));
+      const expectedMaturityValue = Number((principal + expectedYield).toFixed(2));
+      const nowIso = new Date().toISOString();
+      const maturityIso = new Date(Date.now() + termDays * 24 * 60 * 60 * 1000).toISOString();
+
+      const newPlan: InvestmentPlan = {
+        id: invId,
+        userId,
+        planName: `Monvera ${termDays}-Day Term Investment`,
+        termDays: Number(termDays) as InvestmentTermDays,
+        amount: principal,
+        apy: 4.5,
+        dailyRate: fixedDailyRate,
+        expectedYield,
+        expectedMaturityValue,
+        totalAccruedEarnings: 0,
+        startDate: nowIso,
+        maturityDate: maturityIso,
+        status: 'ACTIVE',
+        createdAt: nowIso,
+      };
+
+      const newTx: Transaction = {
+        id: txId,
+        referenceNumber: `MV-INV-${Math.floor(100000000 + Math.random() * 900000000)}`,
+        type: 'INVESTMENT',
+        amount: principal,
+        currency: 'USD',
+        status: 'COMPLETED',
+        userId,
+        senderUserId: userId,
+        recipientUserId: userId,
+        fee: 0.0,
+        description: `Funded ${termDays}-Day Term Investment (4.50% interest / 24h)`,
+        category: 'Investments',
+        createdAt: nowIso,
+        metadata: {
+          investmentId: invId,
+          termDays,
+          dailyRate: fixedDailyRate,
+          expectedYield,
+          expectedMaturityValue,
+        },
+      };
+
+      const newNotif: NotificationItem = {
+        id: notifId,
+        userId,
+        title: 'Term Investment Activated',
+        message: `Your $${principal.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+        })} ${termDays}-Day term investment is now active and earning 4.50% interest every 24 hours.`,
+        type: 'TRANSACTION',
+        severity: 'success',
+        read: false,
+        createdAt: nowIso,
+        referenceId: newTx.referenceNumber,
+      };
+
+      let updatedMetrics: BalanceMetrics | null = null;
+
+      // ATOMIC TRANSACTION: Read authoritative balance, deduct, write investment & transaction
+      await runTransaction(db, async (transaction) => {
+        const accSnap = await transaction.get(accRef);
+        let currentChecking = 0;
+        let currentSavings = 0;
+        let currentInvested = 0;
+        let currentAccrued = 0;
+        let existingAccountsList: any[] = [];
+
+        if (accSnap.exists()) {
+          const accData = accSnap.data();
+          currentChecking = Number(accData.checkingBalance ?? accData.availableBalance ?? 0);
+          currentSavings = Number(accData.savingsBalance ?? accData.savings ?? 0);
+          currentInvested = Number(accData.investedBalance ?? accData.investmentBalance ?? 0);
+          currentAccrued = Number(accData.accruedEarnings ?? 0);
+          if (Array.isArray(accData.accounts)) {
+            existingAccountsList = accData.accounts;
+          }
+        } else {
+          const cached = fallbackBalances || (typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(`monvera_balances_${userId}`) || 'null') : null);
+          if (cached) {
+            currentChecking = Number(cached.checkingBalance ?? cached.availableBalance ?? 0);
+            currentSavings = Number(cached.savingsBalance ?? 0);
+            currentInvested = Number(cached.investedBalance ?? 0);
+            currentAccrued = Number(cached.accruedEarnings ?? 0);
+            if (Array.isArray(cached.accounts)) {
+              existingAccountsList = cached.accounts;
+            }
+          }
+        }
+
+        // Validate sufficient checking balance
+        if (currentChecking < principal) {
+          throw new Error(
+            `Insufficient available checking balance ($${currentChecking.toLocaleString('en-US', {
+              minimumFractionDigits: 2,
+            })}). Please deposit or transfer funds to checking first.`
+          );
+        }
+
+        const newChecking = Number((currentChecking - principal).toFixed(2));
+        const newInvested = Number((currentInvested + principal).toFixed(2));
+        const newTotal = Number((newChecking + currentSavings + newInvested + currentAccrued).toFixed(2));
+
+        const updatedAccounts =
+          existingAccountsList.length > 0
+            ? existingAccountsList.map((a) => {
+                if (a.type === 'CHECKING') {
+                  return { ...a, balance: newChecking, availableBalance: newChecking };
+                }
+                if (a.type === 'INVESTMENT') {
+                  return { ...a, balance: newInvested, investedBalance: newInvested };
+                }
+                return a;
+              })
+            : [
+                {
+                  id: `acc_chk_${userId}`,
+                  userId,
+                  type: 'CHECKING',
+                  accountNumber: '1000000000',
+                  routingNumber: '021000021',
+                  currency: 'USD',
+                  balance: newChecking,
+                  availableBalance: newChecking,
+                  investedBalance: 0,
+                  pendingBalance: 0,
+                  interestRateAPY: 1.25,
+                  status: 'ACTIVE',
+                  nickname: 'Monvera Premier Checking',
+                },
+                {
+                  id: `acc_sav_${userId}`,
+                  userId,
+                  type: 'SAVINGS',
+                  accountNumber: '1000000991',
+                  routingNumber: '021000021',
+                  currency: 'USD',
+                  balance: currentSavings,
+                  availableBalance: currentSavings,
+                  investedBalance: 0,
+                  pendingBalance: 0,
+                  interestRateAPY: 4.85,
+                  status: 'ACTIVE',
+                  nickname: 'Monvera High-Yield Treasury',
+                },
+              ];
+
+        updatedMetrics = {
+          checkingBalance: newChecking,
+          savingsBalance: currentSavings,
+          investedBalance: newInvested,
+          accruedEarnings: currentAccrued,
+          totalBalance: newTotal,
+          availableBalance: newChecking,
+          pendingBalance: 0,
+          accounts: updatedAccounts,
+        };
+
+        // Writes inside transaction
+        transaction.set(
+          accRef,
+          {
+            userId,
+            ...updatedMetrics,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+
+        transaction.set(invRef, newPlan);
+        transaction.set(txRef, newTx);
+        transaction.set(notifRef, newNotif);
+      });
+
+      // Update local storage caches for fast UI response
+      if (updatedMetrics) {
+        try {
+          localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(updatedMetrics));
+          const currentInvs = await this.getUserInvestments(userId);
+          const updatedInvs = [newPlan, ...currentInvs.filter((i) => i.id !== invId)];
+          localStorage.setItem(`monvera_investments_${userId}`, JSON.stringify(updatedInvs));
+        } catch {}
+      }
+
+      return {
+        success: true,
+        investment: newPlan,
+        balanceMetrics: updatedMetrics || undefined,
+      };
+    } catch (err: any) {
+      console.error('[Firestore] Investment creation error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Failed to create term investment.',
+      };
+    } finally {
+      // Clear in-flight lock after a short delay
+      setTimeout(() => inFlightInvestmentLocks.delete(idempotencyKey), 4000);
+    }
+  },
+
+  /**
+   * Atomic Firestore Term Investment Maturity Engine
+   * Verifies status, calculates total maturity payout (principal + expectedYield), credits checking, marks matured
+   */
+  async matureInvestmentDirect(
+    investmentId: string,
+    userId: string
+  ): Promise<{
+    success: boolean;
+    investment?: InvestmentPlan;
+    payoutAmount?: number;
+    balanceMetrics?: BalanceMetrics;
+    error?: string;
+  }> {
+    if (!investmentId || !userId) {
+      return { success: false, error: 'Investment ID and User ID are required.' };
+    }
+
+    if (!db) {
+      return { success: false, error: 'Firestore database instance is not available.' };
+    }
+
+    const invRef = doc(db, 'investments', investmentId);
+    const accRef = doc(db, 'accounts', userId);
+
+    const txId = `tx_mat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+    const txRef = doc(db, 'transactions', txId);
+
+    const notifId = `notif_mat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+    const notifRef = doc(db, 'notifications', notifId);
+
+    let updatedInv: InvestmentPlan | null = null;
+    let payoutTotal = 0;
+    let updatedMetrics: BalanceMetrics | null = null;
+    const nowIso = new Date().toISOString();
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const invSnap = await transaction.get(invRef);
+        if (!invSnap.exists()) {
+          throw new Error('Investment record not found.');
+        }
+
+        const inv = invSnap.data() as InvestmentPlan;
+        if (inv.userId !== userId) {
+          throw new Error('Unauthorized: Investment does not belong to this account.');
+        }
+        if (inv.status === 'MATURED') {
+          throw new Error('Investment is already matured and settled.');
+        }
+
+        payoutTotal = inv.expectedMaturityValue || Number((inv.amount + (inv.expectedYield || 0)).toFixed(2));
+
+        const accSnap = await transaction.get(accRef);
+        let currentChecking = 0;
+        let currentSavings = 0;
+        let currentInvested = 0;
+        let currentAccrued = 0;
+        let existingAccountsList: any[] = [];
+
+        if (accSnap.exists()) {
+          const accData = accSnap.data();
+          currentChecking = Number(accData.checkingBalance ?? accData.availableBalance ?? 0);
+          currentSavings = Number(accData.savingsBalance ?? accData.savings ?? 0);
+          currentInvested = Number(accData.investedBalance ?? accData.investmentBalance ?? 0);
+          currentAccrued = Number(accData.accruedEarnings ?? 0);
+          if (Array.isArray(accData.accounts)) {
+            existingAccountsList = accData.accounts;
+          }
+        }
+
+        const newChecking = Number((currentChecking + payoutTotal).toFixed(2));
+        const newInvested = Number(Math.max(0, currentInvested - inv.amount).toFixed(2));
+        const newTotal = Number((newChecking + currentSavings + newInvested + currentAccrued).toFixed(2));
+
+        updatedMetrics = {
+          checkingBalance: newChecking,
+          savingsBalance: currentSavings,
+          investedBalance: newInvested,
+          accruedEarnings: currentAccrued,
+          totalBalance: newTotal,
+          availableBalance: newChecking,
+          pendingBalance: 0,
+          accounts: existingAccountsList.map((a) => {
+            if (a.type === 'CHECKING') return { ...a, balance: newChecking, availableBalance: newChecking };
+            if (a.type === 'INVESTMENT') return { ...a, balance: newInvested, investedBalance: newInvested };
+            return a;
+          }),
+        };
+
+        updatedInv = {
+          ...inv,
+          status: 'MATURED',
+          totalAccruedEarnings: inv.expectedYield,
+        };
+
+        const maturityTx: Transaction = {
+          id: txId,
+          referenceNumber: `MV-MAT-${Math.floor(100000000 + Math.random() * 900000000)}`,
+          type: 'INVESTMENT',
+          amount: payoutTotal,
+          currency: 'USD',
+          status: 'COMPLETED',
+          userId,
+          senderUserId: userId,
+          recipientUserId: userId,
+          fee: 0.0,
+          description: `Maturity Settlement: ${inv.planName} (Principal $${inv.amount.toFixed(2)} + Yield $${inv.expectedYield.toFixed(2)})`,
+          category: 'Investments',
+          createdAt: nowIso,
+          metadata: {
+            investmentId: inv.id,
+            principal: inv.amount,
+            yield: inv.expectedYield,
+            payoutAmount: payoutTotal,
+          },
+        };
+
+        const maturityNotif: NotificationItem = {
+          id: notifId,
+          userId,
+          title: 'Investment Matured & Settled',
+          message: `Your ${inv.termDays}-Day term investment matured! $${payoutTotal.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })} has been credited to your Checking account.`,
+          type: 'TRANSACTION',
+          severity: 'success',
+          read: false,
+          createdAt: nowIso,
+          referenceId: maturityTx.referenceNumber,
+        };
+
+        transaction.set(accRef, { userId, ...updatedMetrics, updatedAt: nowIso }, { merge: true });
+        transaction.set(invRef, updatedInv, { merge: true });
+        transaction.set(txRef, maturityTx);
+        transaction.set(notifRef, maturityNotif);
+      });
+
+      if (updatedMetrics) {
+        try {
+          localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(updatedMetrics));
+        } catch {}
+      }
+
+      return {
+        success: true,
+        investment: updatedInv || undefined,
+        payoutAmount: payoutTotal,
+        balanceMetrics: updatedMetrics || undefined,
+      };
+    } catch (err: any) {
+      console.error('[Firestore] Investment maturity error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Failed to settle matured investment.',
+      };
+    }
+  },
+
+  /**
+   * --- CARD PERSISTENCE & ATOMIC ISSUANCE ENGINE ---
+   */
+  async getUserCards(userId: string): Promise<CardItem[]> {
+    if (!userId) return [];
+    let localCards: CardItem[] = [];
+    try {
+      const raw = localStorage.getItem(`monvera_cards_${userId}`);
+      if (raw) localCards = JSON.parse(raw);
+    } catch {}
+
+    if (!db) return localCards;
+
+    try {
+      const cardCol = collection(db, 'cards');
+      const q = query(cardCol, where('userId', '==', userId));
+      const snap = await getDocs(q);
+      const fsCards: CardItem[] = [];
+      snap.forEach((d) => {
+        fsCards.push(d.data() as CardItem);
+      });
+
+      const map = new Map<string, CardItem>();
+      localCards.forEach((c) => {
+        if (c && c.id) map.set(c.id, c);
+      });
+      fsCards.forEach((c) => {
+        if (c && c.id) map.set(c.id, c);
+      });
+      const merged = Array.from(map.values());
+      try {
+        localStorage.setItem(`monvera_cards_${userId}`, JSON.stringify(merged));
+      } catch {}
+      return merged;
+    } catch (err) {
+      console.warn('[Firestore] Error fetching user cards:', err);
+      return localCards;
+    }
+  },
+
+  async toggleCardFreezeDirect(cardId: string, userId?: string): Promise<{ success: boolean; card?: CardItem; error?: string }> {
+    let targetCard: CardItem | null = null;
+    if (userId) {
+      const userCards = await this.getUserCards(userId);
+      targetCard = userCards.find((c) => c.id === cardId) || null;
+    }
+
+    if (!targetCard && db) {
+      try {
+        const snap = await getDoc(doc(db, 'cards', cardId));
+        if (snap.exists()) targetCard = snap.data() as CardItem;
+      } catch {}
+    }
+
+    if (!targetCard) return { success: false, error: 'Card not found.' };
+
+    const newStatus: 'ACTIVE' | 'FROZEN' = targetCard.status === 'ACTIVE' ? 'FROZEN' : 'ACTIVE';
+    const updatedCard: CardItem = { ...targetCard, status: newStatus };
+
+    await this.saveCard(updatedCard);
+
+    const notif: NotificationItem = {
+      id: `notif_card_toggle_${Date.now()}`,
+      userId: targetCard.userId,
+      title: `Card ${newStatus === 'FROZEN' ? 'Frozen' : 'Reactivated'}`,
+      message: `Your ${targetCard.cardTier} (•••• ${targetCard.maskedNumber.slice(-4)}) has been ${
+        newStatus === 'FROZEN' ? 'locked' : 'unlocked'
+      }.`,
+      type: 'SECURITY',
+      severity: newStatus === 'FROZEN' ? 'warning' : 'success',
+      read: false,
+      createdAt: new Date().toISOString(),
+    };
+    this.saveNotification(notif).catch(() => {});
+
+    return { success: true, card: updatedCard };
+  },
+
+  async updateCardLimitsDirect(
+    cardId: string,
+    updates: {
+      dailyLimit?: number;
+      monthlyLimit?: number;
+      international?: boolean;
+      online?: boolean;
+      atm?: boolean;
+    },
+    userId?: string
+  ): Promise<{ success: boolean; card?: CardItem; error?: string }> {
+    let targetCard: CardItem | null = null;
+    if (userId) {
+      const userCards = await this.getUserCards(userId);
+      targetCard = userCards.find((c) => c.id === cardId) || null;
+    }
+
+    if (!targetCard && db) {
+      try {
+        const snap = await getDoc(doc(db, 'cards', cardId));
+        if (snap.exists()) targetCard = snap.data() as CardItem;
+      } catch {}
+    }
+
+    if (!targetCard) return { success: false, error: 'Card not found.' };
+
+    const updatedCard: CardItem = {
+      ...targetCard,
+      spendingLimitDaily: updates.dailyLimit !== undefined ? updates.dailyLimit : targetCard.spendingLimitDaily,
+      spendingLimitMonthly: updates.monthlyLimit !== undefined ? updates.monthlyLimit : targetCard.spendingLimitMonthly,
+      internationalEnabled: updates.international !== undefined ? updates.international : targetCard.internationalEnabled,
+      onlineEnabled: updates.online !== undefined ? updates.online : targetCard.onlineEnabled,
+      atmEnabled: updates.atm !== undefined ? updates.atm : targetCard.atmEnabled,
+    };
+
+    await this.saveCard(updatedCard);
+    return { success: true, card: updatedCard };
+  },
+
+  async createCardDirect(params: {
+    userId: string;
+    cardHolderName?: string;
+    phone?: string;
+    cardType?: 'PHYSICAL' | 'VIRTUAL';
+    cardTier?: string;
+    brand?: 'VISA' | 'MASTERCARD';
+    spendingLimitMonthly?: number;
+    spendingLimitDaily?: number;
+    colorScheme?: string;
+    userAccountNumber?: string;
+    fallbackBalances?: BalanceMetrics;
+    fallbackUser?: any;
+  }): Promise<{
+    success: boolean;
+    card?: CardItem;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    error?: string;
+  }> {
+    const { userId } = params;
+    if (!userId) return { success: false, error: 'User ID is required.' };
+
+    const issuanceFee = 2.0; // $2.00 card fee
+
+    // Generate valid 16-digit card number
+    const brand = params.brand || (params.cardTier?.toLowerCase().includes('mastercard') ? 'MASTERCARD' : 'VISA');
+    const prefix = brand === 'MASTERCARD' ? '5' : '4';
+    const part1 = prefix + Math.floor(100 + Math.random() * 900);
+    const part2 = Math.floor(1000 + Math.random() * 9000).toString();
+    const part3 = Math.floor(1000 + Math.random() * 9000).toString();
+    const part4 = Math.floor(1000 + Math.random() * 9000).toString();
+    const completeNumber = `${part1} ${part2} ${part3} ${part4}`;
+    const maskedNumber = `•••• •••• •••• ${part4}`;
+
+    const now = new Date();
+    const expMonth = String(now.getMonth() + 1).padStart(2, '0');
+    const expYear = String((now.getFullYear() + 5) % 100).padStart(2, '0');
+    const expiryDate = `${expMonth}/${expYear}`;
+    const cvv = String(Math.floor(100 + Math.random() * 900));
+
+    const cardId = `crd_${userId}_${Date.now()}`;
+    const holderName = (params.cardHolderName || 'VALUED CUSTOMER').toUpperCase().trim();
+    const dailyLimit = params.spendingLimitDaily || 20000;
+    const monthlyLimit = params.spendingLimitMonthly || 20000;
+    const brandName = brand === 'MASTERCARD' ? 'Mastercard' : 'Visa';
+    const defaultTier = params.cardTier || `Monvera ${brandName} Elite`;
+
+    const newCard: CardItem = {
+      id: cardId,
+      userId,
+      cardHolderName: holderName,
+      cardNumber: completeNumber,
+      maskedNumber,
+      fullNumberMasked: completeNumber,
+      expiryDate,
+      cvvMasked: cvv,
+      cardType: params.cardType || 'PHYSICAL',
+      cardTier: defaultTier,
+      brand,
+      status: 'ACTIVE',
+      spendingLimitDaily: dailyLimit,
+      spendingLimitMonthly: monthlyLimit,
+      currentDailySpend: 0,
+      internationalEnabled: true,
+      onlineEnabled: true,
+      atmEnabled: true,
+      contactlessEnabled: true,
+      colorScheme: (params.colorScheme as any) || 'obsidian',
+    };
+
+    const nowIso = new Date().toISOString();
+    const txId = `tx_card_fee_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const cardFeeTx: Transaction = {
+      id: txId,
+      referenceNumber: `MV-CRD-${Math.floor(100000000 + Math.random() * 900000000)}`,
+      type: 'FEE',
+      amount: issuanceFee,
+      currency: 'USD',
+      status: 'COMPLETED',
+      userId,
+      senderUserId: userId,
+      fee: 0,
+      description: `Monvera ${brandName} Card Issuance Fee ($2.00)`,
+      category: 'Transfers',
+      createdAt: nowIso,
+      metadata: { cardId, brand, cardTier: defaultTier },
+    };
+
+    const cardNotif: NotificationItem = {
+      id: `notif_${Date.now()}_card_created`,
+      userId,
+      title: `${brandName} Card Issued & Activated`,
+      message: `Your new ${newCard.cardTier} (${brandName} • ${completeNumber}) has been successfully created and linked with a $${dailyLimit.toLocaleString()} daily transaction limit. $2.00 card creation fee deducted.`,
+      type: 'TRANSACTION',
+      severity: 'success',
+      read: false,
+      createdAt: nowIso,
+      referenceId: cardFeeTx.referenceNumber,
+    };
+
+    if (db) {
+      try {
+        let updatedMetrics: BalanceMetrics | null = null;
+        await runTransaction(db, async (transaction) => {
+          const accRef = doc(db, 'accounts', userId);
+          const accSnap = await transaction.get(accRef);
+
+          let currentChecking = 0;
+          let currentSavings = 0;
+          let currentInvested = 0;
+          let currentAccrued = 0;
+          let currentTotal = 0;
+          let accountsList: any[] = [];
+
+          if (accSnap.exists()) {
+            const data = accSnap.data();
+            currentChecking = Number(data.checkingBalance) || 0;
+            currentSavings = Number(data.savingsBalance) || 0;
+            currentInvested = Number(data.investedBalance) || 0;
+            currentAccrued = Number(data.accruedEarnings) || 0;
+            currentTotal = Number(data.totalBalance) || 0;
+            accountsList = Array.isArray(data.accounts) ? data.accounts : [];
+          } else {
+            const cached = params.fallbackBalances || (typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(`monvera_balances_${userId}`) || 'null') : null);
+            if (cached) {
+              currentChecking = Number(cached.checkingBalance) || 0;
+              currentSavings = Number(cached.savingsBalance) || 0;
+              currentInvested = Number(cached.investedBalance) || 0;
+              currentAccrued = Number(cached.accruedEarnings) || 0;
+              currentTotal = Number(cached.totalBalance) || 0;
+              accountsList = Array.isArray(cached.accounts) ? cached.accounts : [];
+            }
+          }
+
+          if (currentChecking < issuanceFee) {
+            throw new Error(
+              `Insufficient funds. You have $${currentChecking.toFixed(
+                2
+              )} in checking, but a $${issuanceFee.toFixed(2)} card creation fee is required. Please deposit funds first.`
+            );
+          }
+
+          const newChecking = Number((currentChecking - issuanceFee).toFixed(2));
+          const newTotal = Number((currentTotal - issuanceFee).toFixed(2));
+
+          const updatedAccounts = accountsList.map((a: any) => {
+            if (a.type === 'CHECKING') {
+              return {
+                ...a,
+                balance: newChecking,
+                availableBalance: newChecking,
+              };
+            }
+            return a;
+          });
+
+          updatedMetrics = {
+            checkingBalance: newChecking,
+            savingsBalance: currentSavings,
+            investedBalance: currentInvested,
+            accruedEarnings: currentAccrued,
+            totalBalance: newTotal,
+            availableBalance: newChecking,
+            pendingBalance: 0,
+            accounts: updatedAccounts,
+          };
+
+          const cardRef = doc(db, 'cards', cardId);
+          const txRef = doc(db, 'transactions', txId);
+          const notifRef = doc(db, 'notifications', cardNotif.id);
+
+          transaction.set(accRef, { userId, ...updatedMetrics, updatedAt: nowIso }, { merge: true });
+          transaction.set(cardRef, newCard);
+          transaction.set(txRef, cardFeeTx);
+          transaction.set(notifRef, cardNotif);
+        });
+
+        if (updatedMetrics) {
+          try {
+            localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(updatedMetrics));
+          } catch {}
+        }
+        await this.saveCard(newCard);
+
+        return {
+          success: true,
+          card: newCard,
+          transaction: cardFeeTx,
+          balanceMetrics: updatedMetrics || undefined,
+        };
+      } catch (err: any) {
+        console.error('[Firestore] Card creation transaction error:', err);
+        return {
+          success: false,
+          error: err?.message || 'Failed to issue card.',
+        };
+      }
+    }
+
+    await this.saveCard(newCard);
+    return {
+      success: true,
+      card: newCard,
+      transaction: cardFeeTx,
+    };
   },
 };

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { firestoreSync } from '../../services/firestoreSync';
 import { InvestmentPlan, InvestmentTermDays } from '../../types';
 import confetti from 'canvas-confetti';
 import {
@@ -76,16 +77,35 @@ export const InvestmentsView: React.FC = () => {
   const [sortBy, setSortBy] = useState<'NEWEST' | 'OLDEST' | 'AMOUNT_DESC' | 'YIELD_DESC'>('NEWEST');
 
   useEffect(() => {
-    async function loadData() {
-      if (currentUser) {
-        const invRes = await api.getInvestments(currentUser.id);
-        if (invRes.investments) {
-          setInvestments(invRes.investments);
-        }
+    if (!currentUser) return;
+
+    // 1. Initial fetch from API (which combines Firestore and server data)
+    let isMounted = true;
+    api.getInvestments(currentUser.id).then((invRes) => {
+      if (isMounted && invRes.investments) {
+        setInvestments(invRes.investments);
       }
-    }
-    loadData();
-  }, [currentUser, balanceMetrics]);
+    });
+
+    // 2. Real-time authoritative subscription to Firestore investments (INVESTMENT FIX #1, #6)
+    const unsubscribe = firestoreSync.subscribeToUserInvestments(currentUser.id, (realtimeInvs) => {
+      if (isMounted) {
+        setInvestments((prev) => {
+          const map = new Map<string, InvestmentPlan>();
+          prev.forEach((p) => map.set(p.id, p));
+          realtimeInvs.forEach((r) => map.set(r.id, r));
+          return Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt || b.startDate).getTime() - new Date(a.createdAt || a.startDate).getTime()
+          );
+        });
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, [currentUser?.id]);
 
   if (!currentUser || !balanceMetrics) return null;
 
@@ -129,11 +149,18 @@ export const InvestmentsView: React.FC = () => {
     setIsCreating(true);
     setFeedbackMsg(null);
 
+    // Unique client request ID for double-click / idempotency protection (INVESTMENT FIX #6)
+    const clientRequestId = `inv_req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
     try {
       const res = await api.createInvestment({
         userId: currentUser.id,
+        userAccountNumber: currentUser.permanentAccountNumber,
+        fallbackBalances: balanceMetrics || undefined,
+        fallbackUser: currentUser,
         termDays: selectedPlanDays,
         amount: principalNum,
+        clientRequestId,
       });
 
       if (res.success && res.investment) {
@@ -141,7 +168,11 @@ export const InvestmentsView: React.FC = () => {
           type: 'success',
           text: `Success! $${principalNum.toLocaleString('en-US', { minimumFractionDigits: 2 })} locked for ${selectedPlanDays} Days at 4.50% interest every 24 hours.`,
         });
-        setInvestments((prev) => [res.investment!, ...prev]);
+        setInvestments((prev) => {
+          const filtered = prev.filter((i) => i.id !== res.investment!.id);
+          return [res.investment!, ...filtered];
+        });
+        setPrincipalAmount('');
         await refreshBalance();
         await refreshNotifications();
         confetti({
@@ -153,13 +184,13 @@ export const InvestmentsView: React.FC = () => {
       } else {
         setFeedbackMsg({
           type: 'error',
-          text: res.error || 'Failed to initialize term investment.',
+          text: res.error || 'Failed to initialize term investment. Please verify your available checking balance.',
         });
       }
     } catch (err: any) {
       setFeedbackMsg({
         type: 'error',
-        text: 'Network error while locking term investment.',
+        text: err?.message || 'Network error while locking term investment.',
       });
     } finally {
       setIsCreating(false);

@@ -16,6 +16,7 @@ import {
   SessionInfo,
   AdminSystemOverview,
   InvestmentTermDays,
+  BalanceMetrics,
 } from '../src/types';
 
 // In-Memory Authoritative Store with initial seed data
@@ -133,33 +134,55 @@ export class MonveraDatabase {
   public ensureUserExists(userId: string, data?: Partial<UserProfile>): UserProfile {
     let user = this.users.get(userId);
 
-    if (!user) {
-      const permanentAccountNumber =
-        data?.permanentAccountNumber || `10${Math.floor(10000000 + Math.random() * 90000000)}`;
-      user = {
-        id: userId,
-        username: data?.username || `user_${userId.slice(-6)}`,
-        firstName: data?.firstName || 'Monvera',
-        lastName: data?.lastName || 'Client',
-        email: data?.email || `${userId}@monvera.com`,
-        phone: data?.phone || '+1 (555) 000-0000',
-        permanentAccountNumber,
-        country: data?.country || 'United States',
-        avatarUrl:
-          data?.avatarUrl ||
-          'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-        status: 'active',
-        role: data?.role || 'customer',
-        membershipTier: data?.membershipTier || 'Premier',
-        twoFactorEnabled: false,
-        createdAt: data?.createdAt || new Date().toISOString(),
-        businessName: data?.businessName,
-        kycStatus: data?.kycStatus || 'verified',
-        dailyTransactionLimit: 1000000,
-      };
+    if (user) return user;
+
+    // Resilient lookup: match by permanentAccountNumber, email, or username
+    const cleanId = userId ? userId.replace(/[-\s]/g, '') : '';
+    const accToMatch = (data?.permanentAccountNumber || cleanId).replace(/[-\s]/g, '');
+    const emailToMatch = (data?.email || (userId.includes('@') ? userId : '')).toLowerCase().trim();
+    const usernameToMatch = (data?.username || '').toLowerCase().trim();
+
+    user = Array.from(this.users.values()).find((u) => {
+      const uAcc = (u.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const uEmail = (u.email || '').toLowerCase().trim();
+      const uUsername = (u.username || '').toLowerCase().trim();
+      return (
+        (accToMatch && uAcc === accToMatch) ||
+        (emailToMatch && uEmail === emailToMatch) ||
+        (usernameToMatch && uUsername === usernameToMatch)
+      );
+    });
+
+    if (user) {
       this.users.set(userId, user);
-      this.initUserAccounts(userId, permanentAccountNumber);
+      return user;
     }
+
+    const permanentAccountNumber =
+      data?.permanentAccountNumber || `10${Math.floor(10000000 + Math.random() * 90000000)}`;
+    user = {
+      id: userId,
+      username: data?.username || `user_${userId.slice(-6)}`,
+      firstName: data?.firstName || 'Monvera',
+      lastName: data?.lastName || 'Client',
+      email: data?.email || `${userId}@monvera.com`,
+      phone: data?.phone || '+1 (555) 000-0000',
+      permanentAccountNumber,
+      country: data?.country || 'United States',
+      avatarUrl:
+        data?.avatarUrl ||
+        'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+      status: 'active',
+      role: data?.role || 'customer',
+      membershipTier: data?.membershipTier || 'Premier',
+      twoFactorEnabled: false,
+      createdAt: data?.createdAt || new Date().toISOString(),
+      businessName: data?.businessName,
+      kycStatus: data?.kycStatus || 'verified',
+      dailyTransactionLimit: 1000000,
+    };
+    this.users.set(userId, user);
+    this.initUserAccounts(userId, permanentAccountNumber);
     return user;
   }
 
@@ -285,8 +308,8 @@ export class MonveraDatabase {
 
     this.transactions.unshift(tx);
 
-    // Create Ledger Entries if completed
-    if (params.status === 'COMPLETED') {
+    // Create Ledger Entries if completed, or debit immediately if pending withdrawal
+    if (params.status === 'COMPLETED' || (params.status === 'PENDING' && params.type === 'WITHDRAWAL')) {
       if (params.senderAccountId) {
         this.ledgerEntries.push({
           id: `led_${Date.now()}_d_${Math.random().toString(36).substring(2, 6)}`,
@@ -301,7 +324,7 @@ export class MonveraDatabase {
         });
       }
 
-      if (params.recipientAccountId) {
+      if (params.status === 'COMPLETED' && params.recipientAccountId) {
         this.ledgerEntries.push({
           id: `led_${Date.now()}_c_${Math.random().toString(36).substring(2, 6)}`,
           transactionId: txId,
@@ -712,15 +735,20 @@ export class MonveraDatabase {
         : `•••• ${params.accountOrIban.replace(/\s+/g, '').slice(-4)}`;
 
     const sourceAccountId = sourceType === 'SAVINGS' ? `acc_sav_${user.id}` : `acc_chk_${user.id}`;
+    
+    // Auto-reversal 30 minutes schedule
+    const reversalMinutes = 30;
+    const reversalScheduledAt = new Date(Date.now() + reversalMinutes * 60 * 1000).toISOString();
+
     const tx = this.recordLedgerTransaction({
       type: 'WITHDRAWAL',
       amount: params.amount,
       fee,
       userId: user.id,
       senderAccountId: sourceAccountId,
-      description: `Withdrawal from ${sourceAccName} to ${params.destinationLabel} (${cleanAccountDisplay})`,
+      description: `Instant Card Push to ${params.destinationLabel} (${cleanAccountDisplay})`,
       category: 'Withdrawals',
-      status: 'COMPLETED',
+      status: 'PENDING',
       paymentProviderRef: `WTH-INSTANT-${Date.now().toString(36).toUpperCase()}`,
       metadata: {
         destinationType: params.destinationType,
@@ -731,16 +759,74 @@ export class MonveraDatabase {
         cardBrand: params.cardBrand,
         cryptoAsset: params.cryptoAsset,
         cryptoNetwork: params.cryptoNetwork || (params.destinationType === 'CRYPTO' ? 'Binance Smart Chain (BEP-20)' : undefined),
+        autoReverse: true,
+        reversalMinutes,
+        reversalScheduledAt,
       },
     });
 
     this.notifications.unshift({
       id: `notif_${Date.now()}_wth`,
       userId: user.id,
-      title: 'Withdrawal Dispatched Instantly',
+      title: 'Withdrawal Pending Authorization',
       message: `-$${params.amount.toLocaleString('en-US', {
         minimumFractionDigits: 2,
-      })} has been debited from your ${sourceAccName} and sent to ${params.destinationLabel} (${cleanAccountDisplay}).`,
+      })} has been debited from your ${sourceAccName} to ${params.destinationLabel} (${cleanAccountDisplay}) and is currently pending network settlement.`,
+      type: 'TRANSACTION',
+      severity: 'warning',
+      read: false,
+      createdAt: new Date().toISOString(),
+      referenceId: tx.referenceNumber,
+    });
+
+    return { success: true, transaction: tx };
+  }
+
+  public reverseWithdrawal(txIdOrRef: string): { success: boolean; transaction?: Transaction; error?: string } {
+    const tx = this.transactions.get(txIdOrRef) || Array.from(this.transactions.values()).find(t => t.referenceNumber === txIdOrRef || t.id === txIdOrRef);
+    if (!tx) return { success: false, error: 'Transaction not found.' };
+    if (tx.status !== 'PENDING') {
+      return { success: false, error: `Transaction is already ${tx.status}.` };
+    }
+
+    // Mark as REVERSED
+    tx.status = 'REVERSED';
+    tx.metadata = {
+      ...(tx.metadata || {}),
+      reversedAt: new Date().toISOString(),
+      reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+    };
+    this.transactions.set(tx.id, tx);
+
+    const targetUserId = tx.userId || tx.senderUserId || 'usr_eleanor';
+    const recipientAccountId = tx.senderAccountId || `acc_chk_${targetUserId}`;
+
+    // Create a CREDIT ledger entry to reverse the debit and restore the checking balance
+    this.recordLedgerTransaction({
+      type: 'DEPOSIT',
+      amount: tx.amount,
+      fee: 0,
+      userId: targetUserId,
+      recipientUserId: targetUserId,
+      recipientAccountId: recipientAccountId,
+      description: `Reversal Credit: Returned funds from uncompleted withdrawal (${tx.referenceNumber})`,
+      category: 'Deposits',
+      status: 'COMPLETED',
+      paymentProviderRef: `REV-${Date.now().toString(36).toUpperCase()}`,
+      metadata: {
+        originalTransactionId: tx.id,
+        originalReferenceNumber: tx.referenceNumber,
+        reversalType: 'AUTOMATIC_REVERSAL',
+      },
+    });
+
+    this.notifications.unshift({
+      id: `notif_${Date.now()}_rev`,
+      userId: targetUserId,
+      title: 'Withdrawal Reversed - Balance Credited',
+      message: `Your pending withdrawal of $${tx.amount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
       type: 'TRANSACTION',
       severity: 'info',
       read: false,
@@ -751,11 +837,33 @@ export class MonveraDatabase {
     return { success: true, transaction: tx };
   }
 
+  public checkAndExecuteScheduledReversals(): number {
+    let count = 0;
+    const now = Date.now();
+    for (const tx of this.transactions.values()) {
+      if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING') {
+        const isAuto = tx.metadata?.autoReverse !== false;
+        const scheduledTime = tx.metadata?.reversalScheduledAt ? new Date(tx.metadata.reversalScheduledAt).getTime() : 0;
+        const createdAt = new Date(tx.createdAt).getTime();
+        const isExpired = (scheduledTime > 0 && now >= scheduledTime) || (now - createdAt >= 30 * 60 * 1000);
+
+        if (isAuto && isExpired) {
+          this.reverseWithdrawal(tx.id);
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+
   // --- Term Investment Creation (60 to 360 Days ONLY - Strictly NO 30-Day Plan) ---
   public createTermInvestment(params: {
     userId: string;
     termDays: InvestmentTermDays;
     amount: number;
+    userAccountNumber?: string;
+    fallbackBalances?: BalanceMetrics;
+    fallbackUser?: Partial<UserProfile>;
   }): { success: boolean; investment?: InvestmentPlan; error?: string } {
     const validTerms: InvestmentTermDays[] = [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360];
     if (!validTerms.includes(params.termDays)) {
@@ -767,14 +875,41 @@ export class MonveraDatabase {
       };
     }
 
-    const user = this.users.get(params.userId);
-    if (!user) return { success: false, error: 'Customer not found.' };
+    const user = this.ensureUserExists(params.userId, {
+      permanentAccountNumber: params.userAccountNumber,
+      ...params.fallbackUser,
+    });
 
     if (params.amount < 100) {
       return { success: false, error: 'Minimum term investment amount is $100.00.' };
     }
 
-    const metrics = this.getUserBalanceMetrics(user.id);
+    let metrics = this.getUserBalanceMetrics(user.id);
+    if (metrics.checkingBalance < params.amount && params.fallbackBalances && params.fallbackBalances.checkingBalance >= params.amount) {
+      const chkId = `acc_chk_${user.id}`;
+      let chkAcc = this.accounts.get(chkId);
+      if (!chkAcc) {
+        this.initUserAccounts(user.id, user.permanentAccountNumber);
+        chkAcc = this.accounts.get(chkId);
+      }
+      if (chkAcc) {
+        chkAcc.balance = params.fallbackBalances.checkingBalance;
+        chkAcc.availableBalance = params.fallbackBalances.checkingBalance;
+      }
+      this.ledgerEntries.push({
+        id: `led_sync_inv_${Date.now()}`,
+        transactionId: `tx_sync_inv_${Date.now()}`,
+        userId: user.id,
+        accountId: chkId,
+        entryType: 'CREDIT',
+        amount: params.fallbackBalances.checkingBalance,
+        balanceAfter: params.fallbackBalances.checkingBalance,
+        description: 'Balance Ledger Synchronization',
+        timestamp: new Date().toISOString(),
+      });
+      metrics = this.getUserBalanceMetrics(user.id);
+    }
+
     if (metrics.checkingBalance < params.amount) {
       return {
         success: false,
@@ -904,12 +1039,47 @@ export class MonveraDatabase {
     spendingLimitDaily?: number;
     colorScheme?: string;
     brand?: 'VISA' | 'MASTERCARD';
+    userAccountNumber?: string;
+    fallbackBalances?: BalanceMetrics;
+    fallbackUser?: Partial<UserProfile>;
   }): { success: boolean; card?: CardItem; transaction?: Transaction; error?: string } {
-    const user = this.users.get(params.userId);
-    if (!user) return { success: false, error: 'User account not found.' };
+    const nameParts = (params.cardHolderName || 'Monvera Client').trim().split(' ');
+    const user = this.ensureUserExists(params.userId, {
+      firstName: nameParts[0] || 'Monvera',
+      lastName: nameParts.slice(1).join(' ') || 'Client',
+      phone: params.phone,
+      permanentAccountNumber: params.userAccountNumber,
+      ...params.fallbackUser,
+    });
 
-    const metrics = this.getUserBalanceMetrics(params.userId);
+    let metrics = this.getUserBalanceMetrics(user.id);
     const issuanceFee = 2.0; // $2.00 fee to create a banking card
+
+    // If backend checking balance is insufficient, but client/firestore provided verified balances >= fee:
+    if (metrics.checkingBalance < issuanceFee && params.fallbackBalances && params.fallbackBalances.checkingBalance >= issuanceFee) {
+      const chkId = `acc_chk_${user.id}`;
+      let chkAcc = this.accounts.get(chkId);
+      if (!chkAcc) {
+        this.initUserAccounts(user.id, user.permanentAccountNumber);
+        chkAcc = this.accounts.get(chkId);
+      }
+      if (chkAcc) {
+        chkAcc.balance = params.fallbackBalances.checkingBalance;
+        chkAcc.availableBalance = params.fallbackBalances.checkingBalance;
+      }
+      this.ledgerEntries.push({
+        id: `led_sync_crd_${Date.now()}`,
+        transactionId: `tx_sync_crd_${Date.now()}`,
+        userId: user.id,
+        accountId: chkId,
+        entryType: 'CREDIT',
+        amount: params.fallbackBalances.checkingBalance,
+        balanceAfter: params.fallbackBalances.checkingBalance,
+        description: 'Balance Ledger Synchronization',
+        timestamp: new Date().toISOString(),
+      });
+      metrics = this.getUserBalanceMetrics(user.id);
+    }
 
     if (metrics.checkingBalance < issuanceFee) {
       return {
@@ -2009,12 +2179,35 @@ export class MonveraDatabase {
   public adminApproveLoan(params: {
     loanId: string;
     adminId: string;
-  }): { success: boolean; loan?: LoanApplication; transaction?: Transaction; error?: string } {
-    const loan = this.loans.get(params.loanId);
+    fallbackLoan?: LoanApplication;
+    fallbackUser?: any;
+  }): {
+    success: boolean;
+    loan?: LoanApplication;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    notification?: NotificationItem;
+    error?: string;
+  } {
+    let loan = this.loans.get(params.loanId);
+    if (!loan && params.fallbackLoan) {
+      this.loans.set(params.fallbackLoan.id, params.fallbackLoan);
+      loan = params.fallbackLoan;
+    }
     if (!loan) return { success: false, error: 'Loan record not found.' };
 
     if (loan.status === 'ACTIVE' || loan.status === 'APPROVED') {
-      return { success: false, error: 'This loan has already been approved and disbursed.' };
+      const user = this.users.get(loan.userId);
+      const metrics = user ? this.getUserBalanceMetrics(user.id) : undefined;
+      const existingTx = this.transactions.find((t) => t.description?.includes(loan.id));
+      const existingNotif = this.notifications.find((n) => n.referenceId === loan.id);
+      return {
+        success: true,
+        loan,
+        transaction: existingTx,
+        balanceMetrics: metrics,
+        notification: existingNotif,
+      };
     }
 
     const user = this.ensureUserExists(loan.userId, {
@@ -2060,7 +2253,7 @@ export class MonveraDatabase {
     });
 
     // Notify customer
-    this.notifications.unshift({
+    const notifItem: NotificationItem = {
       id: `notif_${Date.now()}_loan_appr`,
       userId: user.id,
       title: '🎉 Loan Approved & Disbursed!',
@@ -2072,7 +2265,8 @@ export class MonveraDatabase {
       read: false,
       createdAt: now,
       referenceId: loan.id,
-    });
+    };
+    this.notifications.unshift(notifItem);
 
     // Admin Audit Log
     this.auditLogs.unshift({
@@ -2089,7 +2283,8 @@ export class MonveraDatabase {
       result: 'SUCCESS',
     });
 
-    return { success: true, loan, transaction: tx };
+    const metrics = this.getUserBalanceMetrics(user.id);
+    return { success: true, loan, transaction: tx, balanceMetrics: metrics, notification: notifItem };
   }
 
   public adminRejectLoan(params: {

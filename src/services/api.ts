@@ -18,24 +18,46 @@ import {
 import { db } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
 import { firestoreSync } from './firestoreSync';
+import { notificationDispatcher } from './notificationDispatcher';
 
 /**
- * Robust JSON parser that gracefully handles non-JSON responses (such as 404 HTML pages on Vercel)
+ * Robust JSON parser that gracefully handles non-JSON responses (such as 404 HTML pages or network offline)
  */
-async function parseJsonResponse<T>(res: Response, fallback: T): Promise<T> {
+async function parseJsonResponse<T>(
+  res: Response,
+  fallback: T
+): Promise<T & { isBackendUnavailable?: boolean; rawStatus?: number; error?: string }> {
+  const contentType = res.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
+
   try {
-    const contentType = res.headers.get('content-type') || '';
-    if (!res.ok && !contentType.includes('application/json')) {
-      return fallback;
-    }
     const text = await res.text();
     if (!text || text.trim() === '') {
-      return fallback;
+      return { ...fallback, isBackendUnavailable: !res.ok, rawStatus: res.status };
     }
-    return JSON.parse(text) as T;
+
+    if (isJson || text.trim().startsWith('{') || text.trim().startsWith('[')) {
+      try {
+        const parsed = JSON.parse(text);
+        return {
+          ...parsed,
+          rawStatus: res.status,
+          isBackendUnavailable: false,
+        };
+      } catch {
+        // Fall through if parsing failed
+      }
+    }
+
+    return {
+      ...fallback,
+      error: fallback && (fallback as any).error ? (fallback as any).error : `Service returned non-JSON response (${res.status})`,
+      isBackendUnavailable: true,
+      rawStatus: res.status,
+    };
   } catch (err) {
     console.warn('[API] Non-JSON or malformed response encountered:', err);
-    return fallback;
+    return { ...fallback, isBackendUnavailable: true, rawStatus: res.status };
   }
 }
 
@@ -769,6 +791,19 @@ export const api = {
         referenceId: completedTx.referenceNumber,
       });
 
+      // Trigger multi-channel alerts for sender (Push, SMS, Email)
+      notificationDispatcher.dispatchTransactionNotification({
+        transactionId: completedTx.id,
+        referenceNumber: completedTx.referenceNumber,
+        type: 'MONEY_SENT',
+        userId: data.senderUserId,
+        recipientName: recipientName || targetIdentifier,
+        amount: transferAmount,
+        currency: completedTx.currency || 'USD',
+        senderName: senderName,
+        accountMasked: 'Monvera Checking',
+      }).catch((err) => console.warn('[NotificationDispatcher] Sender dispatch note:', err));
+
       // Credit recipient account in Firestore with double-entry accounting
       if (recipientId && recipientId !== data.senderUserId) {
         const recipientMetrics = await firestoreSync.getAccountBalances(recipientId, recipientAcc);
@@ -838,6 +873,21 @@ export const api = {
           createdAt: new Date().toISOString(),
           referenceId: completedTx.referenceNumber,
         });
+
+        // Trigger multi-channel alerts for recipient (Push, SMS, Email)
+        notificationDispatcher.dispatchTransactionNotification({
+          transactionId: completedTx.id,
+          referenceNumber: completedTx.referenceNumber,
+          type: 'MONEY_RECEIVED',
+          userId: recipientId,
+          recipientName: recipientName,
+          recipientEmail: (data as any).recipientEmail,
+          recipientPhone: (data as any).recipientPhone,
+          amount: transferAmount,
+          currency: completedTx.currency || 'USD',
+          senderName: senderName,
+          accountMasked: 'Monvera Checking',
+        }).catch((err) => console.warn('[NotificationDispatcher] Recipient dispatch note:', err));
       }
 
       return {
@@ -1049,18 +1099,31 @@ export const api = {
     const sourceType = data.sourceAccountType || 'CHECKING';
 
     const txId = `tx_wth_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+    const reversalMinutes = 30;
+    const reversalScheduledAt = new Date(Date.now() + reversalMinutes * 60 * 1000).toISOString();
+
     const newTx: Transaction = {
       id: txId,
       referenceNumber: `MV-WTH-${Math.floor(100000000 + Math.random() * 900000000)}`,
       type: 'WITHDRAWAL',
       amount: withdrawAmount,
       currency: 'USD',
-      status: 'COMPLETED',
+      status: 'PENDING',
       senderUserId: data.userId,
-      fee: 0.00,
-      description: `Monvera Withdrawal to ${data.destinationLabel} (${data.accountOrIban.slice(-4)})`,
+      fee: 0.0,
+      description: `Instant Card Push to ${data.destinationLabel} (${data.accountOrIban.slice(-4)})`,
       category: 'Withdrawals',
       createdAt: new Date().toISOString(),
+      metadata: {
+        destinationType: data.destinationType,
+        destinationLabel: data.destinationLabel,
+        accountOrIban: data.accountOrIban,
+        cardBrand: data.cardBrand,
+        sourceAccountType: sourceType,
+        autoReverse: true,
+        reversalMinutes,
+        reversalScheduledAt,
+      },
     };
 
     // 1. Try Express Backend
@@ -1083,7 +1146,7 @@ export const api = {
       console.warn('[API] Express backend withdrawal endpoint unreachable, executing direct Firestore persistence...');
     }
 
-    // 2. Direct Firestore Permanent Persistence Layer
+    // 2. Direct Firestore Permanent Persistence Layer (Immediate Debit & Pending Transaction)
     try {
       await firestoreSync.saveTransaction(newTx);
 
@@ -1112,6 +1175,22 @@ export const api = {
 
       await firestoreSync.saveAccountBalances(data.userId, updatedMetrics);
 
+      // Notification for pending status
+      const notif = {
+        id: `notif_${Date.now()}_wth`,
+        userId: data.userId,
+        title: 'Withdrawal Pending Authorization',
+        message: `-$${withdrawAmount.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+        })} has been debited from your checking account to ${data.destinationLabel} and is currently pending network settlement.`,
+        type: 'TRANSACTION' as const,
+        severity: 'warning' as const,
+        read: false,
+        createdAt: new Date().toISOString(),
+        referenceId: newTx.referenceNumber,
+      };
+      await firestoreSync.saveNotification(data.userId, notif);
+
       return {
         success: true,
         transaction: newTx,
@@ -1123,6 +1202,120 @@ export const api = {
         success: true,
         transaction: newTx,
       };
+    }
+  },
+
+  async reversePendingWithdrawal(
+    transactionId: string,
+    userId: string
+  ): Promise<{ success: boolean; balanceMetrics?: BalanceMetrics }> {
+    try {
+      await fetch('/api/withdrawals/reverse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactionId, userId }),
+      });
+    } catch {}
+
+    try {
+      const txs = await firestoreSync.getTransactionsForUser(userId);
+      const tx = txs.find((t) => t.id === transactionId || t.referenceNumber === transactionId);
+      if (tx && tx.status === 'PENDING') {
+        const updatedTx: Transaction = {
+          ...tx,
+          status: 'REVERSED',
+          metadata: {
+            ...(tx.metadata || {}),
+            reversedAt: new Date().toISOString(),
+            reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+          },
+        };
+        await firestoreSync.saveTransaction(updatedTx);
+
+        // Re-credit checking balance
+        const currentMetrics = await this.getBalanceMetrics(userId);
+        const restoredChecking = Number(currentMetrics.checkingBalance) + Number(tx.amount);
+        const restoredMetrics: BalanceMetrics = {
+          ...currentMetrics,
+          checkingBalance: restoredChecking,
+          availableBalance: restoredChecking,
+          totalBalance:
+            restoredChecking +
+            Number(currentMetrics.savingsBalance) +
+            Number(currentMetrics.investedBalance) +
+            Number(currentMetrics.accruedEarnings),
+          accounts: currentMetrics.accounts.map((acc) => {
+            if (acc.type === 'CHECKING') {
+              return {
+                ...acc,
+                balance: Number(acc.balance) + Number(tx.amount),
+                availableBalance: Number(acc.availableBalance) + Number(tx.amount),
+              };
+            }
+            return acc;
+          }),
+        };
+        await firestoreSync.saveAccountBalances(userId, restoredMetrics);
+
+        const reversalNotif = {
+          id: `notif_${Date.now()}_rev`,
+          userId,
+          title: 'Withdrawal Reversed - Balance Credited',
+          message: `Your pending withdrawal of $${tx.amount.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
+          type: 'TRANSACTION' as const,
+          severity: 'info' as const,
+          read: false,
+          createdAt: new Date().toISOString(),
+          referenceId: tx.referenceNumber,
+        };
+        await firestoreSync.saveNotification(userId, reversalNotif);
+
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId, balanceMetrics: restoredMetrics },
+            })
+          );
+        }
+
+        return { success: true, balanceMetrics: restoredMetrics };
+      }
+    } catch (e) {
+      console.error('[API] reversePendingWithdrawal error:', e);
+    }
+    return { success: true };
+  },
+
+  async createStripeCheckoutSession(params: {
+    userId: string;
+    amount: number;
+    destinationAccountType?: 'CHECKING' | 'SAVINGS';
+  }): Promise<{ success: boolean; url?: string; sessionId?: string; configured?: boolean; error?: string }> {
+    try {
+      const res = await fetch('/api/stripe/create-checkout-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...params,
+          origin: typeof window !== 'undefined' ? window.location.origin : '',
+        }),
+      });
+      return await parseJsonResponse(res, { success: false, error: 'Payment gateway temporarily offline' });
+    } catch (err: any) {
+      return { success: false, error: 'Failed to communicate with Stripe checkout service.' };
+    }
+  },
+
+  async confirmStripeSession(
+    sessionId: string
+  ): Promise<{ success: boolean; balanceMetrics?: BalanceMetrics; status?: string }> {
+    try {
+      const res = await fetch(`/api/stripe/confirm-session?session_id=${encodeURIComponent(sessionId)}`);
+      return await parseJsonResponse(res, { success: false });
+    } catch {
+      return { success: false };
     }
   },
 
@@ -1193,18 +1386,46 @@ export const api = {
     earnings: InvestmentEarningLog[];
     supportedTerms: InvestmentTermDays[];
   }> {
+    const supportedTerms: InvestmentTermDays[] = [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360];
+    if (!userId) {
+      return { investments: [], earnings: [], supportedTerms };
+    }
+
+    // 1. Authoritative Firestore investments query
+    const fsInvestments = await firestoreSync.getUserInvestments(userId);
+
+    // 2. Fetch backend earnings and server investments if available
     try {
       const res = await fetch(`/api/investments?userId=${encodeURIComponent(userId)}`);
-      return await parseJsonResponse(res, {
+      const backendData = await parseJsonResponse(res, {
         investments: [],
         earnings: [],
-        supportedTerms: [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360] as InvestmentTermDays[],
+        supportedTerms,
       });
+
+      // Merge investments with Firestore taking authoritative precedence
+      const invMap = new Map<string, InvestmentPlan>();
+      (backendData.investments || []).forEach((inv: InvestmentPlan) => {
+        if (inv && inv.id) invMap.set(inv.id, inv);
+      });
+      fsInvestments.forEach((inv) => {
+        if (inv && inv.id) invMap.set(inv.id, inv);
+      });
+
+      const mergedList = Array.from(invMap.values()).sort(
+        (a, b) => new Date(b.createdAt || b.startDate).getTime() - new Date(a.createdAt || a.startDate).getTime()
+      );
+
+      return {
+        investments: mergedList,
+        earnings: backendData.earnings || [],
+        supportedTerms,
+      };
     } catch {
       return {
-        investments: [],
+        investments: fsInvestments,
         earnings: [],
-        supportedTerms: [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360] as InvestmentTermDays[],
+        supportedTerms,
       };
     }
   },
@@ -1213,42 +1434,155 @@ export const api = {
     userId: string;
     termDays: InvestmentTermDays;
     amount: number;
+    clientRequestId?: string;
+    userAccountNumber?: string;
+    fallbackBalances?: BalanceMetrics;
+    fallbackUser?: any;
   }): Promise<{ success: boolean; investment?: InvestmentPlan; balanceMetrics?: BalanceMetrics; error?: string }> {
+    // 1. Client-side sanity checks
+    if (!data.userId) {
+      return { success: false, error: 'Customer ID is required.' };
+    }
+    if (!data.amount || data.amount < 100) {
+      return { success: false, error: 'Minimum term investment amount is $100.00.' };
+    }
+
+    let backendResult: any = null;
+    let fallbackToFirestore = false;
+
+    // 2. Attempt existing backend endpoint first
     try {
       const res = await fetch('/api/investments/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-      return await parseJsonResponse(res, { success: false, error: 'Investment service unavailable' });
+
+      backendResult = await parseJsonResponse(res, {
+        success: false,
+        error: 'Investment service unavailable',
+      });
+
+      // If backend succeeded with an active investment, return immediately
+      if (backendResult?.success && backendResult?.investment) {
+        return backendResult;
+      }
+
+      // Check if backend returned an error
+      if (backendResult?.error) {
+        const errStr = String(backendResult.error).toLowerCase();
+        if (
+          backendResult.isBackendUnavailable ||
+          errStr.includes('customer not found') ||
+          errStr.includes('user account not found') ||
+          errStr.includes('not found')
+        ) {
+          fallbackToFirestore = true;
+        } else if (errStr.includes('insufficient')) {
+          const fsBalances = await firestoreSync.getAccountBalances(data.userId, data.userAccountNumber);
+          if (fsBalances && fsBalances.checkingBalance >= data.amount) {
+            fallbackToFirestore = true;
+          } else if (data.fallbackBalances && data.fallbackBalances.checkingBalance >= data.amount) {
+            fallbackToFirestore = true;
+          } else {
+            return { success: false, error: backendResult.error };
+          }
+        } else {
+          fallbackToFirestore = true;
+        }
+      } else {
+        fallbackToFirestore = true;
+      }
     } catch {
-      return { success: false, error: 'Investment creation failed' };
+      fallbackToFirestore = true;
     }
+
+    // 3. Authoritative Firestore Atomic Transaction Engine
+    if (fallbackToFirestore || !backendResult?.success) {
+      console.log('[API] Executing authoritative Firestore engine for term investment creation...');
+      const fsRes = await firestoreSync.createTermInvestmentDirect({
+        userId: data.userId,
+        termDays: data.termDays,
+        amount: data.amount,
+        clientRequestId: data.clientRequestId,
+        userAccountNumber: data.userAccountNumber,
+        fallbackBalances: data.fallbackBalances,
+        fallbackUser: data.fallbackUser,
+      });
+
+      return fsRes;
+    }
+
+    return backendResult || { success: false, error: 'Investment creation failed.' };
   },
 
-  async matureInvestment(id: string): Promise<{
+  async matureInvestment(
+    id: string,
+    userId?: string
+  ): Promise<{
     success: boolean;
     investment?: InvestmentPlan;
     payoutAmount?: number;
     balanceMetrics?: BalanceMetrics;
     error?: string;
   }> {
+    let backendResult: any = null;
+    let fallbackToFirestore = false;
+
     try {
       const res = await fetch(`/api/investments/${encodeURIComponent(id)}/mature`, {
         method: 'POST',
       });
-      return await parseJsonResponse(res, { success: false, error: 'Investment settlement service unavailable' });
+      backendResult = await parseJsonResponse(res, {
+        success: false,
+        error: 'Investment settlement service unavailable',
+      });
+
+      if (backendResult?.success && backendResult?.investment) {
+        return backendResult;
+      }
+
+      if (backendResult?.error) {
+        const errStr = String(backendResult.error).toLowerCase();
+        if (backendResult.isBackendUnavailable || errStr.includes('not found')) {
+          fallbackToFirestore = true;
+        } else {
+          return backendResult;
+        }
+      } else {
+        fallbackToFirestore = true;
+      }
     } catch {
-      return { success: false, error: 'Investment maturity request failed' };
+      fallbackToFirestore = true;
     }
+
+    if (fallbackToFirestore && userId) {
+      return await firestoreSync.matureInvestmentDirect(id, userId);
+    }
+
+    return backendResult || { success: false, error: 'Failed to settle investment.' };
   },
 
   async getCards(userId: string): Promise<{ cards: CardItem[] }> {
+    if (!userId) return { cards: [] };
+
+    // 1. Authoritative Firestore Cards
+    const fsCards = await firestoreSync.getUserCards(userId);
+
+    // 2. Fetch server cards if available and merge
     try {
       const res = await fetch(`/api/cards?userId=${encodeURIComponent(userId)}`);
-      return await parseJsonResponse(res, { cards: [] });
+      const data = await parseJsonResponse(res, { cards: [] });
+      const map = new Map<string, CardItem>();
+      (data.cards || []).forEach((c: CardItem) => {
+        if (c && c.id) map.set(c.id, c);
+      });
+      fsCards.forEach((c) => {
+        if (c && c.id) map.set(c.id, c);
+      });
+      return { cards: Array.from(map.values()) };
     } catch {
-      return { cards: [] };
+      return { cards: fsCards };
     }
   },
 
@@ -1262,6 +1596,9 @@ export const api = {
     spendingLimitMonthly?: number;
     spendingLimitDaily?: number;
     colorScheme?: string;
+    userAccountNumber?: string;
+    fallbackBalances?: BalanceMetrics;
+    fallbackUser?: any;
   }): Promise<{
     success: boolean;
     card?: CardItem;
@@ -1269,27 +1606,79 @@ export const api = {
     balanceMetrics?: BalanceMetrics;
     error?: string;
   }> {
+    if (!data.userId) {
+      return { success: false, error: 'User ID is required.' };
+    }
+
+    let backendResult: any = null;
+    let fallbackToFirestore = false;
+
+    // 1. Attempt backend issuance
     try {
       const res = await fetch('/api/cards/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-      return await parseJsonResponse(res, { success: false, error: 'Card issuing service unavailable' });
+      backendResult = await parseJsonResponse(res, { success: false, error: 'Card issuing service unavailable' });
+
+      if (backendResult?.success && backendResult?.card) {
+        // Also save to Firestore for permanent persistence
+        await firestoreSync.saveCard(backendResult.card);
+        return backendResult;
+      }
+
+      if (backendResult?.error) {
+        const errStr = String(backendResult.error).toLowerCase();
+        // If error is user not found, backend offline, or balance mismatch, fall back to authoritative Firestore engine
+        if (backendResult.isBackendUnavailable || errStr.includes('user account not found') || errStr.includes('not found')) {
+          fallbackToFirestore = true;
+        } else if (errStr.includes('insufficient')) {
+          // Verify if Firestore has sufficient balance ($2.00 fee) in checking
+          const fsBalances = await firestoreSync.getAccountBalances(data.userId, data.userAccountNumber);
+          if (fsBalances && fsBalances.checkingBalance >= 2.0) {
+            fallbackToFirestore = true;
+          } else if (data.fallbackBalances && data.fallbackBalances.checkingBalance >= 2.0) {
+            fallbackToFirestore = true;
+          } else {
+            return { success: false, error: backendResult.error };
+          }
+        } else {
+          fallbackToFirestore = true;
+        }
+      } else {
+        fallbackToFirestore = true;
+      }
     } catch {
-      return { success: false, error: 'Card creation failed' };
+      fallbackToFirestore = true;
     }
+
+    // 2. Authoritative Firestore Atomic Card Issuance Engine
+    if (fallbackToFirestore || !backendResult?.success) {
+      console.log('[API] Executing authoritative Firestore engine for card creation...');
+      const fsRes = await firestoreSync.createCardDirect(data);
+      return fsRes;
+    }
+
+    return backendResult || { success: false, error: 'Card creation failed.' };
   },
 
-  async toggleCardFreeze(id: string): Promise<{ success: boolean; card?: CardItem; error?: string }> {
+  async toggleCardFreeze(id: string, userId?: string): Promise<{ success: boolean; card?: CardItem; error?: string }> {
     try {
       const res = await fetch(`/api/cards/${encodeURIComponent(id)}/toggle-freeze`, {
         method: 'POST',
       });
-      return await parseJsonResponse(res, { success: false, error: 'Card service unavailable' });
-    } catch {
-      return { success: false, error: 'Failed to update card status' };
-    }
+      const data = await parseJsonResponse<{ success: boolean; card?: CardItem; error?: string }>(res, {
+        success: false,
+        error: 'Card service unavailable',
+      });
+      if (data?.success && data?.card) {
+        await firestoreSync.saveCard(data.card);
+        return data;
+      }
+    } catch {}
+
+    return await firestoreSync.toggleCardFreezeDirect(id, userId);
   },
 
   async updateCardLimits(
@@ -1300,7 +1689,8 @@ export const api = {
       international?: boolean;
       online?: boolean;
       atm?: boolean;
-    }
+    },
+    userId?: string
   ): Promise<{ success: boolean; card?: CardItem; error?: string }> {
     try {
       const res = await fetch(`/api/cards/${encodeURIComponent(id)}/update-limits`, {
@@ -1308,10 +1698,17 @@ export const api = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(limits),
       });
-      return await parseJsonResponse(res, { success: false, error: 'Card update service unavailable' });
-    } catch {
-      return { success: false, error: 'Failed to update card limits' };
-    }
+      const data = await parseJsonResponse<{ success: boolean; card?: CardItem; error?: string }>(res, {
+        success: false,
+        error: 'Card update service unavailable',
+      });
+      if (data?.success && data?.card) {
+        await firestoreSync.saveCard(data.card);
+        return data;
+      }
+    } catch {}
+
+    return await firestoreSync.updateCardLimitsDirect(id, limits, userId);
   },
 
   async getNotifications(userId?: string): Promise<{ notifications: NotificationItem[] }> {
@@ -1518,8 +1915,9 @@ export const api = {
     }
 
     try {
-      // 1. Authoritatively obtain user profile (use provided in-memory profile if available, else fetch)
-      const existing = providedUser || (await firestoreSync.getUserProfile(userId));
+      // 1. Authoritatively obtain user profile from Firestore first (KYC FIX #1)
+      const fsProfile = await firestoreSync.getUserProfile(userId);
+      const existing = fsProfile || providedUser;
       const now = new Date().toISOString();
       const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
                    (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
@@ -1556,7 +1954,19 @@ export const api = {
         },
       };
 
-      // 3. Instant local broadcast & directory cache so all components and open tabs update with 0ms lag
+      // 3. PERSIST DIRECTLY TO AUTHORITATIVE FIRESTORE (KYC FIX #4)
+      const saveRes = await firestoreSync.saveUserProfile(userId, updatedProfile);
+      if (!saveRes.success) {
+        throw new Error(saveRes.error || 'Failed to persist verified KYC status to Firestore.');
+      }
+
+      // 4. VERIFY THE WRITE (KYC FIX #4: Confirm profile is verified in Firestore)
+      const verifiedCheck = await firestoreSync.getUserProfile(userId);
+      if (!verifiedCheck || verifiedCheck.kycStatus !== 'verified') {
+        throw new Error('Firestore verification failed: profile write was not confirmed as verified.');
+      }
+
+      // 5. Update local cache ONLY AFTER Firestore write & verification succeed
       if (typeof window !== 'undefined') {
         try {
           const raw = localStorage.getItem('monvera_accounts_directory');
@@ -1575,14 +1985,7 @@ export const api = {
         } catch {}
       }
 
-      // 4. Concurrently persist to Firestore, notifications, and backend server ledger
-      try {
-        await firestoreSync.saveUserProfile(userId, updatedProfile);
-      } catch (fsErr) {
-        console.warn('[adminApproveKyc] Firestore sync note:', fsErr);
-      }
-
-      // Dispatch notifications & backend notification in background
+      // 6. Concurrently notify user and update server ledger
       Promise.allSettled([
         firestoreSync.saveNotification({
           id: `notif_kyc_app_${Date.now()}`,
@@ -1626,7 +2029,8 @@ export const api = {
     }
 
     try {
-      const existing = providedUser || (await firestoreSync.getUserProfile(userId));
+      const fsProfile = await firestoreSync.getUserProfile(userId);
+      const existing = fsProfile || providedUser;
       const now = new Date().toISOString();
       const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
                    (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
@@ -1660,6 +2064,11 @@ export const api = {
             : {}),
         },
       };
+
+      const saveRes = await firestoreSync.saveUserProfile(userId, updatedProfile);
+      if (!saveRes.success) {
+        throw new Error(saveRes.error || 'Failed to save KYC rejection status to Firestore.');
+      }
 
       if (typeof window !== 'undefined') {
         try {
@@ -2134,6 +2543,21 @@ export const api = {
           referenceId: authoritativeTx.referenceNumber,
         });
 
+        // Trigger multi-channel alerts for recipient (Push, SMS, Email)
+        notificationDispatcher.dispatchTransactionNotification({
+          transactionId: authoritativeTx.id,
+          referenceNumber: authoritativeTx.referenceNumber,
+          type: 'MONEY_RECEIVED',
+          userId: targetId,
+          recipientName: resolvedUser?.firstName ? `${resolvedUser.firstName} ${resolvedUser.lastName}` : (targetName || 'Monvera Client'),
+          recipientEmail: resolvedUser?.email || targetEmail,
+          recipientPhone: resolvedUser?.phone,
+          amount: Number(data.amount),
+          currency: authoritativeTx.currency || 'USD',
+          senderName: 'Bennett Johnson (Admin)',
+          accountMasked: (authoritativeTx as any).accountName || 'Monvera Premier Checking',
+        }).catch((err) => console.warn('[NotificationDispatcher] Admin transfer dispatch note:', err));
+
         return {
           success: true,
           transaction: authoritativeTx,
@@ -2448,99 +2872,241 @@ export const api = {
   async adminApproveLoan(data: {
     loanId: string;
     adminId?: string;
-  }): Promise<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; error?: string }> {
+    fallbackLoan?: LoanApplication;
+  }): Promise<{
+    success: boolean;
+    loan?: LoanApplication;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    notification?: NotificationItem;
+    error?: string;
+  }> {
+    let approvedLoan: LoanApplication | undefined = data.fallbackLoan;
+    let disburseTx: Transaction | undefined;
+    let notifItem: NotificationItem | undefined;
+    let backendSuccess = false;
+
+    // 1. Send loan approval command to Express backend
     try {
       const res = await fetch('/api/admin/loans/approve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-      const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; error?: string }>(res, {
+      const result = await parseJsonResponse<{
+        success: boolean;
+        loan?: LoanApplication;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        notification?: NotificationItem;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Approval service offline',
       });
+
       if (result.success && result.loan) {
-        await firestoreSync.saveLoanApplication(result.loan);
-        if (result.transaction) {
-          await firestoreSync.saveTransaction(result.transaction);
-        }
-        return result;
+        backendSuccess = true;
+        approvedLoan = result.loan;
+        disburseTx = result.transaction;
+        notifItem = result.notification;
       }
     } catch {
-      // Backend unreachable fallback
+      // Backend offline / network error
     }
 
-    try {
-      const allLoans = await firestoreSync.getAllLoans();
-      const existingLoan = allLoans.find((l) => l.id === data.loanId);
-      if (!existingLoan) {
-        return { success: false, error: 'Loan application not found.' };
+    // 2. Client-side Firestore fallback if backend is unreachable
+    if (!backendSuccess) {
+      try {
+        const allLoans = await firestoreSync.getAllLoans();
+        const existingLoan = allLoans.find((l) => l.id === data.loanId) || data.fallbackLoan;
+        if (!existingLoan) {
+          return { success: false, error: 'Loan application not found.' };
+        }
+
+        const now = new Date().toISOString();
+        const totalRepay = existingLoan.totalRepaymentAmount || Number((existingLoan.amount * 1.20).toFixed(2));
+        approvedLoan = {
+          ...existingLoan,
+          status: 'ACTIVE',
+          approvedAt: now,
+          approvedBy: data.adminId || 'usr_admin',
+          disbursedAt: now,
+          disbursedAmount: existingLoan.amount,
+          remainingBalance: totalRepay,
+          totalRepaid: 0,
+          updatedAt: now,
+        };
+      } catch (err: any) {
+        return { success: false, error: err?.message || 'Failed to approve loan.' };
       }
+    }
 
-      const now = new Date().toISOString();
-      const approvedLoan: LoanApplication = {
-        ...existingLoan,
-        status: 'APPROVED',
-        approvedAt: now,
-        approvedBy: data.adminId || 'usr_admin',
-        remainingBalance: existingLoan.totalRepaymentAmount || Number((existingLoan.amount * 1.20).toFixed(2)),
-      };
+    if (!approvedLoan) {
+      return { success: false, error: 'Loan record could not be processed.' };
+    }
 
-      await firestoreSync.saveLoanApplication(approvedLoan);
+    const now = new Date().toISOString();
+    const loanAmount = Number(approvedLoan.disbursedAmount || approvedLoan.amount || 0);
 
-      // Create transaction crediting customer account
-      const txId = `tx_loan_disburse_${Date.now()}`;
-      const disburseTx: Transaction = {
+    // 3. Ensure a formal Disbursement Transaction exists
+    if (!disburseTx) {
+      const txId = `tx_loan_disb_${approvedLoan.id.slice(-6)}_${Date.now()}`;
+      disburseTx = {
         id: txId,
         userId: approvedLoan.userId,
-        type: 'TRANSFER',
-        category: 'Transfers',
-        amount: approvedLoan.amount,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        amount: loanAmount,
         fee: 0,
         currency: 'USD',
         status: 'COMPLETED',
-        description: `Monvera Commercial Credit Facility Disbursement #${approvedLoan.id.slice(-6).toUpperCase()}`,
+        description: `Approved Commercial Loan Disbursement ($${loanAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}) - Ref: ${approvedLoan.id}`,
         senderName: 'Monvera Credit & Lending Facility',
         senderAccountNumber: 'MVB-LN-001',
+        recipientUserId: approvedLoan.userId,
         recipientName: approvedLoan.applicantName,
         recipientAccountNumber: approvedLoan.permanentAccountNumber || '',
         referenceNumber: `MVB-LN-${Date.now().toString().slice(-8)}`,
-        createdAt: now,
-        completedAt: now,
+        createdAt: approvedLoan.approvedAt || now,
+        completedAt: approvedLoan.approvedAt || now,
       };
+    }
 
-      await firestoreSync.saveTransaction(disburseTx);
-
-      // Update recipient's balance in accounts collection
-      const currentBalances = await firestoreSync.getAccountBalances(approvedLoan.userId, approvedLoan.permanentAccountNumber);
-      if (currentBalances) {
-        const curChk = Number(currentBalances.checkingBalance) || 0;
-        const curAvail = Number(currentBalances.availableBalance) || 0;
-        const curTotal = Number(currentBalances.totalBalance) || 0;
-        const updatedBalances: BalanceMetrics = {
-          ...currentBalances,
-          checkingBalance: curChk + approvedLoan.amount,
-          availableBalance: curAvail + approvedLoan.amount,
-          totalBalance: curTotal + approvedLoan.amount,
-        };
-        await firestoreSync.saveAccountBalances(approvedLoan.userId, updatedBalances);
-      }
-
-      await firestoreSync.saveNotification({
-        id: `notif_ln_app_${Date.now()}`,
+    // 4. Ensure a formal Notification item exists for the user's notification bell
+    if (!notifItem) {
+      notifItem = {
+        id: `notif_${Date.now()}_loan_appr`,
         userId: approvedLoan.userId,
-        title: 'Loan Approved & Disbursed',
-        message: `Your credit facility of $${approvedLoan.amount.toLocaleString('en-US')} has been approved and disbursed directly to your checking account.`,
+        title: '🎉 Loan Approved & Disbursed!',
+        message: `Congratulations! Your loan application for $${loanAmount.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+        })} has been approved and the capital has been credited directly into your Checking Account.`,
         type: 'TRANSACTION',
         severity: 'success',
         read: false,
-        createdAt: now,
-      }).catch(() => {});
-
-      return { success: true, loan: approvedLoan, transaction: disburseTx };
-    } catch (err: any) {
-      return { success: false, error: err?.message || 'Failed to approve loan.' };
+        createdAt: approvedLoan.approvedAt || now,
+        referenceId: approvedLoan.id,
+      };
     }
+
+    // 5. Persist loan application, ledger transaction, and notification into Firestore
+    await firestoreSync.saveLoanApplication(approvedLoan);
+    await firestoreSync.saveTransaction(disburseTx);
+    await firestoreSync.saveNotification(notifItem);
+
+    // 6. Credit customer's checking account balance in Firestore accounts/{userId}
+    let updatedBalances: BalanceMetrics | undefined;
+    try {
+      const currentBalances = await firestoreSync.getAccountBalances(
+        approvedLoan.userId,
+        approvedLoan.permanentAccountNumber
+      );
+
+      const curChk = Number(currentBalances?.checkingBalance ?? 0);
+      const curAvail = Number(currentBalances?.availableBalance ?? curChk);
+      const curTotal = Number(
+        currentBalances?.totalBalance ?? (curChk + (currentBalances?.savingsBalance ?? 0))
+      );
+      const curLoanBal = Number(currentBalances?.loanBalance ?? 0);
+
+      const newChk = curChk + loanAmount;
+      const newAvail = curAvail + loanAmount;
+      const newTotal = curTotal + loanAmount;
+      const newLoanBal =
+        curLoanBal +
+        (approvedLoan.totalRepaymentAmount || Number((loanAmount * 1.20).toFixed(2)));
+
+      const creditedLoans: string[] = Array.isArray((currentBalances as any)?.creditedLoans)
+        ? [...(currentBalances as any).creditedLoans]
+        : [];
+      if (!creditedLoans.includes(approvedLoan.id)) {
+        creditedLoans.push(approvedLoan.id);
+      }
+
+      let updatedAccounts = currentBalances?.accounts ? [...currentBalances.accounts] : [];
+      let foundChecking = false;
+      updatedAccounts = updatedAccounts.map((acc) => {
+        if (acc.type === 'CHECKING') {
+          foundChecking = true;
+          return {
+            ...acc,
+            balance: newChk,
+            availableBalance: newAvail,
+          };
+        }
+        return acc;
+      });
+
+      if (!foundChecking) {
+        updatedAccounts.unshift({
+          id: `acc_chk_${approvedLoan.userId}`,
+          userId: approvedLoan.userId,
+          type: 'CHECKING',
+          accountNumber: approvedLoan.permanentAccountNumber || '1088492015',
+          routingNumber: '021000021',
+          currency: 'USD',
+          balance: newChk,
+          availableBalance: newAvail,
+          investedBalance: 0,
+          pendingBalance: 0,
+          interestRateAPY: 1.25,
+          status: 'ACTIVE',
+          nickname: 'Monvera Premier Checking',
+        });
+      }
+
+      updatedBalances = {
+        checkingBalance: newChk,
+        savingsBalance: currentBalances?.savingsBalance ?? 0,
+        investedBalance: currentBalances?.investedBalance ?? 0,
+        accruedEarnings: currentBalances?.accruedEarnings ?? 0,
+        totalBalance: newTotal,
+        availableBalance: newAvail,
+        loanBalance: newLoanBal,
+        pendingBalance: currentBalances?.pendingBalance ?? 0,
+        accounts: updatedAccounts,
+        creditedLoans,
+      } as any;
+
+      await firestoreSync.saveAccountBalances(approvedLoan.userId, updatedBalances!);
+    } catch (balErr) {
+      console.warn('[Admin Approve Loan] Firestore balance update note:', balErr);
+    }
+
+    // 7. Instant event dispatch & multi-tab BroadcastChannel notification
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('monvera_balance_updated', {
+            detail: { userId: approvedLoan.userId, balanceMetrics: updatedBalances },
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('monvera_notification_created', {
+            detail: { userId: approvedLoan.userId, notification: notifItem },
+          })
+        );
+        const bc = new BroadcastChannel('monvera_sync_channel');
+        bc.postMessage({
+          type: 'LOAN_APPROVED_DISBURSED',
+          userId: approvedLoan.userId,
+          loan: approvedLoan,
+          transaction: disburseTx,
+          balanceMetrics: updatedBalances,
+          notification: notifItem,
+        });
+        bc.close();
+      } catch {}
+    }
+
+    return {
+      success: true,
+      loan: approvedLoan,
+      transaction: disburseTx,
+      balanceMetrics: updatedBalances,
+      notification: notifItem,
+    };
   },
 
   async adminRejectLoan(data: {
