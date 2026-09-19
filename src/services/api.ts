@@ -1189,7 +1189,7 @@ export const api = {
         createdAt: new Date().toISOString(),
         referenceId: newTx.referenceNumber,
       };
-      await firestoreSync.saveNotification(data.userId, notif);
+      await firestoreSync.saveNotification(notif);
 
       return {
         success: true,
@@ -1270,7 +1270,7 @@ export const api = {
           createdAt: new Date().toISOString(),
           referenceId: tx.referenceNumber,
         };
-        await firestoreSync.saveNotification(userId, reversalNotif);
+        await firestoreSync.saveNotification(reversalNotif);
 
         if (typeof window !== 'undefined') {
           window.dispatchEvent(
@@ -1711,20 +1711,27 @@ export const api = {
     return await firestoreSync.updateCardLimitsDirect(id, limits, userId);
   },
 
-  async getNotifications(userId?: string): Promise<{ notifications: NotificationItem[] }> {
+  async getNotifications(
+    userId?: string,
+    userAccountNumber?: string,
+    userEmail?: string
+  ): Promise<{ notifications: NotificationItem[] }> {
     const notifMap = new Map<string, NotificationItem>();
 
     // 1. Fetch from permanent Firestore notifications
     if (userId) {
       try {
-        const fsNotifs = await firestoreSync.getNotificationsForUser(userId);
+        const fsNotifs = await firestoreSync.getNotificationsForUser(userId, userAccountNumber, userEmail);
         fsNotifs.forEach((n) => notifMap.set(n.id, n));
       } catch {}
     }
 
     // 2. Fetch from backend Express API
     try {
-      const url = userId ? `/api/notifications?userId=${encodeURIComponent(userId)}` : '/api/notifications';
+      const queryParams = new URLSearchParams();
+      if (userId) queryParams.set('userId', userId);
+      if (userAccountNumber) queryParams.set('accountNumber', userAccountNumber);
+      const url = `/api/notifications${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
       const res = await fetch(url);
       const data = await parseJsonResponse<{ notifications: NotificationItem[] }>(res, { notifications: [] });
       if (data && Array.isArray(data.notifications)) {
@@ -3070,6 +3077,13 @@ export const api = {
       } as any;
 
       await firestoreSync.saveAccountBalances(approvedLoan.userId, updatedBalances!);
+      if (data.fallbackLoan?.userId && data.fallbackLoan.userId !== approvedLoan.userId) {
+        await firestoreSync.saveAccountBalances(data.fallbackLoan.userId, updatedBalances!);
+      }
+      if (data.fallbackLoan?.userId && data.fallbackLoan.userId !== approvedLoan.userId && notifItem) {
+        const altNotif = { ...notifItem, id: `notif_${Date.now()}_loan_alt`, userId: data.fallbackLoan.userId };
+        await firestoreSync.saveNotification(altNotif);
+      }
     } catch (balErr) {
       console.warn('[Admin Approve Loan] Firestore balance update note:', balErr);
     }
@@ -3077,24 +3091,30 @@ export const api = {
     // 7. Instant event dispatch & multi-tab BroadcastChannel notification
     if (typeof window !== 'undefined') {
       try {
+        const eventDetail = {
+          userId: approvedLoan.userId,
+          fallbackUserId: data.fallbackLoan?.userId,
+          accountNumber: approvedLoan.permanentAccountNumber,
+          email: approvedLoan.applicantEmail,
+          balanceMetrics: updatedBalances,
+          notification: notifItem,
+          loan: approvedLoan,
+        };
         window.dispatchEvent(
           new CustomEvent('monvera_balance_updated', {
-            detail: { userId: approvedLoan.userId, balanceMetrics: updatedBalances },
+            detail: eventDetail,
           })
         );
         window.dispatchEvent(
           new CustomEvent('monvera_notification_created', {
-            detail: { userId: approvedLoan.userId, notification: notifItem },
+            detail: eventDetail,
           })
         );
         const bc = new BroadcastChannel('monvera_sync_channel');
         bc.postMessage({
           type: 'LOAN_APPROVED_DISBURSED',
-          userId: approvedLoan.userId,
-          loan: approvedLoan,
+          ...eventDetail,
           transaction: disburseTx,
-          balanceMetrics: updatedBalances,
-          notification: notifItem,
         });
         bc.close();
       } catch {}

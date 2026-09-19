@@ -278,7 +278,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const refreshNotifications = useCallback(async () => {
     if (!currentUser) return;
     try {
-      const res = await api.getNotifications(currentUser.id);
+      const res = await api.getNotifications(currentUser.id, currentUser.permanentAccountNumber, currentUser.email);
       if (res.notifications) {
         setNotifications(res.notifications);
         setLastUpdateTimestamp(Date.now());
@@ -347,6 +347,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     if (!currentUser?.id) return;
 
+    const isTargetUser = (target: any): boolean => {
+      if (!target) return false;
+      if (!target.userId && !target.accountNumber && !target.email && !target.fallbackUserId) return true;
+      if (target.userId === currentUser.id || target.fallbackUserId === currentUser.id) return true;
+      const cleanTargetAcc = (target.accountNumber || '').replace(/[-\s]/g, '');
+      const cleanUserAcc = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      if (cleanTargetAcc && cleanUserAcc && cleanTargetAcc === cleanUserAcc) return true;
+      if (target.email && currentUser.email && target.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim()) return true;
+      return false;
+    };
+
     // 1. Real-time Firestore account balance listener under accounts/{uid}
     const unsubBalance = firestoreSync.subscribeToAccountBalances(
       currentUser.id,
@@ -380,23 +391,57 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     );
 
-    // 3. Fallback interval for polling notifications, balances, and backup KYC status sync
+    // 3. Real-time Firestore loan listener: immediately reconcile active/approved loans into Checking Account balance & notification bell
+    const unsubLoans = firestoreSync.subscribeToLoans((allLoans) => {
+      if (!currentUser) return;
+      const userCleanAcc = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const userEmail = (currentUser.email || '').toLowerCase().trim();
+
+      const userActiveLoans = allLoans.filter((l) => {
+        const lCleanAcc = (l.permanentAccountNumber || '').replace(/[-\s]/g, '');
+        const lEmail = (l.applicantEmail || '').toLowerCase().trim();
+        const matches = l.userId === currentUser.id ||
+          (userCleanAcc && lCleanAcc === userCleanAcc) ||
+          (userEmail && lEmail === userEmail);
+        return matches && (l.status === 'ACTIVE' || l.status === 'APPROVED');
+      });
+
+      if (userActiveLoans.length > 0) {
+        refreshBalance();
+        refreshNotifications();
+      }
+    });
+
+    // 4. Real-time Firestore notification listener: immediately updates the notification bell in real-time
+    const unsubNotifications = firestoreSync.subscribeToNotifications(
+      currentUser.id,
+      (newNotifs) => {
+        if (newNotifs && newNotifs.length > 0) {
+          setNotifications(newNotifs);
+          setLastUpdateTimestamp(Date.now());
+        }
+      },
+      currentUser.permanentAccountNumber,
+      currentUser.email
+    );
+
+    // 5. Fallback interval for polling notifications, balances, and backup KYC status sync
     const interval = setInterval(() => {
       refreshBalance();
       refreshNotifications();
       refreshProfile();
     }, 3000);
 
-    // 4. Silently sync FCM registration token if browser permission is already granted
+    // 6. Silently sync FCM registration token if browser permission is already granted
     pushNotificationService.syncTokenForUser(currentUser.id).catch(() => {});
 
-    // 5. Listen to foreground push notifications while tab is open
+    // 7. Listen to foreground push notifications while tab is open
     const unsubPush = pushNotificationService.listenToForegroundMessages(() => {
       refreshNotifications();
       refreshBalance();
     });
 
-    // 6. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
+    // 8. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
     const handleKycStatusUpdated = (e: any) => {
       const detail = e.detail;
       if (!detail) return;
@@ -441,7 +486,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const handleBalanceUpdated = (e: any) => {
       const detail = e.detail;
       if (!detail) return;
-      if (currentUser?.id && (!detail.userId || detail.userId === currentUser.id)) {
+      if (isTargetUser(detail)) {
         if (detail.balanceMetrics) {
           setBalanceMetrics(detail.balanceMetrics);
           cacheUserBalances(currentUser.id, detail.balanceMetrics);
@@ -455,7 +500,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const handleNotificationCreated = (e: any) => {
       const detail = e.detail;
       if (!detail) return;
-      if (currentUser?.id && (!detail.userId || detail.userId === currentUser.id)) {
+      if (isTargetUser(detail)) {
         if (detail.notification) {
           setNotifications((prev) => {
             const exists = prev.some((n) => n.id === detail.notification.id);
@@ -474,7 +519,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       syncChannel.onmessage = (event) => {
         const data = event.data;
         if (!data) return;
-        if (currentUser?.id && (!data.userId || data.userId === currentUser.id)) {
+        if (isTargetUser(data)) {
           if (data.balanceMetrics) {
             setBalanceMetrics(data.balanceMetrics);
             cacheUserBalances(currentUser.id, data.balanceMetrics);
@@ -505,6 +550,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => {
       unsubBalance();
       unsubProfile();
+      unsubLoans();
+      unsubNotifications();
       unsubPush();
       clearInterval(interval);
       if (syncChannel) {
@@ -519,7 +566,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.removeEventListener('focus', refreshProfile);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [currentUser?.id, currentUser?.permanentAccountNumber, refreshBalance, refreshNotifications, refreshProfile]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, refreshBalance, refreshNotifications, refreshProfile]);
 
   const getPersistedAvatar = (userId: string, defaultAvatar?: string) => {
     try {

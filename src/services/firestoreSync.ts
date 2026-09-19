@@ -390,41 +390,95 @@ export const firestoreSync = {
   /**
    * Fetch all notifications for a specific user from Firestore
    */
-  async getNotificationsForUser(userId: string): Promise<NotificationItem[]> {
+  async getNotificationsForUser(userId: string, userAccountNumber?: string, userEmail?: string): Promise<NotificationItem[]> {
     if (!userId || !db) return [];
     try {
       const notifCol = collection(db, 'notifications');
       const qUser = query(notifCol, where('userId', '==', userId));
       const snap = await getDocs(qUser);
       const notifs: NotificationItem[] = [];
+      const notifIds = new Set<string>();
+
       snap.forEach((d) => {
         const item = d.data() as NotificationItem;
-        notifs.push({
-          id: d.id || item.id,
-          ...item,
-        });
+        const id = d.id || item.id;
+        if (!notifIds.has(id)) {
+          notifIds.add(id);
+          notifs.push({ id, ...item });
+        }
       });
 
-      // Auto-reconcile notifications for active loans if missing
+      // Also query by accountNumber if different
+      if (userAccountNumber) {
+        try {
+          const qAcc = query(notifCol, where('userId', '==', userAccountNumber));
+          const snapAcc = await getDocs(qAcc);
+          snapAcc.forEach((d) => {
+            const item = d.data() as NotificationItem;
+            const id = d.id || item.id;
+            if (!notifIds.has(id)) {
+              notifIds.add(id);
+              notifs.push({ id, ...item });
+            }
+          });
+        } catch {}
+      }
+
+      // Auto-reconcile notifications for active approved loans if missing
       try {
         const loansCol = collection(db, 'loans');
-        const qLoans = query(loansCol, where('userId', '==', userId));
-        const loansSnap = await getDocs(qLoans);
-        loansSnap.forEach((lDoc) => {
-          const lData = lDoc.data() as LoanApplication;
+        const candidateLoans: LoanApplication[] = [];
+        try {
+          const qLoans = query(loansCol, where('userId', '==', userId));
+          const loansSnap = await getDocs(qLoans);
+          loansSnap.forEach((lDoc) => candidateLoans.push(lDoc.data() as LoanApplication));
+        } catch {}
+
+        if (userAccountNumber) {
+          try {
+            const qAcc = query(loansCol, where('permanentAccountNumber', '==', userAccountNumber));
+            const snapAcc = await getDocs(qAcc);
+            snapAcc.forEach((lDoc) => {
+              const lData = lDoc.data() as LoanApplication;
+              if (!candidateLoans.some((x) => x.id === lData.id)) {
+                candidateLoans.push(lData);
+              }
+            });
+          } catch {}
+        }
+
+        // Check local storage for active loans
+        try {
+          const raw = localStorage.getItem('monvera_permanent_loans');
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              parsed.forEach((l: LoanApplication) => {
+                const matches = l.userId === userId ||
+                  (userAccountNumber && l.permanentAccountNumber === userAccountNumber) ||
+                  (userEmail && l.applicantEmail?.toLowerCase() === userEmail.toLowerCase());
+                if (matches && !candidateLoans.some((x) => x.id === l.id)) {
+                  candidateLoans.push(l);
+                }
+              });
+            }
+          }
+        } catch {}
+
+        candidateLoans.forEach((lData) => {
           if (lData.status === 'ACTIVE' || lData.status === 'APPROVED') {
             const hasLoanNotif = notifs.some(
               (n) =>
                 n.referenceId === lData.id ||
                 n.id.includes(lData.id) ||
-                (n.title && n.title.includes('Loan Approved') && n.message?.includes(lData.amount?.toString()))
+                (n.title && n.title.includes('Loan Approved') && n.message?.includes(Number(lData.amount || 0).toLocaleString('en-US')))
             );
             if (!hasLoanNotif) {
               const loanNotif: NotificationItem = {
                 id: `notif_loan_appr_${lData.id}`,
                 userId,
                 title: '🎉 Loan Approved & Disbursed!',
-                message: `Congratulations! Your loan application for $${Number(lData.amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} has been approved and the capital has been credited directly into your Checking Account.`,
+                message: `Congratulations! Your credit facility for $${Number(lData.amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} has been approved and the capital has been credited directly into your Checking Account.`,
                 type: 'TRANSACTION',
                 severity: 'success',
                 read: false,
@@ -444,6 +498,34 @@ export const firestoreSync = {
     } catch (err) {
       console.warn('[Firestore] Error fetching user notifications:', err);
       return [];
+    }
+  },
+
+  /**
+   * Real-time subscription to notifications for a user
+   */
+  subscribeToNotifications(
+    userId: string,
+    onUpdate: (notifs: NotificationItem[]) => void,
+    userAccountNumber?: string,
+    userEmail?: string
+  ): () => void {
+    if (!userId || !db) return () => {};
+
+    // Initial load
+    this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
+
+    try {
+      const notifCol = collection(db, 'notifications');
+      const unsubscribe = onSnapshot(notifCol, () => {
+        this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
+      }, (err) => {
+        console.warn('[Firestore] notifications subscription note:', err);
+      });
+      return unsubscribe;
+    } catch (err) {
+      console.warn('[Firestore] subscribeToNotifications setup note:', err);
+      return () => {};
     }
   },
 
@@ -811,22 +893,58 @@ export const firestoreSync = {
         // Reconciliation check: ensure all active approved loans for this user are credited
         try {
           const loansCol = collection(db, 'loans');
-          const qLoans = query(loansCol, where('userId', '==', userId));
-          const loansSnap = await getDocs(qLoans);
-          if (!loansSnap.empty) {
+          const candidateLoans: LoanApplication[] = [];
+          try {
+            const qLoans = query(loansCol, where('userId', '==', userId));
+            const snap = await getDocs(qLoans);
+            snap.forEach((d) => candidateLoans.push(d.data() as LoanApplication));
+          } catch {}
+
+          if (userAccountNumber) {
+            try {
+              const qAcc = query(loansCol, where('permanentAccountNumber', '==', userAccountNumber));
+              const snapAcc = await getDocs(qAcc);
+              snapAcc.forEach((d) => {
+                const item = d.data() as LoanApplication;
+                if (!candidateLoans.some((x) => x.id === item.id)) {
+                  candidateLoans.push(item);
+                }
+              });
+            } catch {}
+          }
+
+          try {
+            const localRaw = localStorage.getItem('monvera_permanent_loans');
+            if (localRaw) {
+              const parsed = JSON.parse(localRaw);
+              if (Array.isArray(parsed)) {
+                parsed.forEach((l: LoanApplication) => {
+                  const matches = l.userId === userId ||
+                    (userAccountNumber && l.permanentAccountNumber === userAccountNumber);
+                  if (matches && !candidateLoans.some((x) => x.id === l.id)) {
+                    candidateLoans.push(l);
+                  }
+                });
+              }
+            }
+          } catch {}
+
+          if (candidateLoans.length > 0) {
             let uncreditedLoanSum = 0;
             let activeLoansTotal = 0;
+            let totalDisbursedForActiveLoans = 0;
             const creditedLoans: string[] = Array.isArray(data.creditedLoans) ? [...data.creditedLoans] : [];
             let needsSync = false;
 
-            loansSnap.forEach((lDoc) => {
-              const l = lDoc.data() as LoanApplication;
+            candidateLoans.forEach((l) => {
               if (l.status === 'ACTIVE' || l.status === 'APPROVED') {
                 const repBal = Number(l.remainingBalance ?? l.totalRepaymentAmount ?? (l.amount * 1.20));
                 activeLoansTotal += repBal;
+                const disAmt = Number(l.disbursedAmount || l.amount || 0);
+                totalDisbursedForActiveLoans += disAmt;
 
                 if (!creditedLoans.includes(l.id)) {
-                  uncreditedLoanSum += Number(l.disbursedAmount || l.amount || 0);
+                  uncreditedLoanSum += disAmt;
                   creditedLoans.push(l.id);
                   needsSync = true;
                 }
@@ -842,6 +960,16 @@ export const firestoreSync = {
               chk += uncreditedLoanSum;
               avail += uncreditedLoanSum;
               total += uncreditedLoanSum;
+              needsSync = true;
+            }
+
+            // Absolute check: If active approved loans exist, checking account balance must reflect the disbursed amount
+            if (totalDisbursedForActiveLoans > 0 && chk < totalDisbursedForActiveLoans) {
+              const shortfall = totalDisbursedForActiveLoans - chk;
+              chk += shortfall;
+              avail += shortfall;
+              total += shortfall;
+              needsSync = true;
             }
 
             if (needsSync) {
@@ -1559,6 +1687,11 @@ export const firestoreSync = {
         accRef,
         async (snap) => {
           if (snap.exists()) {
+            const reconciled = await this.getAccountBalances(userId, userAccountNumber);
+            if (reconciled) {
+              onUpdate(reconciled);
+              return;
+            }
             const data = snap.data();
             const chk = Number(data.checkingBalance ?? 0);
             const sav = Number(data.savingsBalance ?? data.savings ?? 0);

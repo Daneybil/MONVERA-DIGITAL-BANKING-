@@ -683,16 +683,17 @@ app.post('/api/stripe/webhook', async (req: Request, res: Response) => {
         },
       });
 
-      if (depResult.success) {
-        serverNotificationDispatcher.dispatchNotification({
+      if (depResult.success && depResult.transaction) {
+        const tx = depResult.transaction;
+        serverNotificationDispatcher.dispatch({
+          transactionId: tx.id,
+          referenceNumber: tx.referenceNumber,
+          type: 'MONEY_RECEIVED',
           userId,
-          title: 'Deposit Settled via Stripe',
-          message: `+$${amount.toLocaleString('en-US', {
-            minimumFractionDigits: 2,
-          })} has been credited to your Monvera Checking Account from your debit card.`,
-          type: 'TRANSACTION',
-          severity: 'success',
-        });
+          amount,
+          currency: 'USD',
+          accountMasked: 'Monvera Checking',
+        }).catch(() => {});
       }
     }
   }
@@ -718,11 +719,11 @@ app.get('/api/stripe/confirm-session', async (req: Request, res: Response) => {
       const userId = session.client_reference_id || session.metadata?.userId;
       const amountStr = session.metadata?.amount;
       const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
-      const destinationAccountType = session.metadata?.destinationAccountType || 'CHECKING';
+      const destinationAccountType: 'CHECKING' | 'SAVINGS' = session.metadata?.destinationAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
 
       if (userId && amount > 0) {
         // Check if already deposited
-        const existingTx = Array.from(db.transactions.values()).find(
+        const existingTx = db.transactions.find(
           (t) => t.paymentProviderRef === `STRIPE-${session.id}`
         );
 
@@ -1043,9 +1044,23 @@ app.post('/api/cards/:id/update-limits', (req: Request, res: Response) => {
 // --- NOTIFICATIONS & SECURITY ---
 app.get('/api/notifications', (req: Request, res: Response) => {
   const userId = req.query.userId as string;
+  const accountNumber = req.query.accountNumber as string;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-  const userNotifs = db.notifications.filter((n) => n.userId === userId);
+  const matchedUserIds = new Set<string>([userId]);
+  const user = db.users.get(userId) || Array.from(db.users.values()).find(
+    (u) =>
+      u.id === userId ||
+      (accountNumber && u.permanentAccountNumber === accountNumber) ||
+      (userId.includes('@') && u.email.toLowerCase() === userId.toLowerCase())
+  );
+  if (user) {
+    matchedUserIds.add(user.id);
+    if (user.permanentAccountNumber) matchedUserIds.add(user.permanentAccountNumber);
+  }
+  if (accountNumber) matchedUserIds.add(accountNumber);
+
+  const userNotifs = db.notifications.filter((n) => matchedUserIds.has(n.userId) || n.userId === 'all');
   // Sort latest first
   userNotifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   res.json({ notifications: userNotifs });

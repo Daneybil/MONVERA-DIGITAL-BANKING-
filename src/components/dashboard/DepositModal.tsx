@@ -21,7 +21,7 @@ import {
 
 export const DepositModal: React.FC = () => {
   const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications } = useAuth();
-  const [depositMethod, setDepositMethod] = useState<'CARD' | 'ACH' | 'WIRE' | 'INSTANT_PAY' | 'CRYPTO_WALLET'>('CARD');
+  const [depositMethod, setDepositMethod] = useState<'CARD' | 'CRYPTO_WALLET'>('CARD');
   const [destinationAccount, setDestinationAccount] = useState<'CHECKING' | 'SAVINGS'>('CHECKING');
   const [amount, setAmount] = useState<string>('5000');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -29,25 +29,7 @@ export const DepositModal: React.FC = () => {
   const [isSuccess, setIsSuccess] = useState(false);
   const [paymentRef, setPaymentRef] = useState<string | null>(null);
 
-  // Web3 / Crypto State
-  const [cryptoWalletConnected, setCryptoWalletConnected] = useState(false);
-  const [selectedWalletProvider, setSelectedWalletProvider] = useState<'MetaMask' | 'Coinbase' | 'WalletConnect' | 'TrustWallet'>('MetaMask');
-  const [selectedCryptoNetwork, setSelectedCryptoNetwork] = useState<'Ethereum' | 'Polygon' | 'Arbitrum' | 'BSC'>('Ethereum');
-  const [selectedCryptoToken, setSelectedCryptoToken] = useState<'USDT' | 'USDC' | 'ETH'>('USDT');
-  const [connectedWalletAddress, setConnectedWalletAddress] = useState<string>('0x71C...8B3e');
-  const [isConnectingWallet, setIsConnectingWallet] = useState(false);
-
   if (activeModal !== 'deposit' || !currentUser) return null;
-
-  const handleConnectWallet = () => {
-    setIsConnectingWallet(true);
-    setTimeout(() => {
-      const randomHex = `0x${Math.random().toString(16).substring(2, 6)}...${Math.random().toString(16).substring(2, 6)}`;
-      setConnectedWalletAddress(randomHex);
-      setCryptoWalletConnected(true);
-      setIsConnectingWallet(false);
-    }, 600);
-  };
 
   const handleDepositSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -57,8 +39,8 @@ export const DepositModal: React.FC = () => {
       return;
     }
 
-    if (depositMethod === 'CRYPTO_WALLET' && !cryptoWalletConnected) {
-      setErrorMessage('Please connect your Web3 Crypto Wallet first.');
+    if (depositMethod === 'CRYPTO_WALLET') {
+      setErrorMessage('Cryptocurrency Web3 Deposit is coming soon. Please use Debit Card / Credit Card via Stripe.');
       return;
     }
 
@@ -66,40 +48,52 @@ export const DepositModal: React.FC = () => {
     setIsProcessing(true);
 
     try {
-      const providerPaymentId = `GATEWAY-${depositMethod}-${Math.floor(100000 + Math.random() * 900000)}`;
-      const res = await api.createDeposit({
+      // 1. Try Stripe Checkout Session
+      const stripeRes = await api.createStripeCheckoutSession({
         userId: currentUser.id,
         amount: numAmount,
-        method: depositMethod,
         destinationAccountType: destinationAccount,
-        providerPaymentId,
-        metadata:
-          depositMethod === 'CRYPTO_WALLET'
-            ? {
-                walletProvider: selectedWalletProvider,
-                network: selectedCryptoNetwork,
-                token: selectedCryptoToken,
-                walletAddress: connectedWalletAddress,
-              }
-            : undefined,
       });
 
-      if (res.success && res.transaction) {
-        setIsSuccess(true);
-        setPaymentRef(res.transaction.referenceNumber);
-        await refreshBalance();
-        await refreshNotifications();
-        confetti({
-          particleCount: 80,
-          spread: 70,
-          origin: { y: 0.6 },
-          colors: ['#059669', '#10b981', '#0f172a', '#3b82f6'],
-        });
-      } else {
-        setErrorMessage(res.error || "We couldn't complete your deposit. Please try again.");
+      if (stripeRes.success && stripeRes.url) {
+        // Automatically redirects them to Stripe Checkout
+        window.location.href = stripeRes.url;
+        return;
       }
+
+      // If Stripe secret key is not yet set in environment, handle graceful fallback deposit
+      if (stripeRes.configured === false) {
+        const providerPaymentId = `CARD-STRIPE-DEMO-${Math.floor(100000 + Math.random() * 900000)}`;
+        const res = await api.createDeposit({
+          userId: currentUser.id,
+          amount: numAmount,
+          method: 'CARD',
+          destinationAccountType: destinationAccount,
+          providerPaymentId,
+          metadata: {
+            gateway: 'Stripe',
+            info: 'Demo card deposit - please add STRIPE_SECRET_KEY to Railway for live Stripe redirection',
+          },
+        });
+
+        if (res.success && res.transaction) {
+          setIsSuccess(true);
+          setPaymentRef(res.transaction.referenceNumber);
+          await refreshBalance();
+          await refreshNotifications();
+          confetti({
+            particleCount: 80,
+            spread: 70,
+            origin: { y: 0.6 },
+            colors: ['#059669', '#10b981', '#0f172a', '#3b82f6'],
+          });
+          return;
+        }
+      }
+
+      setErrorMessage(stripeRes.error || "We couldn't initialize Stripe checkout. Please try again.");
     } catch (err: any) {
-      setErrorMessage('Failed to connect to payment verification provider.');
+      setErrorMessage('Failed to connect to Stripe payment gateway.');
     } finally {
       setIsProcessing(false);
     }
@@ -212,167 +206,54 @@ export const DepositModal: React.FC = () => {
                 <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
                   2. Select Funding Method
                 </label>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Debit Card / Credit Card (Stripe) */}
                   <button
                     type="button"
                     onClick={() => setDepositMethod('CARD')}
-                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
+                    className={`p-4 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
                       depositMethod === 'CARD'
                         ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
                         : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
                     }`}
                   >
-                    <CreditCard className="w-5 h-5 text-emerald-600 mb-2" />
-                    <div>
-                      <div className="font-bold text-xs text-slate-950">Debit / Credit Card</div>
-                      <div className="text-[10px] text-slate-500 font-medium">Instant Gateway</div>
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setDepositMethod('ACH')}
-                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
-                      depositMethod === 'ACH'
-                        ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
-                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                    }`}
-                  >
-                    <Landmark className="w-5 h-5 text-emerald-600 mb-2" />
-                    <div>
-                      <div className="font-bold text-xs text-slate-950">Bank ACH Transfer</div>
-                      <div className="text-[10px] text-slate-500 font-medium">US Bank Link</div>
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setDepositMethod('WIRE')}
-                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
-                      depositMethod === 'WIRE'
-                        ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
-                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                    }`}
-                  >
-                    <ShieldCheck className="w-5 h-5 text-emerald-600 mb-2" />
-                    <div>
-                      <div className="font-bold text-xs text-slate-950">Domestic FedWire</div>
-                      <div className="text-[10px] text-slate-500 font-medium">Same-Day Sovereign</div>
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setDepositMethod('INSTANT_PAY')}
-                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
-                      depositMethod === 'INSTANT_PAY'
-                        ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
-                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                    }`}
-                  >
-                    <RefreshCw className="w-5 h-5 text-emerald-600 mb-2" />
-                    <div>
-                      <div className="font-bold text-xs text-slate-950">Instant RTP</div>
-                      <div className="text-[10px] text-slate-500 font-medium">Real-Time Rails</div>
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setDepositMethod('CRYPTO_WALLET')}
-                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between col-span-2 sm:col-span-2 ${
-                      depositMethod === 'CRYPTO_WALLET'
-                        ? 'bg-indigo-50/90 border-indigo-600 text-slate-950 ring-2 ring-indigo-500/20 shadow-sm'
-                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-                    }`}
-                  >
                     <div className="flex items-center justify-between mb-2">
-                      <Wallet className="w-5 h-5 text-indigo-600" />
-                      <span className="text-[10px] font-black font-mono px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800">
-                        WEB3 CRYPTO
+                      <div className="w-9 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shadow-xs">
+                        <CreditCard className="w-5 h-5 text-white" />
+                      </div>
+                      <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800">
+                        Stripe Instant
                       </span>
                     </div>
                     <div>
-                      <div className="font-bold text-xs text-slate-950">Crypto Wallet Deposit</div>
-                      <div className="text-[10px] text-slate-500 font-medium">
-                        {cryptoWalletConnected ? `Connected: ${connectedWalletAddress}` : 'Connect Wallet (USDT / USDC / ETH)'}
+                      <div className="font-bold text-sm text-slate-950">Debit Card / Credit Card</div>
+                      <div className="text-[11px] text-slate-500 font-medium mt-0.5">
+                        Direct secure payment through Stripe checkout
                       </div>
                     </div>
                   </button>
+
+                  {/* Cryptocurrency Deposit Web3 (Coming Soon) */}
+                  <div className="p-4 rounded-2xl border-2 border-slate-200 bg-slate-50/80 text-left flex flex-col justify-between opacity-85 select-none relative overflow-hidden">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="w-9 h-9 rounded-xl bg-slate-200 text-slate-600 flex items-center justify-center">
+                        <Coins className="w-5 h-5 text-slate-700" />
+                      </div>
+                      <span className="text-[11px] font-black uppercase tracking-wider px-2.5 py-1 rounded-full bg-amber-500 text-slate-950 shadow-xs">
+                        Coming soon
+                      </span>
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-sm text-slate-900">Cryptocurrency Deposit Web3</span>
+                      </div>
+                      <div className="text-[11px] text-slate-500 font-medium mt-0.5">
+                        Web3 wallet & crypto deposits arriving in next release
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
-
-              {/* Web3 Crypto Details Box when Crypto is selected */}
-              {depositMethod === 'CRYPTO_WALLET' && (
-                <div className="p-4 sm:p-5 rounded-2xl bg-indigo-50/70 border-2 border-indigo-200 space-y-4 animate-in fade-in">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Coins className="w-4 h-4 text-indigo-600" />
-                      <span className="text-xs font-black text-indigo-950 uppercase font-mono">Web3 Wallet Configuration</span>
-                    </div>
-                    {cryptoWalletConnected ? (
-                      <span className="flex items-center gap-1.5 text-xs font-mono font-bold text-emerald-700 bg-emerald-100 px-2.5 py-0.5 rounded-full">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                        Connected
-                      </span>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={handleConnectWallet}
-                        disabled={isConnectingWallet}
-                        className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs transition-colors flex items-center gap-1.5 shadow-sm cursor-pointer"
-                      >
-                        <Link className="w-3.5 h-3.5" />
-                        {isConnectingWallet ? 'Connecting...' : 'Connect Wallet'}
-                      </button>
-                    )}
-                  </div>
-
-                  {cryptoWalletConnected ? (
-                    <div className="space-y-3">
-                      <div className="grid grid-cols-3 gap-2 text-xs">
-                        <div className="p-2.5 rounded-xl bg-white border border-indigo-100">
-                          <span className="text-[10px] text-slate-500 block font-mono">Wallet</span>
-                          <span className="font-bold text-slate-900 font-mono">{connectedWalletAddress}</span>
-                        </div>
-                        <div className="p-2.5 rounded-xl bg-white border border-indigo-100">
-                          <span className="text-[10px] text-slate-500 block font-mono">Token</span>
-                          <select
-                            value={selectedCryptoToken}
-                            onChange={(e) => setSelectedCryptoToken(e.target.value as any)}
-                            className="font-bold text-slate-900 font-mono bg-transparent w-full cursor-pointer focus:outline-none"
-                          >
-                            <option value="USDT">USDT (Tether)</option>
-                            <option value="USDC">USDC (USD Coin)</option>
-                            <option value="ETH">ETH (Ethereum)</option>
-                          </select>
-                        </div>
-                        <div className="p-2.5 rounded-xl bg-white border border-indigo-100">
-                          <span className="text-[10px] text-slate-500 block font-mono">Network</span>
-                          <select
-                            value={selectedCryptoNetwork}
-                            onChange={(e) => setSelectedCryptoNetwork(e.target.value as any)}
-                            className="font-bold text-slate-900 font-mono bg-transparent w-full cursor-pointer focus:outline-none"
-                          >
-                            <option value="Ethereum">ERC-20</option>
-                            <option value="Polygon">Polygon</option>
-                            <option value="Arbitrum">Arbitrum</option>
-                            <option value="BSC">BNB Chain</option>
-                          </select>
-                        </div>
-                      </div>
-                      <div className="text-[11px] text-indigo-900 font-medium flex items-center gap-1.5">
-                        <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Instant 1:1 auto-conversion to USD credited directly to your selected bank account.</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="text-xs text-indigo-800 font-medium">
-                      Click <strong className="font-bold">Connect Wallet</strong> to link your MetaMask, Coinbase, or Trust Wallet and authorize instant stablecoin funding.
-                    </div>
-                  )}
-                </div>
-              )}
 
               {/* 3. Amount Input */}
               <div className="space-y-2">
@@ -461,7 +342,7 @@ export const DepositModal: React.FC = () => {
                 <div className="flex items-center justify-between">
                   <span className="text-slate-500 font-sans">Method:</span>
                   <span className="text-slate-800 font-sans font-semibold">
-                    {depositMethod === 'CRYPTO_WALLET' ? `Web3 Wallet (${selectedCryptoToken})` : `${depositMethod} Protocol`}
+                    {depositMethod === 'CARD' ? 'Debit / Credit Card (Stripe Gateway)' : 'Web3 Crypto Gateway'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between pt-2 border-t border-slate-200">

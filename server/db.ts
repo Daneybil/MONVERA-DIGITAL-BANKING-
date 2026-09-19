@@ -783,7 +783,7 @@ export class MonveraDatabase {
   }
 
   public reverseWithdrawal(txIdOrRef: string): { success: boolean; transaction?: Transaction; error?: string } {
-    const tx = this.transactions.get(txIdOrRef) || Array.from(this.transactions.values()).find(t => t.referenceNumber === txIdOrRef || t.id === txIdOrRef);
+    const tx = this.transactions.find(t => t.referenceNumber === txIdOrRef || t.id === txIdOrRef);
     if (!tx) return { success: false, error: 'Transaction not found.' };
     if (tx.status !== 'PENDING') {
       return { success: false, error: `Transaction is already ${tx.status}.` };
@@ -796,10 +796,9 @@ export class MonveraDatabase {
       reversedAt: new Date().toISOString(),
       reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
     };
-    this.transactions.set(tx.id, tx);
 
     const targetUserId = tx.userId || tx.senderUserId || 'usr_eleanor';
-    const recipientAccountId = tx.senderAccountId || `acc_chk_${targetUserId}`;
+    const recipientAccountId = (tx as any).senderAccountId || `acc_chk_${targetUserId}`;
 
     // Create a CREDIT ledger entry to reverse the debit and restore the checking balance
     this.recordLedgerTransaction({
@@ -840,7 +839,7 @@ export class MonveraDatabase {
   public checkAndExecuteScheduledReversals(): number {
     let count = 0;
     const now = Date.now();
-    for (const tx of this.transactions.values()) {
+    for (const tx of this.transactions) {
       if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING') {
         const isAuto = tx.metadata?.autoReverse !== false;
         const scheduledTime = tx.metadata?.reversalScheduledAt ? new Date(tx.metadata.reversalScheduledAt).getTime() : 0;
@@ -2267,6 +2266,13 @@ export class MonveraDatabase {
       referenceId: loan.id,
     };
     this.notifications.unshift(notifItem);
+    if (loan.userId && loan.userId !== user.id) {
+      this.notifications.unshift({
+        ...notifItem,
+        id: `notif_${Date.now()}_loan_appr_alt`,
+        userId: loan.userId,
+      });
+    }
 
     // Admin Audit Log
     this.auditLogs.unshift({
