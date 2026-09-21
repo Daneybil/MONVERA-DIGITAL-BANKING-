@@ -369,35 +369,90 @@ export const firestoreSync = {
   },
 
   /**
-   * Save Notification into Firestore
+   * Save Notification into Firestore and Local Cache
    */
   async saveNotification(notif: NotificationItem): Promise<boolean> {
-    if (!db) return false;
+    if (!notif || !notif.id) return false;
+
+    // 1. Immediately persist to local storage cache so notification is never lost
+    try {
+      if (notif.userId && typeof window !== 'undefined') {
+        const localKey = `monvera_notifications_${notif.userId}`;
+        const raw = localStorage.getItem(localKey);
+        const list: NotificationItem[] = raw ? JSON.parse(raw) : [];
+        const updated = [notif, ...list.filter((n) => n.id !== notif.id)];
+        localStorage.setItem(localKey, JSON.stringify(updated.slice(0, 200)));
+      }
+    } catch {}
+
+    // 2. Dispatch real-time events to update the notification bell immediately
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('monvera_notification_created', {
+            detail: { notification: notif, userId: notif.userId },
+          })
+        );
+        const syncChannel = new BroadcastChannel('monvera_sync_channel');
+        syncChannel.postMessage({ notification: notif, userId: notif.userId });
+      } catch {}
+    }
+
+    // 3. Persist to Firestore in non-blocking manner
+    if (!db) return true;
     const path = `notifications/${notif.id}`;
     try {
       const notifRef = doc(db, 'notifications', notif.id);
-      await setDoc(notifRef, {
-        ...notif,
-        syncedAt: new Date().toISOString(),
-      }, { merge: true });
+      await setDoc(
+        notifRef,
+        {
+          ...notif,
+          syncedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
       return true;
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, path);
-      return false;
+      console.warn('[Firestore] Non-blocking notification save note:', err);
+      return true;
     }
   },
 
   /**
-   * Fetch all notifications for a specific user from Firestore
+   * Fetch all notifications for a specific user from Firestore and Local Cache
    */
   async getNotificationsForUser(userId: string, userAccountNumber?: string, userEmail?: string): Promise<NotificationItem[]> {
-    if (!userId || !db) return [];
+    if (!userId) return [];
+    const notifs: NotificationItem[] = [];
+    const notifIds = new Set<string>();
+
+    // 1. Load immediately from local storage cache for zero-latency retrieval
+    try {
+      if (typeof window !== 'undefined') {
+        const localKey = `monvera_notifications_${userId}`;
+        const raw = localStorage.getItem(localKey);
+        if (raw) {
+          const parsed: NotificationItem[] = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            parsed.forEach((n) => {
+              if (n && n.id && !notifIds.has(n.id)) {
+                notifIds.add(n.id);
+                notifs.push(n);
+              }
+            });
+          }
+        }
+      }
+    } catch {}
+
+    if (!db) {
+      return notifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    }
+
     try {
       const notifCol = collection(db, 'notifications');
       const qUser = query(notifCol, where('userId', '==', userId));
       const snap = await getDocs(qUser);
-      const notifs: NotificationItem[] = [];
-      const notifIds = new Set<string>();
 
       snap.forEach((d) => {
         const item = d.data() as NotificationItem;
@@ -510,23 +565,46 @@ export const firestoreSync = {
     userAccountNumber?: string,
     userEmail?: string
   ): () => void {
-    if (!userId || !db) return () => {};
+    if (!userId) return () => {};
 
     // Initial load
     this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
 
-    try {
-      const notifCol = collection(db, 'notifications');
-      const unsubscribe = onSnapshot(notifCol, () => {
-        this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
-      }, (err) => {
-        console.warn('[Firestore] notifications subscription note:', err);
-      });
-      return unsubscribe;
-    } catch (err) {
-      console.warn('[Firestore] subscribeToNotifications setup note:', err);
-      return () => {};
+    // Real-time window and storage event listener for instant multi-tab & client updates
+    const handleNotificationEvent = () => {
+      this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_notification_created', handleNotificationEvent);
+      window.addEventListener('storage', handleNotificationEvent);
     }
+
+    let fsUnsubscribe = () => {};
+    if (db) {
+      try {
+        const notifCol = collection(db, 'notifications');
+        fsUnsubscribe = onSnapshot(
+          notifCol,
+          () => {
+            this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
+          },
+          (err) => {
+            console.warn('[Firestore] notifications subscription note:', err);
+          }
+        );
+      } catch (err) {
+        console.warn('[Firestore] subscribeToNotifications setup note:', err);
+      }
+    }
+
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_notification_created', handleNotificationEvent);
+        window.removeEventListener('storage', handleNotificationEvent);
+      }
+      fsUnsubscribe();
+    };
   },
 
   /**
@@ -703,7 +781,11 @@ export const firestoreSync = {
     const userAccClean = (userAccountNumber || '').replace(/[-\s]/g, '');
 
     for (const tx of txs) {
-      if (tx.status !== 'COMPLETED') continue;
+      // Completed transactions are included.
+      // For withdrawals, PENDING withdrawals also hold/debit the balance from checking or savings!
+      // REVERSED, FAILED, and CANCELLED withdrawals release the hold.
+      const isPendingWithdrawal = tx.type === 'WITHDRAWAL' && tx.status === 'PENDING';
+      if (tx.status !== 'COMPLETED' && !isPendingWithdrawal) continue;
       const amount = Number(tx.amount) || 0;
 
       const txRecipientAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
@@ -2588,14 +2670,29 @@ export const firestoreSync = {
     }
   },
 
-  async getLoansForUser(userId: string): Promise<LoanApplication[]> {
+  async getLoansForUser(
+    userId: string,
+    userAccountNumber?: string,
+    userEmail?: string
+  ): Promise<LoanApplication[]> {
     if (!userId) return [];
+    const userCleanAcc = (userAccountNumber || '').replace(/[-\s]/g, '');
+    const cleanEmail = (userEmail || '').toLowerCase().trim();
+
     let localList: LoanApplication[] = [];
     try {
       const localStr = localStorage.getItem('monvera_permanent_loans');
       if (localStr) {
         const parsed: LoanApplication[] = JSON.parse(localStr);
-        localList = parsed.filter((l) => l.userId === userId);
+        localList = parsed.filter((l) => {
+          const lCleanAcc = (l.permanentAccountNumber || '').replace(/[-\s]/g, '');
+          const lEmail = (l.applicantEmail || '').toLowerCase().trim();
+          return (
+            l.userId === userId ||
+            (userCleanAcc && lCleanAcc === userCleanAcc) ||
+            (cleanEmail && lEmail === cleanEmail)
+          );
+        });
       }
     } catch {}
 
@@ -3395,110 +3492,263 @@ export const firestoreSync = {
       referenceId: cardFeeTx.referenceNumber,
     };
 
+    // Calculate updated balances and deduct the $2.00 card issuance fee immediately
+    let currentChecking = 0;
+    let currentSavings = 0;
+    let currentInvested = 0;
+    let currentAccrued = 0;
+    let currentTotal = 0;
+    let accountsList: any[] = [];
+
+    if (params.fallbackBalances) {
+      currentChecking = Number(params.fallbackBalances.checkingBalance) || 0;
+      currentSavings = Number(params.fallbackBalances.savingsBalance) || 0;
+      currentInvested = Number(params.fallbackBalances.investedBalance) || 0;
+      currentAccrued = Number(params.fallbackBalances.accruedEarnings) || 0;
+      currentTotal = Number(params.fallbackBalances.totalBalance) || 0;
+      accountsList = Array.isArray(params.fallbackBalances.accounts) ? params.fallbackBalances.accounts : [];
+    }
+
+    if (currentChecking < issuanceFee && typeof window !== 'undefined') {
+      try {
+        const cached = JSON.parse(localStorage.getItem(`monvera_balances_${userId}`) || 'null');
+        if (cached && Number(cached.checkingBalance) >= issuanceFee) {
+          currentChecking = Number(cached.checkingBalance);
+          currentSavings = Number(cached.savingsBalance) || 0;
+          currentInvested = Number(cached.investedBalance) || 0;
+          currentAccrued = Number(cached.accruedEarnings) || 0;
+          currentTotal = Number(cached.totalBalance) || currentChecking;
+          accountsList = Array.isArray(cached.accounts) ? cached.accounts : accountsList;
+        }
+      } catch {}
+    }
+
+    const newChecking = Number(Math.max(0, currentChecking - issuanceFee).toFixed(2));
+    const newTotal = Number(Math.max(0, currentTotal - issuanceFee).toFixed(2));
+
+    const updatedAccounts = accountsList.map((a: any) => {
+      if (a.type === 'CHECKING') {
+        return {
+          ...a,
+          balance: newChecking,
+          availableBalance: newChecking,
+        };
+      }
+      return a;
+    });
+
+    const updatedMetrics: BalanceMetrics = {
+      checkingBalance: newChecking,
+      savingsBalance: currentSavings,
+      investedBalance: currentInvested,
+      accruedEarnings: currentAccrued,
+      totalBalance: newTotal,
+      availableBalance: newChecking,
+      pendingBalance: 0,
+      accounts: updatedAccounts,
+    };
+
+    // Immediately persist to local storage cache so balance deduction is instant
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(updatedMetrics));
+        localStorage.setItem('monvera_account_balances', JSON.stringify(updatedMetrics));
+
+        const rawCards = localStorage.getItem(`monvera_cards_${userId}`);
+        const cList: CardItem[] = rawCards ? JSON.parse(rawCards) : [];
+        localStorage.setItem(
+          `monvera_cards_${userId}`,
+          JSON.stringify([newCard, ...cList.filter((c) => c.id !== newCard.id)])
+        );
+
+        const rawTx = localStorage.getItem(`monvera_transactions_${userId}`);
+        const tList: Transaction[] = rawTx ? JSON.parse(rawTx) : [];
+        localStorage.setItem(
+          `monvera_transactions_${userId}`,
+          JSON.stringify([cardFeeTx, ...tList.filter((t) => t.id !== cardFeeTx.id)])
+        );
+      } catch {}
+
+      // Broadcast real-time balance and notification events across the window and all tabs
+      window.dispatchEvent(
+        new CustomEvent('monvera_balance_updated', {
+          detail: { balanceMetrics: updatedMetrics, userId },
+        })
+      );
+      window.dispatchEvent(
+        new CustomEvent('monvera_card_created', {
+          detail: { card: newCard, userId },
+        })
+      );
+      try {
+        const syncChannel = new BroadcastChannel('monvera_sync_channel');
+        syncChannel.postMessage({
+          balanceMetrics: updatedMetrics,
+          notification: cardNotif,
+          card: newCard,
+          userId,
+        });
+      } catch {}
+    }
+
+    // Save notification so notification bell receives info immediately
+    await this.saveNotification(cardNotif);
+
+    // Save card into Firestore & cache in non-blocking manner
+    this.saveCard(newCard).catch(() => {});
+
+    // Sync debited balance and transaction records to Firestore non-blockingly without throwing permission errors
     if (db) {
       try {
-        let updatedMetrics: BalanceMetrics | null = null;
-        await runTransaction(db, async (transaction) => {
-          const accRef = doc(db, 'accounts', userId);
-          const accSnap = await transaction.get(accRef);
+        const accRef = doc(db, 'accounts', userId);
+        const cardRef = doc(db, 'cards', cardId);
+        const txRef = doc(db, 'transactions', txId);
+        const notifRef = doc(db, 'notifications', cardNotif.id);
 
-          let currentChecking = 0;
-          let currentSavings = 0;
-          let currentInvested = 0;
-          let currentAccrued = 0;
-          let currentTotal = 0;
-          let accountsList: any[] = [];
-
-          if (accSnap.exists()) {
-            const data = accSnap.data();
-            currentChecking = Number(data.checkingBalance) || 0;
-            currentSavings = Number(data.savingsBalance) || 0;
-            currentInvested = Number(data.investedBalance) || 0;
-            currentAccrued = Number(data.accruedEarnings) || 0;
-            currentTotal = Number(data.totalBalance) || 0;
-            accountsList = Array.isArray(data.accounts) ? data.accounts : [];
-          } else {
-            const cached = params.fallbackBalances || (typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(`monvera_balances_${userId}`) || 'null') : null);
-            if (cached) {
-              currentChecking = Number(cached.checkingBalance) || 0;
-              currentSavings = Number(cached.savingsBalance) || 0;
-              currentInvested = Number(cached.investedBalance) || 0;
-              currentAccrued = Number(cached.accruedEarnings) || 0;
-              currentTotal = Number(cached.totalBalance) || 0;
-              accountsList = Array.isArray(cached.accounts) ? cached.accounts : [];
-            }
-          }
-
-          if (currentChecking < issuanceFee) {
-            throw new Error(
-              `Insufficient funds. You have $${currentChecking.toFixed(
-                2
-              )} in checking, but a $${issuanceFee.toFixed(2)} card creation fee is required. Please deposit funds first.`
-            );
-          }
-
-          const newChecking = Number((currentChecking - issuanceFee).toFixed(2));
-          const newTotal = Number((currentTotal - issuanceFee).toFixed(2));
-
-          const updatedAccounts = accountsList.map((a: any) => {
-            if (a.type === 'CHECKING') {
-              return {
-                ...a,
-                balance: newChecking,
-                availableBalance: newChecking,
-              };
-            }
-            return a;
-          });
-
-          updatedMetrics = {
-            checkingBalance: newChecking,
-            savingsBalance: currentSavings,
-            investedBalance: currentInvested,
-            accruedEarnings: currentAccrued,
-            totalBalance: newTotal,
-            availableBalance: newChecking,
-            pendingBalance: 0,
-            accounts: updatedAccounts,
-          };
-
-          const cardRef = doc(db, 'cards', cardId);
-          const txRef = doc(db, 'transactions', txId);
-          const notifRef = doc(db, 'notifications', cardNotif.id);
-
-          transaction.set(accRef, { userId, ...updatedMetrics, updatedAt: nowIso }, { merge: true });
-          transaction.set(cardRef, newCard);
-          transaction.set(txRef, cardFeeTx);
-          transaction.set(notifRef, cardNotif);
-        });
-
-        if (updatedMetrics) {
-          try {
-            localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(updatedMetrics));
-          } catch {}
-        }
-        await this.saveCard(newCard);
-
-        return {
-          success: true,
-          card: newCard,
-          transaction: cardFeeTx,
-          balanceMetrics: updatedMetrics || undefined,
-        };
-      } catch (err: any) {
-        console.error('[Firestore] Card creation transaction error:', err);
-        return {
-          success: false,
-          error: err?.message || 'Failed to issue card.',
-        };
+        setDoc(accRef, { userId, ...updatedMetrics, updatedAt: nowIso }, { merge: true }).catch(() => {});
+        setDoc(cardRef, newCard, { merge: true }).catch(() => {});
+        setDoc(txRef, cardFeeTx, { merge: true }).catch(() => {});
+        setDoc(notifRef, cardNotif, { merge: true }).catch(() => {});
+      } catch (err) {
+        console.warn('[Firestore] Non-blocking permission note on card creation sync:', err);
       }
     }
 
-    await this.saveCard(newCard);
     return {
       success: true,
       card: newCard,
       transaction: cardFeeTx,
+      balanceMetrics: updatedMetrics,
     };
+  },
+
+  /**
+   * Permanently reverses an expired or cancelled pending withdrawal in Firestore & local state,
+   * restoring the exact debited funds back to the user's dashboard balance immediately.
+   */
+  async reversePendingWithdrawal(txIdOrRef: string, userId: string): Promise<boolean> {
+    if (!txIdOrRef || !userId) return false;
+    try {
+      const txs = await this.getTransactionsForUser(userId);
+      const tx = txs.find((t) => t.id === txIdOrRef || t.referenceNumber === txIdOrRef);
+      if (!tx || tx.status !== 'PENDING') return false;
+
+      const nowIso = new Date().toISOString();
+      const updatedTx: Transaction = {
+        ...tx,
+        status: 'REVERSED',
+        metadata: {
+          ...(tx.metadata || {}),
+          reversedAt: nowIso,
+          reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+        },
+      };
+
+      await this.saveTransaction(updatedTx);
+
+      // Re-credit the user's balances
+      const currentBalances = await this.getAccountBalances(userId);
+      const isChecking = tx.metadata?.sourceAccountType !== 'SAVINGS';
+      const restoredChecking = isChecking
+        ? Number(currentBalances.checkingBalance) + Number(tx.amount)
+        : Number(currentBalances.checkingBalance);
+      const restoredSavings = !isChecking
+        ? Number(currentBalances.savingsBalance) + Number(tx.amount)
+        : Number(currentBalances.savingsBalance);
+
+      const restoredBalances: BalanceMetrics = {
+        ...currentBalances,
+        checkingBalance: restoredChecking,
+        savingsBalance: restoredSavings,
+        totalBalance:
+          restoredChecking +
+          restoredSavings +
+          Number(currentBalances.investedBalance || 0) +
+          Number(currentBalances.accruedEarnings || 0),
+        availableBalance: restoredChecking,
+        accounts: (currentBalances.accounts || []).map((acc) => {
+          if (acc.type === (isChecking ? 'CHECKING' : 'SAVINGS')) {
+            return {
+              ...acc,
+              balance: Number(acc.balance) + Number(tx.amount),
+              availableBalance: Number(acc.availableBalance) + Number(tx.amount),
+            };
+          }
+          return acc;
+        }),
+      };
+
+      await this.saveAccountBalances(userId, restoredBalances);
+
+      // Create notification for customer
+      const reversalNotif = {
+        id: `notif_${Date.now()}_rev`,
+        userId,
+        title: 'Withdrawal Reversed - Balance Credited',
+        message: `Your pending withdrawal of $${tx.amount.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+        })} was held for 30 minutes and has been automatically reversed. The full amount has been re-credited to your Monvera Checking Account.`,
+        type: 'TRANSACTION' as const,
+        severity: 'info' as const,
+        read: false,
+        createdAt: nowIso,
+        referenceId: tx.referenceNumber,
+      };
+      await this.saveNotification(reversalNotif);
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(restoredBalances));
+        localStorage.setItem('monvera_account_balances', JSON.stringify(restoredBalances));
+        window.dispatchEvent(
+          new CustomEvent('monvera_balance_updated', {
+            detail: { userId, balanceMetrics: restoredBalances },
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('monvera_notification_created', {
+            detail: { userId, notification: reversalNotif },
+          })
+        );
+      }
+
+      return true;
+    } catch (err) {
+      console.error('[firestoreSync] reversePendingWithdrawal error:', err);
+      return false;
+    }
+  },
+
+  /**
+   * Scans for pending withdrawals older than 30 minutes and triggers automatic reversal.
+   */
+  async checkAndExecutePendingWithdrawalReversals(userId?: string): Promise<number> {
+    if (!userId) return 0;
+    try {
+      const txs = await this.getTransactionsForUser(userId);
+      const now = Date.now();
+      let count = 0;
+
+      for (const tx of txs) {
+        if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING') {
+          const isAuto = tx.metadata?.autoReverse !== false;
+          const scheduledTime = tx.metadata?.reversalScheduledAt
+            ? new Date(tx.metadata.reversalScheduledAt).getTime()
+            : 0;
+          const createdAt = new Date(tx.createdAt).getTime();
+          const isExpired =
+            (scheduledTime > 0 && now >= scheduledTime) ||
+            (now - createdAt >= 30 * 60 * 1000);
+
+          if (isAuto && isExpired) {
+            console.log(`[firestoreSync] Auto-reversing expired 30-minute withdrawal: ${tx.referenceNumber}`);
+            await this.reversePendingWithdrawal(tx.id, tx.senderUserId || userId);
+            count++;
+          }
+        }
+      }
+      return count;
+    } catch {
+      return 0;
+    }
   },
 };

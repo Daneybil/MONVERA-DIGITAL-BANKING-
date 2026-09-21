@@ -138,6 +138,14 @@ export const WithdrawModal: React.FC = () => {
         destinationLabel,
         accountOrIban,
         cardBrand,
+        userAccountNumber: currentUser.permanentAccountNumber,
+        fallbackBalances: balanceMetrics || undefined,
+        fallbackUser: {
+          firstName: currentUser.firstName,
+          lastName: currentUser.lastName,
+          email: currentUser.email,
+          permanentAccountNumber: currentUser.permanentAccountNumber,
+        },
       });
 
       if (res.success && res.transaction) {

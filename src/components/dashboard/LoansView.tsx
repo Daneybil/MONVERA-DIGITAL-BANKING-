@@ -150,8 +150,22 @@ export const LoansView: React.FC = () => {
     description: 'A minimum of $2,000.00 in account transaction volume or deposits is required to unlock your first credit facility.',
   });
 
-  const [loans, setLoans] = useState<LoanApplication[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [loans, setLoans] = useState<LoanApplication[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem('monvera_permanent_loans');
+      if (raw) {
+        const parsed: LoanApplication[] = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+        }
+      }
+    } catch {}
+    return [];
+  });
+  const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
   // Form State
@@ -186,11 +200,20 @@ export const LoansView: React.FC = () => {
     try {
       const [eligRes, loansRes] = await Promise.all([
         api.getLoanEligibility(currentUser.id),
-        api.getLoans(currentUser.id),
+        api.getLoans(currentUser.id, currentUser.permanentAccountNumber, currentUser.email),
       ]);
 
       if (eligRes) setEligibility(eligRes);
-      if (loansRes && loansRes.loans) setLoans(loansRes.loans);
+      if (loansRes && Array.isArray(loansRes.loans)) {
+        setLoans((prev) => {
+          const map = new Map<string, LoanApplication>();
+          prev.forEach((l) => map.set(l.id, l));
+          loansRes.loans.forEach((l) => map.set(l.id, l));
+          return Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+        });
+      }
     } catch (err) {
       console.error('Error loading loan info:', err);
     } finally {
@@ -202,11 +225,72 @@ export const LoansView: React.FC = () => {
     loadData();
 
     if (currentUser?.id) {
+      const userCleanAcc = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const userEmail = (currentUser.email || '').toLowerCase().trim();
+
       const unsubscribe = firestoreSync.subscribeToLoans((allLoans) => {
-        const userLoans = allLoans.filter((l) => l.userId === currentUser.id);
-        setLoans(userLoans);
+        const userLoans = allLoans.filter((l) => {
+          const lCleanAcc = (l.permanentAccountNumber || '').replace(/[-\s]/g, '');
+          const lEmail = (l.applicantEmail || '').toLowerCase().trim();
+          return (
+            l.userId === currentUser.id ||
+            (userCleanAcc && lCleanAcc === userCleanAcc) ||
+            (userEmail && lEmail === userEmail)
+          );
+        });
+        if (userLoans.length > 0) {
+          setLoans((prev) => {
+            const map = new Map<string, LoanApplication>();
+            prev.forEach((l) => map.set(l.id, l));
+            userLoans.forEach((l) => map.set(l.id, l));
+            return Array.from(map.values()).sort(
+              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            );
+          });
+        }
       });
-      return () => unsubscribe();
+
+      const handleLoanUpdated = (e: any) => {
+        const updatedLoan = e.detail?.loan;
+        if (updatedLoan) {
+          setLoans((prev) => {
+            const map = new Map<string, LoanApplication>();
+            prev.forEach((l) => map.set(l.id, l));
+            map.set(updatedLoan.id, updatedLoan);
+            return Array.from(map.values()).sort(
+              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            );
+          });
+        }
+        loadData();
+      };
+
+      const handleStorageChange = (e: StorageEvent) => {
+        if (e.key === 'monvera_permanent_loans' && e.newValue) {
+          try {
+            const list = JSON.parse(e.newValue);
+            if (Array.isArray(list)) {
+              setLoans((prev) => {
+                const map = new Map<string, LoanApplication>();
+                prev.forEach((l) => map.set(l.id, l));
+                list.forEach((l: LoanApplication) => map.set(l.id, l));
+                return Array.from(map.values()).sort(
+                  (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+                );
+              });
+            }
+          } catch {}
+        }
+      };
+
+      window.addEventListener('monvera_loan_updated', handleLoanUpdated);
+      window.addEventListener('storage', handleStorageChange);
+
+      return () => {
+        unsubscribe();
+        window.removeEventListener('monvera_loan_updated', handleLoanUpdated);
+        window.removeEventListener('storage', handleStorageChange);
+      };
     }
   }, [currentUser]);
 
@@ -342,6 +426,16 @@ export const LoansView: React.FC = () => {
       });
 
       if (res.success && res.loan) {
+        const updated = res.loan;
+        setLoans((prev) => {
+          const map = new Map<string, LoanApplication>();
+          prev.forEach((l) => map.set(l.id, l));
+          map.set(updated.id, updated);
+          return Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+        });
+
         setRepayFeedback({
           type: 'success',
           message: res.remainingBalance === 0

@@ -24,6 +24,8 @@ import {
   CreditCard,
   Building,
   UserCheck,
+  RotateCcw,
+  AlertCircle,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 
@@ -626,10 +628,38 @@ export const TransactionsView: React.FC = () => {
                         <span className="text-xs text-slate-500 font-sans ml-1">USD</span>
                       </div>
                       <div className="flex items-center sm:justify-end space-x-1">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                        <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider font-mono">
-                          {tx.status}
-                        </span>
+                        {tx.status === 'COMPLETED' && (
+                          <>
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider font-mono">
+                              Settled
+                            </span>
+                          </>
+                        )}
+                        {tx.status === 'PENDING' && (
+                          <>
+                            <Clock className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
+                            <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider font-mono">
+                              Pending (30m Hold)
+                            </span>
+                          </>
+                        )}
+                        {tx.status === 'REVERSED' && (
+                          <>
+                            <RotateCcw className="w-3.5 h-3.5 text-sky-600" />
+                            <span className="text-[10px] font-bold text-sky-700 uppercase tracking-wider font-mono">
+                              Reversed & Credited
+                            </span>
+                          </>
+                        )}
+                        {tx.status !== 'COMPLETED' && tx.status !== 'PENDING' && tx.status !== 'REVERSED' && (
+                          <>
+                            <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+                            <span className="text-[10px] font-bold text-rose-700 uppercase tracking-wider font-mono">
+                              {tx.status}
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
 

@@ -40,6 +40,7 @@ import {
   Home,
   Send,
   Banknote,
+  Webhook,
 } from 'lucide-react';
 import { AdminOverviewView } from './AdminOverviewView';
 import { AdminCustomersView } from './AdminCustomersView';
@@ -53,6 +54,7 @@ import { AdminDemoFundsView } from './AdminDemoFundsView';
 import { AdminNotificationsView } from './AdminNotificationsView';
 import { AdminAuditLogView } from './AdminAuditLogView';
 import { AdminLoansView } from './AdminLoansView';
+import { AdminWebhooksView } from './AdminWebhooksView';
 import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 
 export const AdminDashboard: React.FC = () => {
@@ -706,6 +708,7 @@ export const AdminDashboard: React.FC = () => {
       blinkingText: pendingLoansCount > 0 ? `${pendingLoansCount} NEW` : (totalLoansCount > 0 ? `${totalLoansCount} LOANS` : undefined),
     },
     { id: 'demo_funds', label: 'Sandbox Test Funds', icon: Coins },
+    { id: 'webhooks', label: 'Webhooks & API', icon: Webhook },
     { id: 'notifications', label: 'Sentinel Alerts', icon: Bell },
     { id: 'audit', label: 'Audit Trail', icon: FileText },
   ];
@@ -974,6 +977,13 @@ export const AdminDashboard: React.FC = () => {
 
         {activeTab === 'notifications' && (
           <AdminNotificationsView
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'webhooks' && (
+          <AdminWebhooksView
+            customers={customers}
             onRefreshData={loadAllAdminData}
           />
         )}

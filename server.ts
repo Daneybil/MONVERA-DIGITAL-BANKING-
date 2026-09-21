@@ -701,6 +701,68 @@ app.post('/api/stripe/webhook', async (req: Request, res: Response) => {
   res.json({ received: true });
 });
 
+// Webhook status endpoint
+app.get('/api/webhooks/status', (req: Request, res: Response) => {
+  const stripeConfigured = isStripeConfigured();
+  const webhookSecretConfigured = Boolean(process.env.STRIPE_WEBHOOK_SECRET);
+  res.json({
+    success: true,
+    stripeConfigured,
+    webhookSecretConfigured,
+    stripeWebhookPath: '/api/stripe/webhook',
+    incomingWebhookPath: '/api/webhooks/incoming',
+    supportedEvents: [
+      'checkout.session.completed',
+      'payment_intent.succeeded',
+      'charge.refunded',
+    ],
+  });
+});
+
+// Generic inbound webhook handler (for custom fintech partners or external aggregators)
+app.post('/api/webhooks/incoming', (req: Request, res: Response) => {
+  const payload = req.body || {};
+  const eventType = payload.event || payload.type || 'generic.webhook';
+  console.log(`[Webhooks Inbound] Event '${eventType}' received:`, JSON.stringify(payload).slice(0, 150));
+
+  res.json({
+    success: true,
+    received: true,
+    event: eventType,
+    processedAt: new Date().toISOString(),
+  });
+});
+
+// Sandbox Webhook Simulator for instant testing
+app.post('/api/webhooks/test-simulate', (req: Request, res: Response) => {
+  const { userId, amount, eventType } = req.body;
+  const targetUser = userId ? db.users.get(userId) : Array.from(db.users.values())[0];
+  if (!targetUser) {
+    return res.status(400).json({ error: 'No customer account found for webhook simulation.' });
+  }
+
+  const depositAmount = Number(amount) || 100.0;
+  const depResult = db.processDeposit({
+    userId: targetUser.id,
+    amount: depositAmount,
+    method: 'CARD',
+    destinationAccountType: 'CHECKING',
+    providerPaymentId: `SIM-WH-${Date.now()}`,
+    metadata: {
+      isSimulation: true,
+      simulatedEvent: eventType || 'checkout.session.completed',
+      timestamp: new Date().toISOString(),
+    },
+  });
+
+  res.json({
+    success: true,
+    message: `Simulated webhook event '${eventType || 'checkout.session.completed'}' processed successfully.`,
+    depositResult: depResult,
+    balanceMetrics: db.getUserBalanceMetrics(targetUser.id),
+  });
+});
+
 // Confirm session callback endpoint for client return
 app.get('/api/stripe/confirm-session', async (req: Request, res: Response) => {
   const sessionId = req.query.session_id as string;
@@ -765,6 +827,9 @@ app.post('/api/withdrawals/create', (req: Request, res: Response) => {
     cardBrand,
     cryptoAsset,
     cryptoNetwork,
+    userAccountNumber,
+    fallbackBalances,
+    fallbackUser,
   } = req.body;
 
   if (!userId || !amount || !destinationLabel || !accountOrIban) {
@@ -782,13 +847,16 @@ app.post('/api/withdrawals/create', (req: Request, res: Response) => {
     cardBrand,
     cryptoAsset,
     cryptoNetwork,
+    userAccountNumber,
+    fallbackBalances,
+    fallbackUser,
   });
 
   if (!result.success) {
     return res.status(400).json({ error: result.error });
   }
 
-  const metrics = db.getUserBalanceMetrics(userId);
+  const metrics = result.balanceMetrics || db.getUserBalanceMetrics(userId);
   res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
 

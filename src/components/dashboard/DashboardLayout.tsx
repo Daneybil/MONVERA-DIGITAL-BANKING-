@@ -482,10 +482,9 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
             >
               <Bell className="w-4 h-4" />
               {unreadNotifsCount > 0 && (
-                <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
-              )}
-              {unreadNotifsCount > 0 && (
-                <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-emerald-600" />
+                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 bg-emerald-600 text-white text-[10px] font-black rounded-full flex items-center justify-center border-2 border-white shadow-xs">
+                  {unreadNotifsCount > 99 ? '99+' : unreadNotifsCount}
+                </span>
               )}
             </button>
 

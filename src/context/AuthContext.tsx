@@ -427,6 +427,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // 5. Fallback interval for polling notifications, balances, and backup KYC status sync
     const interval = setInterval(() => {
+      // Check if any pending 30-minute withdrawals need to be reversed and restored
+      api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
       refreshBalance();
       refreshNotifications();
       refreshProfile();
