@@ -640,7 +640,7 @@ export const TransactionsView: React.FC = () => {
                           <>
                             <Clock className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
                             <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider font-mono">
-                              Pending (30m Hold)
+                              Pending
                             </span>
                           </>
                         )}

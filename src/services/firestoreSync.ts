@@ -3687,7 +3687,7 @@ export const firestoreSync = {
         title: 'Withdrawal Reversed - Balance Credited',
         message: `Your pending withdrawal of $${tx.amount.toLocaleString('en-US', {
           minimumFractionDigits: 2,
-        })} was held for 30 minutes and has been automatically reversed. The full amount has been re-credited to your Monvera Checking Account.`,
+        })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
         type: 'TRANSACTION' as const,
         severity: 'info' as const,
         read: false,

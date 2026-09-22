@@ -15,9 +15,7 @@ import {
   Check,
   Coins,
   Zap,
-  Sparkles,
   Info,
-  Clock,
 } from 'lucide-react';
 
 const COMMON_BANKS = [
@@ -158,6 +156,13 @@ export const WithdrawModal: React.FC = () => {
           sourceAccount: sourceAccount === 'CHECKING' ? 'Premier Checking' : 'Treasury Savings',
           method: 'Instant Debit Card Push',
         });
+        if (res.balanceMetrics && typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId: currentUser.id, balanceMetrics: res.balanceMetrics },
+            })
+          );
+        }
         await refreshBalance();
         await refreshNotifications();
       } else {
@@ -550,26 +555,12 @@ export const WithdrawModal: React.FC = () => {
               </div>
 
               <div className="space-y-1.5">
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-100 text-amber-900 text-xs font-black uppercase tracking-wider border border-amber-300">
-                  <Sparkles className="w-3.5 h-3.5 text-amber-600" /> Debited & Pending Settlement
-                </div>
                 <h3 className="text-2xl sm:text-3xl font-black text-slate-950">Withdrawal Submitted</h3>
                 <div className="text-3xl sm:text-4xl font-black text-slate-950 font-mono">
                   -${numAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
                 <p className="text-xs sm:text-sm text-slate-600 font-medium">
                   {receiptDetails?.destinationLabel} ({receiptDetails?.accountDisplay})
-                </p>
-              </div>
-
-              {/* 30-min Auto-reversal notice */}
-              <div className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-200 text-left text-xs text-amber-900 space-y-1">
-                <div className="font-bold flex items-center gap-1.5 text-amber-950">
-                  <Clock className="w-4 h-4 text-amber-600" />
-                  <span>30-Minute Automatic Reversal Guarantee</span>
-                </div>
-                <p className="text-[11px] text-amber-800 leading-relaxed">
-                  Your checking account has been debited. The payout is pending network confirmation. If the transaction is not settled within 30 minutes, the funds will automatically be reversed and credited back to your account dashboard.
                 </p>
               </div>
 
@@ -594,7 +585,7 @@ export const WithdrawModal: React.FC = () => {
                 </div>
                 <div className="flex items-center justify-between pt-2 border-t border-slate-200">
                   <span className="text-slate-500 font-sans">Status:</span>
-                  <span className="text-amber-700 font-sans font-black">PENDING AUTHORIZATION (DEBITED)</span>
+                  <span className="text-amber-700 font-sans font-black">PENDING</span>
                 </div>
               </div>
 

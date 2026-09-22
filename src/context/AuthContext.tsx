@@ -219,6 +219,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, []);
 
+  const fetchUsers = useCallback(async () => {
+    try {
+      const res = await api.getUsers();
+      if (res.users && res.users.length > 0) {
+        setAvailableUsers(res.users);
+      } else {
+        const fsUsers = await firestoreSync.getAllUsers();
+        if (fsUsers && fsUsers.length > 0) {
+          setAvailableUsers(fsUsers);
+        }
+      }
+    } catch (err) {
+      console.error('Error fetching users:', err);
+      try {
+        const fsUsers = await firestoreSync.getAllUsers();
+        if (fsUsers && fsUsers.length > 0) {
+          setAvailableUsers(fsUsers);
+        }
+      } catch {}
+    }
+  }, []);
+
   // Listen to browser URL changes (e.g. user manually typing /MonveraMV or pressing back/forward)
   useEffect(() => {
     const handleUrlChange = () => {
@@ -234,22 +256,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setCurrentViewState('admin');
     }
 
+    fetchUsers();
+
     return () => {
       window.removeEventListener('popstate', handleUrlChange);
       window.removeEventListener('hashchange', handleUrlChange);
     };
-  }, []);
-
-  const fetchUsers = useCallback(async () => {
-    try {
-      const res = await api.getUsers();
-      if (res.users) {
-        setAvailableUsers(res.users);
-      }
-    } catch (err) {
-      console.error('Error fetching users:', err);
-    }
-  }, []);
+  }, [fetchUsers]);
 
   const refreshBalance = useCallback(async () => {
     if (!currentUser) return;
@@ -974,11 +987,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // If user entered Account Number or Username instead of Email
       if (!cleanIdentifier.includes('@')) {
         // Check if there is a known user in the system with this account number or username
-        const matched = availableUsers.find(
+        let matched = availableUsers.find(
           (u) =>
             u.permanentAccountNumber === cleanIdentifier.replace(/[-\s]/g, '') ||
             u.username.toLowerCase() === cleanIdentifier.toLowerCase()
         );
+
+        // Fallback: If not in local list, lookup directly from Firestore directory
+        if (!matched) {
+          try {
+            const fsUser = await firestoreSync.findRecipient(cleanIdentifier);
+            if (fsUser && fsUser.email) {
+              matched = fsUser;
+            }
+          } catch {}
+        }
+
         if (matched && matched.email) {
           emailToAuth = matched.email;
         } else {

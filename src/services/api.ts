@@ -890,6 +890,22 @@ export const api = {
         }).catch((err) => console.warn('[NotificationDispatcher] Recipient dispatch note:', err));
       }
 
+      // Update local storage and dispatch real-time events immediately for zero-lag response
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(`monvera_balances_${data.senderUserId}`, JSON.stringify(updatedSenderMetrics));
+        localStorage.setItem('monvera_account_balances', JSON.stringify(updatedSenderMetrics));
+        window.dispatchEvent(
+          new CustomEvent('monvera_balance_updated', {
+            detail: { userId: data.senderUserId, balanceMetrics: updatedSenderMetrics },
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('monvera_transaction_created', {
+            detail: { userId: data.senderUserId, transaction: completedTx },
+          })
+        );
+      }
+
       return {
         success: true,
         transaction: completedTx,
@@ -1203,7 +1219,7 @@ export const api = {
         title: 'Withdrawal Pending Authorization',
         message: `-$${withdrawAmount.toLocaleString('en-US', {
           minimumFractionDigits: 2,
-        })} has been debited from your checking account to ${data.destinationLabel} and is held for 30 minutes pending network settlement.`,
+        })} has been debited from your checking account to ${data.destinationLabel} and is currently pending network settlement.`,
         type: 'TRANSACTION' as const,
         severity: 'warning' as const,
         read: false,
