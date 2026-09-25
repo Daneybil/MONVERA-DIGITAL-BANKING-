@@ -21,6 +21,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "firebase": "^12.18.0",
+    "firebase-admin": "^14.5.0",
     "html-to-image": "^1.11.13",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.546.0",

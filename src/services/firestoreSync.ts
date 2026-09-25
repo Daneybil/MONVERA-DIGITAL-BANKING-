@@ -95,6 +95,9 @@ export function isNonExistentAccount(user: { id?: string; email?: string; firstN
   return false;
 }
 
+const inFlightReversals = new Set<string>();
+const inFlightTransfers = new Set<string>();
+
 export const firestoreSync = {
   /**
    * Save or update Customer Profile in Firestore under users/{uid}
@@ -318,7 +321,7 @@ export const firestoreSync = {
       return true;
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, path);
-      return true; // Still return true if local backup succeeded
+      return false;
     }
   },
 
@@ -760,7 +763,7 @@ export const firestoreSync = {
       return true;
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, path);
-      return true;
+      return false;
     }
   },
 
@@ -995,22 +998,6 @@ export const firestoreSync = {
             } catch {}
           }
 
-          try {
-            const localRaw = localStorage.getItem('monvera_permanent_loans');
-            if (localRaw) {
-              const parsed = JSON.parse(localRaw);
-              if (Array.isArray(parsed)) {
-                parsed.forEach((l: LoanApplication) => {
-                  const matches = l.userId === userId ||
-                    (userAccountNumber && l.permanentAccountNumber === userAccountNumber);
-                  if (matches && !candidateLoans.some((x) => x.id === l.id)) {
-                    candidateLoans.push(l);
-                  }
-                });
-              }
-            }
-          } catch {}
-
           if (candidateLoans.length > 0) {
             let uncreditedLoanSum = 0;
             let activeLoansTotal = 0;
@@ -1035,22 +1022,6 @@ export const firestoreSync = {
 
             if (activeLoansTotal !== loanBal && activeLoansTotal > 0) {
               loanBal = activeLoansTotal;
-              needsSync = true;
-            }
-
-            if (uncreditedLoanSum > 0) {
-              chk += uncreditedLoanSum;
-              avail += uncreditedLoanSum;
-              total += uncreditedLoanSum;
-              needsSync = true;
-            }
-
-            // Absolute check: If active approved loans exist, checking account balance must reflect the disbursed amount
-            if (totalDisbursedForActiveLoans > 0 && chk < totalDisbursedForActiveLoans) {
-              const shortfall = totalDisbursedForActiveLoans - chk;
-              chk += shortfall;
-              avail += shortfall;
-              total += shortfall;
               needsSync = true;
             }
 
@@ -1177,7 +1148,7 @@ export const firestoreSync = {
       return cachedMetrics;
     } catch (err) {
       handleFirestoreError(err, OperationType.GET, path);
-      return cachedMetrics;
+      return null;
     }
   },
 
@@ -1767,13 +1738,8 @@ export const firestoreSync = {
       const accRef = doc(db, 'accounts', userId);
       const unsubscribe = onSnapshot(
         accRef,
-        async (snap) => {
+        (snap) => {
           if (snap.exists()) {
-            const reconciled = await this.getAccountBalances(userId, userAccountNumber);
-            if (reconciled) {
-              onUpdate(reconciled);
-              return;
-            }
             const data = snap.data();
             const chk = Number(data.checkingBalance ?? 0);
             const sav = Number(data.savingsBalance ?? data.savings ?? 0);
@@ -2992,16 +2958,7 @@ export const firestoreSync = {
             existingAccountsList = accData.accounts;
           }
         } else {
-          const cached = fallbackBalances || (typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(`monvera_balances_${userId}`) || 'null') : null);
-          if (cached) {
-            currentChecking = Number(cached.checkingBalance ?? cached.availableBalance ?? 0);
-            currentSavings = Number(cached.savingsBalance ?? 0);
-            currentInvested = Number(cached.investedBalance ?? 0);
-            currentAccrued = Number(cached.accruedEarnings ?? 0);
-            if (Array.isArray(cached.accounts)) {
-              existingAccountsList = cached.accounts;
-            }
-          }
+          throw new Error('Authoritative account balance could not be found. Please ensure your account is initialized with valid funds.');
         }
 
         // Validate sufficient checking balance
@@ -3164,6 +3121,14 @@ export const firestoreSync = {
         }
         if (inv.status === 'MATURED') {
           throw new Error('Investment is already matured and settled.');
+        }
+
+        const nowMs = Date.now();
+        const maturityMs = new Date(inv.maturityDate).getTime();
+        if (nowMs < maturityMs) {
+          throw new Error(
+            `EARLY_MATURITY_REJECTED: Investment has not reached maturity date (${inv.maturityDate}). Current time is before maturity. Early settlement is strictly prohibited.`
+          );
         }
 
         payoutTotal = inv.expectedMaturityValue || Number((inv.amount + (inv.expectedYield || 0)).toFixed(2));
@@ -3416,6 +3381,30 @@ export const firestoreSync = {
 
     const issuanceFee = 2.0; // $2.00 card fee
 
+    // 1. Read authoritative Firestore account balance first
+    const authoritativeBalances = await this.getAccountBalances(userId, params.userAccountNumber);
+    const currentMetrics = authoritativeBalances || params.fallbackBalances;
+
+    // 2. Determine actual checking balance from authoritative state (no localStorage financial fallback)
+    const currentChecking = currentMetrics ? Number(currentMetrics.checkingBalance) || 0 : 0;
+    const currentSavings = currentMetrics ? Number(currentMetrics.savingsBalance) || 0 : 0;
+    const currentInvested = currentMetrics ? Number(currentMetrics.investedBalance) || 0 : 0;
+    const currentAccrued = currentMetrics ? Number(currentMetrics.accruedEarnings) || 0 : 0;
+    const currentTotal = currentMetrics ? Number(currentMetrics.totalBalance) || (currentChecking + currentSavings) : 0;
+    const accountsList: any[] = (currentMetrics && Array.isArray(currentMetrics.accounts)) ? currentMetrics.accounts : [];
+
+    // 3. Require checkingBalance >= issuanceFee: reject immediately if insufficient
+    if (currentChecking < issuanceFee) {
+      return {
+        success: false,
+        error: `Insufficient checking balance ($${currentChecking.toFixed(2)}). Card issuance requires a $${issuanceFee.toFixed(2)} account setup fee.`,
+      };
+    }
+
+    // 4. If sufficient: deduct exactly the issuance fee
+    const newChecking = Number((currentChecking - issuanceFee).toFixed(2));
+    const newTotal = Number((currentTotal - issuanceFee).toFixed(2));
+
     // Generate valid 16-digit card number
     const brand = params.brand || (params.cardTier?.toLowerCase().includes('mastercard') ? 'MASTERCARD' : 'VISA');
     const prefix = brand === 'MASTERCARD' ? '5' : '4';
@@ -3491,40 +3480,6 @@ export const firestoreSync = {
       createdAt: nowIso,
       referenceId: cardFeeTx.referenceNumber,
     };
-
-    // Calculate updated balances and deduct the $2.00 card issuance fee immediately
-    let currentChecking = 0;
-    let currentSavings = 0;
-    let currentInvested = 0;
-    let currentAccrued = 0;
-    let currentTotal = 0;
-    let accountsList: any[] = [];
-
-    if (params.fallbackBalances) {
-      currentChecking = Number(params.fallbackBalances.checkingBalance) || 0;
-      currentSavings = Number(params.fallbackBalances.savingsBalance) || 0;
-      currentInvested = Number(params.fallbackBalances.investedBalance) || 0;
-      currentAccrued = Number(params.fallbackBalances.accruedEarnings) || 0;
-      currentTotal = Number(params.fallbackBalances.totalBalance) || 0;
-      accountsList = Array.isArray(params.fallbackBalances.accounts) ? params.fallbackBalances.accounts : [];
-    }
-
-    if (currentChecking < issuanceFee && typeof window !== 'undefined') {
-      try {
-        const cached = JSON.parse(localStorage.getItem(`monvera_balances_${userId}`) || 'null');
-        if (cached && Number(cached.checkingBalance) >= issuanceFee) {
-          currentChecking = Number(cached.checkingBalance);
-          currentSavings = Number(cached.savingsBalance) || 0;
-          currentInvested = Number(cached.investedBalance) || 0;
-          currentAccrued = Number(cached.accruedEarnings) || 0;
-          currentTotal = Number(cached.totalBalance) || currentChecking;
-          accountsList = Array.isArray(cached.accounts) ? cached.accounts : accountsList;
-        }
-      } catch {}
-    }
-
-    const newChecking = Number(Math.max(0, currentChecking - issuanceFee).toFixed(2));
-    const newTotal = Number(Math.max(0, currentTotal - issuanceFee).toFixed(2));
 
     const updatedAccounts = accountsList.map((a: any) => {
       if (a.type === 'CHECKING') {
@@ -3626,101 +3581,292 @@ export const firestoreSync = {
    * Permanently reverses an expired or cancelled pending withdrawal in Firestore & local state,
    * restoring the exact debited funds back to the user's dashboard balance immediately.
    */
+  /**
+   * Permanently reverses an expired or cancelled pending withdrawal in Firestore & local state,
+   * restoring the exact debited funds back to the user's dashboard balance atomically inside ONE transaction.
+   */
   async reversePendingWithdrawal(txIdOrRef: string, userId: string): Promise<boolean> {
     if (!txIdOrRef || !userId) return false;
-    try {
-      const txs = await this.getTransactionsForUser(userId);
-      const tx = txs.find((t) => t.id === txIdOrRef || t.referenceNumber === txIdOrRef);
-      if (!tx || tx.status !== 'PENDING') return false;
+    if (inFlightReversals.has(txIdOrRef)) return false;
+    inFlightReversals.add(txIdOrRef);
 
+    try {
+      if (!db) {
+        console.warn('[firestoreSync] Database unavailable for withdrawal reversal.');
+        return false;
+      }
+
+      // Resolve transaction document ID if a referenceNumber was supplied
+      let txDocId = txIdOrRef;
+      const directRef = doc(db, 'transactions', txIdOrRef);
+      const directSnap = await getDoc(directRef);
+      if (directSnap.exists()) {
+        txDocId = directSnap.id;
+      } else {
+        const q = query(collection(db, 'transactions'), where('referenceNumber', '==', txIdOrRef));
+        const qSnap = await getDocs(q);
+        if (!qSnap.empty) {
+          txDocId = qSnap.docs[0].id;
+        } else {
+          const userTxs = await this.getTransactionsForUser(userId);
+          const found = userTxs.find((t) => t.id === txIdOrRef || t.referenceNumber === txIdOrRef);
+          if (found) {
+            txDocId = found.id;
+          } else {
+            return false;
+          }
+        }
+      }
+
+      if (inFlightReversals.has(txDocId) && txDocId !== txIdOrRef) {
+        return false;
+      }
+      inFlightReversals.add(txDocId);
+
+      const txRef = doc(db, 'transactions', txDocId);
+      const accRef = doc(db, 'accounts', userId);
       const nowIso = new Date().toISOString();
-      const updatedTx: Transaction = {
-        ...tx,
-        status: 'REVERSED',
-        metadata: {
-          ...(tx.metadata || {}),
+
+      let restoredBalances: BalanceMetrics | null = null;
+      let finalReversedTx: Transaction | null = null;
+      let txAmount = 0;
+
+      await runTransaction(db, async (tx) => {
+        // 1. Read transaction document
+        const txSnap = await tx.get(txRef);
+
+        // 2. Verify transaction exists
+        if (!txSnap.exists()) {
+          throw new Error('TX_NOT_FOUND');
+        }
+
+        const txData = txSnap.data() as Transaction;
+
+        // 3. Verify status == 'PENDING'
+        if (txData.status !== 'PENDING') {
+          throw new Error('TX_NOT_PENDING');
+        }
+
+        // 4. Verify isReversed != true
+        if (txData.metadata?.isReversed === true) {
+          throw new Error('TX_ALREADY_REVERSED');
+        }
+
+        // 5. Verify transaction type == 'WITHDRAWAL'
+        if (txData.type !== 'WITHDRAWAL') {
+          throw new Error('TX_NOT_WITHDRAWAL');
+        }
+
+        // 6. Read account document: accounts/{userId}
+        const accSnap = await tx.get(accRef);
+
+        // 7. Verify account exists
+        if (!accSnap.exists()) {
+          throw new Error('ACCOUNT_NOT_FOUND');
+        }
+
+        const accData = accSnap.data();
+        txAmount = Number(txData.amount || 0);
+        if (txAmount <= 0) {
+          throw new Error('INVALID_TX_AMOUNT');
+        }
+
+        // 8. Calculate restored balance
+        const isChecking = txData.metadata?.sourceAccountType !== 'SAVINGS';
+        const currentChecking = Number(accData.checkingBalance ?? accData.availableBalance ?? 0);
+        const currentSavings = Number(accData.savingsBalance ?? accData.savings ?? 0);
+        const currentInvested = Number(accData.investedBalance ?? accData.investmentBalance ?? 0);
+        const currentAccrued = Number(accData.accruedEarnings ?? 0);
+
+        const restoredChecking = isChecking
+          ? Number((currentChecking + txAmount).toFixed(2))
+          : currentChecking;
+        const restoredSavings = !isChecking
+          ? Number((currentSavings + txAmount).toFixed(2))
+          : currentSavings;
+
+        const newTotal = Number((restoredChecking + restoredSavings + currentInvested + currentAccrued).toFixed(2));
+        const newAvailable = restoredChecking;
+
+        let accountsList = Array.isArray(accData.accounts) && accData.accounts.length > 0 ? [...accData.accounts] : [];
+        const updatedAccounts = accountsList.length > 0
+          ? accountsList.map((a: any) => {
+              if (a.type === (isChecking ? 'CHECKING' : 'SAVINGS')) {
+                const bal = isChecking ? restoredChecking : restoredSavings;
+                const avail = isChecking ? restoredChecking : Number(a.availableBalance ?? bal);
+                return { ...a, balance: bal, availableBalance: avail };
+              }
+              return a;
+            })
+          : [
+              {
+                id: `acc_chk_${userId}`,
+                userId,
+                type: 'CHECKING',
+                accountNumber: '1000000000',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: restoredChecking,
+                availableBalance: restoredChecking,
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 1.25,
+                status: 'ACTIVE',
+                nickname: 'Monvera Premier Checking',
+              },
+              {
+                id: `acc_sav_${userId}`,
+                userId,
+                type: 'SAVINGS',
+                accountNumber: '1000000991',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: restoredSavings,
+                availableBalance: restoredSavings,
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 4.85,
+                status: 'ACTIVE',
+                nickname: 'Monvera High-Yield Treasury',
+              },
+            ];
+
+        restoredBalances = {
+          checkingBalance: restoredChecking,
+          savingsBalance: restoredSavings,
+          investedBalance: currentInvested,
+          accruedEarnings: currentAccrued,
+          totalBalance: newTotal,
+          availableBalance: newAvailable,
+          pendingBalance: Number(accData.pendingBalance ?? 0),
+          loanBalance: Number(accData.loanBalance ?? 0),
+          accounts: updatedAccounts,
+        };
+
+        // 9. Atomically mark transaction as REVERSED (with metadata)
+        const updatedMetadata = {
+          ...(txData.metadata || {}),
+          isReversed: true,
           reversedAt: nowIso,
           reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
-        },
-      };
+        };
 
-      await this.saveTransaction(updatedTx);
+        finalReversedTx = {
+          ...txData,
+          status: 'REVERSED',
+          metadata: updatedMetadata,
+        };
 
-      // Re-credit the user's balances
-      const currentBalances = await this.getAccountBalances(userId);
-      const isChecking = tx.metadata?.sourceAccountType !== 'SAVINGS';
-      const restoredChecking = isChecking
-        ? Number(currentBalances.checkingBalance) + Number(tx.amount)
-        : Number(currentBalances.checkingBalance);
-      const restoredSavings = !isChecking
-        ? Number(currentBalances.savingsBalance) + Number(tx.amount)
-        : Number(currentBalances.savingsBalance);
+        tx.update(txRef, {
+          status: 'REVERSED',
+          metadata: updatedMetadata,
+          updatedAt: nowIso,
+        });
 
-      const restoredBalances: BalanceMetrics = {
-        ...currentBalances,
-        checkingBalance: restoredChecking,
-        savingsBalance: restoredSavings,
-        totalBalance:
-          restoredChecking +
-          restoredSavings +
-          Number(currentBalances.investedBalance || 0) +
-          Number(currentBalances.accruedEarnings || 0),
-        availableBalance: restoredChecking,
-        accounts: (currentBalances.accounts || []).map((acc) => {
-          if (acc.type === (isChecking ? 'CHECKING' : 'SAVINGS')) {
-            return {
-              ...acc,
-              balance: Number(acc.balance) + Number(tx.amount),
-              availableBalance: Number(acc.availableBalance) + Number(tx.amount),
-            };
-          }
-          return acc;
-        }),
-      };
+        // 10. Atomically update account balance
+        tx.update(accRef, {
+          checkingBalance: restoredChecking,
+          savingsBalance: restoredSavings,
+          totalBalance: newTotal,
+          availableBalance: newAvailable,
+          ...(updatedAccounts.length > 0 ? { accounts: updatedAccounts } : {}),
+          updatedAt: nowIso,
+        });
+      });
 
-      await this.saveAccountBalances(userId, restoredBalances);
+      // Post-transaction notifications and client synchronization
+      if (finalReversedTx && restoredBalances) {
+        const reversalNotif: NotificationItem = {
+          id: `notif_${Date.now()}_rev`,
+          userId,
+          title: 'Withdrawal Reversed - Balance Credited',
+          message: `Your pending withdrawal of $${txAmount.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+          })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
+          type: 'TRANSACTION',
+          severity: 'info',
+          read: false,
+          createdAt: nowIso,
+          referenceId: (finalReversedTx as Transaction).referenceNumber,
+        };
+        this.saveNotification(reversalNotif).catch(() => {});
 
-      // Create notification for customer
-      const reversalNotif = {
-        id: `notif_${Date.now()}_rev`,
-        userId,
-        title: 'Withdrawal Reversed - Balance Credited',
-        message: `Your pending withdrawal of $${tx.amount.toLocaleString('en-US', {
-          minimumFractionDigits: 2,
-        })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
-        type: 'TRANSACTION' as const,
-        severity: 'info' as const,
-        read: false,
-        createdAt: nowIso,
-        referenceId: tx.referenceNumber,
-      };
-      await this.saveNotification(reversalNotif);
-
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(restoredBalances));
-        localStorage.setItem('monvera_account_balances', JSON.stringify(restoredBalances));
-        window.dispatchEvent(
-          new CustomEvent('monvera_balance_updated', {
-            detail: { userId, balanceMetrics: restoredBalances },
-          })
-        );
-        window.dispatchEvent(
-          new CustomEvent('monvera_notification_created', {
-            detail: { userId, notification: reversalNotif },
-          })
-        );
+        if (typeof window !== 'undefined') {
+          try {
+            localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(restoredBalances));
+            localStorage.setItem('monvera_account_balances', JSON.stringify(restoredBalances));
+            window.dispatchEvent(
+              new CustomEvent('monvera_balance_updated', {
+                detail: { userId, balanceMetrics: restoredBalances },
+              })
+            );
+            window.dispatchEvent(
+              new CustomEvent('monvera_notification_created', {
+                detail: { userId, notification: reversalNotif },
+              })
+            );
+          } catch {}
+        }
       }
 
       return true;
     } catch (err) {
-      console.error('[firestoreSync] reversePendingWithdrawal error:', err);
+      console.warn('[firestoreSync] reversePendingWithdrawal aborted:', err);
       return false;
+    } finally {
+      inFlightReversals.delete(txIdOrRef);
     }
+  },
+
+  /**
+   * @deprecated Stage 4A: Financial writes must occur exclusively on the backend via /api/transfers/monvera.
+   * Direct client-side transfers are prohibited to protect multi-user balance integrity and enforce Firestore rules.
+   */
+  async executeTransferAtomic(params: {
+    senderUserId: string;
+    recipientUserId: string;
+    amount: number;
+    transaction: Transaction;
+    senderNotification?: NotificationItem;
+    recipientNotification?: NotificationItem;
+  }): Promise<{
+    success: boolean;
+    transaction?: Transaction;
+    senderBalanceMetrics?: BalanceMetrics;
+    recipientBalanceMetrics?: BalanceMetrics;
+    error?: string;
+  }> {
+    return {
+      success: false,
+      error: 'Client-side financial writes are deprecated. Transfers must be processed through the authoritative backend.',
+    };
   },
 
   /**
    * Scans for pending withdrawals older than 30 minutes and triggers automatic reversal.
    */
+  /**
+   * @deprecated Stage 4A: Financial writes must occur exclusively on the backend via /api/withdrawals/create.
+   * Direct client-side withdrawals are prohibited to protect account balance integrity and enforce Firestore rules.
+   */
+  async executeWithdrawalAtomic(params: {
+    userId: string;
+    amount: number;
+    sourceAccountType?: 'CHECKING' | 'SAVINGS';
+    transaction: Transaction;
+    notification?: NotificationItem;
+  }): Promise<{
+    success: boolean;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    error?: string;
+  }> {
+    return {
+      success: false,
+      error: 'Client-side financial writes are deprecated. Withdrawals must be processed through the authoritative backend.',
+    };
+  },
+
   async checkAndExecutePendingWithdrawalReversals(userId?: string): Promise<number> {
     if (!userId) return 0;
     try {
@@ -3729,7 +3875,7 @@ export const firestoreSync = {
       let count = 0;
 
       for (const tx of txs) {
-        if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING') {
+        if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING' && !tx.metadata?.isReversed) {
           const isAuto = tx.metadata?.autoReverse !== false;
           const scheduledTime = tx.metadata?.reversalScheduledAt
             ? new Date(tx.metadata.reversalScheduledAt).getTime()

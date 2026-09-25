@@ -5,6 +5,19 @@ import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
 import { UserProfile, InvestmentTermDays } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
+import { requireFirebaseAuth, optionalFirebaseAuth, AuthenticatedRequest } from './server/authMiddleware';
+import { adminFirestore } from './server/firebaseAdmin';
+import {
+  executeServerTransfer,
+  executeServerWithdrawal,
+  executeServerDeposit,
+  executeServerAdminTransfer,
+  executeServerAdminDevFunding,
+  executeServerLoanDisbursement,
+  executeServerLoanRepayment,
+  executeServerInvestmentCreation,
+  executeServerInvestmentMaturity,
+} from './server/firestoreTransactions';
 
 const app = express();
 const PORT = 3000;
@@ -445,76 +458,84 @@ app.get('/api/accounts/lookup', (req: Request, res: Response) => {
 });
 
 // --- TRANSFERS ---
-// Monvera-to-Monvera Transfer (Accepts Account Number OR Username)
-app.post('/api/transfers/monvera', (req: Request, res: Response) => {
-  const { senderUserId, recipientUserId, recipientAccountNumber, recipientUsername, recipientIdentifier, amount, description, category } = req.body;
+// Monvera-to-Monvera Transfer (Server-Authoritative Firestore Transaction)
+app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const authUid = req.auth!.uid;
+  const {
+    recipientUserId,
+    recipientAccountNumber,
+    recipientUsername,
+    recipientIdentifier,
+    amount,
+    description,
+    category,
+    referenceNumber,
+    referenceId,
+    idempotencyKey,
+  } = req.body;
+
   const rawTarget = (recipientIdentifier || recipientAccountNumber || recipientUsername || recipientUserId || '') as string;
+  const transferRef = (referenceNumber || referenceId || idempotencyKey || '') as string;
 
-  if (!senderUserId || !rawTarget.trim() || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ error: 'Sender ID, valid recipient account number or username, and positive amount are required.' });
+  if (!rawTarget.trim() || !amount || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Valid recipient account number, username, or ID and a positive amount are required.' });
   }
 
-  const cleanTarget = rawTarget.toString().trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
-  const recipient = Array.from(db.users.values()).find(
-    (u) =>
-      (recipientUserId && u.id === recipientUserId) ||
-      u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget ||
-      (u.username && u.username.toLowerCase() === cleanTarget) ||
-      (u.email && u.email.toLowerCase() === cleanTarget) ||
-      (u.id && u.id.toLowerCase() === cleanTarget) ||
-      `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanTarget
-  );
-
-  if (!recipient) {
-    return res.status(404).json({ error: `Recipient "${rawTarget}" not found in Monvera directory.` });
-  }
-
-  const result = db.recordMonveraTransfer({
-    senderUserId,
-    recipientUserId: recipient.id,
-    amount: Number(amount),
-    description: description || `Transfer to ${recipient.firstName} ${recipient.lastName} (@${recipient.username || 'user'})`,
-    category: category || 'Transfers',
-  });
-
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
-  }
-
-  const senderMetrics = db.getUserBalanceMetrics(senderUserId);
-  res.json({ success: true, transaction: result.transaction, balanceMetrics: senderMetrics });
-
-  // Asynchronous multi-channel alerts (Push, SMS, Email)
-  const senderUser = db.users.get(senderUserId);
-  if (result.transaction) {
-    const tx = result.transaction;
-    // Notify Recipient
-    serverNotificationDispatcher.dispatch({
-      transactionId: tx.id,
-      referenceNumber: tx.referenceNumber,
-      type: 'MONEY_RECEIVED',
-      userId: recipient.id,
-      recipientName: `${recipient.firstName} ${recipient.lastName}`,
-      recipientEmail: recipient.email,
-      recipientPhone: recipient.phone,
+  try {
+    const result = await executeServerTransfer({
+      senderUid: authUid,
+      recipientIdentifier: rawTarget,
       amount: Number(amount),
-      currency: tx.currency || 'USD',
-      senderName: senderUser ? `${senderUser.firstName} ${senderUser.lastName}` : 'Monvera Member',
-      accountMasked: 'Monvera Checking',
-    }).catch((err) => console.warn('[ServerDispatcher] Transfer recipient dispatch note:', err?.message || err));
+      description,
+      category,
+      referenceNumber: transferRef || undefined,
+    });
 
-    // Notify Sender
-    serverNotificationDispatcher.dispatch({
-      transactionId: tx.id,
-      referenceNumber: tx.referenceNumber,
-      type: 'MONEY_SENT',
-      userId: senderUserId,
-      recipientName: `${recipient.firstName} ${recipient.lastName}`,
-      amount: Number(amount),
-      currency: tx.currency || 'USD',
-      senderName: senderUser ? `${senderUser.firstName} ${senderUser.lastName}` : 'You',
-      accountMasked: 'Monvera Checking',
-    }).catch((err) => console.warn('[ServerDispatcher] Transfer sender dispatch note:', err?.message || err));
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    res.json({
+      success: true,
+      transaction: result.transaction,
+      balanceMetrics: result.senderBalanceMetrics,
+      recipientBalanceMetrics: result.recipientBalanceMetrics,
+    });
+
+    // Asynchronous multi-channel alerts (Push, SMS, Email)
+    if (result.transaction) {
+      const tx = result.transaction;
+      // Notify Recipient
+      if (tx.recipientUserId) {
+        serverNotificationDispatcher.dispatch({
+          transactionId: tx.id,
+          referenceNumber: tx.referenceNumber,
+          type: 'MONEY_RECEIVED',
+          userId: tx.recipientUserId,
+          recipientName: tx.recipientName || 'Monvera Member',
+          amount: Number(amount),
+          currency: tx.currency || 'USD',
+          senderName: tx.senderName || 'Monvera Member',
+          accountMasked: 'Monvera Checking',
+        }).catch((err) => console.warn('[ServerDispatcher] Transfer recipient dispatch note:', err?.message || err));
+      }
+
+      // Notify Sender
+      serverNotificationDispatcher.dispatch({
+        transactionId: tx.id,
+        referenceNumber: tx.referenceNumber,
+        type: 'MONEY_SENT',
+        userId: authUid,
+        recipientName: tx.recipientName || 'Monvera Member',
+        amount: Number(amount),
+        currency: tx.currency || 'USD',
+        senderName: tx.senderName || 'You',
+        accountMasked: 'Monvera Checking',
+      }).catch((err) => console.warn('[ServerDispatcher] Transfer sender dispatch note:', err?.message || err));
+    }
+  } catch (err: any) {
+    console.error('[/api/transfers/monvera Error]', err);
+    res.status(500).json({ error: err?.message || 'Internal transfer processing error.' });
   }
 });
 
@@ -548,28 +569,51 @@ app.post('/api/transfers/internal', (req: Request, res: Response) => {
 });
 
 // --- DEPOSITS & PAYMENT GATEWAY VERIFICATION ---
-app.post('/api/deposits/create', (req: Request, res: Response) => {
-  const { userId, amount, method, destinationAccountType, providerPaymentId, metadata } = req.body;
+app.post('/api/deposits/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { amount, method, destinationAccountType, providerPaymentId, referenceNumber, metadata } = req.body;
+  const userId = req.auth?.uid || req.body.userId;
 
   if (!userId || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ error: 'Valid user ID and amount are required.' });
+    return res.status(400).json({ error: 'Valid user ID and positive amount are required.' });
   }
 
-  const result = db.processDeposit({
-    userId,
-    amount: Number(amount),
-    method: method || 'CARD',
-    destinationAccountType: destinationAccountType || 'CHECKING',
-    providerPaymentId,
-    metadata,
-  });
+  try {
+    const result = await executeServerDeposit({
+      userId,
+      amount: Number(amount),
+      method: method || 'CARD',
+      destinationAccountType: destinationAccountType || 'CHECKING',
+      providerPaymentId,
+      referenceNumber,
+      metadata,
+    });
 
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    // Mirror to memory db for local consistency
+    try {
+      db.processDeposit({
+        userId,
+        amount: Number(amount),
+        method: method || 'CARD',
+        destinationAccountType: destinationAccountType || 'CHECKING',
+        providerPaymentId: result.transaction?.referenceNumber || providerPaymentId,
+        metadata,
+      });
+    } catch {}
+
+    return res.json({
+      success: true,
+      transaction: result.transaction,
+      balanceMetrics: result.balanceMetrics,
+      isDuplicate: result.isDuplicate,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/deposits/create] Uncaught error:', err);
+    return res.status(500).json({ error: err?.message || 'Server failed to process deposit.' });
   }
-
-  const metrics = db.getUserBalanceMetrics(userId);
-  res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
 
 // --- STRIPE INTEGRATION (DEPOSITS) ---
@@ -670,6 +714,23 @@ app.post('/api/stripe/webhook', async (req: Request, res: Response) => {
 
     if (userId && amount > 0) {
       console.log(`[Stripe Webhook] Crediting deposit of $${amount} for user ${userId}`);
+      try {
+        await executeServerDeposit({
+          userId,
+          amount,
+          method: 'CARD',
+          destinationAccountType,
+          providerPaymentId: `STRIPE-${session.id}`,
+          metadata: {
+            stripeSessionId: session.id,
+            stripePaymentStatus: session.payment_status,
+            currency: session.currency,
+          },
+        });
+      } catch (e: any) {
+        console.warn('[Stripe Webhook] Firestore server deposit note:', e?.message || e);
+      }
+
       const depResult = db.processDeposit({
         userId,
         amount,
@@ -815,9 +876,9 @@ app.get('/api/stripe/confirm-session', async (req: Request, res: Response) => {
 });
 
 // --- WITHDRAWALS ---
-app.post('/api/withdrawals/create', (req: Request, res: Response) => {
+app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const authUid = req.auth!.uid;
   const {
-    userId,
     amount,
     destinationType,
     destinationLabel,
@@ -825,39 +886,43 @@ app.post('/api/withdrawals/create', (req: Request, res: Response) => {
     sourceAccountType,
     routingNumber,
     cardBrand,
-    cryptoAsset,
-    cryptoNetwork,
-    userAccountNumber,
-    fallbackBalances,
-    fallbackUser,
+    referenceNumber,
+    referenceId,
+    idempotencyKey,
   } = req.body;
 
-  if (!userId || !amount || !destinationLabel || !accountOrIban) {
-    return res.status(400).json({ error: 'Missing required withdrawal details.' });
+  const withdrawRef = (referenceNumber || referenceId || idempotencyKey || '') as string;
+
+  if (!amount || Number(amount) <= 0 || !destinationLabel || !accountOrIban) {
+    return res.status(400).json({ error: 'Missing required withdrawal details or positive amount.' });
   }
 
-  const result = db.processWithdrawal({
-    userId,
-    amount: Number(amount),
-    destinationType: destinationType || 'CARD',
-    destinationLabel,
-    accountOrIban,
-    sourceAccountType: sourceAccountType || 'CHECKING',
-    routingNumber,
-    cardBrand,
-    cryptoAsset,
-    cryptoNetwork,
-    userAccountNumber,
-    fallbackBalances,
-    fallbackUser,
-  });
+  try {
+    const result = await executeServerWithdrawal({
+      userId: authUid,
+      amount: Number(amount),
+      sourceAccountType: sourceAccountType || 'CHECKING',
+      destinationType: destinationType || 'CARD',
+      destinationLabel,
+      accountOrIban,
+      cardBrand,
+      routingNumber,
+      referenceNumber: withdrawRef || undefined,
+    });
 
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    res.json({
+      success: true,
+      transaction: result.transaction,
+      balanceMetrics: result.balanceMetrics,
+    });
+  } catch (err: any) {
+    console.error('[/api/withdrawals/create Error]', err);
+    res.status(500).json({ error: err?.message || 'Internal withdrawal processing error.' });
   }
-
-  const metrics = result.balanceMetrics || db.getUserBalanceMetrics(userId);
-  res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
 
 // Reverse pending withdrawal
@@ -963,55 +1028,111 @@ app.get('/api/transactions', (req: Request, res: Response) => {
 });
 
 // --- INVESTMENTS CENTER ---
-app.get('/api/investments', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
+app.get('/api/investments', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const userId = (req.query.userId as string) || req.auth?.uid;
   if (!userId) return res.status(400).json({ error: 'userId required' });
 
-  const userInvestments = Array.from(db.investments.values()).filter((i) => i.userId === userId);
-  const earnings = db.investmentEarnings.filter((e) => e.userId === userId);
+  try {
+    const fsSnap = await adminFirestore.collection('investments').where('userId', '==', userId).get();
+    const fsInvestments: any[] = [];
+    fsSnap.forEach((doc) => fsInvestments.push(doc.data()));
 
-  res.json({
-    investments: userInvestments,
-    earnings,
-    supportedTerms: [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360],
-  });
+    // Merge with in-memory investments for full synchronization
+    const userInvestmentsMap = new Map<string, any>();
+    fsInvestments.forEach((i) => userInvestmentsMap.set(i.id, i));
+    Array.from(db.investments.values())
+      .filter((i) => i.userId === userId)
+      .forEach((i) => {
+        if (!userInvestmentsMap.has(i.id)) userInvestmentsMap.set(i.id, i);
+      });
+
+    const earnings = db.investmentEarnings.filter((e) => e.userId === userId);
+
+    res.json({
+      investments: Array.from(userInvestmentsMap.values()),
+      earnings,
+      supportedTerms: [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360],
+    });
+  } catch (err: any) {
+    const userInvestments = Array.from(db.investments.values()).filter((i) => i.userId === userId);
+    const earnings = db.investmentEarnings.filter((e) => e.userId === userId);
+    res.json({
+      investments: userInvestments,
+      earnings,
+      supportedTerms: [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360],
+    });
+  }
 });
 
-app.post('/api/investments/create', (req: Request, res: Response) => {
-  const { userId, termDays, amount, userAccountNumber, fallbackBalances, fallbackUser } = req.body;
+app.post('/api/investments/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { termDays, amount, userAccountNumber, clientRequestId, fallbackUser } = req.body;
+  const userId = req.auth?.uid || req.body.userId;
 
   if (!userId || !termDays || !amount) {
     return res.status(400).json({ error: 'User ID, term duration, and amount are required.' });
   }
 
-  const result = db.createTermInvestment({
-    userId,
-    termDays: Number(termDays) as InvestmentTermDays,
-    amount: Number(amount),
-    userAccountNumber,
-    fallbackBalances,
-    fallbackUser,
-  });
+  try {
+    const result = await executeServerInvestmentCreation({
+      userId,
+      termDays: Number(termDays) as InvestmentTermDays,
+      amount: Number(amount),
+      clientRequestId,
+      userAccountNumber,
+      fallbackUser,
+    });
 
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    // Mirror to in-memory db for local sync
+    try {
+      db.createTermInvestment({
+        userId,
+        termDays: Number(termDays) as InvestmentTermDays,
+        amount: Number(amount),
+        userAccountNumber,
+        fallbackUser,
+      });
+    } catch {}
+
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[/api/investments/create] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Server error creating term investment.' });
   }
-
-  const metrics = db.getUserBalanceMetrics(result.investment?.userId || userId);
-  res.json({ success: true, investment: result.investment, balanceMetrics: metrics });
 });
 
-// Simulate Early/Fast-forward Maturity for testing
-app.post('/api/investments/:id/mature', (req: Request, res: Response) => {
+// Settlement of Matured Term Investment
+app.post('/api/investments/:id/mature', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const result = db.matureInvestment(id);
+  const userId = req.auth?.uid || req.body.userId;
 
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
+  if (!userId) {
+    return res.status(401).json({ error: 'Authentication required to settle investment.' });
   }
 
-  const userMetrics = db.getUserBalanceMetrics(result.investment!.userId);
-  res.json({ success: true, investment: result.investment, payoutAmount: result.payoutAmount, balanceMetrics: userMetrics });
+  try {
+    const result = await executeServerInvestmentMaturity({
+      investmentId: id,
+      userId,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    // Mirror to in-memory db for local sync
+    try {
+      db.matureInvestment(id);
+    } catch {}
+
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[/api/investments/:id/mature] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Server error settling term investment.' });
+  }
 });
 
 // --- CARDS ---
@@ -1381,7 +1502,7 @@ app.post('/api/admin/transactions/:id/update-status', (req: Request, res: Respon
 });
 
 // Admin Transfer Direct Endpoint (Bennett Johnson)
-app.post('/api/admin/transfer', (req: Request, res: Response) => {
+app.post('/api/admin/transfer', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const {
     adminId,
     targetUserId,
@@ -1392,83 +1513,133 @@ app.post('/api/admin/transfer', (req: Request, res: Response) => {
     amount,
     description,
     category,
+    referenceNumber,
   } = req.body;
 
-  if (!targetUserId || !amount || Number(amount) <= 0) {
+  const targetIdentifier = targetUserId || targetAccountNumber || targetEmail || targetUsername;
+
+  if (!targetIdentifier || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Target customer ID and positive transfer amount are required.' });
   }
 
-  const result = db.recordAdminTransfer({
-    adminId: adminId || 'usr_admin',
-    targetUserId,
-    targetAccountNumber,
-    targetName,
-    targetUsername,
-    targetEmail,
-    amount: Number(amount),
-    description: description || 'Administrative Direct Transfer from Bennett Johnson',
-    category: category || 'Transfers',
-  });
-
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
-  }
-
-  const recipientId = result.transaction?.recipientUserId || targetUserId;
-  const targetMetrics = db.getUserBalanceMetrics(recipientId);
-  res.json({
-    success: true,
-    transaction: result.transaction,
-    targetBalanceMetrics: targetMetrics,
-  });
-
-  // Asynchronously dispatch multi-channel notification for Bennett Johnson admin transfer
-  if (result.transaction) {
-    const tx = result.transaction;
-    const recipientUser = db.users.get(recipientId);
-    serverNotificationDispatcher.dispatch({
-      transactionId: tx.id,
-      referenceNumber: tx.referenceNumber,
-      type: 'MONEY_RECEIVED',
-      userId: recipientId,
-      recipientName: recipientUser ? `${recipientUser.firstName} ${recipientUser.lastName}` : (targetName || 'Monvera Client'),
-      recipientEmail: recipientUser?.email || targetEmail,
-      recipientPhone: recipientUser?.phone,
+  try {
+    const result = await executeServerAdminTransfer({
+      adminId: adminId || req.auth?.uid || 'usr_admin',
+      targetIdentifier,
       amount: Number(amount),
-      currency: tx.currency || 'USD',
-      senderName: 'Bennett Johnson (Admin)',
-      accountMasked: (tx as any).accountName || 'Monvera Premier Checking',
-    }).catch((err) => console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err));
+      description: description || 'Administrative Direct Transfer from Bennett Johnson',
+      category: category || 'Transfers',
+      referenceNumber,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    const resolvedTargetId = result.transaction?.recipientUserId || targetUserId;
+
+    // Mirror to memory db for local caching consistency
+    try {
+      db.recordAdminTransfer({
+        adminId: adminId || 'usr_admin',
+        targetUserId: resolvedTargetId,
+        targetAccountNumber,
+        targetName,
+        targetUsername,
+        targetEmail,
+        amount: Number(amount),
+        description: description || 'Administrative Direct Transfer from Bennett Johnson',
+        category: category || 'Transfers',
+      });
+    } catch {}
+
+    res.json({
+      success: true,
+      transaction: result.transaction,
+      targetBalanceMetrics: result.targetBalanceMetrics,
+      isDuplicate: result.isDuplicate || false,
+    });
+
+    // Asynchronously dispatch multi-channel notification for Bennett Johnson admin transfer
+    if (result.transaction) {
+      const tx = result.transaction;
+      const recipientUser = db.users.get(resolvedTargetId);
+      serverNotificationDispatcher.dispatch({
+        transactionId: tx.id,
+        referenceNumber: tx.referenceNumber,
+        type: 'MONEY_RECEIVED',
+        userId: resolvedTargetId,
+        recipientName: recipientUser ? `${recipientUser.firstName} ${recipientUser.lastName}` : (targetName || tx.recipientName || 'Monvera Client'),
+        recipientEmail: recipientUser?.email || targetEmail,
+        recipientPhone: recipientUser?.phone,
+        amount: Number(amount),
+        currency: tx.currency || 'USD',
+        senderName: 'Bennett Johnson (Admin)',
+        accountMasked: (tx as any).accountName || 'Monvera Premier Checking',
+      }).catch((err) => console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err));
+    }
+  } catch (err: any) {
+    console.error('[POST /api/admin/transfer] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Server error processing administrative transfer.' });
   }
 });
 
 // Admin Development Funding System (Isolated for testing/staging)
-app.post('/api/admin/dev-fund', (req: Request, res: Response) => {
-  const { adminId, targetUserId, amount, reason, targetAccountType } = req.body;
+app.post('/api/admin/dev-fund', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { adminId, targetUserId, amount, reason, targetAccountType, referenceId } = req.body;
 
   if (!targetUserId || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Target customer ID and positive amount are required.' });
   }
 
-  const result = db.issueAdminDevFunding({
-    adminId: adminId || 'usr_admin',
-    targetUserId,
-    amount: Number(amount),
-    reason: reason || 'Sandbox liquidity disbursement',
-    targetAccountType: targetAccountType || 'CHECKING',
-  });
+  const numAmount = Number(amount);
 
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
+  if (numAmount > db.devFundingPoolBalance) {
+    return res.status(400).json({
+      error: `Requested amount exceeds available Development Funding Pool balance ($${db.devFundingPoolBalance.toLocaleString(
+        'en-US',
+        { minimumFractionDigits: 2 }
+      )}).`,
+    });
   }
 
-  const targetMetrics = db.getUserBalanceMetrics(targetUserId);
-  res.json({
-    success: true,
-    transaction: result.transaction,
-    targetBalanceMetrics: targetMetrics,
-    devFundingPoolBalance: db.devFundingPoolBalance,
-  });
+  try {
+    const result = await executeServerAdminDevFunding({
+      adminId: adminId || req.auth?.uid || 'usr_admin',
+      targetUserId,
+      amount: numAmount,
+      reason: reason || 'Sandbox liquidity disbursement',
+      targetAccountType: targetAccountType || 'CHECKING',
+      referenceId,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    // Mirror to memory db
+    try {
+      db.issueAdminDevFunding({
+        adminId: adminId || 'usr_admin',
+        targetUserId,
+        amount: numAmount,
+        reason: reason || 'Sandbox liquidity disbursement',
+        targetAccountType: targetAccountType || 'CHECKING',
+        referenceId,
+      });
+    } catch {}
+
+    return res.json({
+      success: true,
+      transaction: result.transaction,
+      targetBalanceMetrics: result.targetBalanceMetrics,
+      devFundingPoolBalance: db.devFundingPoolBalance,
+      isDuplicate: result.isDuplicate || false,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/admin/dev-fund] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Server error issuing development funding.' });
+  }
 });
 
 app.post('/api/admin/dev-topup', (req: Request, res: Response) => {
@@ -1530,12 +1701,32 @@ app.post('/api/loans/apply', (req: Request, res: Response) => {
   res.json(result);
 });
 
-app.post('/api/admin/loans/approve', (req: Request, res: Response) => {
+app.post('/api/admin/loans/approve', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { loanId, adminId, fallbackLoan, fallbackUser } = req.body;
   if (!loanId) return res.status(400).json({ error: 'loanId is required.' });
-  const result = db.adminApproveLoan({ loanId, adminId: adminId || 'usr_admin', fallbackLoan, fallbackUser });
-  if (!result.success) return res.status(400).json({ error: result.error });
-  res.json(result);
+
+  try {
+    const result = await executeServerLoanDisbursement({
+      loanId,
+      adminId: req.auth?.uid || adminId || 'usr_admin',
+      fallbackLoan,
+      fallbackUser,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    // Mirror to in-memory db for local synchronization
+    try {
+      db.adminApproveLoan({ loanId, adminId: adminId || 'usr_admin', fallbackLoan, fallbackUser });
+    } catch {}
+
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[/api/admin/loans/approve] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Server error approving loan.' });
+  }
 });
 
 app.post('/api/admin/loans/reject', (req: Request, res: Response) => {
@@ -1546,22 +1737,48 @@ app.post('/api/admin/loans/reject', (req: Request, res: Response) => {
   res.json(result);
 });
 
-app.post('/api/loans/repay', (req: Request, res: Response) => {
-  const { loanId, userId, amount, sourceAccountId, note, fallbackLoan, fallbackUser } = req.body;
+app.post('/api/loans/repay', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { loanId, amount, sourceAccountId, note, referenceNumber, fallbackLoan, fallbackUser } = req.body;
+  const userId = req.auth?.uid || req.body.userId;
+
   if (!loanId || !userId || !amount) {
     return res.status(400).json({ error: 'loanId, userId, and repayment amount are required.' });
   }
-  const result = db.repayLoan({
-    loanId,
-    userId,
-    amount: Number(amount),
-    sourceAccountId,
-    note,
-    fallbackLoan,
-    fallbackUser,
-  });
-  if (!result.success) return res.status(400).json({ error: result.error });
-  res.json(result);
+
+  try {
+    const result = await executeServerLoanRepayment({
+      loanId,
+      userId,
+      amount: Number(amount),
+      sourceAccountId,
+      note,
+      referenceNumber,
+      fallbackLoan,
+      fallbackUser,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+
+    // Mirror to in-memory db for local synchronization
+    try {
+      db.repayLoan({
+        loanId,
+        userId,
+        amount: Number(amount),
+        sourceAccountId,
+        note,
+        fallbackLoan,
+        fallbackUser,
+      });
+    } catch {}
+
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[/api/loans/repay] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Server error processing loan repayment.' });
+  }
 });
 
 // --- SUPPORT CHAT LIVE PERSISTENCE ---

@@ -23,6 +23,7 @@ interface AdminDemoFundsViewProps {
     amount: number;
     reason: string;
     targetAccountType: 'CHECKING' | 'SAVINGS';
+    referenceId?: string;
   }) => Promise<{ success: boolean; error?: string }>;
   onTopUpPool: (amount: number) => Promise<{ success: boolean; error?: string }>;
   onRefreshData?: () => Promise<void>;

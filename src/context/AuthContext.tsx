@@ -438,11 +438,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       currentUser.email
     );
 
-    // 5. Fallback interval for polling notifications, balances, and backup KYC status sync
+    // 5. Fallback interval for polling notifications and backup KYC status sync (balances are handled by live onSnapshot listener)
     const interval = setInterval(() => {
       // Check if any pending 30-minute withdrawals need to be reversed and restored
       api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
-      refreshBalance();
       refreshNotifications();
       refreshProfile();
     }, 3000);
@@ -692,12 +691,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
           console.log('[Auth] Authenticated Firebase user detected:', firebaseUser.uid);
           
-          // Instant hydration from local cache to prevent any 00 flicker
-          const cachedBalances = getCachedUserBalances(firebaseUser.uid);
-          if (cachedBalances && isMounted) {
-            setBalanceMetrics(cachedBalances);
-          }
-
+          // Always prioritize authoritative Firestore balances across all browsers
           let userProfile = await firestoreSync.getUserProfile(firebaseUser.uid);
 
           if (!userProfile) {
@@ -730,7 +724,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0 && isMounted) {
               setBalanceMetrics(fsMetrics);
               cacheUserBalances(resolvedUser.id, fsMetrics);
-            } else if (!cachedBalances && isMounted) {
+            } else if (isMounted) {
               const metricsRes = await api.getCurrentUser(resolvedUser.id);
               if (metricsRes.balanceMetrics && isMounted) {
                 setBalanceMetrics(metricsRes.balanceMetrics);
@@ -844,12 +838,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
     };
 
-    // Instant cache check so balance appears with zero lag
-    const cachedBalances = getCachedUserBalances(uid);
-    if (cachedBalances) {
-      setBalanceMetrics(cachedBalances);
-    }
-
     // Set user immediately for responsive UI feedback
     setCurrentUser(finalUser);
     cacheUserInDirectory(finalUser);
@@ -897,51 +885,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } else if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts && backendSync.balanceMetrics.accounts.length > 0) {
       setBalanceMetrics(backendSync.balanceMetrics);
       cacheUserBalances(uid, backendSync.balanceMetrics);
-    } else if (!cachedBalances) {
-      // Fallback baseline only if user has never transacted
-      const initialZeroMetrics: BalanceMetrics = {
-        checkingBalance: 0,
-        savingsBalance: 0,
-        investedBalance: 0,
-        accruedEarnings: 0,
-        totalBalance: 0,
-        availableBalance: 0,
-        pendingBalance: 0,
-        accounts: [
-          {
-            id: `acc_chk_${uid}`,
-            userId: uid,
-            type: 'CHECKING',
-            accountNumber: finalUser.permanentAccountNumber || '1048291048',
-            routingNumber: '021000021',
-            currency: 'USD',
-            balance: 0,
-            availableBalance: 0,
-            investedBalance: 0,
-            pendingBalance: 0,
-            interestRateAPY: 0.05,
-            status: 'ACTIVE',
-            nickname: 'Monvera Checking Account',
-          },
-          {
-            id: `acc_svg_${uid}`,
-            userId: uid,
-            type: 'SAVINGS',
-            accountNumber: `20${(finalUser.permanentAccountNumber || '1048291048').slice(2)}`,
-            routingNumber: '021000021',
-            currency: 'USD',
-            balance: 0,
-            availableBalance: 0,
-            investedBalance: 0,
-            pendingBalance: 0,
-            interestRateAPY: 4.85,
-            status: 'ACTIVE',
-            nickname: 'Monvera Savings Account',
-          }
-        ]
-      };
-      setBalanceMetrics(initialZeroMetrics);
-      cacheUserBalances(uid, initialZeroMetrics);
     }
 
     if (notifRes?.notifications) {

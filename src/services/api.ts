@@ -15,10 +15,30 @@ import {
   InvestmentTermDays,
   KycStatus,
 } from '../types';
-import { db } from './firebase';
+import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
 import { firestoreSync } from './firestoreSync';
 import { notificationDispatcher } from './notificationDispatcher';
+
+/**
+ * Retrieves Firebase Auth Bearer token headers for authenticated backend calls
+ */
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  try {
+    if (auth && auth.currentUser) {
+      const token = await auth.currentUser.getIdToken();
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+    }
+  } catch (err) {
+    console.warn('[getAuthHeaders] Could not retrieve Firebase ID token:', err);
+  }
+  return headers;
+}
 
 /**
  * Robust JSON parser that gracefully handles non-JSON responses (such as 404 HTML pages or network offline)
@@ -618,39 +638,22 @@ export const api = {
     category?: Transaction['category'];
   }): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
     const transferAmount = Number(data.amount);
-    const targetIdentifier = (data.recipientIdentifier || data.recipientAccountNumber || data.recipientUsername || '').trim();
-
-    let serverSuccess = false;
-    let serverResData: any = null;
-
-    // 1. Try Express Backend Transfer API first
-    try {
-      const res = await fetch('/api/transfers/monvera', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const resData = await res.json();
-        if (resData && typeof resData === 'object') {
-          if (resData.success) {
-            serverSuccess = true;
-            serverResData = resData;
-          } else if (resData.error && res.status !== 404 && res.status !== 500) {
-            // Business logic rejection from backend (e.g. Insufficient funds)
-            return resData;
-          }
-        }
-      }
-    } catch {
-      console.warn('[API] Server transfer unavailable, activating direct double-entry transfer execution...');
+    if (!transferAmount || isNaN(transferAmount) || transferAmount <= 0) {
+      return { success: false, error: 'Transfer amount must be greater than $0.00.' };
+    }
+    if (!data.senderUserId) {
+      return { success: false, error: 'Sender user ID is required.' };
     }
 
-    // Resolve Recipient Details (from verified input, server transaction, Cloud DB, or SEED)
-    let recipientId = data.recipientUserId || serverResData?.transaction?.recipientUserId;
-    let recipientName = data.recipientName || serverResData?.transaction?.recipientName;
-    let recipientAcc = data.recipientAccountNumber || serverResData?.transaction?.recipientAccountNumber;
+    const targetIdentifier = (data.recipientIdentifier || data.recipientAccountNumber || data.recipientUsername || '').trim();
+    if (!targetIdentifier && !data.recipientUserId) {
+      return { success: false, error: 'Recipient account number or identifier is required.' };
+    }
+
+    // 1. Resolve Recipient Details FIRST before ANY debit or transaction creation
+    let recipientId = data.recipientUserId;
+    let recipientName = data.recipientName;
+    let recipientAcc = data.recipientAccountNumber;
 
     if (!recipientId || !recipientName) {
       try {
@@ -679,7 +682,22 @@ export const api = {
       }
     }
 
-    // Find sender details from Cloud Firestore or Seed
+    // 2. Validate recipient BEFORE any financial operations
+    if (!recipientId) {
+      return {
+        success: false,
+        error: 'Recipient account could not be found. Please verify the account number, username, or email.',
+      };
+    }
+
+    if (recipientId === data.senderUserId) {
+      return {
+        success: false,
+        error: 'You cannot transfer funds to your own account. Use internal account transfer instead.',
+      };
+    }
+
+    // 3. Find sender details and check authoritative sender balance
     let senderName = 'Monvera Customer';
     let senderAcc = '1000000000';
     try {
@@ -696,202 +714,56 @@ export const api = {
       }
     } catch {}
 
-    // Construct completed transaction record
-    const txId = serverResData?.transaction?.id || `tx_mv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-    const completedTx: Transaction = {
-      id: txId,
-      referenceNumber: serverResData?.transaction?.referenceNumber || `MV-TRF-${Math.floor(100000000 + Math.random() * 900000000)}`,
-      type: 'TRANSFER',
-      amount: transferAmount,
-      currency: 'USD',
-      status: 'COMPLETED',
-      senderUserId: data.senderUserId,
-      senderName,
-      senderAccountNumber: senderAcc,
-      recipientUserId: recipientId,
-      recipientName: recipientName || targetIdentifier || 'Monvera Recipient',
-      recipientAccountNumber: recipientAcc || '1088492015',
-      fee: 0.00,
-      description: data.description || `Transfer to ${recipientName || targetIdentifier}`,
-      category: data.category || 'Transfers',
-      createdAt: serverResData?.transaction?.createdAt || new Date().toISOString(),
-      completedAt: serverResData?.transaction?.completedAt || new Date().toISOString(),
-    };
-
-    // Calculate debited balance for sender
     const senderMetrics = await firestoreSync.getAccountBalances(data.senderUserId, senderAcc) || await this.getBalanceMetrics(data.senderUserId);
-    const newChecking = Math.max(0, (senderMetrics?.checkingBalance || 0) - transferAmount);
-    const currentSavings = senderMetrics?.savingsBalance || 0;
-    const currentInvested = senderMetrics?.investedBalance || 0;
+    const currentSenderChecking = Number(senderMetrics?.checkingBalance || 0);
 
-    const updatedSenderMetrics: BalanceMetrics = {
-      ...senderMetrics,
-      checkingBalance: newChecking,
-      savingsBalance: currentSavings,
-      investedBalance: currentInvested,
-      accruedEarnings: senderMetrics?.accruedEarnings || 0,
-      totalBalance: newChecking + currentSavings + currentInvested,
-      availableBalance: newChecking,
-      pendingBalance: 0,
-      accounts: (senderMetrics?.accounts && senderMetrics.accounts.length > 0)
-        ? senderMetrics.accounts.map((a) =>
-            a.type === 'CHECKING'
-              ? { ...a, balance: Math.max(0, a.balance - transferAmount), availableBalance: Math.max(0, a.availableBalance - transferAmount) }
-              : a
-          )
-        : [
-            {
-              id: `acc_chk_${data.senderUserId}`,
-              userId: data.senderUserId,
-              type: 'CHECKING',
-              accountNumber: senderAcc || '1045827391',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: newChecking,
-              availableBalance: newChecking,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 1.25,
-              status: 'ACTIVE',
-              nickname: 'Monvera Premier Checking',
-            },
-            {
-              id: `acc_sav_${data.senderUserId}`,
-              userId: data.senderUserId,
-              type: 'SAVINGS',
-              accountNumber: senderAcc ? `10${senderAcc.slice(2, -3)}991` : '1000000991',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: currentSavings,
-              availableBalance: currentSavings,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 4.85,
-              status: 'ACTIVE',
-              nickname: 'Monvera High-Yield Treasury',
-            }
-          ],
-    };
+    if (currentSenderChecking < transferAmount) {
+      return {
+        success: false,
+        error: `Insufficient checking balance ($${currentSenderChecking.toFixed(2)}). Transfer requires $${transferAmount.toFixed(2)}.`,
+      };
+    }
 
-    // Persist to Cloud Firestore for sender & ledger
-    try {
-      await firestoreSync.saveTransaction(completedTx);
-      await firestoreSync.saveAccountBalances(data.senderUserId, updatedSenderMetrics);
+    // 4. Call authoritative server-side transfer endpoint with verified Firebase Auth ID token
+    const refNum = (data as any).referenceNumber || (data as any).referenceId || (data as any).idempotencyKey;
+    const authHeaders = await getAuthHeaders();
 
-      // Instant debit notification for sender
-      await firestoreSync.saveNotification({
-        id: `notif_${Date.now()}_sent`,
-        userId: data.senderUserId,
-        title: 'Transfer Sent',
-        message: `You transferred $${transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} to ${recipientName || targetIdentifier}.`,
-        type: 'TRANSACTION',
-        severity: 'info',
-        read: false,
-        createdAt: new Date().toISOString(),
-        referenceId: completedTx.referenceNumber,
-      });
-
-      // Trigger multi-channel alerts for sender (Push, SMS, Email)
-      notificationDispatcher.dispatchTransactionNotification({
-        transactionId: completedTx.id,
-        referenceNumber: completedTx.referenceNumber,
-        type: 'MONEY_SENT',
-        userId: data.senderUserId,
-        recipientName: recipientName || targetIdentifier,
+    const response = await fetch('/api/transfers/monvera', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        recipientUserId: recipientId,
+        recipientAccountNumber: recipientAcc,
+        recipientUsername: (data as any).recipientUsername,
+        recipientIdentifier: targetIdentifier,
         amount: transferAmount,
-        currency: completedTx.currency || 'USD',
-        senderName: senderName,
-        accountMasked: 'Monvera Checking',
-      }).catch((err) => console.warn('[NotificationDispatcher] Sender dispatch note:', err));
+        description: data.description,
+        category: data.category,
+        referenceNumber: refNum,
+      }),
+    });
 
-      // Credit recipient account in Firestore with double-entry accounting
-      if (recipientId && recipientId !== data.senderUserId) {
-        const recipientMetrics = await firestoreSync.getAccountBalances(recipientId, recipientAcc);
-        const rChecking = (recipientMetrics?.checkingBalance || 0) + transferAmount;
-        const rSavings = recipientMetrics?.savingsBalance || 0;
-        const rInvested = recipientMetrics?.investedBalance || 0;
+    const parsed = await parseJsonResponse<{
+      success: boolean;
+      transaction?: Transaction;
+      balanceMetrics?: BalanceMetrics;
+      recipientBalanceMetrics?: BalanceMetrics;
+      error?: string;
+    }>(response, { success: false, error: 'Transfer failed' });
 
-        const updatedRecipientMetrics: BalanceMetrics = {
-          checkingBalance: rChecking,
-          savingsBalance: rSavings,
-          investedBalance: rInvested,
-          accruedEarnings: recipientMetrics?.accruedEarnings || 0,
-          totalBalance: rChecking + rSavings + rInvested,
-          availableBalance: rChecking,
-          pendingBalance: 0,
-          accounts: (recipientMetrics?.accounts && recipientMetrics.accounts.length > 0)
-            ? recipientMetrics.accounts.map((a) =>
-                a.type === 'CHECKING'
-                  ? { ...a, balance: a.balance + transferAmount, availableBalance: a.availableBalance + transferAmount }
-                  : a
-              )
-            : [
-                {
-                  id: `acc_chk_${recipientId}`,
-                  userId: recipientId,
-                  type: 'CHECKING',
-                  accountNumber: recipientAcc || '1088492015',
-                  routingNumber: '021000021',
-                  currency: 'USD',
-                  balance: rChecking,
-                  availableBalance: rChecking,
-                  investedBalance: 0,
-                  pendingBalance: 0,
-                  interestRateAPY: 1.25,
-                  status: 'ACTIVE',
-                  nickname: 'Monvera Premier Checking',
-                },
-                {
-                  id: `acc_sav_${recipientId}`,
-                  userId: recipientId,
-                  type: 'SAVINGS',
-                  accountNumber: recipientAcc ? `10${recipientAcc.slice(2, -3)}991` : '1000000991',
-                  routingNumber: '021000021',
-                  currency: 'USD',
-                  balance: rSavings,
-                  availableBalance: rSavings,
-                  investedBalance: 0,
-                  pendingBalance: 0,
-                  interestRateAPY: 4.85,
-                  status: 'ACTIVE',
-                  nickname: 'Monvera High-Yield Treasury',
-                }
-              ],
-        };
+    if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+      return {
+        success: false,
+        error: parsed.error || 'Transfer failed. Neither account balance was modified.',
+      };
+    }
 
-        await firestoreSync.saveAccountBalances(recipientId, updatedRecipientMetrics);
+    const updatedSenderMetrics = parsed.balanceMetrics;
+    const finalTx = parsed.transaction;
 
-        // Instant credit notification for recipient
-        await firestoreSync.saveNotification({
-          id: `notif_${Date.now()}_rcv`,
-          userId: recipientId,
-          title: 'Money Received',
-          message: `Received $${transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} from ${senderName}.`,
-          type: 'TRANSACTION',
-          severity: 'success',
-          read: false,
-          createdAt: new Date().toISOString(),
-          referenceId: completedTx.referenceNumber,
-        });
-
-        // Trigger multi-channel alerts for recipient (Push, SMS, Email)
-        notificationDispatcher.dispatchTransactionNotification({
-          transactionId: completedTx.id,
-          referenceNumber: completedTx.referenceNumber,
-          type: 'MONEY_RECEIVED',
-          userId: recipientId,
-          recipientName: recipientName,
-          recipientEmail: (data as any).recipientEmail,
-          recipientPhone: (data as any).recipientPhone,
-          amount: transferAmount,
-          currency: completedTx.currency || 'USD',
-          senderName: senderName,
-          accountMasked: 'Monvera Checking',
-        }).catch((err) => console.warn('[NotificationDispatcher] Recipient dispatch note:', err));
-      }
-
-      // Update local storage and dispatch real-time events immediately for zero-lag response
-      if (typeof window !== 'undefined') {
+    // Post-transaction non-blocking alerts & local state dispatch
+    if (typeof window !== 'undefined') {
+      try {
         localStorage.setItem(`monvera_balances_${data.senderUserId}`, JSON.stringify(updatedSenderMetrics));
         localStorage.setItem('monvera_account_balances', JSON.stringify(updatedSenderMetrics));
         window.dispatchEvent(
@@ -901,24 +773,17 @@ export const api = {
         );
         window.dispatchEvent(
           new CustomEvent('monvera_transaction_created', {
-            detail: { userId: data.senderUserId, transaction: completedTx },
+            detail: { userId: data.senderUserId, transaction: finalTx },
           })
         );
-      }
-
-      return {
-        success: true,
-        transaction: completedTx,
-        balanceMetrics: updatedSenderMetrics,
-      };
-    } catch (persistErr) {
-      console.error('[API] Error persisting transfer:', persistErr);
-      return {
-        success: true,
-        transaction: completedTx,
-        balanceMetrics: updatedSenderMetrics,
-      };
+      } catch {}
     }
+
+    return {
+      success: true,
+      transaction: finalTx,
+      balanceMetrics: updatedSenderMetrics,
+    };
   },
 
   async sendInternalTransfer(data: {
@@ -949,154 +814,66 @@ export const api = {
     metadata?: Record<string, any>;
   }): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
     const depositAmount = Number(data.amount);
-    const targetType = data.destinationAccountType || 'CHECKING';
 
     if (isNaN(depositAmount) || depositAmount <= 0) {
       return { success: false, error: 'Invalid deposit amount.' };
     }
 
-    // 1. Fetch current balance metrics to guarantee strictly additive calculation
-    let currentMetrics: BalanceMetrics;
-    try {
-      currentMetrics = await this.getBalanceMetrics(data.userId, data.metadata?.accountNumber);
-    } catch {
-      currentMetrics = {
-        checkingBalance: 0,
-        savingsBalance: 0,
-        investedBalance: 0,
-        accruedEarnings: 0,
-        totalBalance: 0,
-        availableBalance: 0,
-        pendingBalance: 0,
-        accounts: [],
-      };
-    }
+    const authHeaders = await getAuthHeaders();
 
-    const isChecking = targetType === 'CHECKING';
-    const prevChecking = Number(currentMetrics.checkingBalance) || 0;
-    const prevSavings = Number(currentMetrics.savingsBalance) || 0;
-    const prevInvested = Number(currentMetrics.investedBalance) || 0;
-    const prevAccrued = Number(currentMetrics.accruedEarnings) || 0;
-
-    const updatedChecking = isChecking ? prevChecking + depositAmount : prevChecking;
-    const updatedSavings = !isChecking ? prevSavings + depositAmount : prevSavings;
-    const updatedTotal = updatedChecking + updatedSavings + prevInvested + prevAccrued;
-    const updatedAvailable = updatedChecking;
-
-    const updatedMetrics: BalanceMetrics = {
-      ...currentMetrics,
-      checkingBalance: updatedChecking,
-      savingsBalance: updatedSavings,
-      investedBalance: prevInvested,
-      accruedEarnings: prevAccrued,
-      totalBalance: updatedTotal,
-      availableBalance: updatedAvailable,
-      accounts: currentMetrics.accounts && currentMetrics.accounts.length > 0
-        ? currentMetrics.accounts.map((acc) => {
-            if (acc.type === targetType) {
-              const prevAccBal = Number(acc.balance) || 0;
-              const prevAccAvail = Number(acc.availableBalance) || 0;
-              return {
-                ...acc,
-                balance: prevAccBal + depositAmount,
-                availableBalance: prevAccAvail + depositAmount,
-              };
-            }
-            return acc;
-          })
-        : [
-            {
-              id: `acc_chk_${data.userId}`,
-              userId: data.userId,
-              type: 'CHECKING',
-              accountNumber: data.metadata?.accountNumber || '1088492015',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: updatedChecking,
-              availableBalance: updatedChecking,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 1.25,
-              status: 'ACTIVE',
-              nickname: 'Monvera Premier Checking',
-            },
-            {
-              id: `acc_sav_${data.userId}`,
-              userId: data.userId,
-              type: 'SAVINGS',
-              accountNumber: '1088492991',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: updatedSavings,
-              availableBalance: updatedSavings,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 4.85,
-              status: 'ACTIVE',
-              nickname: 'Monvera High-Yield Treasury',
-            },
-          ],
-    };
-
-    // Generate permanent deposit transaction
-    const txId = `tx_dep_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-    const newTx: Transaction = {
-      id: txId,
-      referenceNumber: `MV-DEP-${Math.floor(100000000 + Math.random() * 900000000)}`,
-      type: 'DEPOSIT',
-      amount: depositAmount,
-      currency: 'USD',
-      status: 'COMPLETED',
-      userId: data.userId,
-      senderUserId: data.userId,
-      recipientUserId: data.userId,
-      fee: 0.00,
-      description: `Monvera ${data.method} Deposit - Added to ${targetType}`,
-      category: 'Deposits',
-      createdAt: new Date().toISOString(),
-      metadata: {
-        destinationAccountType: targetType,
-        depositMethod: data.method,
-        ...data.metadata,
-      },
-    };
-
-    // 2. Persist directly to Firestore & local permanent storage
-    try {
-      await firestoreSync.saveTransaction(newTx);
-      await firestoreSync.saveAccountBalances(data.userId, updatedMetrics);
-    } catch (fsErr) {
-      console.warn('[API] Firestore save transaction/balance notice:', fsErr);
-    }
-
-    // 3. Sync with Express backend
     try {
       const res = await fetch('/api/deposits/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify(data),
       });
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const resData = await res.json();
-        if (resData && typeof resData === 'object' && resData.transaction) {
-          // If server created a distinct transaction reference, merge it
-          return {
-            success: true,
-            transaction: { ...newTx, referenceNumber: resData.transaction.referenceNumber || newTx.referenceNumber },
-            balanceMetrics: updatedMetrics,
-          };
-        }
-      }
-    } catch {
-      // Backend sync fallback
-    }
 
-    return {
-      success: true,
-      transaction: newTx,
-      balanceMetrics: updatedMetrics,
-    };
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        error?: string;
+      }>(res, { success: false, error: 'Deposit service unavailable' });
+
+      if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+        return {
+          success: false,
+          error: parsed.error || 'Failed to record deposit in authoritative ledger. Please try again.',
+        };
+      }
+
+      const finalTx = parsed.transaction;
+      const updatedMetrics = parsed.balanceMetrics;
+
+      // Update local storage cache and dispatch UI events
+      if (typeof window !== 'undefined') {
+        try {
+          localStorage.setItem(`monvera_balances_${data.userId}`, JSON.stringify(updatedMetrics));
+          localStorage.setItem('monvera_account_balances', JSON.stringify(updatedMetrics));
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId: data.userId, balanceMetrics: updatedMetrics },
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent('monvera_transaction_created', {
+              detail: { userId: data.userId, transaction: finalTx },
+            })
+          );
+        } catch {}
+      }
+
+      return {
+        success: true,
+        transaction: finalTx,
+        balanceMetrics: updatedMetrics,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Network error while processing deposit.',
+      };
+    }
   },
 
   async createWithdrawal(data: {
@@ -1122,114 +899,47 @@ export const api = {
     const withdrawAmount = Number(data.amount);
     const sourceType = data.sourceAccountType || 'CHECKING';
 
-    const txId = `tx_wth_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-    const reversalMinutes = 30;
-    const reversalScheduledAt = new Date(Date.now() + reversalMinutes * 60 * 1000).toISOString();
+    if (!data.userId || withdrawAmount <= 0) {
+      return { success: false, error: 'Please enter a valid positive withdrawal amount.' };
+    }
 
-    const newTx: Transaction = {
-      id: txId,
-      referenceNumber: `MV-WTH-${Math.floor(100000000 + Math.random() * 900000000)}`,
-      type: 'WITHDRAWAL',
-      amount: withdrawAmount,
-      currency: 'USD',
-      status: 'PENDING',
-      senderUserId: data.userId,
-      fee: 0.0,
-      description: `Instant Card Push to ${data.destinationLabel} (${data.accountOrIban.slice(-4)})`,
-      category: 'Withdrawals',
-      createdAt: new Date().toISOString(),
-      metadata: {
+    // Call authoritative server-side withdrawal endpoint with verified Firebase Auth ID token
+    const authHeaders = await getAuthHeaders();
+
+    const response = await fetch('/api/withdrawals/create', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        amount: withdrawAmount,
         destinationType: data.destinationType,
         destinationLabel: data.destinationLabel,
         accountOrIban: data.accountOrIban,
-        cardBrand: data.cardBrand,
         sourceAccountType: sourceType,
-        autoReverse: true,
-        reversalMinutes,
-        reversalScheduledAt,
-      },
-    };
-
-    // Calculate debit metrics immediately so UI and storage update with zero lag
-    const currentMetrics = data.fallbackBalances || (await this.getBalanceMetrics(data.userId, data.userAccountNumber));
-    const isChecking = sourceType === 'CHECKING';
-    const updatedChecking = isChecking
-      ? Math.max(0, currentMetrics.checkingBalance - withdrawAmount)
-      : currentMetrics.checkingBalance;
-    const updatedSavings = !isChecking
-      ? Math.max(0, currentMetrics.savingsBalance - withdrawAmount)
-      : currentMetrics.savingsBalance;
-
-    const computedMetrics: BalanceMetrics = {
-      ...currentMetrics,
-      checkingBalance: updatedChecking,
-      savingsBalance: updatedSavings,
-      totalBalance:
-        updatedChecking +
-        updatedSavings +
-        Number(currentMetrics.investedBalance || 0) +
-        Number(currentMetrics.accruedEarnings || 0),
-      availableBalance: updatedChecking,
-      accounts: (currentMetrics.accounts || []).map((acc) => {
-        if (acc.type === sourceType) {
-          return {
-            ...acc,
-            balance: Math.max(0, acc.balance - withdrawAmount),
-            availableBalance: Math.max(0, acc.availableBalance - withdrawAmount),
-          };
-        }
-        return acc;
+        routingNumber: data.routingNumber,
+        cardBrand: data.cardBrand,
       }),
-    };
+    });
 
-    // 1. Try Express Backend
-    let finalTx: Transaction = newTx;
-    let finalMetrics: BalanceMetrics = computedMetrics;
+    const parsed = await parseJsonResponse<{
+      success: boolean;
+      transaction?: Transaction;
+      balanceMetrics?: BalanceMetrics;
+      error?: string;
+    }>(response, { success: false, error: 'Withdrawal authorization failed' });
 
-    try {
-      const res = await fetch('/api/withdrawals/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...data,
-          fallbackBalances: currentMetrics,
-        }),
-      });
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const resData = await res.json();
-        if (resData && typeof resData === 'object' && resData.success) {
-          if (resData.transaction) finalTx = resData.transaction;
-          if (resData.balanceMetrics) finalMetrics = resData.balanceMetrics;
-        }
-      }
-    } catch {
-      console.warn('[API] Express backend withdrawal endpoint unreachable, proceeding with local & Firestore sync...');
+    if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+      return {
+        success: false,
+        error: parsed.error || 'Failed to authorize withdrawal.',
+      };
     }
 
-    // 2. Direct Firestore Permanent Persistence Layer (Immediate Debit & Pending Transaction)
-    try {
-      await firestoreSync.saveTransaction(finalTx);
-      await firestoreSync.saveAccountBalances(data.userId, finalMetrics);
+    const finalMetrics = parsed.balanceMetrics;
+    const finalTx = parsed.transaction;
 
-      // Notification for pending status
-      const notif = {
-        id: `notif_${Date.now()}_wth`,
-        userId: data.userId,
-        title: 'Withdrawal Pending Authorization',
-        message: `-$${withdrawAmount.toLocaleString('en-US', {
-          minimumFractionDigits: 2,
-        })} has been debited from your checking account to ${data.destinationLabel} and is currently pending network settlement.`,
-        type: 'TRANSACTION' as const,
-        severity: 'warning' as const,
-        read: false,
-        createdAt: new Date().toISOString(),
-        referenceId: finalTx.referenceNumber,
-      };
-      await firestoreSync.saveNotification(notif);
-
-      // Update local storage and dispatch events
-      if (typeof window !== 'undefined') {
+    // Update local storage and dispatch events
+    if (typeof window !== 'undefined') {
+      try {
         localStorage.setItem(`monvera_balances_${data.userId}`, JSON.stringify(finalMetrics));
         localStorage.setItem('monvera_account_balances', JSON.stringify(finalMetrics));
 
@@ -1243,41 +953,14 @@ export const api = {
             detail: { userId: data.userId, transaction: finalTx },
           })
         );
-        window.dispatchEvent(
-          new CustomEvent('monvera_notification_created', {
-            detail: { userId: data.userId, notification: notif },
-          })
-        );
-
-        try {
-          const channel = new BroadcastChannel('monvera_sync_channel');
-          channel.postMessage({
-            type: 'BALANCE_UPDATED',
-            userId: data.userId,
-            balanceMetrics: finalMetrics,
-          });
-          channel.postMessage({
-            type: 'TRANSACTION_CREATED',
-            userId: data.userId,
-            transaction: finalTx,
-          });
-          channel.close();
-        } catch {}
-      }
-
-      return {
-        success: true,
-        transaction: finalTx,
-        balanceMetrics: finalMetrics,
-      };
-    } catch (fsErr) {
-      console.error('[API] Firestore withdrawal save notice:', fsErr);
-      return {
-        success: true,
-        transaction: finalTx,
-        balanceMetrics: finalMetrics,
-      };
+      } catch {}
     }
+
+    return {
+      success: true,
+      transaction: finalTx,
+      balanceMetrics: finalMetrics,
+    };
   },
 
   async reversePendingWithdrawal(
@@ -1472,73 +1155,64 @@ export const api = {
       return { success: false, error: 'Minimum term investment amount is $100.00.' };
     }
 
-    let backendResult: any = null;
-    let fallbackToFirestore = false;
-
-    // 2. Attempt existing backend endpoint first
     try {
+      const headers = await getAuthHeaders();
       const res = await fetch('/api/investments/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(data),
       });
 
-      backendResult = await parseJsonResponse(res, {
+      const result = await parseJsonResponse<{
+        success: boolean;
+        investment?: InvestmentPlan;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Investment service unavailable',
       });
 
-      // If backend succeeded with an active investment, return immediately
-      if (backendResult?.success && backendResult?.investment) {
-        return backendResult;
+      if (!res.ok || !result.success) {
+        return {
+          success: false,
+          error: result.error || `Investment creation rejected (${res.status})`,
+        };
       }
 
-      // Check if backend returned an error
-      if (backendResult?.error) {
-        const errStr = String(backendResult.error).toLowerCase();
-        if (
-          backendResult.isBackendUnavailable ||
-          errStr.includes('customer not found') ||
-          errStr.includes('user account not found') ||
-          errStr.includes('not found')
-        ) {
-          fallbackToFirestore = true;
-        } else if (errStr.includes('insufficient')) {
-          const fsBalances = await firestoreSync.getAccountBalances(data.userId, data.userAccountNumber);
-          if (fsBalances && fsBalances.checkingBalance >= data.amount) {
-            fallbackToFirestore = true;
-          } else if (data.fallbackBalances && data.fallbackBalances.checkingBalance >= data.amount) {
-            fallbackToFirestore = true;
-          } else {
-            return { success: false, error: backendResult.error };
+      if (typeof window !== 'undefined' && result.investment) {
+        try {
+          if (result.balanceMetrics) {
+            window.dispatchEvent(
+              new CustomEvent('monvera_balance_updated', {
+                detail: {
+                  userId: data.userId,
+                  balanceMetrics: result.balanceMetrics,
+                },
+              })
+            );
           }
-        } else {
-          fallbackToFirestore = true;
-        }
-      } else {
-        fallbackToFirestore = true;
+          window.dispatchEvent(
+            new CustomEvent('monvera_investment_updated', {
+              detail: { investment: result.investment },
+            })
+          );
+        } catch {}
       }
-    } catch {
-      fallbackToFirestore = true;
+
+      return {
+        success: true,
+        investment: result.investment,
+        balanceMetrics: result.balanceMetrics,
+      };
+    } catch (err: any) {
+      console.error('[createInvestment] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error communicating with investment service.',
+      };
     }
-
-    // 3. Authoritative Firestore Atomic Transaction Engine
-    if (fallbackToFirestore || !backendResult?.success) {
-      console.log('[API] Executing authoritative Firestore engine for term investment creation...');
-      const fsRes = await firestoreSync.createTermInvestmentDirect({
-        userId: data.userId,
-        termDays: data.termDays,
-        amount: data.amount,
-        clientRequestId: data.clientRequestId,
-        userAccountNumber: data.userAccountNumber,
-        fallbackBalances: data.fallbackBalances,
-        fallbackUser: data.fallbackUser,
-      });
-
-      return fsRes;
-    }
-
-    return backendResult || { success: false, error: 'Investment creation failed.' };
   },
 
   async matureInvestment(
@@ -1551,41 +1225,65 @@ export const api = {
     balanceMetrics?: BalanceMetrics;
     error?: string;
   }> {
-    let backendResult: any = null;
-    let fallbackToFirestore = false;
-
     try {
+      const headers = await getAuthHeaders();
       const res = await fetch(`/api/investments/${encodeURIComponent(id)}/mature`, {
         method: 'POST',
+        headers,
+        body: JSON.stringify({ userId }),
       });
-      backendResult = await parseJsonResponse(res, {
+
+      const result = await parseJsonResponse<{
+        success: boolean;
+        investment?: InvestmentPlan;
+        payoutAmount?: number;
+        balanceMetrics?: BalanceMetrics;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Investment settlement service unavailable',
       });
 
-      if (backendResult?.success && backendResult?.investment) {
-        return backendResult;
+      if (!res.ok || !result.success) {
+        return {
+          success: false,
+          error: result.error || `Investment settlement rejected (${res.status})`,
+        };
       }
 
-      if (backendResult?.error) {
-        const errStr = String(backendResult.error).toLowerCase();
-        if (backendResult.isBackendUnavailable || errStr.includes('not found')) {
-          fallbackToFirestore = true;
-        } else {
-          return backendResult;
-        }
-      } else {
-        fallbackToFirestore = true;
+      if (typeof window !== 'undefined' && result.investment) {
+        try {
+          if (result.balanceMetrics) {
+            window.dispatchEvent(
+              new CustomEvent('monvera_balance_updated', {
+                detail: {
+                  userId: userId || result.investment.userId,
+                  balanceMetrics: result.balanceMetrics,
+                },
+              })
+            );
+          }
+          window.dispatchEvent(
+            new CustomEvent('monvera_investment_updated', {
+              detail: { investment: result.investment },
+            })
+          );
+        } catch {}
       }
-    } catch {
-      fallbackToFirestore = true;
-    }
 
-    if (fallbackToFirestore && userId) {
-      return await firestoreSync.matureInvestmentDirect(id, userId);
+      return {
+        success: true,
+        investment: result.investment,
+        payoutAmount: result.payoutAmount,
+        balanceMetrics: result.balanceMetrics,
+      };
+    } catch (err: any) {
+      console.error('[matureInvestment] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error communicating with investment settlement service.',
+      };
     }
-
-    return backendResult || { success: false, error: 'Failed to settle investment.' };
   },
 
   async getCards(userId: string): Promise<{ cards: CardItem[] }> {
@@ -1694,24 +1392,17 @@ export const api = {
         if (backendResult.isBackendUnavailable || errStr.includes('user account not found') || errStr.includes('not found')) {
           fallbackToFirestore = true;
         } else if (errStr.includes('insufficient')) {
-          // Verify if Firestore or local cache has sufficient balance ($2.00 fee) in checking
+          // Verify if authoritative Firestore has sufficient balance ($2.00 fee) in checking
           const fsBalances = await firestoreSync.getAccountBalances(data.userId, data.userAccountNumber);
-          if (fsBalances && fsBalances.checkingBalance >= 2.0) {
+          if (fsBalances && Number(fsBalances.checkingBalance) >= 2.0) {
             fallbackToFirestore = true;
-          } else if (data.fallbackBalances && data.fallbackBalances.checkingBalance >= 2.0) {
+          } else if (data.fallbackBalances && Number(data.fallbackBalances.checkingBalance) >= 2.0) {
             fallbackToFirestore = true;
           } else {
-            // Check localStorage
-            try {
-              const localCached = JSON.parse(localStorage.getItem(`monvera_balances_${data.userId}`) || 'null');
-              if (localCached && Number(localCached.checkingBalance) >= 2.0) {
-                fallbackToFirestore = true;
-              } else {
-                fallbackToFirestore = true;
-              }
-            } catch {
-              fallbackToFirestore = true;
-            }
+            return {
+              success: false,
+              error: backendResult.error || 'Insufficient checking balance to cover the $2.00 card issuance fee.',
+            };
           }
         } else {
           fallbackToFirestore = true;
@@ -2399,273 +2090,59 @@ export const api = {
       return { success: false, error: 'Please enter a valid recipient account number and positive transfer amount.' };
     }
 
-    // 1. Authoritatively resolve the recipient from Firestore or Directory
-    let resolvedUser: UserProfile | null = null;
+    const authHeaders = await getAuthHeaders();
+
     try {
-      resolvedUser = await firestoreSync.findRecipient(data.targetUserId);
-    } catch {}
+      const res = await fetch('/api/admin/transfer', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          adminId: data.adminId || 'usr_admin',
+          targetUserId: data.targetUserId,
+          amount: Number(data.amount),
+          description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
+          category: data.category || 'Transfers',
+        }),
+      });
 
-    if (!resolvedUser) {
-      try {
-        resolvedUser = await firestoreSync.getUserProfile(data.targetUserId);
-      } catch {}
-    }
+      const result = await parseJsonResponse<{
+        success: boolean;
+        transaction?: Transaction;
+        targetBalanceMetrics?: BalanceMetrics;
+        isDuplicate?: boolean;
+        error?: string;
+      }>(res, { success: false, error: 'Admin transfer service unavailable' });
 
-    // Fallback: check local accounts directory cache
-    if (!resolvedUser && typeof window !== 'undefined' && window.localStorage) {
-      try {
-        const cachedRaw = localStorage.getItem('monvera_accounts_directory');
-        if (cachedRaw) {
-          const directory: UserProfile[] = JSON.parse(cachedRaw);
-          const cleanInput = data.targetUserId.trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
-          resolvedUser = directory.find((u) => {
-            const uAcc = (u.permanentAccountNumber || (u as any).accountNumber || '').replace(/[-\s]/g, '');
-            const uUser = (u.username || '').replace(/^@/, '').toLowerCase();
-            const uEmail = (u.email || '').toLowerCase();
-            const uId = (u.id || (u as any).uid || '').toLowerCase();
-            return (
-              (cleanInput && uAcc === cleanInput) ||
-              (cleanInput && uUser === cleanInput) ||
-              (cleanInput && uEmail === cleanInput) ||
-              (cleanInput && uId === cleanInput)
-            );
-          }) || null;
-        }
-      } catch {}
-    }
+      if (!result.success || !result.transaction) {
+        return {
+          success: false,
+          error: result.error || 'Failed to complete administrative transfer.',
+        };
+      }
 
-    // Fallback: lookup via backend
-    if (!resolvedUser) {
-      try {
-        const lookup = await this.lookupRecipient(data.targetUserId, data.adminId || 'usr_admin');
-        if (lookup && lookup.valid) {
-          resolvedUser = {
-            id: lookup.recipientId,
-            username: lookup.username || 'customer',
-            firstName: lookup.firstName || 'Monvera',
-            lastName: lookup.lastName || 'Customer',
-            email: `${lookup.username || 'customer'}@monvera.com`,
-            phone: '+1 (555) 019-2834',
-            permanentAccountNumber: lookup.permanentAccountNumber,
-            country: 'United States',
-            status: 'active',
-            membershipTier: lookup.membershipTier || 'Premier',
-            role: 'customer',
-            createdAt: new Date().toISOString(),
-            twoFactorEnabled: false,
-            kycStatus: 'verified',
-            emailVerified: true,
-            dailyTransactionLimit: 1000000,
-          };
-        }
-      } catch {}
-    }
+      // If current logged-in user is recipient, update local storage cache and dispatch event
+      const recipientId = result.transaction.recipientUserId || data.targetUserId;
+      if (typeof window !== 'undefined' && result.targetBalanceMetrics) {
+        try {
+          localStorage.setItem(`monvera_balances_${recipientId}`, JSON.stringify(result.targetBalanceMetrics));
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId: recipientId, balanceMetrics: result.targetBalanceMetrics },
+            })
+          );
+        } catch {}
+      }
 
-    // Authoritatively reject if recipient cannot be resolved - DO NOT fall back to account number as targetId
-    if (!resolvedUser) {
+      return {
+        success: true,
+        transaction: result.transaction,
+        targetBalanceMetrics: result.targetBalanceMetrics,
+      };
+    } catch (err: any) {
       return {
         success: false,
-        error: 'Recipient account could not be resolved. Please verify the 10-digit Monvera permanent account number.',
+        error: err?.message || 'Network error occurred while processing administrative transfer.',
       };
-    }
-
-    const targetId = resolvedUser.id; // Strictly authoritative Firebase UID
-    const targetAcc = resolvedUser.permanentAccountNumber || data.targetUserId.replace(/[-\s]/g, '');
-    const targetName = `${resolvedUser.firstName || ''} ${resolvedUser.lastName || ''}`.trim() || 'Monvera Customer';
-    const targetUsername = resolvedUser.username;
-    const targetEmail = resolvedUser.email;
-
-    try {
-      // 2. Authoritative backend transaction execution
-      let authoritativeTx: Transaction;
-
-      try {
-        const res = await fetch('/api/admin/transfer', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            adminId: data.adminId || 'usr_admin',
-            targetUserId: targetId,
-            targetAccountNumber: targetAcc,
-            targetName,
-            targetUsername,
-            targetEmail,
-            amount: Number(data.amount),
-            description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
-            category: data.category || 'Transfers',
-          }),
-        });
-
-        const result = await parseJsonResponse<{ success: boolean; transaction?: Transaction; targetBalanceMetrics?: BalanceMetrics; error?: string }>(
-          res,
-          { success: false, error: 'Admin transfer server is unavailable' }
-        );
-
-        if (result.success && result.transaction) {
-          authoritativeTx = result.transaction;
-        } else {
-          // Direct fallback transaction when backend server is unavailable or route fails on deployed site
-          const txId = `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-          const refNumber = `MVB-ADM-${Date.now().toString().slice(-8)}`;
-          authoritativeTx = {
-            id: txId,
-            userId: targetId,
-            type: 'TRANSFER',
-            category: data.category || 'Transfers',
-            amount: Number(data.amount),
-            fee: 0,
-            currency: 'USD',
-            status: 'COMPLETED',
-            description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
-            senderName: 'Bennett Johnson (Admin)',
-            senderAccountNumber: 'MVB-ADM-0001',
-            recipientName: targetName,
-            recipientAccountNumber: targetAcc,
-            referenceNumber: refNumber,
-            createdAt: new Date().toISOString(),
-            completedAt: new Date().toISOString(),
-          };
-        }
-      } catch {
-        // Direct fallback transaction when network or backend server is completely offline
-        const txId = `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        const refNumber = `MVB-ADM-${Date.now().toString().slice(-8)}`;
-        authoritativeTx = {
-          id: txId,
-          userId: targetId,
-          type: 'TRANSFER',
-          category: data.category || 'Transfers',
-          amount: Number(data.amount),
-          fee: 0,
-          currency: 'USD',
-          status: 'COMPLETED',
-          description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
-          senderName: 'Bennett Johnson (Admin)',
-          senderAccountNumber: 'MVB-ADM-0001',
-          recipientName: targetName,
-          recipientAccountNumber: targetAcc,
-          referenceNumber: refNumber,
-          createdAt: new Date().toISOString(),
-          completedAt: new Date().toISOString(),
-        };
-      }
-
-      // 3. Atomically persist to Firestore
-      try {
-        // 3a. Save transaction record to Firestore ledger
-        await firestoreSync.saveTransaction(authoritativeTx);
-
-        // 3b. Read recipient's latest Firestore balance, add transfer amount, and persist to accounts/{targetId}
-        const transferAmt = Number(data.amount);
-        const currentRecipientMetrics = await firestoreSync.getAccountBalances(targetId, targetAcc);
-
-        const curChecking = Number(currentRecipientMetrics?.checkingBalance) || 0;
-        const curSavings = Number(currentRecipientMetrics?.savingsBalance) || 0;
-        const curInvested = Number(currentRecipientMetrics?.investedBalance) || 0;
-        const curAccrued = Number(currentRecipientMetrics?.accruedEarnings) || 0;
-        const curPending = Number(currentRecipientMetrics?.pendingBalance) || 0;
-        const curTotal = Number(currentRecipientMetrics?.totalBalance) || (curChecking + curSavings + curInvested + curAccrued);
-        const curAvailable = Number(currentRecipientMetrics?.availableBalance) || curChecking;
-        const curMonthlyIncome = Number((currentRecipientMetrics as any)?.monthlyIncome) || 0;
-        const curMonthlySpending = Number((currentRecipientMetrics as any)?.monthlySpending) || 0;
-
-        const newChecking = curChecking + transferAmt;
-        const newAvailable = curAvailable + transferAmt;
-        const newTotal = curTotal + transferAmt;
-        const newMonthlyIncome = curMonthlyIncome + transferAmt;
-
-        const updatedRecipientMetrics: BalanceMetrics = {
-          checkingBalance: newChecking,
-          availableBalance: newAvailable,
-          totalBalance: newTotal,
-          savingsBalance: curSavings,
-          investedBalance: curInvested,
-          accruedEarnings: curAccrued,
-          pendingBalance: curPending,
-          accounts: [
-            {
-              id: `acc_chk_${targetId}`,
-              userId: targetId,
-              type: 'CHECKING',
-              accountNumber: targetAcc || '1000000000',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: newChecking,
-              availableBalance: newAvailable,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 1.25,
-              status: 'ACTIVE',
-              nickname: 'Monvera Premier Checking',
-            },
-            {
-              id: `acc_sav_${targetId}`,
-              userId: targetId,
-              type: 'SAVINGS',
-              accountNumber: targetAcc ? `10${targetAcc.slice(2, -3)}991` : '1000000991',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: curSavings,
-              availableBalance: curSavings,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 4.85,
-              status: 'ACTIVE',
-              nickname: 'Monvera High-Yield Treasury',
-            },
-          ],
-        };
-
-        // Also preserve monthly tracking metrics
-        (updatedRecipientMetrics as any).monthlyIncome = newMonthlyIncome;
-        (updatedRecipientMetrics as any).monthlySpending = curMonthlySpending;
-
-        await firestoreSync.saveAccountBalances(targetId, updatedRecipientMetrics);
-
-        // 3c. Create and save official recipient notification in Firestore
-        const notifId = `notif_${Date.now()}_adm_${Math.random().toString(36).substring(2, 6)}`;
-        await firestoreSync.saveNotification({
-          id: notifId,
-          userId: targetId,
-          title: 'Money Received',
-          message: `Received $${Number(data.amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} from Bennett Johnson (MVB •••• 0001).`,
-          type: 'TRANSACTION',
-          severity: 'success',
-          read: false,
-          createdAt: authoritativeTx.createdAt || new Date().toISOString(),
-          referenceId: authoritativeTx.referenceNumber,
-        });
-
-        // Trigger multi-channel alerts for recipient (Push, SMS, Email)
-        notificationDispatcher.dispatchTransactionNotification({
-          transactionId: authoritativeTx.id,
-          referenceNumber: authoritativeTx.referenceNumber,
-          type: 'MONEY_RECEIVED',
-          userId: targetId,
-          recipientName: resolvedUser?.firstName ? `${resolvedUser.firstName} ${resolvedUser.lastName}` : (targetName || 'Monvera Client'),
-          recipientEmail: resolvedUser?.email || targetEmail,
-          recipientPhone: resolvedUser?.phone,
-          amount: Number(data.amount),
-          currency: authoritativeTx.currency || 'USD',
-          senderName: 'Bennett Johnson (Admin)',
-          accountMasked: (authoritativeTx as any).accountName || 'Monvera Premier Checking',
-        }).catch((err) => console.warn('[NotificationDispatcher] Admin transfer dispatch note:', err));
-
-        return {
-          success: true,
-          transaction: authoritativeTx,
-          targetBalanceMetrics: updatedRecipientMetrics,
-        };
-      } catch (fsErr) {
-        console.warn('[Firestore] Sync note during admin transfer:', fsErr);
-        return {
-          success: true,
-          transaction: authoritativeTx,
-          targetBalanceMetrics: undefined,
-        };
-      }
-    } catch (err: any) {
-      return { success: false, error: err?.message || 'Network error occurred while processing administrative transfer.' };
     }
   },
 
@@ -2675,63 +2152,65 @@ export const api = {
     amount: number;
     reason: string;
     targetAccountType?: 'CHECKING' | 'SAVINGS';
-  }): Promise<{ success: boolean; transaction?: Transaction; targetBalanceMetrics?: BalanceMetrics; devFundingPoolBalance?: number; error?: string }> {
-    let resTx: Transaction | undefined;
-    let resMetrics: BalanceMetrics | undefined;
+    referenceId?: string;
+  }): Promise<{
+    success: boolean;
+    transaction?: Transaction;
+    targetBalanceMetrics?: BalanceMetrics;
+    devFundingPoolBalance?: number;
+    isDuplicate?: boolean;
+    error?: string;
+  }> {
+    const referenceId = data.referenceId || `MVB-DEV-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const authHeaders = await getAuthHeaders();
 
     try {
       const res = await fetch('/api/admin/dev-fund', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
+        headers: authHeaders,
+        body: JSON.stringify({ ...data, referenceId }),
       });
-      const result = await parseJsonResponse<{ success: boolean; transaction?: Transaction; targetBalanceMetrics?: BalanceMetrics; devFundingPoolBalance?: number; error?: string }>(res, { success: false, error: 'Dev funding service unavailable' });
-      if (result.success && result.transaction) {
-        resTx = result.transaction;
-        resMetrics = result.targetBalanceMetrics;
-      }
-    } catch {}
 
-    if (!resTx) {
-      const txId = `tx_dev_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-      resTx = {
-        id: txId,
-        userId: data.targetUserId,
-        type: 'ADMIN_DEVELOPMENT_FUNDING',
-        category: 'Transfers',
-        amount: Number(data.amount),
-        fee: 0,
-        currency: 'USD',
-        status: 'COMPLETED',
-        description: `Monvera Developer Liquidity Injection: ${data.reason}`,
-        senderName: 'Monvera Developer Sandbox Pool',
-        senderAccountNumber: 'MVB-DEV-POOL',
-        recipientName: 'Developer Sandbox Account',
-        recipientAccountNumber: 'Sandbox',
-        referenceNumber: `MVB-DEV-${Date.now().toString().slice(-8)}`,
-        createdAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
-      };
-    }
+      const result = await parseJsonResponse<{
+        success: boolean;
+        transaction?: Transaction;
+        targetBalanceMetrics?: BalanceMetrics;
+        devFundingPoolBalance?: number;
+        isDuplicate?: boolean;
+        error?: string;
+      }>(res, { success: false, error: 'Dev funding service unavailable' });
 
-    try {
-      await firestoreSync.saveTransaction(resTx);
-      const curBalances = await firestoreSync.getAccountBalances(data.targetUserId);
-      if (curBalances) {
-        const curChk = Number(curBalances.checkingBalance) || 0;
-        const curAvail = Number(curBalances.availableBalance) || 0;
-        const curTotal = Number(curBalances.totalBalance) || 0;
-        resMetrics = {
-          ...curBalances,
-          checkingBalance: curChk + Number(data.amount),
-          availableBalance: curAvail + Number(data.amount),
-          totalBalance: curTotal + Number(data.amount),
+      if (!result.success || !result.transaction) {
+        return {
+          success: false,
+          error: result.error || 'Failed to issue sandbox development funding.',
         };
-        await firestoreSync.saveAccountBalances(data.targetUserId, resMetrics);
       }
-      return { success: true, transaction: resTx, targetBalanceMetrics: resMetrics };
-    } catch {
-      return { success: true, transaction: resTx, targetBalanceMetrics: resMetrics };
+
+      // Update local storage cache if recipient is cached locally
+      if (typeof window !== 'undefined' && result.targetBalanceMetrics) {
+        try {
+          localStorage.setItem(`monvera_balances_${data.targetUserId}`, JSON.stringify(result.targetBalanceMetrics));
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId: data.targetUserId, balanceMetrics: result.targetBalanceMetrics },
+            })
+          );
+        } catch {}
+      }
+
+      return {
+        success: true,
+        transaction: result.transaction,
+        targetBalanceMetrics: result.targetBalanceMetrics,
+        devFundingPoolBalance: result.devFundingPoolBalance,
+        isDuplicate: result.isDuplicate,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Network error occurred while issuing developer funding.',
+      };
     }
   },
 
@@ -2982,18 +2461,14 @@ export const api = {
     notification?: NotificationItem;
     error?: string;
   }> {
-    let approvedLoan: LoanApplication | undefined = data.fallbackLoan;
-    let disburseTx: Transaction | undefined;
-    let notifItem: NotificationItem | undefined;
-    let backendSuccess = false;
-
-    // 1. Send loan approval command to Express backend
     try {
+      const headers = await getAuthHeaders();
       const res = await fetch('/api/admin/loans/approve', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(data),
       });
+
       const result = await parseJsonResponse<{
         success: boolean;
         loan?: LoanApplication;
@@ -3006,221 +2481,63 @@ export const api = {
         error: 'Approval service offline',
       });
 
-      if (result.success && result.loan) {
-        backendSuccess = true;
-        approvedLoan = result.loan;
-        disburseTx = result.transaction;
-        notifItem = result.notification;
-      }
-    } catch {
-      // Backend offline / network error
-    }
-
-    // 2. Client-side Firestore fallback if backend is unreachable
-    if (!backendSuccess) {
-      try {
-        const allLoans = await firestoreSync.getAllLoans();
-        const existingLoan = allLoans.find((l) => l.id === data.loanId) || data.fallbackLoan;
-        if (!existingLoan) {
-          return { success: false, error: 'Loan application not found.' };
-        }
-
-        const now = new Date().toISOString();
-        const totalRepay = existingLoan.totalRepaymentAmount || Number((existingLoan.amount * 1.20).toFixed(2));
-        approvedLoan = {
-          ...existingLoan,
-          status: 'ACTIVE',
-          approvedAt: now,
-          approvedBy: data.adminId || 'usr_admin',
-          disbursedAt: now,
-          disbursedAmount: existingLoan.amount,
-          remainingBalance: totalRepay,
-          totalRepaid: 0,
-          updatedAt: now,
+      if (!res.ok || !result.success) {
+        return {
+          success: false,
+          error: result.error || `Loan approval failed (${res.status})`,
         };
-      } catch (err: any) {
-        return { success: false, error: err?.message || 'Failed to approve loan.' };
-      }
-    }
-
-    if (!approvedLoan) {
-      return { success: false, error: 'Loan record could not be processed.' };
-    }
-
-    const now = new Date().toISOString();
-    const loanAmount = Number(approvedLoan.disbursedAmount || approvedLoan.amount || 0);
-
-    // 3. Ensure a formal Disbursement Transaction exists
-    if (!disburseTx) {
-      const txId = `tx_loan_disb_${approvedLoan.id.slice(-6)}_${Date.now()}`;
-      disburseTx = {
-        id: txId,
-        userId: approvedLoan.userId,
-        type: 'DEPOSIT',
-        category: 'Deposits',
-        amount: loanAmount,
-        fee: 0,
-        currency: 'USD',
-        status: 'COMPLETED',
-        description: `Approved Commercial Loan Disbursement ($${loanAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}) - Ref: ${approvedLoan.id}`,
-        senderName: 'Monvera Credit & Lending Facility',
-        senderAccountNumber: 'MVB-LN-001',
-        recipientUserId: approvedLoan.userId,
-        recipientName: approvedLoan.applicantName,
-        recipientAccountNumber: approvedLoan.permanentAccountNumber || '',
-        referenceNumber: `MVB-LN-${Date.now().toString().slice(-8)}`,
-        createdAt: approvedLoan.approvedAt || now,
-        completedAt: approvedLoan.approvedAt || now,
-      };
-    }
-
-    // 4. Ensure a formal Notification item exists for the user's notification bell
-    if (!notifItem) {
-      notifItem = {
-        id: `notif_${Date.now()}_loan_appr`,
-        userId: approvedLoan.userId,
-        title: '🎉 Loan Approved & Disbursed!',
-        message: `Congratulations! Your loan application for $${loanAmount.toLocaleString('en-US', {
-          minimumFractionDigits: 2,
-        })} has been approved and the capital has been credited directly into your Checking Account.`,
-        type: 'TRANSACTION',
-        severity: 'success',
-        read: false,
-        createdAt: approvedLoan.approvedAt || now,
-        referenceId: approvedLoan.id,
-      };
-    }
-
-    // 5. Persist loan application, ledger transaction, and notification into Firestore
-    await firestoreSync.saveLoanApplication(approvedLoan);
-    await firestoreSync.saveTransaction(disburseTx);
-    await firestoreSync.saveNotification(notifItem);
-
-    // 6. Credit customer's checking account balance in Firestore accounts/{userId}
-    let updatedBalances: BalanceMetrics | undefined;
-    try {
-      const currentBalances = await firestoreSync.getAccountBalances(
-        approvedLoan.userId,
-        approvedLoan.permanentAccountNumber
-      );
-
-      const curChk = Number(currentBalances?.checkingBalance ?? 0);
-      const curAvail = Number(currentBalances?.availableBalance ?? curChk);
-      const curTotal = Number(
-        currentBalances?.totalBalance ?? (curChk + (currentBalances?.savingsBalance ?? 0))
-      );
-      const curLoanBal = Number(currentBalances?.loanBalance ?? 0);
-
-      const newChk = curChk + loanAmount;
-      const newAvail = curAvail + loanAmount;
-      const newTotal = curTotal + loanAmount;
-      const newLoanBal =
-        curLoanBal +
-        (approvedLoan.totalRepaymentAmount || Number((loanAmount * 1.20).toFixed(2)));
-
-      const creditedLoans: string[] = Array.isArray((currentBalances as any)?.creditedLoans)
-        ? [...(currentBalances as any).creditedLoans]
-        : [];
-      if (!creditedLoans.includes(approvedLoan.id)) {
-        creditedLoans.push(approvedLoan.id);
       }
 
-      let updatedAccounts = currentBalances?.accounts ? [...currentBalances.accounts] : [];
-      let foundChecking = false;
-      updatedAccounts = updatedAccounts.map((acc) => {
-        if (acc.type === 'CHECKING') {
-          foundChecking = true;
-          return {
-            ...acc,
-            balance: newChk,
-            availableBalance: newAvail,
+      // Dispatch local events so UI updates immediately
+      if (typeof window !== 'undefined' && result.loan) {
+        try {
+          const eventDetail = {
+            userId: result.loan.userId,
+            accountNumber: result.loan.permanentAccountNumber,
+            email: result.loan.applicantEmail,
+            balanceMetrics: result.balanceMetrics,
+            notification: result.notification,
+            loan: result.loan,
           };
-        }
-        return acc;
-      });
-
-      if (!foundChecking) {
-        updatedAccounts.unshift({
-          id: `acc_chk_${approvedLoan.userId}`,
-          userId: approvedLoan.userId,
-          type: 'CHECKING',
-          accountNumber: approvedLoan.permanentAccountNumber || '1088492015',
-          routingNumber: '021000021',
-          currency: 'USD',
-          balance: newChk,
-          availableBalance: newAvail,
-          investedBalance: 0,
-          pendingBalance: 0,
-          interestRateAPY: 1.25,
-          status: 'ACTIVE',
-          nickname: 'Monvera Premier Checking',
-        });
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: eventDetail,
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent('monvera_notification_created', {
+              detail: eventDetail,
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent('monvera_loan_updated', {
+              detail: { loan: result.loan, transaction: result.transaction },
+            })
+          );
+          const bc = new BroadcastChannel('monvera_sync_channel');
+          bc.postMessage({
+            type: 'LOAN_APPROVED_DISBURSED',
+            ...eventDetail,
+            transaction: result.transaction,
+          });
+          bc.close();
+        } catch {}
       }
 
-      updatedBalances = {
-        checkingBalance: newChk,
-        savingsBalance: currentBalances?.savingsBalance ?? 0,
-        investedBalance: currentBalances?.investedBalance ?? 0,
-        accruedEarnings: currentBalances?.accruedEarnings ?? 0,
-        totalBalance: newTotal,
-        availableBalance: newAvail,
-        loanBalance: newLoanBal,
-        pendingBalance: currentBalances?.pendingBalance ?? 0,
-        accounts: updatedAccounts,
-        creditedLoans,
-      } as any;
-
-      await firestoreSync.saveAccountBalances(approvedLoan.userId, updatedBalances!);
-      if (data.fallbackLoan?.userId && data.fallbackLoan.userId !== approvedLoan.userId) {
-        await firestoreSync.saveAccountBalances(data.fallbackLoan.userId, updatedBalances!);
-      }
-      if (data.fallbackLoan?.userId && data.fallbackLoan.userId !== approvedLoan.userId && notifItem) {
-        const altNotif = { ...notifItem, id: `notif_${Date.now()}_loan_alt`, userId: data.fallbackLoan.userId };
-        await firestoreSync.saveNotification(altNotif);
-      }
-    } catch (balErr) {
-      console.warn('[Admin Approve Loan] Firestore balance update note:', balErr);
+      return {
+        success: true,
+        loan: result.loan,
+        transaction: result.transaction,
+        balanceMetrics: result.balanceMetrics,
+        notification: result.notification,
+      };
+    } catch (err: any) {
+      console.error('[adminApproveLoan] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error communicating with loan approval service.',
+      };
     }
-
-    // 7. Instant event dispatch & multi-tab BroadcastChannel notification
-    if (typeof window !== 'undefined') {
-      try {
-        const eventDetail = {
-          userId: approvedLoan.userId,
-          fallbackUserId: data.fallbackLoan?.userId,
-          accountNumber: approvedLoan.permanentAccountNumber,
-          email: approvedLoan.applicantEmail,
-          balanceMetrics: updatedBalances,
-          notification: notifItem,
-          loan: approvedLoan,
-        };
-        window.dispatchEvent(
-          new CustomEvent('monvera_balance_updated', {
-            detail: eventDetail,
-          })
-        );
-        window.dispatchEvent(
-          new CustomEvent('monvera_notification_created', {
-            detail: eventDetail,
-          })
-        );
-        const bc = new BroadcastChannel('monvera_sync_channel');
-        bc.postMessage({
-          type: 'LOAN_APPROVED_DISBURSED',
-          ...eventDetail,
-          transaction: disburseTx,
-        });
-        bc.close();
-      } catch {}
-    }
-
-    return {
-      success: true,
-      loan: approvedLoan,
-      transaction: disburseTx,
-      balanceMetrics: updatedBalances,
-      notification: notifItem,
-    };
   },
 
   async adminRejectLoan(data: {
@@ -3273,110 +2590,77 @@ export const api = {
     amount: number;
     sourceAccountId?: string;
     note?: string;
+    referenceNumber?: string;
     fallbackLoan?: any;
     fallbackUser?: any;
-  }): Promise<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; remainingBalance?: number; error?: string }> {
+  }): Promise<{
+    success: boolean;
+    loan?: LoanApplication;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    remainingBalance?: number;
+    error?: string;
+  }> {
     try {
+      const headers = await getAuthHeaders();
       const res = await fetch('/api/loans/repay', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(data),
       });
-      const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; transaction?: Transaction; remainingBalance?: number; error?: string }>(res, {
+
+      const result = await parseJsonResponse<{
+        success: boolean;
+        loan?: LoanApplication;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        remainingBalance?: number;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Repayment service offline',
       });
-      if (result.success && result.loan) {
-        await firestoreSync.saveLoanApplication(result.loan);
-        if (result.transaction) {
-          await firestoreSync.saveTransaction(result.transaction);
-        }
-        if (typeof window !== 'undefined') {
+
+      if (!res.ok || !result.success) {
+        return {
+          success: false,
+          error: result.error || `Repayment rejected by server (${res.status})`,
+        };
+      }
+
+      if (typeof window !== 'undefined' && result.loan) {
+        try {
           window.dispatchEvent(
             new CustomEvent('monvera_loan_updated', {
               detail: { loan: result.loan, transaction: result.transaction },
             })
           );
-        }
-        return result;
+          if (result.balanceMetrics) {
+            window.dispatchEvent(
+              new CustomEvent('monvera_balance_updated', {
+                detail: {
+                  userId: data.userId,
+                  balanceMetrics: result.balanceMetrics,
+                },
+              })
+            );
+          }
+        } catch {}
       }
-    } catch {
-      // Backend unreachable fallback
-    }
 
-    try {
-      const allLoans = await firestoreSync.getAllLoans();
-      const existingLoan = allLoans.find((l) => l.id === data.loanId) || data.fallbackLoan;
-      if (!existingLoan) {
-        return { success: false, error: 'Loan not found.' };
-      }
-      const now = new Date().toISOString();
-      const totalRepay = existingLoan.totalRepaymentAmount || Number((existingLoan.amount * 1.20).toFixed(2));
-      const curRemaining = existingLoan.remainingBalance !== undefined ? existingLoan.remainingBalance : totalRepay;
-      const curRepaid = existingLoan.totalRepaid || 0;
-
-      const repayAmount = Math.min(data.amount, curRemaining);
-      const newRemaining = Number(Math.max(0, curRemaining - repayAmount).toFixed(2));
-      const newRepaid = Number((curRepaid + repayAmount).toFixed(2));
-      const isFullyPaid = newRemaining <= 0;
-
-      const updatedLoan: LoanApplication = {
-        ...existingLoan,
-        remainingBalance: newRemaining,
-        totalRepaid: newRepaid,
-        status: isFullyPaid ? 'PAID' : existingLoan.status,
+      return {
+        success: true,
+        loan: result.loan,
+        transaction: result.transaction,
+        balanceMetrics: result.balanceMetrics,
+        remainingBalance: result.remainingBalance,
       };
-
-      await firestoreSync.saveLoanApplication(updatedLoan);
-
-      // Deduct from user account
-      const currentBalances = await firestoreSync.getAccountBalances(data.userId, existingLoan.permanentAccountNumber);
-      if (currentBalances) {
-        const curChk = Number(currentBalances.checkingBalance) || 0;
-        const curAvail = Number(currentBalances.availableBalance) || 0;
-        const curTotal = Number(currentBalances.totalBalance) || 0;
-        const updatedBalances: BalanceMetrics = {
-          ...currentBalances,
-          checkingBalance: Math.max(0, curChk - repayAmount),
-          availableBalance: Math.max(0, curAvail - repayAmount),
-          totalBalance: Math.max(0, curTotal - repayAmount),
-        };
-        await firestoreSync.saveAccountBalances(data.userId, updatedBalances);
-      }
-
-      const txId = `tx_loan_repay_${Date.now()}`;
-      const repayTx: Transaction = {
-        id: txId,
-        userId: data.userId,
-        type: 'TRANSFER',
-        category: 'Transfers',
-        amount: repayAmount,
-        fee: 0,
-        currency: 'USD',
-        status: 'COMPLETED',
-        description: `Loan Repayment - Credit Facility #${existingLoan.id.slice(-6).toUpperCase()}`,
-        senderName: existingLoan.applicantName || 'Account Holder',
-        senderAccountNumber: existingLoan.permanentAccountNumber || '',
-        recipientName: 'Monvera Credit & Lending Facility',
-        recipientAccountNumber: 'MVB-LN-001',
-        referenceNumber: `MVB-RP-${Date.now().toString().slice(-8)}`,
-        createdAt: now,
-        completedAt: now,
-      };
-
-      await firestoreSync.saveTransaction(repayTx);
-
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('monvera_loan_updated', {
-            detail: { loan: updatedLoan, transaction: repayTx },
-          })
-        );
-      }
-
-      return { success: true, loan: updatedLoan, transaction: repayTx, remainingBalance: newRemaining };
     } catch (err: any) {
-      return { success: false, error: err?.message || 'Failed to process loan repayment.' };
+      console.error('[repayLoan] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error communicating with repayment service.',
+      };
     }
   },
 };

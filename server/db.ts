@@ -269,12 +269,13 @@ export class MonveraDatabase {
     category: Transaction['category'];
     status: TransactionStatus;
     fee?: number;
+    referenceNumber?: string;
     paymentProviderRef?: string;
     timestamp?: string;
     metadata?: Record<string, any>;
   }): Transaction {
     const txId = `tx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const refNum = `MV-${params.type.substring(0, 3)}-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
+    const refNum = params.referenceNumber || `MV-${params.type.substring(0, 3)}-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
     const txTimestamp = params.timestamp || new Date().toISOString();
 
     const senderUser = this.users.get(params.userId);
@@ -727,33 +728,6 @@ export class MonveraDatabase {
 
     let sourceBal = sourceType === 'SAVINGS' ? metrics.savingsBalance : metrics.checkingBalance;
 
-    // If memory ledger balance is less than required, but fallback client balance confirms sufficiency, sync ledger
-    if (sourceBal < totalRequired && params.fallbackBalances) {
-      const fbSourceBal =
-        sourceType === 'SAVINGS'
-          ? params.fallbackBalances.savingsBalance
-          : params.fallbackBalances.checkingBalance;
-      if (fbSourceBal >= totalRequired) {
-        const topUpNeeded = totalRequired - sourceBal + 100;
-        const targetAccId = sourceType === 'SAVINGS' ? `acc_sav_${user.id}` : `acc_chk_${user.id}`;
-        this.recordLedgerTransaction({
-          type: 'DEPOSIT',
-          amount: topUpNeeded,
-          fee: 0,
-          userId: user.id,
-          recipientUserId: user.id,
-          recipientAccountId: targetAccId,
-          description: `Account Liquidity Synchronization`,
-          category: 'Deposits',
-          status: 'COMPLETED',
-          paymentProviderRef: `SYNC-${Date.now()}`,
-          metadata: { isLedgerSync: true },
-        });
-        metrics = this.getUserBalanceMetrics(user.id);
-        sourceBal = sourceType === 'SAVINGS' ? metrics.savingsBalance : metrics.checkingBalance;
-      }
-    }
-
     if (sourceBal < totalRequired) {
       return {
         success: false,
@@ -823,14 +797,15 @@ export class MonveraDatabase {
   public reverseWithdrawal(txIdOrRef: string): { success: boolean; transaction?: Transaction; error?: string } {
     const tx = this.transactions.find(t => t.referenceNumber === txIdOrRef || t.id === txIdOrRef);
     if (!tx) return { success: false, error: 'Transaction not found.' };
-    if (tx.status !== 'PENDING') {
-      return { success: false, error: `Transaction is already ${tx.status}.` };
+    if (tx.status !== 'PENDING' || tx.type !== 'WITHDRAWAL' || tx.metadata?.isReversed) {
+      return { success: false, error: `Transaction is not eligible for reversal (status: ${tx.status}).` };
     }
 
     // Mark as REVERSED
     tx.status = 'REVERSED';
     tx.metadata = {
       ...(tx.metadata || {}),
+      isReversed: true,
       reversedAt: new Date().toISOString(),
       reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
     };
@@ -922,30 +897,6 @@ export class MonveraDatabase {
     }
 
     let metrics = this.getUserBalanceMetrics(user.id);
-    if (metrics.checkingBalance < params.amount && params.fallbackBalances && params.fallbackBalances.checkingBalance >= params.amount) {
-      const chkId = `acc_chk_${user.id}`;
-      let chkAcc = this.accounts.get(chkId);
-      if (!chkAcc) {
-        this.initUserAccounts(user.id, user.permanentAccountNumber);
-        chkAcc = this.accounts.get(chkId);
-      }
-      if (chkAcc) {
-        chkAcc.balance = params.fallbackBalances.checkingBalance;
-        chkAcc.availableBalance = params.fallbackBalances.checkingBalance;
-      }
-      this.ledgerEntries.push({
-        id: `led_sync_inv_${Date.now()}`,
-        transactionId: `tx_sync_inv_${Date.now()}`,
-        userId: user.id,
-        accountId: chkId,
-        entryType: 'CREDIT',
-        amount: params.fallbackBalances.checkingBalance,
-        balanceAfter: params.fallbackBalances.checkingBalance,
-        description: 'Balance Ledger Synchronization',
-        timestamp: new Date().toISOString(),
-      });
-      metrics = this.getUserBalanceMetrics(user.id);
-    }
 
     if (metrics.checkingBalance < params.amount) {
       return {
@@ -1092,32 +1043,6 @@ export class MonveraDatabase {
     let metrics = this.getUserBalanceMetrics(user.id);
     const issuanceFee = 2.0; // $2.00 fee to create a banking card
 
-    // If backend checking balance is insufficient, but client/firestore provided verified balances >= fee:
-    if (metrics.checkingBalance < issuanceFee && params.fallbackBalances && params.fallbackBalances.checkingBalance >= issuanceFee) {
-      const chkId = `acc_chk_${user.id}`;
-      let chkAcc = this.accounts.get(chkId);
-      if (!chkAcc) {
-        this.initUserAccounts(user.id, user.permanentAccountNumber);
-        chkAcc = this.accounts.get(chkId);
-      }
-      if (chkAcc) {
-        chkAcc.balance = params.fallbackBalances.checkingBalance;
-        chkAcc.availableBalance = params.fallbackBalances.checkingBalance;
-      }
-      this.ledgerEntries.push({
-        id: `led_sync_crd_${Date.now()}`,
-        transactionId: `tx_sync_crd_${Date.now()}`,
-        userId: user.id,
-        accountId: chkId,
-        entryType: 'CREDIT',
-        amount: params.fallbackBalances.checkingBalance,
-        balanceAfter: params.fallbackBalances.checkingBalance,
-        description: 'Balance Ledger Synchronization',
-        timestamp: new Date().toISOString(),
-      });
-      metrics = this.getUserBalanceMetrics(user.id);
-    }
-
     if (metrics.checkingBalance < issuanceFee) {
       return {
         success: false,
@@ -1222,7 +1147,21 @@ export class MonveraDatabase {
     amount: number;
     reason: string;
     targetAccountType?: AccountType;
-  }): { success: boolean; transaction?: Transaction; error?: string } {
+    referenceId?: string;
+  }): { success: boolean; transaction?: Transaction; isDuplicate?: boolean; error?: string } {
+    if (params.referenceId) {
+      const existingTx = this.transactions.find(
+        (t) =>
+          (t as any).referenceId === params.referenceId ||
+          t.paymentProviderRef === params.referenceId ||
+          t.referenceNumber === params.referenceId ||
+          (t.metadata && (t.metadata as any).referenceId === params.referenceId)
+      );
+      if (existingTx) {
+        return { success: true, transaction: existingTx, isDuplicate: true };
+      }
+    }
+
     const admin = this.users.get(params.adminId);
     if (!admin || (admin.role !== 'admin' && admin.role !== 'super_admin')) {
       return { success: false, error: 'Unauthorized: Administrative credentials required.' };
@@ -1250,6 +1189,7 @@ export class MonveraDatabase {
         ? `acc_sav_${targetUser.id}`
         : `acc_chk_${targetUser.id}`;
 
+    const refNumber = params.referenceId || `DEV-REF-${Date.now().toString(36).toUpperCase()}`;
     const tx = this.recordLedgerTransaction({
       type: 'ADMIN_DEVELOPMENT_FUNDING',
       amount: params.amount,
@@ -1259,8 +1199,9 @@ export class MonveraDatabase {
       description: `Development Testing Capital: ${params.reason || 'Sandbox liquidity disbursement'}`,
       category: 'Deposits',
       status: 'COMPLETED',
-      paymentProviderRef: `DEV-MINT-${Date.now().toString(36).toUpperCase()}`,
-      metadata: { adminId: admin.id, adminName: `${admin.firstName} ${admin.lastName}`, reason: params.reason },
+      referenceNumber: refNumber,
+      paymentProviderRef: params.referenceId || `DEV-MINT-${Date.now().toString(36).toUpperCase()}`,
+      metadata: { adminId: admin.id, adminName: `${admin.firstName} ${admin.lastName}`, reason: params.reason, referenceId: params.referenceId },
     });
 
     // Create Audit Log
@@ -1278,7 +1219,7 @@ export class MonveraDatabase {
       result: 'SUCCESS',
     });
 
-    return { success: true, transaction: tx };
+    return { success: true, transaction: tx, isDuplicate: false };
   }
 
   public topUpDevFundingPool(adminId: string, amount: number, reason: string): { success: boolean; newBalance: number; error?: string } {
@@ -2487,7 +2428,10 @@ export class MonveraDatabase {
     }
 
     if (sourceAcc.balance < repayAmount) {
-      sourceAcc.balance = Math.max(sourceAcc.balance + repayAmount, repayAmount + 10000);
+      return {
+        success: false,
+        error: `INSUFFICIENT_FUNDS: Available account balance ($${sourceAcc.balance.toFixed(2)}) is less than repayment amount ($${repayAmount.toFixed(2)}).`,
+      };
     }
 
     const now = new Date().toISOString();

@@ -645,6 +645,7 @@ export const AdminDashboard: React.FC = () => {
     amount: number;
     reason: string;
     targetAccountType: 'CHECKING' | 'SAVINGS';
+    referenceId?: string;
   }) => {
     try {
       const res = await api.issueAdminDevFunding({
@@ -653,6 +654,7 @@ export const AdminDashboard: React.FC = () => {
         amount: params.amount,
         reason: params.reason,
         targetAccountType: params.targetAccountType,
+        referenceId: params.referenceId,
       });
 
       if (res.success) {
