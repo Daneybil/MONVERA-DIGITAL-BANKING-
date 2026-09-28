@@ -26,6 +26,8 @@ import {
   Sparkles,
   FileText,
   Banknote,
+  RefreshCw,
+  AlertCircle,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
@@ -33,12 +35,27 @@ import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { firestoreSync } from '../../services/firestoreSync';
 
 export const DashboardOverview: React.FC = () => {
-  const { currentUser, balanceMetrics, openModal, setCurrentView } = useAuth();
+  const { currentUser, balanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
   const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
   const [hideBalances, setHideBalances] = useState<boolean>(false);
   const [copiedAcc, setCopiedAcc] = useState<boolean>(false);
   const [isKycModalOpen, setIsKycModalOpen] = useState<boolean>(false);
+  const [loadTimedOut, setLoadTimedOut] = useState<boolean>(false);
+  const [isRetrying, setIsRetrying] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (balanceMetrics) {
+      setLoadTimedOut(false);
+      setIsRetrying(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setLoadTimedOut(true);
+      setIsRetrying(false);
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [balanceMetrics, isRetrying]);
 
   useEffect(() => {
     async function loadTx() {
@@ -65,10 +82,47 @@ export const DashboardOverview: React.FC = () => {
     loadTx();
   }, [currentUser, balanceMetrics]);
 
-  if (!currentUser || !balanceMetrics) {
+  if (!currentUser) {
     return (
       <div className="p-12 text-center">
         <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent animate-spin rounded-full mx-auto" />
+      </div>
+    );
+  }
+
+  if (!balanceMetrics) {
+    if (loadTimedOut) {
+      return (
+        <div className="p-12 text-center max-w-md mx-auto space-y-4 my-8">
+          <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto border border-amber-200">
+            <AlertCircle className="w-6 h-6" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="text-base font-black text-slate-900">Account Balances Unavailable</h3>
+            <p className="text-xs text-slate-600 font-medium">
+              We were unable to load your live ledger balances from the secure banking core. Please check your connection and retry.
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              setLoadTimedOut(false);
+              setIsRetrying(true);
+              refreshBalance();
+            }}
+            disabled={isRetrying}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-850 text-white text-xs font-bold transition-all shadow-sm cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 ${isRetrying ? 'animate-spin' : ''}`} />
+            <span>{isRetrying ? 'Reconnecting...' : 'Retry Connection'}</span>
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="p-12 text-center space-y-3">
+        <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent animate-spin rounded-full mx-auto" />
+        <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Loading account balances...</p>
       </div>
     );
   }

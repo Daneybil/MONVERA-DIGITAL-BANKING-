@@ -16,7 +16,8 @@ import {
   MultiFactorResolver,
   MultiFactorInfo,
 } from 'firebase/auth';
-import { auth } from '../services/firebase';
+import { doc, setDoc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { auth, db } from '../services/firebase';
 import { firestoreSync } from '../services/firestoreSync';
 import { pushNotificationService } from '../services/pushNotificationService';
 import { UserProfile, NotificationItem } from '../types';
@@ -269,7 +270,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       // 1. Retrieve verified balances directly from permanent Firestore ledger
       const fsMetrics = await firestoreSync.getAccountBalances(currentUser.id, currentUser.permanentAccountNumber);
-      if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0) {
+      if (fsMetrics) {
         setBalanceMetrics(fsMetrics);
         cacheUserBalances(currentUser.id, fsMetrics);
         setLastUpdateTimestamp(Date.now());
@@ -278,7 +279,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // 2. Fetch backend metrics if Firestore is initializing
       const metrics = await api.getBalanceMetrics(currentUser.id, currentUser.permanentAccountNumber);
-      if (metrics && metrics.accounts && metrics.accounts.length > 0) {
+      if (metrics) {
         setBalanceMetrics(metrics);
         cacheUserBalances(currentUser.id, metrics);
         setLastUpdateTimestamp(Date.now());
@@ -659,7 +660,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         // Fetch verified balance metrics from Firestore ledger first
         const fsMetrics = await firestoreSync.getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber);
-        if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0) {
+        if (fsMetrics) {
           setBalanceMetrics(fsMetrics);
           cacheUserBalances(resolvedUser.id, fsMetrics);
         } else {
@@ -721,7 +722,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               api.getNotifications(resolvedUser.id).catch(() => ({ notifications: [] }))
             ]);
 
-            if (fsMetrics && fsMetrics.accounts && fsMetrics.accounts.length > 0 && isMounted) {
+            if (fsMetrics && isMounted) {
               setBalanceMetrics(fsMetrics);
               cacheUserBalances(resolvedUser.id, fsMetrics);
             } else if (isMounted) {
@@ -879,19 +880,95 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       cacheUserInDirectory(mergedUser);
     }
 
-    if (realFsMetrics && realFsMetrics.accounts && realFsMetrics.accounts.length > 0) {
-      setBalanceMetrics(realFsMetrics);
-      cacheUserBalances(uid, realFsMetrics);
-    } else if (backendSync?.balanceMetrics && backendSync.balanceMetrics.accounts && backendSync.balanceMetrics.accounts.length > 0) {
-      setBalanceMetrics(backendSync.balanceMetrics);
-      cacheUserBalances(uid, backendSync.balanceMetrics);
+    let finalMetricsToSet = realFsMetrics;
+    if (!finalMetricsToSet) {
+      // Legitimate base account initialization in Firestore with zero balance for verified session
+      try {
+        const accDocRef = doc(db, 'accounts', uid);
+        const existingAccSnap = await getDoc(accDocRef);
+        if (existingAccSnap.exists()) {
+          const ad = existingAccSnap.data();
+          finalMetricsToSet = {
+            checkingBalance: Number(ad.checkingBalance ?? 0),
+            savingsBalance: Number(ad.savingsBalance ?? 0),
+            investedBalance: Number(ad.investedBalance ?? 0),
+            accruedEarnings: Number(ad.accruedEarnings ?? 0),
+            totalBalance: Number(ad.totalBalance ?? 0),
+            availableBalance: Number(ad.availableBalance ?? ad.checkingBalance ?? 0),
+            pendingBalance: Number(ad.pendingBalance ?? 0),
+            loanBalance: Number(ad.loanBalance ?? 0),
+            accounts: ad.accounts || [],
+          };
+        } else {
+          const nowIso = new Date().toISOString();
+          const initMetrics: BalanceMetrics = {
+            checkingBalance: 0,
+            savingsBalance: 0,
+            investedBalance: 0,
+            accruedEarnings: 0,
+            totalBalance: 0,
+            availableBalance: 0,
+            pendingBalance: 0,
+            loanBalance: 0,
+            accounts: [
+              {
+                id: `acc_chk_${uid}`,
+                userId: uid,
+                type: 'CHECKING',
+                accountNumber: finalUser.permanentAccountNumber || '1000000000',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: 0,
+                availableBalance: 0,
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 1.25,
+                status: 'ACTIVE',
+                nickname: 'Monvera Premier Checking',
+              },
+              {
+                id: `acc_sav_${uid}`,
+                userId: uid,
+                type: 'SAVINGS',
+                accountNumber: (finalUser.permanentAccountNumber && finalUser.permanentAccountNumber.length >= 7)
+                  ? `10${finalUser.permanentAccountNumber.slice(2, -3)}991`
+                  : '1000000991',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: 0,
+                availableBalance: 0,
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 4.85,
+                status: 'ACTIVE',
+                nickname: 'Monvera High-Yield Treasury',
+              },
+            ],
+          };
+          await setDoc(accDocRef, {
+            userId: uid,
+            ...initMetrics,
+            permanentAccountNumber: finalUser.permanentAccountNumber || '1000000000',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          }, { merge: true });
+          finalMetricsToSet = initMetrics;
+        }
+      } catch (accInitErr) {
+        console.warn('[Auth] Base account initialization note:', accInitErr);
+      }
+    }
+
+    if (finalMetricsToSet) {
+      setBalanceMetrics(finalMetricsToSet);
     }
 
     if (notifRes?.notifications) {
       setNotifications(notifRes.notifications);
     }
 
-    if (finalUser.role === 'super_admin' || finalUser.role === 'admin') {
+    const isUserAdmin = finalUser.role === 'super_admin' || finalUser.role === 'admin' || finalUser.email?.toLowerCase() === 'admin@monvera.com' || finalUser.email?.toLowerCase() === 'daneybil2020@gmail.com';
+    if (isUserAdmin) {
       setCurrentView('admin');
     } else {
       setCurrentView('dashboard');
@@ -929,41 +1006,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // If user entered Account Number or Username instead of Email
       if (!cleanIdentifier.includes('@')) {
-        // Check if there is a known user in the system with this account number or username
-        let matched = availableUsers.find(
-          (u) =>
-            u.permanentAccountNumber === cleanIdentifier.replace(/[-\s]/g, '') ||
-            u.username.toLowerCase() === cleanIdentifier.toLowerCase()
-        );
+        let matchedEmail: string | null = null;
+        const cleanAcc = cleanIdentifier.replace(/[-\s]/g, '');
+        const cleanUser = cleanIdentifier.toLowerCase().replace(/^@/, '');
 
-        // Fallback: If not in local list, lookup directly from Firestore directory
-        if (!matched) {
+        try {
+          const usersCol = collection(db, 'users');
+          // 1. Authoritative lookup by permanentAccountNumber
+          let qSnap = await getDocs(query(usersCol, where('permanentAccountNumber', '==', cleanAcc)));
+          if (qSnap.empty) {
+            // 2. Lookup by legacy accountNumber
+            qSnap = await getDocs(query(usersCol, where('accountNumber', '==', cleanAcc)));
+          }
+          if (qSnap.empty) {
+            // 3. Lookup by username
+            qSnap = await getDocs(query(usersCol, where('username', '==', cleanIdentifier.replace(/^@/, ''))));
+          }
+          if (qSnap.empty) {
+            // 4. Lookup by usernameLower
+            qSnap = await getDocs(query(usersCol, where('usernameLower', '==', cleanUser)));
+          }
+
+          if (!qSnap.empty) {
+            const userData = qSnap.docs[0].data();
+            matchedEmail = userData.email || null;
+          }
+        } catch (lookupErr) {
+          console.warn('[Auth] Firestore account lookup error:', lookupErr);
+        }
+
+        // Secondary fallback to firestoreSync directory lookup if needed
+        if (!matchedEmail) {
           try {
             const fsUser = await firestoreSync.findRecipient(cleanIdentifier);
             if (fsUser && fsUser.email) {
-              matched = fsUser;
+              matchedEmail = fsUser.email;
             }
           } catch {}
         }
 
-        if (matched && matched.email) {
-          emailToAuth = matched.email;
+        if (matchedEmail) {
+          emailToAuth = matchedEmail;
         } else {
-          // Attempt backend resolution
-          const backendRes = await api.login(cleanIdentifier, cleanPassword);
-          if (backendRes.success && backendRes.user && backendRes.balanceMetrics) {
-            setCurrentUser(backendRes.user);
-            setBalanceMetrics(backendRes.balanceMetrics);
-            await refreshNotifications();
-            if (backendRes.user.role === 'super_admin' || backendRes.user.role === 'admin') {
-              setCurrentView('admin');
-            } else {
-              setCurrentView('dashboard');
-            }
-            setActiveModal(null);
-            return { success: true };
-          }
-          return { success: false, error: 'No Monvera account found with that Account Number or Username.' };
+          return {
+            success: false,
+            error: 'No Monvera account found with that Account Number or Username.',
+          };
         }
       }
 

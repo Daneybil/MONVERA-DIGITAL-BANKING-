@@ -343,12 +343,12 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                       <span className="font-extrabold text-slate-950 text-base">{customer.firstName} {customer.lastName}</span>
                     </div>
                     <div>
-                      <span className="text-xs font-bold text-slate-500 block uppercase tracking-wider">Email Address</span>
-                      <span className="font-extrabold text-slate-950 break-all">{customer.email}</span>
+                      <span className="text-xs font-bold text-slate-500 block uppercase tracking-wider">Permanent Account #</span>
+                      <span className="font-extrabold text-slate-950 font-mono">{customer.permanentAccountNumber}</span>
                     </div>
                     <div>
-                      <span className="text-xs font-bold text-slate-500 block uppercase tracking-wider">Phone Number</span>
-                      <span className="font-extrabold text-slate-950">{customer.phone || '+1 (555) 019-2834'}</span>
+                      <span className="text-xs font-bold text-slate-500 block uppercase tracking-wider">Platform Username</span>
+                      <span className="font-extrabold text-slate-950 font-mono">@{customer.username}</span>
                     </div>
                     <div>
                       <span className="text-xs font-bold text-slate-500 block uppercase tracking-wider">Country of Residence</span>
@@ -611,11 +611,11 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                   </div>
 
                   <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200">
-                    <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Phone & Email</span>
-                    <span className="font-extrabold text-slate-950 text-xs mt-0.5 block truncate">
-                      {customer.kycPhone || customer.phone || 'No phone'}
+                    <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Account ID & Handle</span>
+                    <span className="font-extrabold text-slate-950 text-xs mt-0.5 block truncate font-mono">
+                      {customer.permanentAccountNumber}
                     </span>
-                    <span className="text-slate-600 text-xs truncate block">{customer.kycEmail || customer.email}</span>
+                    <span className="text-slate-600 text-xs truncate block font-mono">@{customer.username}</span>
                   </div>
 
                   <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200">

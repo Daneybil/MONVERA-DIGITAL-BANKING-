@@ -488,6 +488,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
       let currentSavings = 0;
       let currentInvested = 0;
       let currentAccrued = 0;
+      let currentPending = 0;
       let accountsList: BankAccount[] = [];
 
       if (accSnap.exists) {
@@ -496,6 +497,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         currentSavings = Number(d.savingsBalance ?? d.savings ?? 0);
         currentInvested = Number(d.investedBalance ?? d.investmentBalance ?? 0);
         currentAccrued = Number(d.accruedEarnings ?? 0);
+        currentPending = Number(d.pendingBalance ?? 0);
         if (Array.isArray(d.accounts) && d.accounts.length > 0) {
           accountsList = d.accounts;
         }
@@ -519,6 +521,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
       const newSavings = !isChecking
         ? Number((currentSavings - withdrawAmount).toFixed(2))
         : currentSavings;
+      const newPending = Number((currentPending + withdrawAmount).toFixed(2));
       const newTotal = Number((newChecking + newSavings + currentInvested + currentAccrued).toFixed(2));
 
       const updatedAccounts = accountsList.length > 0
@@ -538,7 +541,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         accruedEarnings: currentAccrued,
         totalBalance: newTotal,
         availableBalance: newChecking,
-        pendingBalance: 0,
+        pendingBalance: newPending,
         accounts: updatedAccounts,
       };
 
@@ -553,7 +556,9 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         amount: withdrawAmount,
         currency: 'USD',
         status: 'PENDING',
+        userId: userId,
         senderUserId: userId,
+        senderAccountNumber: userAcc,
         fee: 0.0,
         description: `Instant Card Push to ${destinationLabel} (${accountOrIban.slice(-4)})`,
         category: 'Withdrawals',
@@ -608,6 +613,206 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
       error: errMsg || 'Server withdrawal transaction failed.',
     };
   }
+}
+
+/**
+ * Atomically reverses a pending Firestore withdrawal and credits funds back to the user's account.
+ * Idempotent: verifies status === 'PENDING' and metadata.isReversed !== true.
+ */
+export async function reverseServerFirestoreWithdrawal(
+  txIdOrRef: string,
+  userId?: string
+): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
+  if (!txIdOrRef) {
+    return { success: false, error: 'Transaction ID or reference is required.' };
+  }
+
+  const nowIso = new Date().toISOString();
+  let targetRef = adminFirestore.collection('transactions').doc(txIdOrRef);
+  let initialSnap = await targetRef.get();
+
+  if (!initialSnap.exists) {
+    const qSnap = await adminFirestore
+      .collection('transactions')
+      .where('referenceNumber', '==', txIdOrRef)
+      .limit(1)
+      .get();
+    if (!qSnap.empty) {
+      targetRef = qSnap.docs[0].ref;
+      initialSnap = qSnap.docs[0];
+    } else {
+      return { success: false, error: 'Transaction not found in Firestore.' };
+    }
+  }
+
+  const existingTx = initialSnap.data() as Transaction;
+  if (existingTx.type !== 'WITHDRAWAL') {
+    return { success: false, error: `Transaction type ${existingTx.type} is not a withdrawal.` };
+  }
+  if (existingTx.status === 'REVERSED' || existingTx.metadata?.isReversed) {
+    return { success: true, transaction: existingTx, error: 'Transaction already reversed.' };
+  }
+  if (existingTx.status !== 'PENDING') {
+    return { success: false, error: `Transaction status is ${existingTx.status}, not PENDING.` };
+  }
+
+  const effectiveUserId = userId || existingTx.userId || existingTx.senderUserId;
+  if (!effectiveUserId) {
+    return { success: false, error: 'Could not determine customer ID for withdrawal reversal.' };
+  }
+
+  const accRef = adminFirestore.collection('accounts').doc(effectiveUserId);
+  let finalReversedTx: Transaction | null = null;
+  let finalMetrics: BalanceMetrics | null = null;
+
+  try {
+    await adminFirestore.runTransaction(async (transaction) => {
+      const txSnap = await transaction.get(targetRef);
+      if (!txSnap.exists) {
+        throw new Error('TX_NOT_FOUND');
+      }
+      const tData = txSnap.data() as Transaction;
+      if (tData.status !== 'PENDING' || tData.metadata?.isReversed) {
+        finalReversedTx = tData;
+        return;
+      }
+
+      const accSnap = await transaction.get(accRef);
+      if (!accSnap.exists) {
+        throw new Error(`Account record for ${effectiveUserId} not found.`);
+      }
+
+      const accData = accSnap.data()!;
+      const reverseAmount = Number(tData.amount || 0);
+      if (reverseAmount <= 0) {
+        throw new Error('INVALID_WITHDRAWAL_AMOUNT');
+      }
+
+      const isChecking = tData.metadata?.sourceAccountType !== 'SAVINGS';
+      const curChecking = Number(accData.checkingBalance ?? accData.availableBalance ?? 0);
+      const curSavings = Number(accData.savingsBalance ?? accData.savings ?? 0);
+      const curInvested = Number(accData.investedBalance ?? accData.investmentBalance ?? 0);
+      const curAccrued = Number(accData.accruedEarnings ?? 0);
+      const curPending = Number(accData.pendingBalance ?? 0);
+
+      const restoredChecking = isChecking
+        ? Number((curChecking + reverseAmount).toFixed(2))
+        : curChecking;
+      const restoredSavings = !isChecking
+        ? Number((curSavings + reverseAmount).toFixed(2))
+        : curSavings;
+      const restoredPending = Math.max(0, Number((curPending - reverseAmount).toFixed(2)));
+      const restoredTotal = Number((restoredChecking + restoredSavings + curInvested + curAccrued).toFixed(2));
+      const restoredAvailable = restoredChecking;
+
+      const userAcc = accData.permanentAccountNumber || tData.senderAccountNumber || '1000000000';
+      const updatedAccounts = (Array.isArray(accData.accounts) && accData.accounts.length > 0)
+        ? accData.accounts.map((a: any) => {
+            if (a.type === (isChecking ? 'CHECKING' : 'SAVINGS')) {
+              const b = isChecking ? restoredChecking : restoredSavings;
+              return { ...a, balance: b, availableBalance: b };
+            }
+            return a;
+          })
+        : buildDefaultAccounts(effectiveUserId, restoredChecking, restoredSavings, curInvested, userAcc);
+
+      finalMetrics = {
+        checkingBalance: restoredChecking,
+        savingsBalance: restoredSavings,
+        investedBalance: curInvested,
+        accruedEarnings: curAccrued,
+        totalBalance: restoredTotal,
+        availableBalance: restoredAvailable,
+        pendingBalance: restoredPending,
+        accounts: updatedAccounts,
+      };
+
+      finalReversedTx = {
+        ...tData,
+        status: 'REVERSED',
+        metadata: {
+          ...(tData.metadata || {}),
+          isReversed: true,
+          reversedAt: nowIso,
+          reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+        },
+      };
+
+      // 1. Credit customer balance back
+      transaction.set(
+        accRef,
+        {
+          userId: effectiveUserId,
+          ...finalMetrics,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      // 2. Mark transaction as REVERSED
+      transaction.set(targetRef, finalReversedTx, { merge: true });
+    });
+
+    return {
+      success: true,
+      transaction: finalReversedTx || undefined,
+      balanceMetrics: finalMetrics || undefined,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Failed to execute Firestore withdrawal reversal.',
+    };
+  }
+}
+
+/**
+ * Scans Firestore for pending withdrawals that reached the 30-minute expiration
+ * and reverses them atomically.
+ */
+export async function executeServerPendingWithdrawalReversals(): Promise<number> {
+  const now = Date.now();
+  let count = 0;
+
+  try {
+    const qSnap = await adminFirestore
+      .collection('transactions')
+      .where('type', '==', 'WITHDRAWAL')
+      .where('status', '==', 'PENDING')
+      .get();
+
+    if (qSnap.empty) {
+      return 0;
+    }
+
+    for (const doc of qSnap.docs) {
+      const data = doc.data() as Transaction;
+      const meta = data.metadata || {};
+
+      if (meta.autoReverse === false || meta.isReversed === true) {
+        continue;
+      }
+
+      const scheduledTime = meta.reversalScheduledAt
+        ? new Date(meta.reversalScheduledAt).getTime()
+        : 0;
+      const createdAt = new Date(data.createdAt).getTime();
+      const isExpired =
+        (scheduledTime > 0 && now >= scheduledTime) ||
+        (!isNaN(createdAt) && now - createdAt >= 30 * 60 * 1000);
+
+      if (isExpired) {
+        const res = await reverseServerFirestoreWithdrawal(doc.id, data.userId || data.senderUserId);
+        if (res.success) {
+          count++;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[executeServerPendingWithdrawalReversals] Scan error:', err);
+  }
+
+  return count;
 }
 
 export interface DepositParams {
@@ -861,6 +1066,7 @@ export interface AdminTransferParams {
   description?: string;
   category?: string;
   referenceNumber?: string;
+  clientRequestId?: string;
 }
 
 export interface AdminTransferResult {
@@ -875,7 +1081,7 @@ export interface AdminTransferResult {
  * Server-authoritative Admin Direct Transfer from Bennett Johnson inside a single Firestore transaction.
  */
 export async function executeServerAdminTransfer(params: AdminTransferParams): Promise<AdminTransferResult> {
-  const { adminId, targetIdentifier, amount, description, category, referenceNumber } = params;
+  const { adminId, targetIdentifier, amount, description, category, referenceNumber, clientRequestId } = params;
   const transferAmount = Number(amount);
 
   if (!targetIdentifier || isNaN(transferAmount) || transferAmount <= 0) {
@@ -896,7 +1102,8 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
   const recipientDisplayName = `${recipientData.firstName || ''} ${recipientData.lastName || ''}`.trim() || recipientData.username || 'Monvera Client';
   const recipientAcc = recipientData.permanentAccountNumber || recipientData.accountNumber || '1000000000';
 
-  const finalRef = referenceNumber || `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
+  const finalRef = referenceNumber || clientRequestId || `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
+  const effectiveClientReqId = clientRequestId || finalRef;
   const txId = `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const accRef = adminFirestore.collection('accounts').doc(recipientUid);
   const txRef = adminFirestore.collection('transactions').doc(txId);
@@ -907,13 +1114,24 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
 
   try {
     await adminFirestore.runTransaction(async (transaction) => {
-      // 1. Check idempotency
+      // 1. Check idempotency by referenceNumber or clientRequestId
       const existingRefQuery = await transaction.get(
         adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
       );
 
-      if (!existingRefQuery.empty) {
-        const existingTx = existingRefQuery.docs[0].data() as Transaction;
+      let existingDoc = !existingRefQuery.empty ? existingRefQuery.docs[0] : null;
+
+      if (!existingDoc && effectiveClientReqId) {
+        const existingReqQuery = await transaction.get(
+          adminFirestore.collection('transactions').where('clientRequestId', '==', effectiveClientReqId).limit(1)
+        );
+        if (!existingReqQuery.empty) {
+          existingDoc = existingReqQuery.docs[0];
+        }
+      }
+
+      if (existingDoc) {
+        const existingTx = existingDoc.data() as Transaction;
         if (existingTx.status === 'COMPLETED') {
           isDuplicate = true;
           finalTx = existingTx;
@@ -936,7 +1154,7 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
         }
       }
 
-      // 2. Read recipient account
+      // 2. Read recipient account (gracefully initialize if first time)
       const accSnap = await transaction.get(accRef);
       let currentChecking = 0;
       let currentSavings = 0;
@@ -986,16 +1204,18 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
       finalTx = {
         id: txId,
         referenceNumber: finalRef,
+        clientRequestId: effectiveClientReqId,
         type: 'TRANSFER',
         amount: transferAmount,
         currency: 'USD',
         status: 'COMPLETED',
-        senderUserId: adminId || 'usr_admin',
+        senderUserId: adminId,
         senderName: 'Bennett Johnson (Admin)',
         senderAccountNumber: '1000000001',
         recipientUserId: recipientUid,
         recipientName: recipientDisplayName,
         recipientAccountNumber: recipientAcc,
+        userId: recipientUid,
         fee: 0.0,
         description: description || 'Administrative Direct Transfer from Bennett Johnson',
         category: (category as any) || 'Transfers',
@@ -1005,6 +1225,8 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
           adminSenderName: 'Bennett Johnson',
           adminSenderAccount: '1000000001',
           disbursementType: 'ADMINISTRATIVE_TRANSFER',
+          adminUid: adminId,
+          clientRequestId: effectiveClientReqId,
         },
       };
 
@@ -1013,6 +1235,7 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
         accRef,
         {
           userId: recipientUid,
+          permanentAccountNumber: recipientAcc,
           ...finalMetrics,
           updatedAt: nowIso,
         },

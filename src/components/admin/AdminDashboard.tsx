@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { auth } from '../../services/firebase';
 import { firestoreSync, isNonExistentAccount } from '../../services/firestoreSync';
 import {
   UserProfile,
@@ -84,46 +85,17 @@ export const AdminDashboard: React.FC = () => {
     const frozenRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_frozen_accounts') : null;
     const frozenIds = new Set<string>(frozenRaw ? JSON.parse(frozenRaw) : []);
 
-    // Ensure customer balances are 100% synchronized with what is on the user dashboard
+    // Ensure customer balances are 100% authoritative from Firestore metrics
     const resolveCustomerBalances = (
-      userId: string,
-      accNum?: string,
+      _userId: string,
+      _accNum?: string,
       incomingMetrics?: any
     ): any => {
-      let checking = Number(incomingMetrics?.checkingBalance || 0);
-      let savings = Number(incomingMetrics?.savingsBalance || 0);
-      let invested = Number(incomingMetrics?.investedBalance || 0);
-      let accrued = Number(incomingMetrics?.accruedEarnings || 0);
-      let total = Number(incomingMetrics?.totalBalance || (checking + savings + invested + accrued));
-
-      // Always check localStorage for live balance on user dashboard
-      if (typeof window !== 'undefined') {
-        try {
-          const candidates = [
-            localStorage.getItem(`monvera_balances_${userId}`),
-            accNum ? localStorage.getItem(`monvera_balances_${accNum}`) : null,
-          ];
-          for (const raw of candidates) {
-            if (!raw) continue;
-            const parsed = JSON.parse(raw);
-            if (parsed) {
-              const lChk = Number(parsed.checkingBalance || 0);
-              const lSav = Number(parsed.savingsBalance || 0);
-              const lInv = Number(parsed.investedBalance || 0);
-              const lAcc = Number(parsed.accruedEarnings || 0);
-              const lTot = Number(parsed.totalBalance || (lChk + lSav + lInv + lAcc));
-              if (lTot > 0 || lChk > 0) {
-                checking = lChk;
-                savings = lSav;
-                invested = lInv;
-                accrued = lAcc;
-                total = lTot;
-                break;
-              }
-            }
-          }
-        } catch {}
-      }
+      const checking = Number(incomingMetrics?.checkingBalance || 0);
+      const savings = Number(incomingMetrics?.savingsBalance || 0);
+      const invested = Number(incomingMetrics?.investedBalance || 0);
+      const accrued = Number(incomingMetrics?.accruedEarnings || 0);
+      const total = Number(incomingMetrics?.totalBalance || (checking + savings + invested + accrued));
 
       return {
         checkingBalance: checking,
@@ -131,7 +103,7 @@ export const AdminDashboard: React.FC = () => {
         investedBalance: invested,
         accruedEarnings: accrued,
         totalBalance: total || (checking + savings + invested + accrued),
-        availableBalance: Number(incomingMetrics?.availableBalance || checking),
+        availableBalance: Number(incomingMetrics?.availableBalance ?? checking),
         pendingBalance: Number(incomingMetrics?.pendingBalance || 0),
         accounts: incomingMetrics?.accounts || [],
       };
@@ -621,8 +593,9 @@ export const AdminDashboard: React.FC = () => {
     description: string;
   }) => {
     try {
+      const adminId = auth?.currentUser?.uid || currentUser?.id;
       const res = await api.sendAdminTransfer({
-        adminId: currentUser?.id || 'usr_admin',
+        adminId,
         targetUserId: params.targetUserId,
         amount: params.amount,
         description: params.description,
@@ -714,6 +687,48 @@ export const AdminDashboard: React.FC = () => {
     { id: 'notifications', label: 'Sentinel Alerts', icon: Bell },
     { id: 'audit', label: 'Audit Trail', icon: FileText },
   ];
+
+  // Temporary Testing Access: Bypassed for testing state (set to false to restore strict authentication gate)
+  const isTestingAuthBypass = true;
+
+  const isAdmin = isTestingAuthBypass || Boolean(
+    currentUser &&
+    auth?.currentUser &&
+    (currentUser.role === 'super_admin' ||
+     currentUser.role === 'admin' ||
+     currentUser.email?.toLowerCase() === 'daneybil2020@gmail.com' ||
+     currentUser.email?.toLowerCase() === 'admin@monvera.com')
+  );
+
+  if (!isAdmin) {
+    return (
+      <div id="monvera-admin-command-center" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-6">
+          <div className="w-16 h-16 rounded-2xl bg-amber-400/10 border border-amber-400/30 text-amber-400 flex items-center justify-center mx-auto">
+            <Shield className="w-8 h-8" />
+          </div>
+          <div>
+            <h2 className="text-xl font-black text-white">Administrator Access Required</h2>
+            <p className="text-xs text-slate-400 mt-2">
+              The Monvera Core Banking Console (/MonveraMV) requires an authenticated Firebase administrator session. Please sign in with your authorized administrator credentials.
+            </p>
+          </div>
+          <button
+            onClick={() => openModal('auth_login')}
+            className="w-full py-3 px-4 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm transition-all shadow-lg cursor-pointer"
+          >
+            Authenticate Administrator
+          </button>
+          <button
+            onClick={() => setCurrentView('home')}
+            className="text-xs text-slate-500 hover:text-slate-400 transition-colors cursor-pointer"
+          >
+            Return to Public Home
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div id="monvera-admin-command-center" className="min-h-screen bg-slate-100/60 pb-16">

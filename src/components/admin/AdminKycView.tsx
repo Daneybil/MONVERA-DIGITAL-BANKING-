@@ -489,16 +489,16 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                     </div>
 
                     <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80">
-                      <span className="text-slate-400 font-bold block">Email Address</span>
-                      <span className="font-bold text-slate-900 text-xs mt-1 block truncate">
-                        {applicant.kycEmail || applicant.email || 'Not Specified'}
+                      <span className="text-slate-400 font-bold block">Permanent Account #</span>
+                      <span className="font-mono font-bold text-slate-900 text-xs mt-1 block truncate">
+                        {applicant.permanentAccountNumber || applicant.id}
                       </span>
                     </div>
 
                     <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80">
-                      <span className="text-slate-400 font-bold block">Phone Number</span>
+                      <span className="text-slate-400 font-bold block">Platform Username</span>
                       <span className="font-bold text-slate-900 text-xs mt-1 block">
-                        {applicant.kycPhone || applicant.phone || 'Not Specified'}
+                        @{applicant.username || 'client'}
                       </span>
                     </div>
 

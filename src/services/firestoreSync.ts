@@ -931,13 +931,7 @@ export const firestoreSync = {
    */
   async getAccountBalances(userId: string, userAccountNumber?: string): Promise<BalanceMetrics | null> {
     if (!userId) return null;
-    let cachedMetrics: BalanceMetrics | null = null;
-    try {
-      const localStr = localStorage.getItem(`monvera_balances_${userId}`);
-      if (localStr) cachedMetrics = JSON.parse(localStr);
-    } catch {}
-
-    if (!db) return cachedMetrics;
+    if (!db) return null;
     const path = `accounts/${userId}`;
     try {
       const accRef = doc(db, 'accounts', userId);
@@ -1138,14 +1132,14 @@ export const firestoreSync = {
         const computed = this.computeBalancesFromTransactions(
           userId,
           txs,
-          cachedMetrics?.accounts || [],
+          [],
           userAccountNumber
         );
         // Persist computed result in background
         this.saveAccountBalances(userId, computed).catch(() => {});
         return computed;
       }
-      return cachedMetrics;
+      return null;
     } catch (err) {
       handleFirestoreError(err, OperationType.GET, path);
       return null;

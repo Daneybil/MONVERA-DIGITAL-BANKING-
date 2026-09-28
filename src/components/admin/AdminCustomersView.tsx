@@ -215,8 +215,8 @@ export const AdminCustomersView: React.FC<AdminCustomersViewProps> = ({
                               <span>{cust.firstName} {cust.lastName}</span>
                               <span className="text-xs font-bold text-slate-400">@{cust.username}</span>
                             </div>
-                            <div className="text-slate-600 font-semibold text-xs mt-1">
-                              {cust.email} • {cust.phone || '+1 (555) 019-2834'}
+                            <div className="text-slate-500 font-semibold text-xs mt-1">
+                              Acc: {cust.permanentAccountNumber} • {cust.membershipTier || 'Premier'}
                             </div>
                           </div>
                         </div>

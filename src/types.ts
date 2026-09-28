@@ -102,6 +102,7 @@ export type TransactionStatus = 'COMPLETED' | 'PENDING' | 'FAILED' | 'REVERSED' 
 export interface Transaction {
   id: string;
   referenceNumber: string; // e.g. "MV-TRF-2026-9048"
+  clientRequestId?: string;
   type: TransactionType;
   amount: number;
   currency: string;

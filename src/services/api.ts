@@ -2085,49 +2085,90 @@ export const api = {
     description?: string;
     category?: Transaction['category'];
     adminId?: string;
+    clientRequestId?: string;
   }): Promise<{ success: boolean; transaction?: Transaction; targetBalanceMetrics?: BalanceMetrics; error?: string }> {
     if (!data.targetUserId || !data.amount || Number(data.amount) <= 0) {
       return { success: false, error: 'Please enter a valid recipient account number and positive transfer amount.' };
     }
 
     const authHeaders = await getAuthHeaders();
+    if (!authHeaders['Authorization']) {
+      return {
+        success: false,
+        error: 'Administrator authentication required. Please sign into an authorized administrator account.',
+      };
+    }
 
     try {
+      const clientReqId = data.clientRequestId || `req_adm_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
       const res = await fetch('/api/admin/transfer', {
         method: 'POST',
         headers: authHeaders,
         body: JSON.stringify({
-          adminId: data.adminId || 'usr_admin',
+          adminId: data.adminId,
           targetUserId: data.targetUserId,
           amount: Number(data.amount),
           description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
           category: data.category || 'Transfers',
+          clientRequestId: clientReqId,
         }),
       });
 
-      const result = await parseJsonResponse<{
-        success: boolean;
-        transaction?: Transaction;
-        targetBalanceMetrics?: BalanceMetrics;
-        isDuplicate?: boolean;
-        error?: string;
-      }>(res, { success: false, error: 'Admin transfer service unavailable' });
+      let responseData: any = null;
+      try {
+        const text = await res.text();
+        if (text) {
+          try {
+            responseData = JSON.parse(text);
+          } catch {}
+        }
+      } catch {}
 
-      if (!result.success || !result.transaction) {
+      if (!res.ok) {
+        if (res.status === 401) {
+          return {
+            success: false,
+            error: responseData?.error || 'Authentication failure: Administrator session expired or invalid. Please re-authenticate.',
+          };
+        }
+        if (res.status === 403) {
+          return {
+            success: false,
+            error: responseData?.error || 'Authorization failure: You do not have administrator permissions to execute transfers.',
+          };
+        }
+        if (res.status === 400 || res.status === 404 || res.status === 422) {
+          return {
+            success: false,
+            error: responseData?.error || `Transfer rejected by banking server (HTTP ${res.status}).`,
+          };
+        }
+        if (res.status >= 500) {
+          return {
+            success: false,
+            error: responseData?.error || `Banking core server error (HTTP ${res.status}). Please try again.`,
+          };
+        }
         return {
           success: false,
-          error: result.error || 'Failed to complete administrative transfer.',
+          error: responseData?.error || `Transfer request failed with HTTP ${res.status}.`,
         };
       }
 
-      // If current logged-in user is recipient, update local storage cache and dispatch event
-      const recipientId = result.transaction.recipientUserId || data.targetUserId;
-      if (typeof window !== 'undefined' && result.targetBalanceMetrics) {
+      if (!responseData || !responseData.success || !responseData.transaction) {
+        return {
+          success: false,
+          error: responseData?.error || 'Failed to complete administrative transfer: Missing transaction confirmation.',
+        };
+      }
+
+      // If current logged-in user is recipient, update in-memory UI state via event without persisting to localStorage as financial authority
+      const recipientId = responseData.transaction.recipientUserId || data.targetUserId;
+      if (typeof window !== 'undefined' && responseData.targetBalanceMetrics) {
         try {
-          localStorage.setItem(`monvera_balances_${recipientId}`, JSON.stringify(result.targetBalanceMetrics));
           window.dispatchEvent(
             new CustomEvent('monvera_balance_updated', {
-              detail: { userId: recipientId, balanceMetrics: result.targetBalanceMetrics },
+              detail: { userId: recipientId, balanceMetrics: responseData.targetBalanceMetrics },
             })
           );
         } catch {}
@@ -2135,13 +2176,13 @@ export const api = {
 
       return {
         success: true,
-        transaction: result.transaction,
-        targetBalanceMetrics: result.targetBalanceMetrics,
+        transaction: responseData.transaction,
+        targetBalanceMetrics: responseData.targetBalanceMetrics,
       };
     } catch (err: any) {
       return {
         success: false,
-        error: err?.message || 'Network error occurred while processing administrative transfer.',
+        error: `Network failure connecting to Monvera Banking Core: ${err?.message || 'Unable to reach server'}`,
       };
     }
   },

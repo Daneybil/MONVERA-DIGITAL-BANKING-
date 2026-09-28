@@ -5,7 +5,7 @@ import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
 import { UserProfile, InvestmentTermDays } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
-import { requireFirebaseAuth, optionalFirebaseAuth, AuthenticatedRequest } from './server/authMiddleware';
+import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, AuthenticatedRequest } from './server/authMiddleware';
 import { adminFirestore } from './server/firebaseAdmin';
 import {
   executeServerTransfer,
@@ -17,6 +17,8 @@ import {
   executeServerLoanRepayment,
   executeServerInvestmentCreation,
   executeServerInvestmentMaturity,
+  executeServerPendingWithdrawalReversals,
+  reverseServerFirestoreWithdrawal,
 } from './server/firestoreTransactions';
 
 const app = express();
@@ -89,7 +91,7 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
   res.json({ success: true, user, balanceMetrics });
 });
 
-app.post('/api/auth/register', (req: Request, res: Response) => {
+app.post('/api/auth/register', async (req: Request, res: Response) => {
   const { id, uid, firstName, lastName, email, phone, dateOfBirth, country, isBusiness, businessName, username, maritalStatus, address, permanentAccountNumber: requestedAccNum } = req.body;
 
   if (!firstName || !lastName || !email) {
@@ -225,6 +227,63 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
     status: 'ACTIVE',
     nickname: 'Monvera Capital Portfolio',
   });
+
+  // Legitimate base account initialization in Firestore with zero balance
+  try {
+    const accRef = adminFirestore.collection('accounts').doc(userId);
+    const existingAcc = await accRef.get();
+    if (!existingAcc.exists) {
+      const nowIso = new Date().toISOString();
+      await accRef.set({
+        userId,
+        checkingBalance: 0,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 0,
+        availableBalance: 0,
+        pendingBalance: 0,
+        loanBalance: 0,
+        permanentAccountNumber,
+        accounts: [
+          {
+            id: chkId,
+            userId,
+            type: 'CHECKING',
+            accountNumber: permanentAccountNumber,
+            routingNumber: '021000021',
+            currency: 'USD',
+            balance: 0,
+            availableBalance: 0,
+            investedBalance: 0,
+            pendingBalance: 0,
+            interestRateAPY: 1.25,
+            status: 'ACTIVE',
+            nickname: 'Monvera Premier Checking',
+          },
+          {
+            id: savId,
+            userId,
+            type: 'SAVINGS',
+            accountNumber: `${permanentAccountNumber.slice(0, 7)}991`,
+            routingNumber: '021000021',
+            currency: 'USD',
+            balance: 0,
+            availableBalance: 0,
+            investedBalance: 0,
+            pendingBalance: 0,
+            interestRateAPY: 4.85,
+            status: 'ACTIVE',
+            nickname: 'Monvera High-Yield Treasury',
+          },
+        ],
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
+  } catch (fsErr) {
+    console.warn('[Register] Firestore initial accounts initialization note:', fsErr);
+  }
 
   // Welcome notification
   db.notifications.push({
@@ -926,15 +985,22 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
 });
 
 // Reverse pending withdrawal
-app.post('/api/withdrawals/reverse', (req: Request, res: Response) => {
+app.post('/api/withdrawals/reverse', async (req: Request, res: Response) => {
   const { transactionId, userId } = req.body;
   if (!transactionId) {
     return res.status(400).json({ error: 'Transaction ID is required.' });
   }
 
+  // Attempt server-authoritative Firestore reversal
+  const fsResult = await reverseServerFirestoreWithdrawal(transactionId, userId);
+  if (fsResult.success) {
+    return res.json({ success: true, transaction: fsResult.transaction, balanceMetrics: fsResult.balanceMetrics });
+  }
+
+  // Fall back to memory store if transaction only existed in memory
   const result = db.reverseWithdrawal(transactionId);
   if (!result.success) {
-    return res.status(400).json({ error: result.error });
+    return res.status(400).json({ error: fsResult.error || result.error });
   }
 
   const effectiveUserId = userId || result.transaction?.userId || 'usr_eleanor';
@@ -943,20 +1009,20 @@ app.post('/api/withdrawals/reverse', (req: Request, res: Response) => {
 });
 
 // Automatic 30-minute withdrawal reversal interval scheduler (runs every 15 seconds)
-setInterval(() => {
+setInterval(async () => {
   try {
-    const reversed = db.checkAndExecuteScheduledReversals();
+    const reversed = await executeServerPendingWithdrawalReversals();
     if (reversed > 0) {
-      console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending withdrawal(s) after 30-minute threshold.`);
+      console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending Firestore withdrawal(s) after 30-minute threshold.`);
     }
   } catch (e) {
-    console.error('[Auto-Reversal] Error checking scheduled reversals:', e);
+    console.error('[Auto-Reversal] Error checking scheduled Firestore reversals:', e);
   }
 }, 15000);
 
 // --- TRANSACTIONS EXPLORER ---
-app.get('/api/transactions', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
+app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const userId = (req.query.userId as string) || req.auth?.uid;
   const category = req.query.category as string;
   const search = (req.query.search as string)?.toLowerCase()?.trim();
   const type = req.query.type as string;
@@ -964,10 +1030,58 @@ app.get('/api/transactions', (req: Request, res: Response) => {
   const startDate = req.query.startDate as string;
   const endDate = req.query.endDate as string;
 
-  let txs = [...db.transactions];
+  let txs: any[] = [];
 
-  if (userId) {
-    txs = txs.filter((t) => t.senderUserId === userId || t.recipientUserId === userId);
+  try {
+    const txCol = adminFirestore.collection('transactions');
+    const txMap = new Map<string, any>();
+
+    if (userId) {
+      let userAcc = '';
+      try {
+        const uSnap = await adminFirestore.collection('users').doc(userId).get();
+        if (uSnap.exists) {
+          userAcc = uSnap.data()?.permanentAccountNumber || '';
+        }
+      } catch {}
+
+      const cleanAcc = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
+
+      const promises = [
+        txCol.where('userId', '==', userId).get(),
+        txCol.where('senderUserId', '==', userId).get(),
+        txCol.where('recipientUserId', '==', userId).get(),
+      ];
+
+      if (cleanAcc) {
+        promises.push(txCol.where('senderAccountNumber', '==', cleanAcc).get());
+        promises.push(txCol.where('recipientAccountNumber', '==', cleanAcc).get());
+      }
+
+      const snaps = await Promise.all(promises.map((p) => p.catch(() => null)));
+      for (const snap of snaps) {
+        if (snap && !snap.empty) {
+          snap.forEach((d) => {
+            const t = d.data();
+            txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
+          });
+        }
+      }
+    } else {
+      const snap = await txCol.get();
+      snap.forEach((d) => {
+        const t = d.data();
+        txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
+      });
+    }
+
+    txs = Array.from(txMap.values());
+  } catch (err) {
+    console.error('[/api/transactions Error reading Firestore]', err);
+    txs = [...db.transactions];
+    if (userId) {
+      txs = txs.filter((t) => t.senderUserId === userId || t.recipientUserId === userId || t.userId === userId);
+    }
   }
 
   if (category && category !== 'ALL' && category !== 'All') {
@@ -1011,13 +1125,13 @@ app.get('/api/transactions', (req: Request, res: Response) => {
   if (search) {
     txs = txs.filter(
       (t) =>
-        t.description.toLowerCase().includes(search) ||
-        t.referenceNumber.toLowerCase().includes(search) ||
+        (t.description && t.description.toLowerCase().includes(search)) ||
+        (t.referenceNumber && t.referenceNumber.toLowerCase().includes(search)) ||
         (t.senderName && t.senderName.toLowerCase().includes(search)) ||
         (t.recipientName && t.recipientName.toLowerCase().includes(search)) ||
-        (t.senderAccountNumber && t.senderAccountNumber.includes(search)) ||
-        (t.recipientAccountNumber && t.recipientAccountNumber.includes(search)) ||
-        t.amount.toString().includes(search)
+        (t.senderAccountNumber && String(t.senderAccountNumber).includes(search)) ||
+        (t.recipientAccountNumber && String(t.recipientAccountNumber).includes(search)) ||
+        (t.amount && t.amount.toString().includes(search))
     );
   }
 
@@ -1502,9 +1616,9 @@ app.post('/api/admin/transactions/:id/update-status', (req: Request, res: Respon
 });
 
 // Admin Transfer Direct Endpoint (Bennett Johnson)
-app.post('/api/admin/transfer', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/admin/transfer', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const adminUid = req.auth!.uid;
   const {
-    adminId,
     targetUserId,
     targetAccountNumber,
     targetName,
@@ -1524,12 +1638,13 @@ app.post('/api/admin/transfer', optionalFirebaseAuth, async (req: AuthenticatedR
 
   try {
     const result = await executeServerAdminTransfer({
-      adminId: adminId || req.auth?.uid || 'usr_admin',
+      adminId: adminUid,
       targetIdentifier,
       amount: Number(amount),
       description: description || 'Administrative Direct Transfer from Bennett Johnson',
       category: category || 'Transfers',
       referenceNumber,
+      clientRequestId: req.body.clientRequestId || referenceNumber,
     });
 
     if (!result.success) {
@@ -1541,7 +1656,7 @@ app.post('/api/admin/transfer', optionalFirebaseAuth, async (req: AuthenticatedR
     // Mirror to memory db for local caching consistency
     try {
       db.recordAdminTransfer({
-        adminId: adminId || 'usr_admin',
+        adminId: adminUid,
         targetUserId: resolvedTargetId,
         targetAccountNumber,
         targetName,

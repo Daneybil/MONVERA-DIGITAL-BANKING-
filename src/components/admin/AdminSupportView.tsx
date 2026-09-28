@@ -874,8 +874,8 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                           MVB •••• {selectedCustomer.permanentAccountNumber?.slice(-4) || '1000'}
                         </span>
                       </div>
-                      <div className="text-[11px] text-slate-400 truncate">
-                        {selectedCustomer.email}
+                      <div className="text-[11px] text-slate-400 truncate font-mono">
+                        Acc: {selectedCustomer.permanentAccountNumber || '1000000000'} • @{selectedCustomer.username || 'client'}
                       </div>
                     </div>
                   </div>
@@ -1327,7 +1327,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                             </span>
                           </div>
                           <div className="text-[11px] text-slate-300 flex items-center gap-2 mt-0.5 truncate">
-                            <span>{selectedCustomer.email}</span>
+                            <span className="font-mono">@{selectedCustomer.username || 'client'}</span>
                             <span>•</span>
                             <span className="font-mono">
                               MVB •••• {selectedCustomer.permanentAccountNumber?.slice(-4) || '1000'}
@@ -1781,7 +1781,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                               ID: {currentTicket.id.slice(0, 12)}
                             </span>
                             <span className="text-xs font-bold text-slate-500">
-                              Recipient: {customer ? `${customer.firstName} ${customer.lastName} (${customer.email})` : currentTicket.userId}
+                              Recipient: {customer ? `${customer.firstName} ${customer.lastName} (Acc: ${customer.permanentAccountNumber || customer.id})` : currentTicket.userId}
                             </span>
                           </div>
                           <h3 className="text-lg font-black text-slate-900">{currentTicket.title}</h3>
@@ -1918,7 +1918,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                     .filter((c) => c.role !== 'admin' && c.id !== 'usr_admin')
                     .map((c) => (
                       <option key={c.id} value={c.id}>
-                        {c.firstName} {c.lastName} ({c.email}) • {c.permanentAccountNumber || 'Account'}
+                        {c.firstName} {c.lastName} • Acc: {c.permanentAccountNumber || c.id} (@{c.username || 'client'})
                       </option>
                     ))}
                 </select>
