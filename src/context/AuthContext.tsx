@@ -424,7 +424,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         refreshBalance();
         refreshNotifications();
       }
-    });
+    }, currentUser.id);
 
     // 4. Real-time Firestore notification listener: immediately updates the notification bell in real-time
     const unsubNotifications = firestoreSync.subscribeToNotifications(
@@ -439,13 +439,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       currentUser.email
     );
 
-    // 5. Fallback interval for polling notifications and backup KYC status sync (balances are handled by live onSnapshot listener)
-    const interval = setInterval(() => {
-      // Check if any pending 30-minute withdrawals need to be reversed and restored
-      api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
-      refreshNotifications();
-      refreshProfile();
-    }, 3000);
+    // 5. Perform initial check for pending withdrawal reversals (event-driven updates and live listeners handle real-time sync)
+    api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
 
     // 6. Silently sync FCM registration token if browser permission is already granted
     pushNotificationService.syncTokenForUser(currentUser.id).catch(() => {});
@@ -495,6 +490,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         refreshProfile();
         refreshBalance();
         refreshNotifications();
+        api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
       }
     };
 
@@ -568,7 +564,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       unsubLoans();
       unsubNotifications();
       unsubPush();
-      clearInterval(interval);
       if (syncChannel) {
         try {
           syncChannel.close();
@@ -716,6 +711,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
             };
             
+            const cachedBalances = getCachedUserBalances(resolvedUser.id);
+            if (cachedBalances && isMounted) {
+              setBalanceMetrics((prev) => prev || cachedBalances);
+            }
+
             // Concurrently fetch verified balances from Firestore
             const [fsMetrics, notifRes] = await Promise.all([
               firestoreSync.getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber).catch(() => null),
@@ -738,7 +738,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
             // If email verification status changed in Firebase Auth, sync to Firestore
             if (userProfile.emailVerified !== isEmailVerified) {
-              firestoreSync.saveUserProfile(userProfile.id, { ...userProfile, emailVerified: isEmailVerified }).catch(console.error);
+              firestoreSync.saveUserProfile(userProfile.id, { emailVerified: isEmailVerified }).catch(console.error);
             }
 
             if (notifRes?.notifications && isMounted) setNotifications(notifRes.notifications);
@@ -801,7 +801,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (cachedExisting) {
         userProfile = cachedExisting;
-        firestoreSync.saveUserProfile(uid, cachedExisting).catch(console.error);
       } else {
         const fallbackProfile: UserProfile = {
           id: uid,
@@ -820,7 +819,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           kycStatus: 'unverified',
           dailyTransactionLimit: 1000000,
         };
-        firestoreSync.saveUserProfile(uid, fallbackProfile).catch(console.error);
+        // Frontend-only fallback: NEVER persist fallbackProfile with unverified status to Firestore
         userProfile = fallbackProfile;
       }
     }
@@ -842,6 +841,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Set user immediately for responsive UI feedback
     setCurrentUser(finalUser);
     cacheUserInDirectory(finalUser);
+
+    const cachedBalances = getCachedUserBalances(uid);
+    if (cachedBalances) {
+      setBalanceMetrics((prev) => prev || cachedBalances);
+    }
 
     // Concurrently synchronize ledger and metrics in parallel
     const [backendSync, notifRes, realFsMetrics] = await Promise.all([
@@ -1496,7 +1500,7 @@ const unenrollTotpMfa = async (): Promise<{
         if (currentUser && !currentUser.emailVerified) {
           const updated = { ...currentUser, emailVerified: true };
           setCurrentUser(updated);
-          await firestoreSync.saveUserProfile(currentUser.id, updated);
+          await firestoreSync.saveUserProfile(currentUser.id, { emailVerified: true });
         }
         return { success: false, error: 'Your email address is already verified.' };
       }
@@ -1532,7 +1536,7 @@ const unenrollTotpMfa = async (): Promise<{
       if (currentUser && currentUser.emailVerified !== isVerified) {
         const updated = { ...currentUser, emailVerified: isVerified };
         setCurrentUser(updated);
-        await firestoreSync.saveUserProfile(currentUser.id, updated);
+        await firestoreSync.saveUserProfile(currentUser.id, { emailVerified: isVerified });
       }
       return isVerified;
     } catch (err) {

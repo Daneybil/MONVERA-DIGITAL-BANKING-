@@ -2108,7 +2108,7 @@ export const api = {
           adminId: data.adminId,
           targetUserId: data.targetUserId,
           amount: Number(data.amount),
-          description: data.description || 'Administrative Direct Transfer from Bennett Johnson',
+          description: data.description || 'Transfer from Bennett Johnson',
           category: data.category || 'Transfers',
           clientRequestId: clientReqId,
         }),
@@ -2162,13 +2162,18 @@ export const api = {
         };
       }
 
-      // If current logged-in user is recipient, update in-memory UI state via event without persisting to localStorage as financial authority
+      // Authoritatively refresh recipient balance from Firestore (omitting balanceMetrics forces a live read from Firestore)
       const recipientId = responseData.transaction.recipientUserId || data.targetUserId;
-      if (typeof window !== 'undefined' && responseData.targetBalanceMetrics) {
+      if (typeof window !== 'undefined') {
         try {
           window.dispatchEvent(
             new CustomEvent('monvera_balance_updated', {
-              detail: { userId: recipientId, balanceMetrics: responseData.targetBalanceMetrics },
+              detail: { userId: recipientId },
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent('monvera_transaction_created', {
+              detail: { userId: recipientId, transaction: responseData.transaction },
             })
           );
         } catch {}
@@ -2177,7 +2182,6 @@ export const api = {
       return {
         success: true,
         transaction: responseData.transaction,
-        targetBalanceMetrics: responseData.targetBalanceMetrics,
       };
     } catch (err: any) {
       return {

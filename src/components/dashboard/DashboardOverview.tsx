@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
-import { Transaction } from '../../types';
+import { Transaction, BalanceMetrics } from '../../types';
 import {
   Wallet,
   TrendingUp,
@@ -26,8 +26,6 @@ import {
   Sparkles,
   FileText,
   Banknote,
-  RefreshCw,
-  AlertCircle,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
@@ -35,94 +33,95 @@ import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { firestoreSync } from '../../services/firestoreSync';
 
 export const DashboardOverview: React.FC = () => {
-  const { currentUser, balanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
+  const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
   const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
   const [hideBalances, setHideBalances] = useState<boolean>(false);
   const [copiedAcc, setCopiedAcc] = useState<boolean>(false);
   const [isKycModalOpen, setIsKycModalOpen] = useState<boolean>(false);
-  const [loadTimedOut, setLoadTimedOut] = useState<boolean>(false);
-  const [isRetrying, setIsRetrying] = useState<boolean>(false);
 
-  useEffect(() => {
-    if (balanceMetrics) {
-      setLoadTimedOut(false);
-      setIsRetrying(false);
-      return;
+  // Effective balance metrics: live authoritative balanceMetrics from Firestore when available.
+  // If Firestore balance data is temporarily unavailable or in background transit,
+  // preserve the last known valid balance from secure cache.
+  const balanceMetrics: BalanceMetrics = useMemo(() => {
+    if (liveBalanceMetrics) {
+      return liveBalanceMetrics;
     }
-    const timer = setTimeout(() => {
-      setLoadTimedOut(true);
-      setIsRetrying(false);
-    }, 6000);
-    return () => clearTimeout(timer);
-  }, [balanceMetrics, isRetrying]);
+    if (typeof window !== 'undefined' && currentUser?.id) {
+      try {
+        const raw = localStorage.getItem(`monvera_balances_${currentUser.id}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed.checkingBalance === 'number') {
+            return parsed;
+          }
+        }
+      } catch {}
+    }
+    return {
+      checkingBalance: 0,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 0,
+      availableBalance: 0,
+      pendingBalance: 0,
+      loanBalance: 0,
+      accounts: [
+        {
+          id: `acc_chk_${currentUser?.id || 'default'}`,
+          userId: currentUser?.id || '',
+          type: 'CHECKING',
+          accountNumber: currentUser?.permanentAccountNumber || '1000000000',
+          routingNumber: '021000021',
+          currency: 'USD',
+          balance: 0,
+          availableBalance: 0,
+          investedBalance: 0,
+          pendingBalance: 0,
+          interestRateAPY: 1.25,
+          status: 'ACTIVE',
+          nickname: 'Monvera Premier Checking',
+        },
+        {
+          id: `acc_sav_${currentUser?.id || 'default'}`,
+          userId: currentUser?.id || '',
+          type: 'SAVINGS',
+          accountNumber: (currentUser?.permanentAccountNumber && currentUser.permanentAccountNumber.length >= 7)
+            ? `10${currentUser.permanentAccountNumber.slice(2, -3)}991`
+            : '1000000991',
+          routingNumber: '021000021',
+          currency: 'USD',
+          balance: 0,
+          availableBalance: 0,
+          investedBalance: 0,
+          pendingBalance: 0,
+          interestRateAPY: 4.85,
+          status: 'ACTIVE',
+          nickname: 'Monvera High-Yield Treasury',
+        },
+      ],
+    };
+  }, [liveBalanceMetrics, currentUser]);
 
   useEffect(() => {
     async function loadTx() {
-      if (currentUser) {
+      if (currentUser?.id) {
         try {
           const fsTxs = await firestoreSync.getTransactionsForUser(currentUser.id, currentUser.permanentAccountNumber);
-          const res = await api.getTransactions({ userId: currentUser.id });
-          const apiTxs = res.transactions || [];
-
-          const map = new Map<string, Transaction>();
-          fsTxs.forEach((t) => map.set(t.id, t));
-          apiTxs.forEach((t) => map.set(t.id, t));
-
-          const merged = Array.from(map.values()).sort(
-            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          );
-
-          setRecentTransactions(merged.slice(0, 8));
+          setRecentTransactions((fsTxs || []).slice(0, 8));
         } catch {
           // Fallback
         }
       }
     }
     loadTx();
-  }, [currentUser, balanceMetrics]);
+  }, [currentUser?.id]);
 
   if (!currentUser) {
     return (
       <div className="p-12 text-center">
         <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent animate-spin rounded-full mx-auto" />
-      </div>
-    );
-  }
-
-  if (!balanceMetrics) {
-    if (loadTimedOut) {
-      return (
-        <div className="p-12 text-center max-w-md mx-auto space-y-4 my-8">
-          <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto border border-amber-200">
-            <AlertCircle className="w-6 h-6" />
-          </div>
-          <div className="space-y-1">
-            <h3 className="text-base font-black text-slate-900">Account Balances Unavailable</h3>
-            <p className="text-xs text-slate-600 font-medium">
-              We were unable to load your live ledger balances from the secure banking core. Please check your connection and retry.
-            </p>
-          </div>
-          <button
-            onClick={() => {
-              setLoadTimedOut(false);
-              setIsRetrying(true);
-              refreshBalance();
-            }}
-            disabled={isRetrying}
-            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-850 text-white text-xs font-bold transition-all shadow-sm cursor-pointer disabled:opacity-50"
-          >
-            <RefreshCw className={`w-4 h-4 ${isRetrying ? 'animate-spin' : ''}`} />
-            <span>{isRetrying ? 'Reconnecting...' : 'Retry Connection'}</span>
-          </button>
-        </div>
-      );
-    }
-
-    return (
-      <div className="p-12 text-center space-y-3">
-        <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent animate-spin rounded-full mx-auto" />
-        <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Loading account balances...</p>
       </div>
     );
   }
@@ -607,13 +606,32 @@ export const DashboardOverview: React.FC = () => {
           ) : (
             <div className="divide-y-2 divide-slate-100">
               {recentTransactions.map((tx) => {
-                const isIncoming =
-                  tx.recipientUserId === currentUser.id && tx.senderUserId !== currentUser.id;
+                const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
+                const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
+                const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+                const isRecipient =
+                  tx.recipientUserId === currentUser?.id ||
+                  (!tx.recipientUserId && tx.userId === currentUser?.id) ||
+                  (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
+
+                const isSender =
+                  (tx.senderUserId === currentUser?.id && tx.recipientUserId !== currentUser?.id) ||
+                  (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
+
+                const isAdminTransferCredit =
+                  (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+                   tx.senderAccountNumber === '1000000001' ||
+                   tx.senderName?.includes('Bennett Johnson')) &&
+                  (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
+
+                const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
                 const isDeposit =
                   tx.type === 'DEPOSIT' ||
                   tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
                   tx.type === 'INVESTMENT_EARNING' ||
-                  tx.type === 'INVESTMENT_MATURITY';
+                  tx.type === 'INVESTMENT_MATURITY' ||
+                  isAdminTransferCredit;
                 const isCredit = isIncoming || isDeposit;
 
                 const dateObj = new Date(tx.createdAt);
@@ -629,9 +647,15 @@ export const DashboardOverview: React.FC = () => {
                   hour12: true,
                 });
 
+                const cleanSenderName = (tx.senderName || '').replace(/\s*\(Admin\)/i, '').trim();
+                const cleanRecipName = (tx.recipientName || '').replace(/\s*\(Admin\)/i, '').trim();
                 const partyName = isCredit
-                  ? tx.senderName || (tx.type === 'DEPOSIT' ? 'Direct ACH Infusion' : 'Authorized Sender')
-                  : tx.recipientName || (tx.type === 'WITHDRAWAL' ? 'External Institution' : 'Commercial Merchant');
+                  ? cleanSenderName || (tx.type === 'DEPOSIT' ? 'Direct ACH Infusion' : 'Bennett Johnson')
+                  : cleanRecipName || (tx.type === 'WITHDRAWAL' ? 'External Institution' : 'Commercial Merchant');
+
+                const displayDescription = (tx.description && tx.description.toLowerCase().includes('administrative direct transfer'))
+                  ? `Transfer from ${cleanSenderName || 'Bennett Johnson'}`
+                  : tx.description;
 
                 return (
                   <div
@@ -658,7 +682,7 @@ export const DashboardOverview: React.FC = () => {
                       <div className="space-y-1 min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-base font-black text-slate-950 group-hover:text-sky-700 transition-colors truncate">
-                            {tx.description}
+                            {displayDescription}
                           </span>
                           <span
                             className={`text-[11px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider ${

@@ -41,14 +41,39 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
 
   if (!transaction) return null;
 
-  const isSender = currentUser ? transaction.senderUserId === currentUser.id : false;
-  const isRecipient = currentUser ? transaction.recipientUserId === currentUser.id : false;
+  const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
+  const txRecipAccClean = (transaction.recipientAccountNumber || '').replace(/[-\s]/g, '');
+  const txSenderAccClean = (transaction.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+  const isRecipient = currentUser
+    ? (transaction.recipientUserId === currentUser.id ||
+       (!transaction.recipientUserId && transaction.userId === currentUser.id) ||
+       (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean))
+    : false;
+
+  const isSender = currentUser
+    ? ((transaction.senderUserId === currentUser.id && transaction.recipientUserId !== currentUser.id) ||
+       (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean))
+    : false;
+
+  const isAdminTransferCredit =
+    (transaction.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+     transaction.senderAccountNumber === '1000000001' ||
+     transaction.senderName?.includes('Bennett Johnson')) &&
+    (isRecipient || transaction.userId === currentUser?.id || transaction.recipientUserId === currentUser?.id);
+
   const isCredit =
-    isRecipient ||
+    (isRecipient && !isSender) ||
+    isAdminTransferCredit ||
     transaction.type === 'DEPOSIT' ||
     transaction.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
     transaction.type === 'INVESTMENT_EARNING' ||
     transaction.type === 'INVESTMENT_MATURITY';
+
+  const cleanSenderName = (transaction.senderName || '').replace(/\s*\(Admin\)/i, '').trim();
+  const displayDescription = (transaction.description && transaction.description.toLowerCase().includes('administrative direct transfer'))
+    ? `Transfer from ${cleanSenderName || 'Bennett Johnson'}`
+    : transaction.description;
 
   const dateObj = new Date(transaction.createdAt);
   const formattedDate = dateObj.toLocaleDateString('en-US', {
@@ -343,7 +368,7 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
             </div>
 
             <p className="text-sm font-bold text-slate-800 mt-2 max-w-md mx-auto">
-              {transaction.description}
+              {displayDescription}
             </p>
           </div>
 

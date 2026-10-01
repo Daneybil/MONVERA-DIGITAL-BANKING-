@@ -42,7 +42,7 @@ export const AdminTransfersView: React.FC<AdminTransfersViewProps> = ({
   const [manualAccountInput, setManualAccountInput] = useState<string>('');
   const [targetUserId, setTargetUserId] = useState<string>(customers[0]?.id || '');
   const [amount, setAmount] = useState<string>('5000');
-  const [description, setDescription] = useState<string>('Administrative Direct Transfer from Bennett Johnson');
+  const [description, setDescription] = useState<string>('Transfer from Bennett Johnson');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -69,8 +69,8 @@ export const AdminTransfersView: React.FC<AdminTransfersViewProps> = ({
     }
 
     const effectiveTargetId = inputMode === 'dropdown'
-      ? targetUserId
-      : (selectedTargetCustomer?.id || manualAccountInput.trim());
+      ? (selectedTargetCustomer?.email || selectedTargetCustomer?.permanentAccountNumber || targetUserId)
+      : (selectedTargetCustomer?.email || selectedTargetCustomer?.permanentAccountNumber || selectedTargetCustomer?.id || manualAccountInput.trim());
 
     if (!effectiveTargetId) {
       setFeedback({ type: 'error', text: 'Please enter or select a valid recipient account number or customer.' });
@@ -89,7 +89,7 @@ export const AdminTransfersView: React.FC<AdminTransfersViewProps> = ({
       const res = await onAdminTransfer({
         targetUserId: effectiveTargetId,
         amount: numAmount,
-        description: description || 'Administrative Direct Transfer from Bennett Johnson',
+        description: description || 'Transfer from Bennett Johnson',
       });
 
       if (res.success) {
@@ -311,7 +311,7 @@ export const AdminTransfersView: React.FC<AdminTransfersViewProps> = ({
                 type="text"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                placeholder="Administrative Direct Transfer from Bennett Johnson"
+                placeholder="Transfer from Bennett Johnson"
                 className="w-full text-xs px-3.5 py-2.5 rounded-xl border-2 border-slate-300 focus:border-emerald-600 focus:outline-hidden focus:ring-2 focus:ring-emerald-500/20 text-slate-950 bg-white font-medium shadow-xs"
               />
             </div>

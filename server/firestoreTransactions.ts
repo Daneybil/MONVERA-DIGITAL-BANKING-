@@ -1,4 +1,4 @@
-import { adminFirestore } from './firebaseAdmin';
+import { adminFirestore, adminAuth } from './firebaseAdmin';
 import {
   Transaction,
   BankAccount,
@@ -85,68 +85,156 @@ function buildDefaultAccounts(userId: string, checking: number, savings: number,
 }
 
 /**
- * Resolves a recipient user document from Firestore users collection
+ * Resolves the canonical Firebase Authentication UID for a user document or candidate ID.
+ * Ensures account numbers, directory IDs, legacy IDs, or usernames never substitute the real Auth UID.
+ * Uses Firebase Admin Auth as authority to avoid unnecessary Firestore collection queries.
+ */
+async function getCanonicalAuthUid(candidate: { id: string; data: any }): Promise<string> {
+  const data = candidate.data || {};
+
+  // 1. Explicit uid / authUid / firebaseUid field on document
+  const explicitUid = data.uid || data.authUid || data.firebaseUid || data.userId;
+  if (explicitUid && typeof explicitUid === 'string' && !explicitUid.startsWith('usr_') && explicitUid.length >= 15) {
+    if (adminAuth) {
+      try {
+        const authUser = await adminAuth.getUser(explicitUid);
+        if (authUser?.uid) return authUser.uid;
+      } catch {}
+    }
+    return explicitUid;
+  }
+
+  // 2. Resolve via email against Firebase Auth (the single source of truth for user authentication)
+  if (data.email && typeof data.email === 'string' && adminAuth) {
+    try {
+      const authUser = await adminAuth.getUserByEmail(data.email.trim());
+      if (authUser?.uid) return authUser.uid;
+    } catch {}
+  }
+
+  // 3. Document ID itself if it is a real Firebase Auth UID (not a legacy usr_ / acc_ / mock prefix)
+  if (candidate.id && !candidate.id.startsWith('usr_') && !candidate.id.startsWith('acc_') && candidate.id.length >= 15) {
+    if (adminAuth) {
+      try {
+        const authUser = await adminAuth.getUser(candidate.id);
+        if (authUser?.uid) return authUser.uid;
+      } catch {}
+    }
+    return candidate.id;
+  }
+
+  return explicitUid || candidate.id;
+}
+
+/**
+ * Resolves a recipient user document from Firestore users collection and verifies canonical Auth UID
  */
 export async function resolveRecipientUser(rawTarget: string): Promise<{ uid: string; data: any } | null> {
-  const cleanTarget = rawTarget.trim().replace(/^@/, '').toLowerCase();
-  const cleanDigits = rawTarget.trim().replace(/[-\s]/g, '');
+  if (!rawTarget) return null;
+  const targetStr = rawTarget.trim();
+  const cleanTarget = targetStr.replace(/^@/, '').toLowerCase();
+  const cleanDigits = targetStr.replace(/[-\s]/g, '');
 
   const usersCol = adminFirestore.collection('users');
 
-  // 1. Direct document ID lookup
-  if (rawTarget.trim().length >= 10) {
-    const directSnap = await usersCol.doc(rawTarget.trim()).get();
+  // Check 0: If target is directly an email, query adminAuth first (zero Firestore read cost)
+  if (targetStr.includes('@') && adminAuth) {
+    try {
+      const authUser = await adminAuth.getUserByEmail(cleanTarget);
+      if (authUser?.uid) {
+        const uSnap = await usersCol.doc(authUser.uid).get();
+        const data = uSnap.exists ? uSnap.data() : { email: authUser.email, uid: authUser.uid };
+        return { uid: authUser.uid, data: { ...data, email: authUser.email, uid: authUser.uid } };
+      }
+    } catch {}
+  }
+
+  // Check 0b: If target is a real Firebase UID, verify in adminAuth (zero Firestore read cost)
+  if (!targetStr.startsWith('usr_') && !targetStr.startsWith('acc_') && targetStr.length >= 15 && adminAuth) {
+    try {
+      const authUser = await adminAuth.getUser(targetStr);
+      if (authUser?.uid) {
+        const uSnap = await usersCol.doc(authUser.uid).get();
+        const data = uSnap.exists ? uSnap.data() : { email: authUser.email, uid: authUser.uid };
+        return { uid: authUser.uid, data: { ...data, uid: authUser.uid } };
+      }
+    } catch {}
+  }
+
+  let candidate: { id: string; data: any } | null = null;
+
+  // 1. Direct document ID lookup in users (O(1) single doc read)
+  if (targetStr.length >= 5) {
+    const directSnap = await usersCol.doc(targetStr).get();
     if (directSnap.exists) {
-      return { uid: directSnap.id, data: directSnap.data() };
+      candidate = { id: directSnap.id, data: directSnap.data() };
     }
   }
 
-  // 2. Query by permanentAccountNumber or accountNumber
-  if (cleanDigits) {
+  // 2. Query by permanentAccountNumber or accountNumber (single indexed query)
+  if (!candidate && cleanDigits && cleanDigits.length >= 6) {
     const qAcc = await usersCol.where('permanentAccountNumber', '==', cleanDigits).limit(1).get();
     if (!qAcc.empty) {
-      return { uid: qAcc.docs[0].id, data: qAcc.docs[0].data() };
-    }
-    const qAccLegacy = await usersCol.where('accountNumber', '==', cleanDigits).limit(1).get();
-    if (!qAccLegacy.empty) {
-      return { uid: qAccLegacy.docs[0].id, data: qAccLegacy.docs[0].data() };
-    }
-  }
-
-  // 3. Query by usernameLower or username
-  if (cleanTarget) {
-    const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).limit(1).get();
-    if (!qUserLower.empty) {
-      return { uid: qUserLower.docs[0].id, data: qUserLower.docs[0].data() };
-    }
-    const qUser = await usersCol.where('username', '==', cleanTarget).limit(1).get();
-    if (!qUser.empty) {
-      return { uid: qUser.docs[0].id, data: qUser.docs[0].data() };
-    }
-    const qEmail = await usersCol.where('email', '==', cleanTarget).limit(1).get();
-    if (!qEmail.empty) {
-      return { uid: qEmail.docs[0].id, data: qEmail.docs[0].data() };
+      candidate = { id: qAcc.docs[0].id, data: qAcc.docs[0].data() };
+    } else {
+      const qAccLegacy = await usersCol.where('accountNumber', '==', cleanDigits).limit(1).get();
+      if (!qAccLegacy.empty) {
+        candidate = { id: qAccLegacy.docs[0].id, data: qAccLegacy.docs[0].data() };
+      }
     }
   }
 
-  // 4. Fallback search scan
-  const allUsersSnap = await usersCol.limit(100).get();
-  for (const d of allUsersSnap.docs) {
-    const u = d.data();
-    const uAcc = (u.permanentAccountNumber || u.accountNumber || '').replace(/[-\s]/g, '');
-    const uUser = (u.username || '').replace(/^@/, '').toLowerCase();
-    const uEmail = (u.email || '').toLowerCase();
-    const uName = `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase();
-
-    if (
-      (cleanDigits && uAcc === cleanDigits) ||
-      (cleanTarget && (uUser === cleanTarget || uEmail === cleanTarget || uName === cleanTarget))
-    ) {
-      return { uid: d.id, data: u };
+  // 3. Query by usernameLower, username, or email (single indexed query)
+  if (!candidate && cleanTarget) {
+    if (cleanTarget.includes('@')) {
+      const qEmail = await usersCol.where('email', '==', cleanTarget).limit(1).get();
+      if (!qEmail.empty) {
+        candidate = { id: qEmail.docs[0].id, data: qEmail.docs[0].data() };
+      }
+    } else {
+      const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).limit(1).get();
+      if (!qUserLower.empty) {
+        candidate = { id: qUserLower.docs[0].id, data: qUserLower.docs[0].data() };
+      } else {
+        const qUser = await usersCol.where('username', '==', cleanTarget).limit(1).get();
+        if (!qUser.empty) {
+          candidate = { id: qUser.docs[0].id, data: qUser.docs[0].data() };
+        }
+      }
     }
   }
 
-  return null;
+  if (!candidate) return null;
+
+  // Resolve CANONICAL Firebase Authentication UID
+  const canonicalUid = await getCanonicalAuthUid(candidate);
+
+  // If candidate was found under a legacy ID, ensure canonical user document exists or merge data
+  if (canonicalUid !== candidate.id) {
+    try {
+      const canonicalUserSnap = await usersCol.doc(canonicalUid).get();
+      if (!canonicalUserSnap.exists) {
+        await usersCol.doc(canonicalUid).set(
+          {
+            ...candidate.data,
+            id: canonicalUid,
+            uid: canonicalUid,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      }
+    } catch {}
+  }
+
+  return {
+    uid: canonicalUid,
+    data: {
+      ...candidate.data,
+      id: canonicalUid,
+      uid: canonicalUid,
+    },
+  };
 }
 
 /**
@@ -1154,8 +1242,15 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
         }
       }
 
-      // 2. Read recipient account (gracefully initialize if first time)
+      // 2. Read recipient account (gracefully initialize if first time) and admin source account if present
       const accSnap = await transaction.get(accRef);
+      const adminAccRef = (adminId && adminId !== recipientUid) ? adminFirestore.collection('accounts').doc(adminId) : null;
+      let adminSnap: FirebaseFirestore.DocumentSnapshot | null = null;
+      if (adminAccRef) {
+        try {
+          adminSnap = await transaction.get(adminAccRef);
+        } catch {}
+      }
       let currentChecking = 0;
       let currentSavings = 0;
       let currentInvested = 0;
@@ -1201,6 +1296,10 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
 
       const nowIso = new Date().toISOString();
 
+      const cleanDescription = (description && !description.toLowerCase().includes('administrative direct transfer'))
+        ? description
+        : 'Transfer from Bennett Johnson';
+
       finalTx = {
         id: txId,
         referenceNumber: finalRef,
@@ -1210,14 +1309,14 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
         currency: 'USD',
         status: 'COMPLETED',
         senderUserId: adminId,
-        senderName: 'Bennett Johnson (Admin)',
+        senderName: 'Bennett Johnson',
         senderAccountNumber: '1000000001',
         recipientUserId: recipientUid,
         recipientName: recipientDisplayName,
         recipientAccountNumber: recipientAcc,
         userId: recipientUid,
         fee: 0.0,
-        description: description || 'Administrative Direct Transfer from Bennett Johnson',
+        description: cleanDescription,
         category: (category as any) || 'Transfers',
         createdAt: nowIso,
         completedAt: nowIso,
@@ -1229,6 +1328,25 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
           clientRequestId: effectiveClientReqId,
         },
       };
+
+      // Atomic commit: debit admin source account if present in Firestore
+      if (adminSnap && adminSnap.exists && adminAccRef) {
+        const adminData = adminSnap.data() || {};
+        const currentAdminChecking = Number(adminData.checkingBalance ?? adminData.availableBalance ?? 0);
+        const newAdminChecking = Math.max(0, Number((currentAdminChecking - transferAmount).toFixed(2)));
+        const currentAdminTotal = Number(adminData.totalBalance ?? currentAdminChecking);
+        const newAdminTotal = Math.max(0, Number((currentAdminTotal - transferAmount).toFixed(2)));
+        transaction.set(
+          adminAccRef,
+          {
+            checkingBalance: newAdminChecking,
+            availableBalance: newAdminChecking,
+            totalBalance: newAdminTotal,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+      }
 
       // Atomic commit: update recipient account document
       transaction.set(

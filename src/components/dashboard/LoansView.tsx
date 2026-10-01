@@ -248,7 +248,7 @@ export const LoansView: React.FC = () => {
             );
           });
         }
-      });
+      }, currentUser.id);
 
       const handleLoanUpdated = (e: any) => {
         const updatedLoan = e.detail?.loan;

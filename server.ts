@@ -1008,17 +1008,19 @@ app.post('/api/withdrawals/reverse', async (req: Request, res: Response) => {
   res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
 
-// Automatic 30-minute withdrawal reversal interval scheduler (runs every 15 seconds)
-setInterval(async () => {
-  try {
-    const reversed = await executeServerPendingWithdrawalReversals();
-    if (reversed > 0) {
-      console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending Firestore withdrawal(s) after 30-minute threshold.`);
+// Automatic 30-minute withdrawal reversal interval scheduler (runs every 15 seconds in standalone server)
+if (!process.env.VERCEL) {
+  setInterval(async () => {
+    try {
+      const reversed = await executeServerPendingWithdrawalReversals();
+      if (reversed > 0) {
+        console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending Firestore withdrawal(s) after 30-minute threshold.`);
+      }
+    } catch (e) {
+      console.error('[Auto-Reversal] Error checking scheduled Firestore reversals:', e);
     }
-  } catch (e) {
-    console.error('[Auto-Reversal] Error checking scheduled Firestore reversals:', e);
-  }
-}, 15000);
+  }, 15000);
+}
 
 // --- TRANSACTIONS EXPLORER ---
 app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
@@ -1031,13 +1033,13 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
   const endDate = req.query.endDate as string;
 
   let txs: any[] = [];
+  let userAcc = '';
 
   try {
     const txCol = adminFirestore.collection('transactions');
     const txMap = new Map<string, any>();
 
     if (userId) {
-      let userAcc = '';
       try {
         const uSnap = await adminFirestore.collection('users').doc(userId).get();
         if (uSnap.exists) {
@@ -1095,14 +1097,35 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
   if (flow && flow !== 'ALL' && userId) {
     if (flow === 'CREDIT') {
       txs = txs.filter((t) => {
-        const isIncoming = t.recipientUserId === userId && t.senderUserId !== userId;
-        const isDeposit = t.type === 'DEPOSIT' || t.type === 'ADMIN_DEVELOPMENT_FUNDING' || t.type === 'INVESTMENT_EARNING' || t.type === 'INVESTMENT_MATURITY';
+        const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
+        const txRecipClean = (t.recipientAccountNumber || '').replace(/[-\s]/g, '');
+        const isRecipient = t.recipientUserId === userId || (!t.recipientUserId && t.userId === userId) || (userAccClean && txRecipClean && txRecipClean === userAccClean);
+        const isAdminTransferCredit =
+          (t.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+           t.senderAccountNumber === '1000000001' ||
+           t.senderName?.includes('Bennett Johnson')) &&
+          (isRecipient || t.userId === userId || t.recipientUserId === userId);
+        const isIncoming = (isRecipient && t.senderUserId !== userId) || isAdminTransferCredit;
+        const isDeposit =
+          t.type === 'DEPOSIT' ||
+          t.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+          t.type === 'INVESTMENT_EARNING' ||
+          t.type === 'INVESTMENT_MATURITY' ||
+          isAdminTransferCredit;
         return isIncoming || isDeposit;
       });
     } else if (flow === 'DEBIT') {
       txs = txs.filter((t) => {
-        const isOutgoing = t.senderUserId === userId && t.recipientUserId !== userId;
+        const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
+        const txSenderClean = (t.senderAccountNumber || '').replace(/[-\s]/g, '');
+        const isOutgoing = (t.senderUserId === userId && t.recipientUserId !== userId) || (userAccClean && txSenderClean && txSenderClean === userAccClean);
         const isWithdrawal = t.type === 'WITHDRAWAL' || t.type === 'CARD_PURCHASE' || t.type === 'FEE';
+        const isAdminTransferCredit =
+          (t.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+           t.senderAccountNumber === '1000000001' ||
+           t.senderName?.includes('Bennett Johnson')) &&
+          (t.recipientUserId === userId || t.userId === userId);
+        if (isAdminTransferCredit) return false;
         return isOutgoing || isWithdrawal;
       });
     }
@@ -1641,7 +1664,7 @@ app.post('/api/admin/transfer', requireAdminAuth, async (req: AuthenticatedReque
       adminId: adminUid,
       targetIdentifier,
       amount: Number(amount),
-      description: description || 'Administrative Direct Transfer from Bennett Johnson',
+      description: description || 'Transfer from Bennett Johnson',
       category: category || 'Transfers',
       referenceNumber,
       clientRequestId: req.body.clientRequestId || referenceNumber,
@@ -1663,7 +1686,7 @@ app.post('/api/admin/transfer', requireAdminAuth, async (req: AuthenticatedReque
         targetUsername,
         targetEmail,
         amount: Number(amount),
-        description: description || 'Administrative Direct Transfer from Bennett Johnson',
+        description: description || 'Transfer from Bennett Johnson',
         category: category || 'Transfers',
       });
     } catch {}
@@ -1689,7 +1712,7 @@ app.post('/api/admin/transfer', requireAdminAuth, async (req: AuthenticatedReque
         recipientPhone: recipientUser?.phone,
         amount: Number(amount),
         currency: tx.currency || 'USD',
-        senderName: 'Bennett Johnson (Admin)',
+        senderName: 'Bennett Johnson',
         accountMasked: (tx as any).accountName || 'Monvera Premier Checking',
       }).catch((err) => console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err));
     }
@@ -1956,4 +1979,9 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
+export { app };

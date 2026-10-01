@@ -587,8 +587,9 @@ export const firestoreSync = {
     if (db) {
       try {
         const notifCol = collection(db, 'notifications');
+        const qNotifs = query(notifCol, where('userId', '==', userId));
         fsUnsubscribe = onSnapshot(
-          notifCol,
+          qNotifs,
           () => {
             this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
           },
@@ -795,13 +796,19 @@ export const firestoreSync = {
       const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
 
       const isSender =
-        tx.senderUserId === userId ||
-        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean);
+        (tx.senderUserId === userId && tx.recipientUserId !== userId) ||
+        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipientAccClean !== userAccClean);
 
       const isRecipient =
         tx.recipientUserId === userId ||
         (!tx.recipientUserId && tx.userId === userId) ||
         (userAccClean && txRecipientAccClean && txRecipientAccClean === userAccClean);
+
+      const isAdminTransferToUser =
+        (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+         tx.senderAccountNumber === '1000000001' ||
+         tx.senderName?.includes('Bennett Johnson')) &&
+        (isRecipient || tx.userId === userId || tx.recipientUserId === userId);
 
       if (tx.type === 'DEPOSIT' || tx.type === 'ADMIN_DEVELOPMENT_FUNDING') {
         if (isRecipient || isSender) {
@@ -812,7 +819,10 @@ export const firestoreSync = {
           }
         }
       } else if (tx.type === 'TRANSFER') {
-        if (isSender && isRecipient) {
+        if (isAdminTransferToUser) {
+          // Direct credit from administrator / bank reserve (Bennett Johnson)
+          checking += amount;
+        } else if (isSender && isRecipient) {
           // Internal account movement or loan disbursement
           const desc = (tx.description || '').toLowerCase();
           if (desc.includes('checking to savings') || desc.includes('chk to sav')) {
@@ -1207,11 +1217,6 @@ export const firestoreSync = {
         );
       }
 
-      // Also get all transactions to ensure zero missed disbursements
-      promises.push(
-        getDocs(txCol).catch(() => ({ forEach: () => {} } as any))
-      );
-
       const snapshots = await Promise.all(promises);
 
       snapshots.forEach((snap) => {
@@ -1454,7 +1459,22 @@ export const firestoreSync = {
                   (u.permanentAccountNumber && lu.permanentAccountNumber && u.permanentAccountNumber === lu.permanentAccountNumber)
               );
               if (existingIdx >= 0) {
-                realUsers[existingIdx] = { ...realUsers[existingIdx], ...lu };
+                // Authoritative merge: Firestore fields take precedence over stale localStorage
+                const fsUser = realUsers[existingIdx];
+                const resolvedKyc = (fsUser.kycStatus === 'verified' || lu.kycStatus === 'verified')
+                  ? 'verified'
+                  : (fsUser.kycStatus || lu.kycStatus || 'unverified');
+                realUsers[existingIdx] = {
+                  ...lu,
+                  ...fsUser,
+                  kycStatus: resolvedKyc,
+                  dailyTransactionLimit: resolvedKyc === 'verified'
+                    ? 1000000
+                    : (fsUser.dailyTransactionLimit || lu.dailyTransactionLimit || 1000000),
+                  kycVerifiedAt: resolvedKyc === 'verified'
+                    ? (fsUser.kycVerifiedAt || lu.kycVerifiedAt)
+                    : fsUser.kycVerifiedAt,
+                };
               } else {
                 realUsers.push(lu);
                 if (db) {
@@ -1469,7 +1489,28 @@ export const firestoreSync = {
           if (curUserRaw) {
             const cu = JSON.parse(curUserRaw);
             if (cu && cu.id && !isNonExistentAccount(cu)) {
-              if (!realUsers.some((u) => u.id === cu.id || (u.permanentAccountNumber && u.permanentAccountNumber === cu.permanentAccountNumber))) {
+              const existingIdx = realUsers.findIndex(
+                (u) =>
+                  u.id === cu.id ||
+                  (u.permanentAccountNumber && cu.permanentAccountNumber && u.permanentAccountNumber === cu.permanentAccountNumber)
+              );
+              if (existingIdx >= 0) {
+                const fsUser = realUsers[existingIdx];
+                const resolvedKyc = (fsUser.kycStatus === 'verified' || cu.kycStatus === 'verified')
+                  ? 'verified'
+                  : (fsUser.kycStatus || cu.kycStatus || 'unverified');
+                realUsers[existingIdx] = {
+                  ...cu,
+                  ...fsUser,
+                  kycStatus: resolvedKyc,
+                  dailyTransactionLimit: resolvedKyc === 'verified'
+                    ? 1000000
+                    : (fsUser.dailyTransactionLimit || cu.dailyTransactionLimit || 1000000),
+                  kycVerifiedAt: resolvedKyc === 'verified'
+                    ? (fsUser.kycVerifiedAt || cu.kycVerifiedAt)
+                    : fsUser.kycVerifiedAt,
+                };
+              } else {
                 realUsers.push(cu);
               }
             }
@@ -1582,8 +1623,8 @@ export const firestoreSync = {
 
     for (const user of users) {
       let balances = await this.getAccountBalances(user.id, user.permanentAccountNumber);
-      if (!balances || balances.totalBalance === 0) {
-        // Hydrate from localStorage cached balances if available
+      if (balances === null) {
+        // Hydrate from local storage cache only if Firestore document has not yet been initialized
         if (typeof window !== 'undefined') {
           try {
             const raw =
@@ -2706,15 +2747,16 @@ export const firestoreSync = {
     }
   },
 
-  subscribeToLoans(onUpdate: (loans: LoanApplication[]) => void): () => void {
+  subscribeToLoans(onUpdate: (loans: LoanApplication[]) => void, userId?: string): () => void {
     if (!db) {
       this.getAllLoans().then(onUpdate);
       return () => {};
     }
     try {
       const colRef = collection(db, 'loans');
+      const qLoans = userId ? query(colRef, where('userId', '==', userId)) : colRef;
       const unsubscribe = onSnapshot(
-        colRef,
+        qLoans,
         (snap) => {
           const list: LoanApplication[] = [];
           snap.forEach((d) => list.push(d.data() as LoanApplication));

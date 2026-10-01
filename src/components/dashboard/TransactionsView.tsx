@@ -122,12 +122,32 @@ export const TransactionsView: React.FC = () => {
       }
 
       // 2. Flow Filter (Credit vs Debit)
-      const isIncoming = tx.recipientUserId === currentUser.id && tx.senderUserId !== currentUser.id;
+      const userAccClean = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
+      const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+      const isRecipient =
+        tx.recipientUserId === currentUser.id ||
+        (!tx.recipientUserId && tx.userId === currentUser.id) ||
+        (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
+
+      const isSender =
+        (tx.senderUserId === currentUser.id && tx.recipientUserId !== currentUser.id) ||
+        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
+
+      const isAdminTransferCredit =
+        (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+         tx.senderAccountNumber === '1000000001' ||
+         tx.senderName?.includes('Bennett Johnson')) &&
+        (isRecipient || tx.userId === currentUser.id || tx.recipientUserId === currentUser.id);
+
+      const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
       const isDeposit =
         tx.type === 'DEPOSIT' ||
         tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
         tx.type === 'INVESTMENT_EARNING' ||
-        tx.type === 'INVESTMENT_MATURITY';
+        tx.type === 'INVESTMENT_MATURITY' ||
+        isAdminTransferCredit;
       const isCredit = isIncoming || isDeposit;
 
       if (flowFilter === 'CREDIT' && !isCredit) return false;
@@ -165,12 +185,32 @@ export const TransactionsView: React.FC = () => {
     let totalOutflow = 0;
 
     for (const tx of filteredTransactions) {
-      const isIncoming = tx.recipientUserId === currentUser.id && tx.senderUserId !== currentUser.id;
+      const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
+      const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+      const isRecipient =
+        tx.recipientUserId === currentUser?.id ||
+        (!tx.recipientUserId && tx.userId === currentUser?.id) ||
+        (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
+
+      const isSender =
+        (tx.senderUserId === currentUser?.id && tx.recipientUserId !== currentUser?.id) ||
+        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
+
+      const isAdminTransferCredit =
+        (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+         tx.senderAccountNumber === '1000000001' ||
+         tx.senderName?.includes('Bennett Johnson')) &&
+        (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
+
+      const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
       const isDeposit =
         tx.type === 'DEPOSIT' ||
         tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
         tx.type === 'INVESTMENT_EARNING' ||
-        tx.type === 'INVESTMENT_MATURITY';
+        tx.type === 'INVESTMENT_MATURITY' ||
+        isAdminTransferCredit;
       const isCredit = isIncoming || isDeposit;
 
       if (isCredit) {
@@ -534,12 +574,32 @@ export const TransactionsView: React.FC = () => {
         ) : (
           <div className="divide-y divide-slate-100">
             {filteredTransactions.map((tx) => {
-              const isIncoming = tx.recipientUserId === currentUser.id && tx.senderUserId !== currentUser.id;
+              const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
+              const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
+              const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+              const isRecipient =
+                tx.recipientUserId === currentUser?.id ||
+                (!tx.recipientUserId && tx.userId === currentUser?.id) ||
+                (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
+
+              const isSender =
+                (tx.senderUserId === currentUser?.id && tx.recipientUserId !== currentUser?.id) ||
+                (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
+
+              const isAdminTransferCredit =
+                (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+                 tx.senderAccountNumber === '1000000001' ||
+                 tx.senderName?.includes('Bennett Johnson')) &&
+                (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
+
+              const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
               const isDeposit =
                 tx.type === 'DEPOSIT' ||
                 tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
                 tx.type === 'INVESTMENT_EARNING' ||
-                tx.type === 'INVESTMENT_MATURITY';
+                tx.type === 'INVESTMENT_MATURITY' ||
+                isAdminTransferCredit;
               const isCredit = isIncoming || isDeposit;
 
               const dateObj = new Date(tx.createdAt);
@@ -555,9 +615,15 @@ export const TransactionsView: React.FC = () => {
                 hour12: true,
               });
 
+              const cleanSenderName = (tx.senderName || '').replace(/\s*\(Admin\)/i, '').trim();
+              const cleanRecipName = (tx.recipientName || '').replace(/\s*\(Admin\)/i, '').trim();
               const partyName = isCredit
-                ? tx.senderName || (tx.type === 'DEPOSIT' ? 'Direct ACH Infusion' : 'Authorized Sender')
-                : tx.recipientName || (tx.type === 'WITHDRAWAL' ? 'External Financial Institution' : 'Commercial Merchant');
+                ? cleanSenderName || (tx.type === 'DEPOSIT' ? 'Direct ACH Infusion' : 'Bennett Johnson')
+                : cleanRecipName || (tx.type === 'WITHDRAWAL' ? 'External Financial Institution' : 'Commercial Merchant');
+
+              const displayDescription = (tx.description && tx.description.toLowerCase().includes('administrative direct transfer'))
+                ? `Transfer from ${cleanSenderName || 'Bennett Johnson'}`
+                : tx.description;
 
               return (
                 <div
@@ -580,7 +646,7 @@ export const TransactionsView: React.FC = () => {
                     <div className="space-y-1 min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-sm font-extrabold text-slate-900 group-hover:text-sky-700 transition-colors truncate">
-                          {tx.description}
+                          {displayDescription}
                         </span>
                         <span
                           className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider ${
