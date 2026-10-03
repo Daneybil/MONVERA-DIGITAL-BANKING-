@@ -2088,6 +2088,32 @@ export class MonveraDatabase {
   }): { success: boolean; loan?: LoanApplication; error?: string } {
     const user = this.ensureUserExists(params.userId, params.fallbackUser);
 
+    // Prevent multiple outstanding loans:
+    // Outstanding: PENDING, APPROVED, ACTIVE when remainingBalance > 0
+    // Closed: PAID, REJECTED, CANCELLED, or remainingBalance <= 0
+    const existingOutstanding = Array.from(this.loans.values()).find((l) => {
+      const isSameUser =
+        l.userId === user.id ||
+        l.userId === params.userId ||
+        (user.permanentAccountNumber && l.permanentAccountNumber === user.permanentAccountNumber) ||
+        (user.email && l.applicantEmail?.toLowerCase() === user.email.toLowerCase());
+      if (!isSameUser) return false;
+      const status = (l.status || '').toUpperCase();
+      const totalRepay = l.totalRepaymentAmount || Number((l.amount * 1.20).toFixed(2));
+      const remaining = l.remainingBalance !== undefined ? l.remainingBalance : totalRepay;
+      if (status === 'PAID' || status === 'REJECTED' || status === 'CANCELLED' || remaining <= 0) {
+        return false;
+      }
+      return status === 'PENDING' || status === 'APPROVED' || (status === 'ACTIVE' && remaining > 0);
+    });
+
+    if (existingOutstanding) {
+      return {
+        success: false,
+        error: 'You currently have an outstanding loan. Please pay off your existing loan before applying for another loan.',
+      };
+    }
+
     if (params.amount < 1000 || params.amount > 1000000) {
       return { success: false, error: 'Loan amounts must be between $1,000 and $1,000,000 USD.' };
     }

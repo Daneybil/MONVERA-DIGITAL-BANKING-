@@ -1036,6 +1036,7 @@ export const api = {
     endDate?: string;
   }): Promise<{ transactions: Transaction[] }> {
     let apiTxs: Transaction[] = [];
+    let backendSuccess = false;
 
     try {
       const query = new URLSearchParams();
@@ -1048,39 +1049,34 @@ export const api = {
       if (params?.endDate) query.append('endDate', params.endDate);
 
       const res = await fetch(`/api/transactions?${query.toString()}`);
-      const data = await parseJsonResponse<{ transactions: Transaction[] }>(res, { transactions: [] });
-      if (data && data.transactions) {
-        apiTxs = data.transactions;
+      if (res.ok) {
+        const data = await parseJsonResponse<{ transactions: Transaction[] }>(res, { transactions: [] });
+        if (data && Array.isArray(data.transactions)) {
+          apiTxs = data.transactions;
+          backendSuccess = true;
+        }
       }
     } catch {
       // Backend unavailable
     }
 
-    // Merge with Firestore permanent transactions and auto-reverse expired 30m withdrawals
+    // Authoritative return from server API without redundant client Firestore query
+    if (backendSuccess && apiTxs.length > 0) {
+      return { transactions: apiTxs };
+    }
+
+    // Resilient fallback to Firestore only if backend is unavailable or returns 0 records
     if (params?.userId) {
       try {
-        await this.checkAndExecutePendingWithdrawalReversals(params.userId);
         const firestoreTxs = await firestoreSync.getTransactionsForUser(params.userId);
-        const map = new Map<string, Transaction>();
-        apiTxs.forEach((t) => map.set(t.id, t));
-        firestoreTxs.forEach((t) => map.set(t.id, t));
-        const merged = Array.from(map.values()).sort(
-          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-        );
-        return { transactions: merged };
+        return { transactions: firestoreTxs };
       } catch {
         // Firestore query notice
       }
     } else {
       try {
         const firestoreTxs = await firestoreSync.getAllTransactions();
-        const map = new Map<string, Transaction>();
-        apiTxs.forEach((t) => map.set(t.id, t));
-        firestoreTxs.forEach((t) => map.set(t.id, t));
-        const merged = Array.from(map.values()).sort(
-          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-        );
-        return { transactions: merged };
+        return { transactions: firestoreTxs };
       } catch {
         // Firestore query notice
       }
@@ -2422,9 +2418,10 @@ export const api = {
     fallbackUser?: any;
   }): Promise<{ success: boolean; loan?: LoanApplication; error?: string }> {
     try {
+      const headers = await getAuthHeaders();
       const res = await fetch('/api/loans/apply', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(data),
       });
       const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; error?: string }>(res, {
@@ -2436,12 +2433,46 @@ export const api = {
         await firestoreSync.saveLoanApplication(result.loan);
         return result;
       }
+      // If server returned an error (e.g. 400 with outstanding loan), return it immediately
+      if (!res.ok || result.error || result.success === false) {
+        return {
+          success: false,
+          error: result.error || 'Failed to submit loan application.',
+        };
+      }
     } catch {
       // Backend unreachable, proceed with direct authoritative Firestore fallback
     }
 
     // Resilient Direct Firestore Fallback: Guarantees zero "server unavailable" errors upon cloud deployment
     try {
+      // Check if user already has an outstanding loan in Firestore
+      const existingLoans = await firestoreSync.getLoansForUser(
+        data.userId,
+        data.permanentAccountNumber,
+        data.applicantEmail
+      );
+      const hasOutstanding = existingLoans.some((l) => {
+        const status = (l.status || '').toUpperCase();
+        const totalRepay = l.totalRepaymentAmount !== undefined
+          ? Number(l.totalRepaymentAmount)
+          : Number((Number(l.amount || 0) * 1.20).toFixed(2));
+        const remaining = l.remainingBalance !== undefined
+          ? Number(l.remainingBalance)
+          : (status === 'PAID' ? 0 : totalRepay);
+        if (status === 'PAID' || status === 'REJECTED' || status === 'CANCELLED' || remaining <= 0) {
+          return false;
+        }
+        return status === 'PENDING' || status === 'APPROVED' || (status === 'ACTIVE' && remaining > 0);
+      });
+
+      if (hasOutstanding) {
+        return {
+          success: false,
+          error: 'You currently have an outstanding loan. Please pay off your existing loan before applying for another loan.',
+        };
+      }
+
       const validTerms = [6, 12, 24, 36, 48, 60];
       const termMonths = validTerms.includes(data.termMonths) ? data.termMonths : 12;
       const totalRepayment = Number((data.amount * 1.20).toFixed(2));

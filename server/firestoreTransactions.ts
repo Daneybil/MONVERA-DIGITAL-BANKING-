@@ -680,6 +680,10 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
     });
 
     if (finalTx) {
+      const schedAt = (finalTx as any)?.metadata?.reversalScheduledAt;
+      if (finalTx.id && schedAt) {
+        scheduleTargetedWithdrawalReversal(finalTx.id, userId, new Date(schedAt).getTime());
+      }
       return {
         success: true,
         transaction: finalTx,
@@ -854,6 +858,29 @@ export async function reverseServerFirestoreWithdrawal(
   }
 }
 
+// In-memory active reversal timer map to ensure targeted event-based execution
+const activeReversalTimers = new Map<string, NodeJS.Timeout>();
+
+export function scheduleTargetedWithdrawalReversal(txId: string, userId: string, scheduledTimeMs: number) {
+  if (!txId || activeReversalTimers.has(txId)) return;
+  const now = Date.now();
+  const delay = Math.max(500, scheduledTimeMs - now);
+  // Cap at 35 minutes
+  if (delay > 35 * 60 * 1000) return;
+
+  const timer = setTimeout(async () => {
+    activeReversalTimers.delete(txId);
+    try {
+      await reverseServerFirestoreWithdrawal(txId, userId);
+    } catch (e) {
+      console.error(`[Auto-Reversal] Failed targeted reversal for ${txId}:`, e);
+    }
+  }, delay);
+
+  if (timer.unref) timer.unref();
+  activeReversalTimers.set(txId, timer);
+}
+
 /**
  * Scans Firestore for pending withdrawals that reached the 30-minute expiration
  * and reverses them atomically.
@@ -894,6 +921,8 @@ export async function executeServerPendingWithdrawalReversals(): Promise<number>
         if (res.success) {
           count++;
         }
+      } else if (scheduledTime > now) {
+        scheduleTargetedWithdrawalReversal(doc.id, data.userId || data.senderUserId, scheduledTime);
       }
     }
   } catch (err) {
@@ -1631,6 +1660,100 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
   }
 }
 
+/**
+ * Server-authoritative check to verify whether a user already has an outstanding loan in Firestore.
+ * 
+ * Outstanding statuses:
+ * - PENDING
+ * - APPROVED
+ * - ACTIVE when remainingBalance > 0
+ * 
+ * Closed statuses:
+ * - PAID
+ * - REJECTED
+ * - CANCELLED
+ * (Also loans with remainingBalance <= 0 are treated as no longer outstanding)
+ */
+export async function checkUserHasOutstandingLoan(params: {
+  userId: string;
+  authUid?: string;
+  permanentAccountNumber?: string;
+  email?: string;
+}): Promise<{ hasOutstanding: boolean; loan?: LoanApplication; canonicalUid: string }> {
+  const { userId, authUid, permanentAccountNumber, email } = params;
+
+  // 1. Resolve canonical user record
+  const userRecord = await resolveRecipientUser(authUid || userId || permanentAccountNumber || email || '');
+  const canonicalUid = userRecord?.uid || authUid || userId;
+  const userAcc = (userRecord?.data?.permanentAccountNumber || permanentAccountNumber || '').replace(/[-\s]/g, '');
+
+  const idCandidates = new Set<string>();
+  if (canonicalUid) idCandidates.add(canonicalUid);
+  if (authUid) idCandidates.add(authUid);
+  if (userId) idCandidates.add(userId);
+
+  const matchedLoansMap = new Map<string, LoanApplication>();
+
+  // 2. Query Firestore loans collection by userId candidates (targeted queries, zero full collection scan)
+  for (const id of idCandidates) {
+    try {
+      const snap = await adminFirestore.collection('loans').where('userId', '==', id).get();
+      snap.forEach((doc) => {
+        const data = doc.data() as LoanApplication;
+        if (data && doc.id) matchedLoansMap.set(doc.id, data);
+      });
+    } catch (err) {
+      console.warn('[checkUserHasOutstandingLoan] Query by userId error:', err);
+    }
+  }
+
+  // Query by permanentAccountNumber if available
+  if (userAcc && userAcc.length >= 6) {
+    try {
+      const snapAcc = await adminFirestore.collection('loans').where('permanentAccountNumber', '==', userAcc).get();
+      snapAcc.forEach((doc) => {
+        const data = doc.data() as LoanApplication;
+        if (data && doc.id) matchedLoansMap.set(doc.id, data);
+      });
+    } catch {}
+  }
+
+  // Query by applicantEmail if available
+  const userEmail = (userRecord?.data?.email || email || '').toLowerCase().trim();
+  if (userEmail && userEmail.includes('@')) {
+    try {
+      const snapEmail = await adminFirestore.collection('loans').where('applicantEmail', '==', userEmail).get();
+      snapEmail.forEach((doc) => {
+        const data = doc.data() as LoanApplication;
+        if (data && doc.id) matchedLoansMap.set(doc.id, data);
+      });
+    } catch {}
+  }
+
+  // 3. Inspect matched loans to determine if any is outstanding
+  for (const loan of matchedLoansMap.values()) {
+    const status = (loan.status || '').toUpperCase();
+    const totalRepay = loan.totalRepaymentAmount !== undefined
+      ? Number(loan.totalRepaymentAmount)
+      : Number((Number(loan.amount || 0) * 1.20).toFixed(2));
+    const remaining = loan.remainingBalance !== undefined
+      ? Number(loan.remainingBalance)
+      : (status === 'PAID' ? 0 : totalRepay);
+
+    // Closed: PAID, REJECTED, CANCELLED, or remainingBalance <= 0
+    if (status === 'PAID' || status === 'REJECTED' || status === 'CANCELLED' || remaining <= 0) {
+      continue;
+    }
+
+    // Outstanding: PENDING, APPROVED, or ACTIVE with remainingBalance > 0
+    if (status === 'PENDING' || status === 'APPROVED' || (status === 'ACTIVE' && remaining > 0)) {
+      return { hasOutstanding: true, loan, canonicalUid };
+    }
+  }
+
+  return { hasOutstanding: false, canonicalUid };
+}
+
 export interface LoanDisbursementParams {
   loanId: string;
   adminId?: string;
@@ -2010,7 +2133,18 @@ export async function executeServerLoanRepayment(
         throw new Error('LOAN_NOT_FOUND: Loan record not found.');
       }
 
-      if (loanData.userId !== userId) {
+      let isAuthorizedOwner = loanData.userId === userId;
+      if (!isAuthorizedOwner) {
+        const callerRecord = await resolveRecipientUser(userId);
+        const callerUid = callerRecord?.uid || userId;
+        const loanUserRecord = await resolveRecipientUser(loanData.userId || loanData.permanentAccountNumber || loanData.applicantEmail);
+        const loanUid = loanUserRecord?.uid || loanData.userId;
+        if (callerUid === loanUid || loanData.userId === callerUid || userId === loanUid) {
+          isAuthorizedOwner = true;
+        }
+      }
+
+      if (!isAuthorizedOwner) {
         throw new Error('UNAUTHORIZED: You are not authorized to make repayments on this credit facility.');
       }
 

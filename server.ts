@@ -19,6 +19,7 @@ import {
   executeServerInvestmentMaturity,
   executeServerPendingWithdrawalReversals,
   reverseServerFirestoreWithdrawal,
+  checkUserHasOutstandingLoan,
 } from './server/firestoreTransactions';
 
 const app = express();
@@ -1008,18 +1009,31 @@ app.post('/api/withdrawals/reverse', async (req: Request, res: Response) => {
   res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
 });
 
-// Automatic 30-minute withdrawal reversal interval scheduler (runs every 15 seconds in standalone server)
+// Targeted 30-minute withdrawal reversal scheduler
 if (!process.env.VERCEL) {
+  // Initial safety sync on startup after 5 seconds
+  setTimeout(async () => {
+    try {
+      const reversed = await executeServerPendingWithdrawalReversals();
+      if (reversed > 0) {
+        console.log(`[Auto-Reversal] Reversed ${reversed} expired pending withdrawal(s) on startup.`);
+      }
+    } catch (e) {
+      console.error('[Auto-Reversal] Startup check error:', e);
+    }
+  }, 5000);
+
+  // Low-frequency safety reconciliation interval (every 10 minutes instead of every 15 seconds)
   setInterval(async () => {
     try {
       const reversed = await executeServerPendingWithdrawalReversals();
       if (reversed > 0) {
-        console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending Firestore withdrawal(s) after 30-minute threshold.`);
+        console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending Firestore withdrawal(s).`);
       }
     } catch (e) {
-      console.error('[Auto-Reversal] Error checking scheduled Firestore reversals:', e);
+      console.error('[Auto-Reversal] Reconciliation check error:', e);
     }
-  }, 15000);
+  }, 10 * 60 * 1000);
 }
 
 // --- TRANSACTIONS EXPLORER ---
@@ -1814,13 +1828,31 @@ app.get('/api/loans/eligibility', (req: Request, res: Response) => {
   res.json({ volume, ...eligibility });
 });
 
-app.post('/api/loans/apply', (req: Request, res: Response) => {
+app.post('/api/loans/apply', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { userId, amount, termMonths, purpose, employmentOrBusinessDetails, annualIncomeOrRevenue, collateralDescription, fallbackUser, applicantName, applicantEmail, applicantPhone, permanentAccountNumber } = req.body;
   if (!userId || !amount) {
     return res.status(400).json({ error: 'User ID and loan amount are required.' });
   }
+
+  const callerUid = req.auth?.uid;
+  const effectiveUserId = callerUid || userId;
+
+  // 1. Authoritative server-side check in Firestore
+  const outstandingCheck = await checkUserHasOutstandingLoan({
+    userId: effectiveUserId,
+    authUid: callerUid,
+    permanentAccountNumber,
+    email: applicantEmail,
+  });
+
+  if (outstandingCheck.hasOutstanding) {
+    return res.status(400).json({
+      error: 'You currently have an outstanding loan. Please pay off your existing loan before applying for another loan.',
+    });
+  }
+
   const result = db.createLoanApplication({
-    userId,
+    userId: outstandingCheck.canonicalUid || effectiveUserId,
     amount: Number(amount),
     termMonths: Number(termMonths) || 12,
     purpose,
@@ -1835,7 +1867,18 @@ app.post('/api/loans/apply', (req: Request, res: Response) => {
       permanentAccountNumber,
     },
   });
+
   if (!result.success) return res.status(400).json({ error: result.error });
+
+  // Persist newly created loan to Firestore so subsequent queries find it
+  if (result.loan) {
+    try {
+      await adminFirestore.collection('loans').doc(result.loan.id).set(result.loan, { merge: true });
+    } catch (fsErr) {
+      console.warn('Failed to persist loan to Firestore in server.ts:', fsErr);
+    }
+  }
+
   res.json(result);
 });
 

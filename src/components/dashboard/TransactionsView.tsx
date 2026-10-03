@@ -49,23 +49,9 @@ export const TransactionsView: React.FC = () => {
     if (!currentUser) return;
     setIsLoading(true);
     try {
-      // 1. Fetch from Firestore permanent ledger
-      const fsTxs = await firestoreSync.getTransactionsForUser(currentUser.id, currentUser.permanentAccountNumber);
-      
-      // 2. Fetch from backend API
+      // Authoritative single-path transaction retrieval
       const res = await api.getTransactions({ userId: currentUser.id });
-      const apiTxs = res.transactions || [];
-
-      // Merge and deduplicate by transaction ID
-      const map = new Map<string, Transaction>();
-      fsTxs.forEach((t) => map.set(t.id, t));
-      apiTxs.forEach((t) => map.set(t.id, t));
-
-      const merged = Array.from(map.values()).sort(
-        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-
-      setTransactions(merged);
+      setTransactions(res.transactions || []);
     } catch (err) {
       console.error('Failed to fetch transactions:', err);
     } finally {

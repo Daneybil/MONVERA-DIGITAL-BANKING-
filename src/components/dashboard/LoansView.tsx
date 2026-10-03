@@ -307,9 +307,32 @@ export const LoansView: React.FC = () => {
   const calculatedTotalRepayment = Number((amount * 1.20).toFixed(2));
   const calculatedMonthlyPayment = Math.round(calculatedTotalRepayment / termMonths);
 
+  // Authoritative check for existing outstanding loan:
+  // Outstanding: PENDING, APPROVED, or ACTIVE with remainingBalance > 0
+  // Closed: PAID, REJECTED, CANCELLED, or remainingBalance <= 0
+  const outstandingLoan = loans.find((l) => {
+    const status = (l.status || '').toUpperCase();
+    const totalRepay = l.totalRepaymentAmount !== undefined
+      ? Number(l.totalRepaymentAmount)
+      : Number((Number(l.amount || 0) * 1.20).toFixed(2));
+    const remaining = l.remainingBalance !== undefined
+      ? Number(l.remainingBalance)
+      : (status === 'PAID' ? 0 : totalRepay);
+    if (status === 'PAID' || status === 'REJECTED' || status === 'CANCELLED' || remaining <= 0) return false;
+    return status === 'PENDING' || status === 'APPROVED' || (status === 'ACTIVE' && remaining > 0);
+  });
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
+
+    if (outstandingLoan) {
+      setFeedback({
+        type: 'error',
+        message: 'You currently have an outstanding loan. Please pay off your existing loan before applying for another loan.',
+      });
+      return;
+    }
 
     if (amount <= 0) {
       setFeedback({ type: 'error', message: 'Please enter a valid loan amount.' });
@@ -641,6 +664,30 @@ export const LoansView: React.FC = () => {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-6">
+            {/* Prominent Warning if User Has Outstanding Loan */}
+            {outstandingLoan && (
+              <div className="p-5 rounded-2xl bg-amber-50 border-3 border-amber-400 text-amber-950 space-y-3 shadow-md">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-6 h-6 text-amber-600 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <h4 className="text-base font-black text-amber-950">Outstanding Loan Detected</h4>
+                    <p className="text-sm font-bold text-amber-900 mt-1 leading-relaxed">
+                      You currently have an outstanding loan. Please pay off your existing loan before applying for another loan.
+                    </p>
+                  </div>
+                </div>
+                {outstandingLoan.status === 'ACTIVE' && (outstandingLoan.remainingBalance === undefined || outstandingLoan.remainingBalance > 0) && (
+                  <button
+                    type="button"
+                    onClick={() => handleOpenRepayModal(outstandingLoan)}
+                    className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-amber-900 hover:bg-amber-950 text-white font-black text-xs sm:text-sm uppercase tracking-wider transition-all cursor-pointer shadow-sm"
+                  >
+                    <Wallet className="w-4 h-4" />
+                    <span>Pay Off Outstanding Loan (${(outstandingLoan.remainingBalance ?? (outstandingLoan.totalRepaymentAmount || outstandingLoan.amount * 1.2)).toLocaleString('en-US', { minimumFractionDigits: 2 })})</span>
+                  </button>
+                )}
+              </div>
+            )}
             
             {/* Amount Slider and Number Input */}
             <div className="space-y-3">
@@ -783,10 +830,19 @@ export const LoansView: React.FC = () => {
             <button
               type="submit"
               disabled={isSubmitting}
-              className="w-full inline-flex items-center justify-center gap-2 text-base sm:text-lg font-black text-white bg-gradient-to-b from-emerald-600 via-emerald-700 to-emerald-800 hover:from-emerald-500 hover:to-emerald-700 border-2 border-emerald-500 border-b-[5px] border-b-emerald-950 px-8 py-4 rounded-2xl shadow-xl active:translate-y-1 active:border-b-[2px] transition-all cursor-pointer disabled:opacity-50"
+              className={`w-full inline-flex items-center justify-center gap-2 text-base sm:text-lg font-black text-white px-8 py-4 rounded-2xl shadow-xl active:translate-y-1 active:border-b-[2px] transition-all cursor-pointer disabled:opacity-50 ${
+                outstandingLoan
+                  ? 'bg-amber-800 hover:bg-amber-900 border-2 border-amber-600 border-b-[5px] border-b-amber-950'
+                  : 'bg-gradient-to-b from-emerald-600 via-emerald-700 to-emerald-800 hover:from-emerald-500 hover:to-emerald-700 border-2 border-emerald-500 border-b-[5px] border-b-emerald-950'
+              }`}
             >
               {isSubmitting ? (
                 <RefreshCw className="w-5 h-5 animate-spin" />
+              ) : outstandingLoan ? (
+                <>
+                  <AlertCircle className="w-5 h-5 text-amber-300" />
+                  <span>Existing Loan Outstanding — Pay Off Required</span>
+                </>
               ) : (
                 <>
                   <span>Submit Loan Application (${amount.toLocaleString('en-US')})</span>

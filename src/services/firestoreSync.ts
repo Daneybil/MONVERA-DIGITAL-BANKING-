@@ -9,6 +9,8 @@ import {
   onSnapshot,
   serverTimestamp,
   runTransaction,
+  limit,
+  orderBy,
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
 import { UserProfile, Transaction, InvestmentPlan, InvestmentTermDays, LoanApplication, CardItem, NotificationItem, NotificationPreferences, ChatMessage } from '../types';
@@ -937,7 +939,8 @@ export const firestoreSync = {
   },
 
   /**
-   * Fetch permanent user account balances from Firestore with dynamic ledger verification
+   * Fetch permanent user account balances from Firestore: accounts/{userId}
+   * Strictly reads the authoritative account document. Zero loan queries, zero transaction scans.
    */
   async getAccountBalances(userId: string, userAccountNumber?: string): Promise<BalanceMetrics | null> {
     if (!userId) return null;
@@ -948,7 +951,7 @@ export const firestoreSync = {
       const snap = await getDoc(accRef);
       let data = snap.exists() ? snap.data() : null;
 
-      // Resilient check: If accounts/{userId} is missing or empty, check legacy accounts/{userAccountNumber}
+      // Resilient check: If accounts/{userId} is missing, check legacy accounts/{userAccountNumber}
       if (!data && userAccountNumber) {
         const cleanAcc = userAccountNumber.replace(/[-\s]/g, '');
         if (cleanAcc && cleanAcc !== userId) {
@@ -957,13 +960,6 @@ export const firestoreSync = {
             const legacySnap = await getDoc(legacyRef);
             if (legacySnap.exists()) {
               const legacyData = legacySnap.data();
-              // Seamlessly copy legacy balance into accounts/{userId} without deleting legacy document
-              await setDoc(accRef, {
-                userId,
-                ...legacyData,
-                migratedFromAccountNumberDoc: cleanAcc,
-                updatedAt: new Date().toISOString(),
-              }, { merge: true });
               data = legacyData;
             }
           } catch {}
@@ -971,102 +967,13 @@ export const firestoreSync = {
       }
 
       if (data) {
-        let chk = Number(data.checkingBalance ?? 0);
-        let sav = Number(data.savingsBalance ?? data.savings ?? 0);
-        let inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
-        let accrued = Number(data.accruedEarnings ?? 0);
-        let avail = Number(data.availableBalance ?? chk);
-        let total = Number(data.totalBalance ?? (chk + sav + inv + accrued));
-        let loanBal = Number(data.loanBalance ?? 0);
-
-        // Reconciliation check: ensure all active approved loans for this user are credited
-        try {
-          const loansCol = collection(db, 'loans');
-          const candidateLoans: LoanApplication[] = [];
-          try {
-            const qLoans = query(loansCol, where('userId', '==', userId));
-            const snap = await getDocs(qLoans);
-            snap.forEach((d) => candidateLoans.push(d.data() as LoanApplication));
-          } catch {}
-
-          if (userAccountNumber) {
-            try {
-              const qAcc = query(loansCol, where('permanentAccountNumber', '==', userAccountNumber));
-              const snapAcc = await getDocs(qAcc);
-              snapAcc.forEach((d) => {
-                const item = d.data() as LoanApplication;
-                if (!candidateLoans.some((x) => x.id === item.id)) {
-                  candidateLoans.push(item);
-                }
-              });
-            } catch {}
-          }
-
-          if (candidateLoans.length > 0) {
-            let uncreditedLoanSum = 0;
-            let activeLoansTotal = 0;
-            let totalDisbursedForActiveLoans = 0;
-            const creditedLoans: string[] = Array.isArray(data.creditedLoans) ? [...data.creditedLoans] : [];
-            let needsSync = false;
-
-            candidateLoans.forEach((l) => {
-              if (l.status === 'ACTIVE' || l.status === 'APPROVED') {
-                const repBal = Number(l.remainingBalance ?? l.totalRepaymentAmount ?? (l.amount * 1.20));
-                activeLoansTotal += repBal;
-                const disAmt = Number(l.disbursedAmount || l.amount || 0);
-                totalDisbursedForActiveLoans += disAmt;
-
-                if (!creditedLoans.includes(l.id)) {
-                  uncreditedLoanSum += disAmt;
-                  creditedLoans.push(l.id);
-                  needsSync = true;
-                }
-              }
-            });
-
-            if (activeLoansTotal !== loanBal && activeLoansTotal > 0) {
-              loanBal = activeLoansTotal;
-              needsSync = true;
-            }
-
-            if (needsSync) {
-              const updatedAccountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
-                ? data.accounts.map((a: any) => {
-                    if (a.type === 'CHECKING') {
-                      return { ...a, balance: chk, availableBalance: avail };
-                    }
-                    if (a.type === 'SAVINGS') {
-                      return { ...a, balance: sav, availableBalance: sav };
-                    }
-                    if (a.type === 'INVESTMENT') {
-                      return { ...a, balance: inv, investedBalance: inv };
-                    }
-                    return a;
-                  })
-                : undefined;
-
-              const syncedMetrics = {
-                userId,
-                checkingBalance: chk,
-                savingsBalance: sav,
-                investedBalance: inv,
-                accruedEarnings: accrued,
-                totalBalance: total,
-                availableBalance: avail,
-                loanBalance: loanBal,
-                pendingBalance: Number(data.pendingBalance ?? 0),
-                ...(updatedAccountsList ? { accounts: updatedAccountsList } : {}),
-                creditedLoans,
-                updatedAt: new Date().toISOString(),
-              };
-
-              // Background non-blocking persistence back to Firestore accounts/{userId}
-              setDoc(accRef, syncedMetrics, { merge: true }).catch(() => {});
-            }
-          }
-        } catch (loanSyncErr) {
-          console.warn('[Firestore] Loan balance reconciliation note:', loanSyncErr);
-        }
+        const chk = Number(data.checkingBalance ?? 0);
+        const sav = Number(data.savingsBalance ?? data.savings ?? 0);
+        const inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
+        const accrued = Number(data.accruedEarnings ?? 0);
+        const avail = Number(data.availableBalance ?? chk);
+        const total = Number(data.totalBalance ?? (chk + sav + inv + accrued));
+        const loanBal = Number(data.loanBalance ?? 0);
 
         const accountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
           ? data.accounts.map((a: any) => {
@@ -1136,19 +1043,6 @@ export const firestoreSync = {
         return metrics;
       }
 
-      // If document does not exist yet in Firestore, compute from verified transactions
-      const txs = await this.getTransactionsForUser(userId, userAccountNumber);
-      if (txs.length > 0) {
-        const computed = this.computeBalancesFromTransactions(
-          userId,
-          txs,
-          [],
-          userAccountNumber
-        );
-        // Persist computed result in background
-        this.saveAccountBalances(userId, computed).catch(() => {});
-        return computed;
-      }
       return null;
     } catch (err) {
       handleFirestoreError(err, OperationType.GET, path);
@@ -1325,54 +1219,20 @@ export const firestoreSync = {
       } catch {}
     }
 
-    // 3. Check accounts collection in Firestore
-    if (cleanDigits) {
+    // 3. Direct document ID lookup in accounts if cleanDigits matches account document key
+    if (cleanDigits && cleanDigits.length >= 6) {
       try {
-        const accCol = collection(db, 'accounts');
-        const accSnap = await getDocs(accCol);
-        for (const ad of accSnap.docs) {
-          const aData = ad.data() as any;
-          const accountsList: any[] = aData.accounts || [];
-          const hasAcc = accountsList.some(
-            (a) => (a.accountNumber || '').replace(/[-\s]/g, '') === cleanDigits
-          );
-          if (hasAcc) {
-            const uid = ad.id;
-            const uProfile = await this.getUserProfile(uid);
-            if (uProfile) return uProfile;
-          }
+        const directAcc = await getDoc(doc(db, 'accounts', cleanDigits));
+        if (directAcc.exists()) {
+          const accData = directAcc.data();
+          const targetUid = accData?.userId || cleanDigits;
+          const uProfile = await this.getUserProfile(targetUid);
+          if (uProfile) return uProfile;
         }
       } catch {}
     }
 
-    // 4. Comprehensive resilient fallback: scan users collection to match any field
-    try {
-      const allUsersSnap = await getDocs(usersCol);
-      for (const d of allUsersSnap.docs) {
-        const u = d.data() as UserProfile & Record<string, any>;
-        const uAcc = (u.permanentAccountNumber || u.accountNumber || '').replace(/[-\s]/g, '');
-        const uUser = (u.username || '').replace(/^@/, '').toLowerCase();
-        const uEmail = (u.email || '').toLowerCase();
-        const uId = (u.id || d.id || '').toLowerCase();
-        const uName = `${u.firstName || ''} ${u.lastName || ''}`.toLowerCase().trim();
-
-        if (
-          (cleanDigits && uAcc === cleanDigits) ||
-          (cleanLower && uUser === cleanLower) ||
-          (cleanLower && uEmail === cleanLower) ||
-          (raw && uId === raw.toLowerCase()) ||
-          (cleanLower.length >= 3 && uName.includes(cleanLower))
-        ) {
-          return {
-            id: d.id || u.id,
-            ...u,
-          };
-        }
-      }
-    } catch (err) {
-      handleFirestoreError(err, OperationType.LIST, 'users');
-    }
-
+    // No fallback scan of entire collections. Return null cleanly if recipient is not found.
     return null;
   },
 
@@ -1537,81 +1397,41 @@ export const firestoreSync = {
   },
 
   /**
-   * Subscribe to real-time updates for all registered users in Firestore
+   * Targeted subscription for registered users list.
+   * Avoids continuous collection-wide snapshots.
    */
   subscribeToUsers(onUpdate: (users: UserProfile[]) => void): () => void {
-    if (!db) return () => {};
-    try {
-      const usersCol = collection(db, 'users');
-      const unsubscribe = onSnapshot(
-        usersCol,
-        (snap) => {
-          const userList: UserProfile[] = [];
-          snap.forEach((d) => {
-            const data = d.data() as any;
-            const uid = d.id || data.id || data.uid;
-            const rawUsername = data.username || (data.email ? data.email.split('@')[0] : `user_${uid.slice(0, 6)}`);
-            const cleanUsername = rawUsername.replace(/^@/, '').trim();
-            const rawAcc = data.permanentAccountNumber || data.accountNumber || '';
-            const cleanAcc = rawAcc.replace(/[-\s]/g, '');
+    let currentUsersMap = new Map<string, UserProfile>();
 
-            userList.push({
-              id: uid,
-              username: cleanUsername,
-              firstName: data.firstName || '',
-              lastName: data.lastName || '',
-              email: data.email || '',
-              phone: data.phone || data.phoneNumber || '',
-              permanentAccountNumber: cleanAcc || '1000000000',
-              dateOfBirth: data.dateOfBirth,
-              country: data.country || 'United States',
-              avatarUrl: data.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-              status: data.status || 'active',
-              role: data.role || 'customer',
-              membershipTier: data.membershipTier || 'Premier',
-              twoFactorEnabled: data.twoFactorEnabled ?? false,
-              createdAt: data.createdAt || new Date().toISOString(),
-              businessName: data.businessName,
-              maritalStatus: data.maritalStatus,
-              taxId: data.taxId,
-              kycStatus: data.kycStatus || 'unverified',
-              kycFullName: data.kycFullName || data.fullName,
-              kycFirstName: data.kycFirstName || data.firstName,
-              kycLastName: data.kycLastName || data.lastName,
-              kycCountry: data.kycCountry || data.country,
-              kycPhone: data.kycPhone || data.phone,
-              kycEmail: data.kycEmail || data.email,
-              kycDateOfBirth: data.kycDateOfBirth || data.dateOfBirth,
-              kycDocumentType: data.kycDocumentType,
-              kycDocumentNumber: data.kycDocumentNumber,
-              kycDocumentImage: data.kycDocumentImage,
-              kycDocumentBackImage: data.kycDocumentBackImage,
-              kycLiveSelfieImage: data.kycLiveSelfieImage,
-              kycStreetAddress: data.kycStreetAddress,
-              kycProofOfAddressType: data.kycProofOfAddressType,
-              kycProofOfAddressImage: data.kycProofOfAddressImage,
-              kycSsn: data.kycSsn,
-              kycSsnImage: data.kycSsnImage,
-              kycItemReviews: data.kycItemReviews || null,
-              kycRejectionReason: data.kycRejectionReason,
-              kycSubmittedAt: data.kycSubmittedAt,
-              kycVerifiedAt: data.kycVerifiedAt,
-              kycReviewDurationMinutes: data.kycReviewDurationMinutes,
-              emailVerified: data.emailVerified ?? false,
-              dailyTransactionLimit: data.dailyTransactionLimit || 1000000,
-            });
-          });
-          onUpdate(userList);
-        },
-        (error) => {
-          console.warn('[Firestore users subscription note]:', error);
-        }
-      );
-      return unsubscribe;
-    } catch (err) {
-      console.warn('[Firestore] Error subscribing to users:', err);
-      return () => {};
+    // Initial on-demand load
+    this.getAllUsers().then((list) => {
+      list.forEach((u) => currentUsersMap.set(u.id, u));
+      onUpdate(Array.from(currentUsersMap.values()));
+    }).catch(() => {});
+
+    const handleUserUpdate = (e: any) => {
+      const detail = e.detail;
+      if (!detail?.userId) return;
+      const existing = currentUsersMap.get(detail.userId);
+      if (existing) {
+        if (detail.status) existing.status = detail.status;
+        if (detail.kycStatus) existing.kycStatus = detail.kycStatus;
+        currentUsersMap.set(detail.userId, { ...existing });
+        onUpdate(Array.from(currentUsersMap.values()));
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_user_status_changed', handleUserUpdate);
+      window.addEventListener('monvera_kyc_status_updated', handleUserUpdate);
     }
+
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_user_status_changed', handleUserUpdate);
+        window.removeEventListener('monvera_kyc_status_updated', handleUserUpdate);
+      }
+    };
   },
 
   /**
@@ -1660,104 +1480,69 @@ export const firestoreSync = {
   },
 
   /**
-   * Subscribe to real-time updates for all registered users and their account balances
+   * Targeted subscription for admin customer updates and balance changes.
+   * Avoids continuous collection-wide snapshots and eliminates repetitive balance reading loops.
    */
   subscribeToUsersWithBalances(
     onUpdate: (users: (UserProfile & { balanceMetrics?: BalanceMetrics })[]) => void
   ): () => void {
-    if (!db) return () => {};
-    try {
-      const usersCol = collection(db, 'users');
-      const unsubscribe = onSnapshot(
-        usersCol,
-        async (snap) => {
-          const userList: (UserProfile & { balanceMetrics?: BalanceMetrics })[] = [];
-          
-          for (const d of snap.docs) {
-            const data = d.data() as any;
-            const uid = d.id || data.id || data.uid;
-            const rawUsername = data.username || (data.email ? data.email.split('@')[0] : `user_${uid.slice(0, 6)}`);
-            const cleanUsername = rawUsername.replace(/^@/, '').trim();
-            const rawAcc = data.permanentAccountNumber || data.accountNumber || '';
-            const cleanAcc = rawAcc.replace(/[-\s]/g, '');
+    let currentUsersMap = new Map<string, UserProfile & { balanceMetrics?: BalanceMetrics }>();
 
-            const profile: UserProfile = {
-              id: uid,
-              username: cleanUsername,
-              firstName: data.firstName || '',
-              lastName: data.lastName || '',
-              email: data.email || '',
-              phone: data.phone || data.phoneNumber || '',
-              permanentAccountNumber: cleanAcc || '1000000000',
-              dateOfBirth: data.dateOfBirth,
-              country: data.country || 'United States',
-              avatarUrl: data.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-              status: data.status || 'active',
-              role: data.role || 'customer',
-              membershipTier: data.membershipTier || 'Premier',
-              twoFactorEnabled: data.twoFactorEnabled ?? false,
-              createdAt: data.createdAt || new Date().toISOString(),
-              businessName: data.businessName,
-              maritalStatus: data.maritalStatus,
-              taxId: data.taxId,
-              kycStatus: data.kycStatus || 'unverified',
-              kycFullName: data.kycFullName || data.fullName,
-              kycFirstName: data.kycFirstName || data.firstName,
-              kycLastName: data.kycLastName || data.lastName,
-              kycCountry: data.kycCountry || data.country,
-              kycPhone: data.kycPhone || data.phone,
-              kycEmail: data.kycEmail || data.email,
-              kycDateOfBirth: data.kycDateOfBirth || data.dateOfBirth,
-              kycDocumentType: data.kycDocumentType,
-              kycDocumentNumber: data.kycDocumentNumber,
-              kycDocumentImage: data.kycDocumentImage,
-              kycDocumentBackImage: data.kycDocumentBackImage,
-              kycLiveSelfieImage: data.kycLiveSelfieImage,
-              kycStreetAddress: data.kycStreetAddress,
-              kycProofOfAddressType: data.kycProofOfAddressType,
-              kycProofOfAddressImage: data.kycProofOfAddressImage,
-              kycSsn: data.kycSsn,
-              kycSsnImage: data.kycSsnImage,
-              kycItemReviews: data.kycItemReviews || null,
-              kycRejectionReason: data.kycRejectionReason,
-              kycSubmittedAt: data.kycSubmittedAt,
-              kycVerifiedAt: data.kycVerifiedAt,
-              kycReviewDurationMinutes: data.kycReviewDurationMinutes,
-              emailVerified: data.emailVerified ?? false,
-              dailyTransactionLimit: data.dailyTransactionLimit || 1000000,
-            };
+    // 1. Initial on-demand load
+    this.getAllUsersWithBalances().then((list) => {
+      list.forEach((u) => currentUsersMap.set(u.id, u));
+      onUpdate(Array.from(currentUsersMap.values()));
+    }).catch(() => {});
 
-            if (isNonExistentAccount(profile)) continue;
-
-            const balances = await this.getAccountBalances(uid, cleanAcc);
-            const metrics: BalanceMetrics = balances || {
-              checkingBalance: 0,
-              savingsBalance: 0,
-              investedBalance: 0,
-              accruedEarnings: 0,
-              totalBalance: 0,
-              availableBalance: 0,
-              pendingBalance: 0,
-              accounts: [],
-            };
-
-            userList.push({
-              ...profile,
-              balanceMetrics: metrics,
-            });
-          }
-
-          onUpdate(userList);
-        },
-        (error) => {
-          console.warn('[Firestore users with balances subscription note]:', error);
+    // 2. Targeted event-driven balance & status updates
+    const handleBalanceUpdate = (e: any) => {
+      const detail = e.detail;
+      if (!detail?.userId) return;
+      const existing = currentUsersMap.get(detail.userId);
+      if (existing) {
+        if (detail.balanceMetrics) {
+          existing.balanceMetrics = detail.balanceMetrics;
         }
-      );
-      return unsubscribe;
-    } catch (err) {
-      console.warn('[Firestore] Error subscribing to users with balances:', err);
-      return () => {};
+        currentUsersMap.set(detail.userId, { ...existing });
+        onUpdate(Array.from(currentUsersMap.values()));
+      }
+    };
+
+    const handleStatusUpdate = (e: any) => {
+      const detail = e.detail;
+      if (!detail?.userId) return;
+      const existing = currentUsersMap.get(detail.userId);
+      if (existing) {
+        if (detail.status) existing.status = detail.status;
+        currentUsersMap.set(detail.userId, { ...existing });
+        onUpdate(Array.from(currentUsersMap.values()));
+      }
+    };
+
+    const handleKycUpdate = (e: any) => {
+      const detail = e.detail;
+      if (!detail?.userId) return;
+      const existing = currentUsersMap.get(detail.userId);
+      if (existing) {
+        if (detail.kycStatus) existing.kycStatus = detail.kycStatus;
+        currentUsersMap.set(detail.userId, { ...existing });
+        onUpdate(Array.from(currentUsersMap.values()));
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_balance_updated', handleBalanceUpdate);
+      window.addEventListener('monvera_user_status_changed', handleStatusUpdate);
+      window.addEventListener('monvera_kyc_status_updated', handleKycUpdate);
     }
+
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_balance_updated', handleBalanceUpdate);
+        window.removeEventListener('monvera_user_status_changed', handleStatusUpdate);
+        window.removeEventListener('monvera_kyc_status_updated', handleKycUpdate);
+      }
+    };
   },
 
   /**
@@ -1945,41 +1730,39 @@ export const firestoreSync = {
   },
 
   /**
-   * Subscribe in real-time to all Firestore transactions
+   * Subscribe to transactions for administrative views using event-driven updates.
+   * Avoids continuous collection-wide snapshot listeners.
    */
   subscribeToAllTransactions(onUpdate: (txs: Transaction[]) => void): () => void {
-    if (!db) return () => {};
-    try {
-      const txCol = collection(db, 'transactions');
-      const unsubscribe = onSnapshot(
-        txCol,
-        (snap) => {
-          const list: Transaction[] = [];
-          snap.forEach((d) => {
-            list.push(d.data() as Transaction);
-          });
-          list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-          onUpdate(list);
-        },
-        (error) => {
-          console.warn('[Firestore transactions subscription note]:', error);
-        }
-      );
-      return unsubscribe;
-    } catch (err) {
-      console.warn('[Firestore] Error subscribing to transactions:', err);
-      return () => {};
+    // Initial on-demand load
+    this.getAllTransactions().then(onUpdate).catch(() => {});
+
+    const handleTxUpdate = () => {
+      this.getAllTransactions().then(onUpdate).catch(() => {});
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_transaction_created', handleTxUpdate);
+      window.addEventListener('monvera_balance_updated', handleTxUpdate);
     }
+
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_transaction_created', handleTxUpdate);
+        window.removeEventListener('monvera_balance_updated', handleTxUpdate);
+      }
+    };
   },
 
   /**
-   * Fetch all Support Tickets and Notifications from Firestore
+   * Fetch all Support Tickets from Firestore strictly scoped by type === 'SUPPORT'
    */
   async getAllSupportTickets(): Promise<NotificationItem[]> {
     if (!db) return [];
     try {
       const notifCol = collection(db, 'notifications');
-      const snap = await getDocs(notifCol);
+      const qSupport = query(notifCol, where('type', '==', 'SUPPORT'));
+      const snap = await getDocs(qSupport);
       const tickets: NotificationItem[] = [];
       snap.forEach((d) => {
         const item = d.data() as NotificationItem;
@@ -1995,14 +1778,15 @@ export const firestoreSync = {
   },
 
   /**
-   * Subscribe in real time to all Support Tickets across all customers
+   * Subscribe in real time to all Support Tickets strictly scoped to type === 'SUPPORT'
    */
   subscribeToSupportTickets(onUpdate: (tickets: NotificationItem[]) => void): () => void {
     if (!db) return () => {};
     try {
       const notifCol = collection(db, 'notifications');
+      const qSupport = query(notifCol, where('type', '==', 'SUPPORT'));
       const unsubscribe = onSnapshot(
-        notifCol,
+        qSupport,
         (snap) => {
           const tickets: NotificationItem[] = [];
           snap.forEach((d) => {
