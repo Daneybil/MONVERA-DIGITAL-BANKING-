@@ -1,5 +1,7 @@
-import React from 'react';
+import React, { useEffect } from 'react';
+import confetti from 'canvas-confetti';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { api } from './services/api';
 import { PublicNavbar } from './components/public/PublicNavbar';
 import { HeroSection } from './components/public/HeroSection';
 import { ServiceOfferings } from './components/public/ServiceOfferings';
@@ -35,8 +37,68 @@ import { DepositModal } from './components/dashboard/DepositModal';
 import { WithdrawModal } from './components/dashboard/WithdrawModal';
 import { WhatsAppSupportChat } from './components/common/WhatsAppSupportChat';
 
+const processedStripeSessions = new Set<string>();
+
 const AppContent: React.FC = () => {
-  const { currentView, currentUser, setCurrentView } = useAuth();
+  const { currentView, currentUser, setCurrentView, refreshBalance, refreshNotifications } = useAuth();
+
+  // Handle Stripe Checkout return URL: /?deposit_status=success&session_id={CHECKOUT_SESSION_ID}&amount=...
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const urlParams = new URLSearchParams(window.location.search);
+    const depositStatus = urlParams.get('deposit_status');
+    const sessionId = urlParams.get('session_id');
+
+    if (depositStatus === 'success' && sessionId) {
+      if (processedStripeSessions.has(sessionId)) return;
+      processedStripeSessions.add(sessionId);
+
+      (async () => {
+        try {
+          const res = await api.confirmStripeSession(sessionId);
+          if (res.success) {
+            await refreshBalance();
+            await refreshNotifications();
+            if (res.transaction) {
+              window.dispatchEvent(
+                new CustomEvent('monvera_transaction_created', {
+                  detail: { userId: res.transaction.userId, transaction: res.transaction },
+                })
+              );
+            }
+            if (res.balanceMetrics) {
+              window.dispatchEvent(
+                new CustomEvent('monvera_balance_updated', {
+                  detail: { userId: res.transaction?.userId || currentUser?.id, balanceMetrics: res.balanceMetrics },
+                })
+              );
+            }
+            try {
+              confetti({
+                particleCount: 80,
+                spread: 70,
+                origin: { y: 0.6 },
+                colors: ['#059669', '#10b981', '#0f172a', '#3b82f6'],
+              });
+            } catch {}
+            setCurrentView('dashboard');
+          } else {
+            console.error('[Stripe Return] Deposit settlement failed:', res.error);
+          }
+        } catch (err) {
+          console.error('[Stripe Return] Error confirming session:', err);
+        } finally {
+          const cleanParams = new URLSearchParams(window.location.search);
+          cleanParams.delete('deposit_status');
+          cleanParams.delete('session_id');
+          cleanParams.delete('amount');
+          const newSearch = cleanParams.toString();
+          const cleanUrl = window.location.pathname + (newSearch ? `?${newSearch}` : '') + window.location.hash;
+          window.history.replaceState({}, '', cleanUrl);
+        }
+      })();
+    }
+  }, [currentUser?.id, refreshBalance, refreshNotifications, setCurrentView]);
 
   // Dedicated Monvera Bank Login Page
   if (currentView === 'login') {

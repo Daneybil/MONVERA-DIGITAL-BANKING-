@@ -348,8 +348,9 @@ export const ProfileView: React.FC = () => {
     e.preventDefault();
     if (!currentUser) return;
 
-    const trimmedFirst = editFirstName.trim();
-    const trimmedLast = editLastName.trim();
+    // If customer is already KYC-verified, legal names are permanently locked
+    const trimmedFirst = isKycVerified ? (currentUser.firstName || '') : editFirstName.trim();
+    const trimmedLast = isKycVerified ? (currentUser.lastName || '') : editLastName.trim();
 
     if (!trimmedFirst || !trimmedLast) {
       setProfileErrorMsg('Legal First Name and Last Name cannot be empty.');
@@ -1054,26 +1055,52 @@ export const ProfileView: React.FC = () => {
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div className="space-y-1.5">
-                      <label className="block text-xs font-bold text-slate-700">Legal First Name *</label>
+                      <div className="flex items-center justify-between">
+                        <label className="block text-xs font-bold text-slate-700">Legal First Name *</label>
+                        {isKycVerified && (
+                          <span className="text-[10px] font-mono font-black text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded flex items-center gap-1">
+                            <Lock className="w-3 h-3 text-emerald-600" />
+                            Verified & Locked
+                          </span>
+                        )}
+                      </div>
                       <input
                         type="text"
                         required
+                        disabled={isKycVerified}
                         value={editFirstName}
                         onChange={(e) => setEditFirstName(e.target.value)}
                         placeholder="e.g. Eleanor"
-                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                        className={`w-full py-2.5 px-3.5 rounded-xl border text-sm font-medium ${
+                          isKycVerified
+                            ? 'bg-slate-100 border-slate-200 text-slate-500 cursor-not-allowed select-none'
+                            : 'bg-white border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-slate-900'
+                        }`}
                       />
                     </div>
 
                     <div className="space-y-1.5">
-                      <label className="block text-xs font-bold text-slate-700">Legal Last Name *</label>
+                      <div className="flex items-center justify-between">
+                        <label className="block text-xs font-bold text-slate-700">Legal Last Name *</label>
+                        {isKycVerified && (
+                          <span className="text-[10px] font-mono font-black text-emerald-800 bg-emerald-100 px-2 py-0.5 rounded flex items-center gap-1">
+                            <Lock className="w-3 h-3 text-emerald-600" />
+                            Verified & Locked
+                          </span>
+                        )}
+                      </div>
                       <input
                         type="text"
                         required
+                        disabled={isKycVerified}
                         value={editLastName}
                         onChange={(e) => setEditLastName(e.target.value)}
                         placeholder="e.g. Vance"
-                        className="w-full py-2.5 px-3.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-medium text-slate-900"
+                        className={`w-full py-2.5 px-3.5 rounded-xl border text-sm font-medium ${
+                          isKycVerified
+                            ? 'bg-slate-100 border-slate-200 text-slate-500 cursor-not-allowed select-none'
+                            : 'bg-white border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 text-slate-900'
+                        }`}
                       />
                     </div>
 

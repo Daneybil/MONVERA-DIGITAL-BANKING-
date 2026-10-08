@@ -82,6 +82,10 @@ export const WithdrawModal: React.FC = () => {
 
   const handleWithdrawSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (currentUser?.status === 'frozen') {
+      setErrorMessage('Your account is currently restricted/frozen. Outgoing transfers and withdrawals are disabled. Please contact compliance support.');
+      return;
+    }
     if (numAmount <= 0) {
       setErrorMessage('Please enter a valid withdrawal amount greater than $0.00.');
       return;

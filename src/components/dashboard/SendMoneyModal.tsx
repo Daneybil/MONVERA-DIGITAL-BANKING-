@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
+import { auth } from '../../services/firebase';
 import { api, RecipientLookupResult } from '../../services/api';
 import confetti from 'canvas-confetti';
 import {
@@ -234,6 +235,10 @@ export const SendMoneyModal: React.FC = () => {
 
   const handleProceedToReview = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin && currentUser?.status === 'frozen') {
+      setErrorMessage('Your account is currently restricted/frozen. Outgoing transfers and withdrawals are disabled. Please contact compliance support.');
+      return;
+    }
     if (!lookupResult || !lookupResult.valid) {
       setErrorMessage('Please enter a valid Monvera Username (e.g. @marcus) or 10-digit Account Number.');
       return;
@@ -259,6 +264,20 @@ export const SendMoneyModal: React.FC = () => {
   const handleExecuteTransfer = async () => {
     setStep('PROCESSING');
     setErrorMessage(null);
+
+    // Preflight Identity Safety Check: ensure displayed customer matches authenticated Firebase user
+    if (!isAdmin) {
+      if (!auth?.currentUser) {
+        setErrorMessage('Authentication required: Please sign in to your Monvera account before transferring funds.');
+        setStep('CONFIRM');
+        return;
+      }
+      if (currentUser && auth.currentUser.uid !== currentUser.id) {
+        setErrorMessage('Session identity mismatch: Authenticated user does not match the active customer profile. Please sign out and sign back in.');
+        setStep('CONFIRM');
+        return;
+      }
+    }
 
     try {
       const transferAmount = parseNumericAmount(amount);

@@ -28,6 +28,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
+import { auth } from '../../services/firebase';
 
 type DateFilterPreset = 'all' | 'today' | 'this_week' | 'this_month' | 'prev_month' | 'custom';
 type FlowFilter = 'ALL' | 'CREDIT' | 'DEBIT';
@@ -45,12 +46,14 @@ export const TransactionsView: React.FC = () => {
   const [selectedTxForReceipt, setSelectedTxForReceipt] = useState<Transaction | null>(null);
   const [showFilterDrawer, setShowFilterDrawer] = useState(false);
 
+  const effectiveUid = auth.currentUser?.uid || currentUser?.id;
+
   const fetchTransactions = async () => {
-    if (!currentUser) return;
+    if (!effectiveUid && !currentUser) return;
     setIsLoading(true);
     try {
       // Authoritative single-path transaction retrieval
-      const res = await api.getTransactions({ userId: currentUser.id });
+      const res = await api.getTransactions({ userId: effectiveUid || currentUser?.id });
       setTransactions(res.transactions || []);
     } catch (err) {
       console.error('Failed to fetch transactions:', err);
@@ -61,7 +64,24 @@ export const TransactionsView: React.FC = () => {
 
   useEffect(() => {
     fetchTransactions();
-  }, [currentUser, balanceMetrics, lastUpdateTimestamp]);
+
+    const handleTxCreated = (e: any) => {
+      const detail = e?.detail;
+      if (!detail) return;
+      if (!detail.userId || detail.userId === effectiveUid || detail.userId === currentUser?.id) {
+        fetchTransactions();
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_transaction_created', handleTxCreated);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_transaction_created', handleTxCreated);
+      }
+    };
+  }, [effectiveUid, currentUser, balanceMetrics, lastUpdateTimestamp]);
 
   if (!currentUser) return null;
 
@@ -113,11 +133,14 @@ export const TransactionsView: React.FC = () => {
       const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
 
       const isRecipient =
+        (effectiveUid && tx.recipientUserId === effectiveUid) ||
+        (!tx.recipientUserId && effectiveUid && tx.userId === effectiveUid) ||
         tx.recipientUserId === currentUser.id ||
         (!tx.recipientUserId && tx.userId === currentUser.id) ||
         (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
 
       const isSender =
+        (effectiveUid && tx.senderUserId === effectiveUid && tx.recipientUserId !== effectiveUid) ||
         (tx.senderUserId === currentUser.id && tx.recipientUserId !== currentUser.id) ||
         (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
 
@@ -125,7 +148,9 @@ export const TransactionsView: React.FC = () => {
         (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
          tx.senderAccountNumber === '1000000001' ||
          tx.senderName?.includes('Bennett Johnson')) &&
-        (isRecipient || tx.userId === currentUser.id || tx.recipientUserId === currentUser.id);
+        (isRecipient ||
+         (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
+         tx.userId === currentUser.id || tx.recipientUserId === currentUser.id);
 
       const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
       const isDeposit =

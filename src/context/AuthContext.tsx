@@ -265,29 +265,46 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, [fetchUsers]);
 
-  const refreshBalance = useCallback(async () => {
-    if (!currentUser) return;
-    try {
-      // 1. Retrieve verified balances directly from permanent Firestore ledger
-      const fsMetrics = await firestoreSync.getAccountBalances(currentUser.id, currentUser.permanentAccountNumber);
-      if (fsMetrics) {
-        setBalanceMetrics(fsMetrics);
-        cacheUserBalances(currentUser.id, fsMetrics);
-        setLastUpdateTimestamp(Date.now());
-        return;
-      }
+  const inflightBalancePromiseRef = React.useRef<Promise<void> | null>(null);
 
-      // 2. Fetch backend metrics if Firestore is initializing
-      const metrics = await api.getBalanceMetrics(currentUser.id, currentUser.permanentAccountNumber);
-      if (metrics) {
-        setBalanceMetrics(metrics);
-        cacheUserBalances(currentUser.id, metrics);
-        setLastUpdateTimestamp(Date.now());
-      }
-    } catch (err) {
-      console.error('Failed to refresh balance:', err);
+  const refreshBalance = useCallback(async () => {
+    const effectiveUid = auth.currentUser?.uid || currentUser?.id;
+    if (!effectiveUid) return;
+
+    if (inflightBalancePromiseRef.current) {
+      return inflightBalancePromiseRef.current;
     }
-  }, [currentUser]);
+
+    const promise = (async () => {
+      try {
+        // 1. Retrieve verified balances directly from permanent Firestore ledger: accounts/{effectiveUid}
+        const fsMetrics = await firestoreSync.getAccountBalances(effectiveUid, currentUser?.permanentAccountNumber);
+        if (fsMetrics) {
+          setBalanceMetrics(fsMetrics);
+          cacheUserBalances(effectiveUid, fsMetrics);
+          return;
+        }
+
+        // 2. Fetch backend metrics if Firestore client is initializing
+        const metrics = await api.getBalanceMetrics(effectiveUid, currentUser?.permanentAccountNumber);
+        if (metrics) {
+          setBalanceMetrics(metrics);
+          cacheUserBalances(effectiveUid, metrics);
+          return;
+        }
+      } catch (err) {
+        console.error('Failed to refresh balance:', err);
+        // On error or RESOURCE_EXHAUSTED: NEVER zero out balance! Preserve existing balanceMetrics.
+      } finally {
+        setTimeout(() => {
+          inflightBalancePromiseRef.current = null;
+        }, 300);
+      }
+    })();
+
+    inflightBalancePromiseRef.current = promise;
+    return promise;
+  }, [currentUser?.id, currentUser?.permanentAccountNumber]);
 
   const refreshNotifications = useCallback(async () => {
     if (!currentUser) return;
@@ -359,33 +376,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // Real-time synchronization interval & Firestore onSnapshot listeners
   useEffect(() => {
-    if (!currentUser?.id) return;
+    const effectiveUid = auth.currentUser?.uid || currentUser?.id;
+    if (!effectiveUid) return;
 
     const isTargetUser = (target: any): boolean => {
       if (!target) return false;
       if (!target.userId && !target.accountNumber && !target.email && !target.fallbackUserId) return true;
-      if (target.userId === currentUser.id || target.fallbackUserId === currentUser.id) return true;
+      if (target.userId === effectiveUid || target.fallbackUserId === effectiveUid || (currentUser && target.userId === currentUser.id)) return true;
       const cleanTargetAcc = (target.accountNumber || '').replace(/[-\s]/g, '');
-      const cleanUserAcc = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const cleanUserAcc = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
       if (cleanTargetAcc && cleanUserAcc && cleanTargetAcc === cleanUserAcc) return true;
-      if (target.email && currentUser.email && target.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim()) return true;
+      if (target.email && currentUser?.email && target.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim()) return true;
       return false;
     };
 
-    // 1. Real-time Firestore account balance listener under accounts/{uid}
+    // 1. Real-time Firestore account balance listener under accounts/{effectiveUid}
     const unsubBalance = firestoreSync.subscribeToAccountBalances(
-      currentUser.id,
-      currentUser.permanentAccountNumber,
+      effectiveUid,
+      currentUser?.permanentAccountNumber,
       (newMetrics) => {
         setBalanceMetrics(newMetrics);
-        cacheUserBalances(currentUser.id, newMetrics);
+        cacheUserBalances(effectiveUid, newMetrics);
         setLastUpdateTimestamp(Date.now());
       }
     );
 
-    // 2. Real-time Firestore profile listener under users/{uid} for instant KYC status reflection
+    // 2. Real-time Firestore profile listener under users/{effectiveUid} for instant KYC status reflection
     const unsubProfile = firestoreSync.subscribeToUserProfile(
-      currentUser.id,
+      effectiveUid,
       (updatedProfile) => {
         if (updatedProfile) {
           setCurrentUser((prev) => {
@@ -458,18 +476,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (currentUser?.id && detail.userId === currentUser.id) {
         refreshNotifications();
         if (detail.user) {
-          setCurrentUser((prev) => ({
-            ...(prev || {}),
-            ...detail.user,
-            avatarUrl: getPersistedAvatar(detail.userId, detail.user.avatarUrl || prev?.avatarUrl),
-          }));
+          setCurrentUser((prev) => {
+            if (!prev) return detail.user;
+            // Invariant: Once kycStatus === 'verified', customer-side state sync events cannot downgrade it
+            const targetKyc = detail.user.kycStatus;
+            const effectiveKyc = (prev.kycStatus === 'verified' && targetKyc !== 'verified')
+              ? 'verified'
+              : (targetKyc || prev.kycStatus);
+            return {
+              ...prev,
+              ...detail.user,
+              kycStatus: effectiveKyc,
+              dailyTransactionLimit: effectiveKyc === 'verified' ? 1000000 : (detail.user.dailyTransactionLimit || prev.dailyTransactionLimit),
+              avatarUrl: getPersistedAvatar(detail.userId, detail.user.avatarUrl || prev?.avatarUrl),
+            };
+          });
         } else if (detail.kycStatus) {
-          setCurrentUser((prev) => ({
-            ...(prev as any),
-            kycStatus: detail.kycStatus,
-            dailyTransactionLimit: detail.kycStatus === 'verified' ? 1000000 : (prev?.dailyTransactionLimit || 25000),
-            status: 'active',
-          }));
+          setCurrentUser((prev) => {
+            if (!prev) return prev;
+            // Invariant: If previous status is verified, ignore any downgrade from local events
+            if (prev.kycStatus === 'verified' && detail.kycStatus !== 'verified') {
+              return prev;
+            }
+            return {
+              ...(prev as any),
+              kycStatus: detail.kycStatus,
+              dailyTransactionLimit: detail.kycStatus === 'verified' ? 1000000 : (prev?.dailyTransactionLimit || 25000),
+              status: 'active',
+            };
+          });
         }
       }
     };
@@ -706,6 +741,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             } catch {}
             const resolvedUser = {
               ...userProfile,
+              id: firebaseUser.uid,
               emailVerified: isEmailVerified,
               avatarUrl: persistedAvatar,
               twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
@@ -904,59 +940,114 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             accounts: ad.accounts || [],
           };
         } else {
-          const nowIso = new Date().toISOString();
-          const initMetrics: BalanceMetrics = {
-            checkingBalance: 0,
-            savingsBalance: 0,
-            investedBalance: 0,
-            accruedEarnings: 0,
-            totalBalance: 0,
-            availableBalance: 0,
-            pendingBalance: 0,
-            loanBalance: 0,
-            accounts: [
-              {
-                id: `acc_chk_${uid}`,
-                userId: uid,
-                type: 'CHECKING',
-                accountNumber: finalUser.permanentAccountNumber || '1000000000',
-                routingNumber: '021000021',
-                currency: 'USD',
-                balance: 0,
-                availableBalance: 0,
+          // Check for legacy account by permanentAccountNumber before creating $0
+          let legacyData: any = null;
+          if (finalUser.permanentAccountNumber) {
+            const cleanAcc = finalUser.permanentAccountNumber.replace(/[-\s]/g, '');
+            if (cleanAcc && cleanAcc !== uid) {
+              try {
+                const legacySnap = await getDoc(doc(db, 'accounts', cleanAcc));
+                if (legacySnap.exists()) {
+                  legacyData = legacySnap.data();
+                }
+              } catch {}
+            }
+          }
+
+          if (legacyData && (Number(legacyData.checkingBalance ?? 0) > 0 || Number(legacyData.totalBalance ?? 0) > 0)) {
+            // Adopt the legacy account non-zero balance into accounts/{uid}
+            const adoptedMetrics: BalanceMetrics = {
+              checkingBalance: Number(legacyData.checkingBalance ?? 0),
+              savingsBalance: Number(legacyData.savingsBalance ?? 0),
+              investedBalance: Number(legacyData.investedBalance ?? 0),
+              accruedEarnings: Number(legacyData.accruedEarnings ?? 0),
+              totalBalance: Number(legacyData.totalBalance ?? 0),
+              availableBalance: Number(legacyData.availableBalance ?? legacyData.checkingBalance ?? 0),
+              pendingBalance: Number(legacyData.pendingBalance ?? 0),
+              loanBalance: Number(legacyData.loanBalance ?? 0),
+              accounts: legacyData.accounts || [],
+            };
+            const nowIso = new Date().toISOString();
+            await setDoc(accDocRef, {
+              userId: uid,
+              ...adoptedMetrics,
+              permanentAccountNumber: finalUser.permanentAccountNumber || '1000000000',
+              updatedAt: nowIso,
+            }, { merge: true });
+            finalMetricsToSet = adoptedMetrics;
+          } else {
+            // Check for identity ambiguity before writing zero balance:
+            let hasAmbiguity = false;
+            if (finalUser.username) {
+              try {
+                const qSameUser = query(collection(db, 'users'), where('usernameLower', '==', finalUser.username.toLowerCase().trim()));
+                const sameUserSnap = await getDocs(qSameUser);
+                if (sameUserSnap.docs.length > 1) {
+                  hasAmbiguity = true;
+                  console.warn('[Auth] Ambiguous identity detected for username:', finalUser.username, '- Skipping zero account write.');
+                }
+              } catch {}
+            }
+
+            // Genuinely new user with no financial history and no identity ambiguity:
+            if (!hasAmbiguity && (!cachedBalances || cachedBalances.totalBalance === 0)) {
+              const nowIso = new Date().toISOString();
+              const initMetrics: BalanceMetrics = {
+                checkingBalance: 0,
+                savingsBalance: 0,
                 investedBalance: 0,
-                pendingBalance: 0,
-                interestRateAPY: 1.25,
-                status: 'ACTIVE',
-                nickname: 'Monvera Premier Checking',
-              },
-              {
-                id: `acc_sav_${uid}`,
-                userId: uid,
-                type: 'SAVINGS',
-                accountNumber: (finalUser.permanentAccountNumber && finalUser.permanentAccountNumber.length >= 7)
-                  ? `10${finalUser.permanentAccountNumber.slice(2, -3)}991`
-                  : '1000000991',
-                routingNumber: '021000021',
-                currency: 'USD',
-                balance: 0,
+                accruedEarnings: 0,
+                totalBalance: 0,
                 availableBalance: 0,
-                investedBalance: 0,
                 pendingBalance: 0,
-                interestRateAPY: 4.85,
-                status: 'ACTIVE',
-                nickname: 'Monvera High-Yield Treasury',
-              },
-            ],
-          };
-          await setDoc(accDocRef, {
-            userId: uid,
-            ...initMetrics,
-            permanentAccountNumber: finalUser.permanentAccountNumber || '1000000000',
-            createdAt: nowIso,
-            updatedAt: nowIso,
-          }, { merge: true });
-          finalMetricsToSet = initMetrics;
+                loanBalance: 0,
+                accounts: [
+                  {
+                    id: `acc_chk_${uid}`,
+                    userId: uid,
+                    type: 'CHECKING',
+                    accountNumber: finalUser.permanentAccountNumber || '1000000000',
+                    routingNumber: '021000021',
+                    currency: 'USD',
+                    balance: 0,
+                    availableBalance: 0,
+                    investedBalance: 0,
+                    pendingBalance: 0,
+                    interestRateAPY: 1.25,
+                    status: 'ACTIVE',
+                    nickname: 'Monvera Premier Checking',
+                  },
+                  {
+                    id: `acc_sav_${uid}`,
+                    userId: uid,
+                    type: 'SAVINGS',
+                    accountNumber: (finalUser.permanentAccountNumber && finalUser.permanentAccountNumber.length >= 7)
+                      ? `10${finalUser.permanentAccountNumber.slice(2, -3)}991`
+                      : '1000000991',
+                    routingNumber: '021000021',
+                    currency: 'USD',
+                    balance: 0,
+                    availableBalance: 0,
+                    investedBalance: 0,
+                    pendingBalance: 0,
+                    interestRateAPY: 4.85,
+                    status: 'ACTIVE',
+                    nickname: 'Monvera High-Yield Treasury',
+                  },
+                ],
+              };
+              await setDoc(accDocRef, {
+                userId: uid,
+                ...initMetrics,
+                permanentAccountNumber: finalUser.permanentAccountNumber || '1000000000',
+                createdAt: nowIso,
+                updatedAt: nowIso,
+              }, { merge: true });
+              finalMetricsToSet = initMetrics;
+            } else if (cachedBalances && cachedBalances.totalBalance > 0) {
+              finalMetricsToSet = cachedBalances;
+            }
+          }
         }
       } catch (accInitErr) {
         console.warn('[Auth] Base account initialization note:', accInitErr);

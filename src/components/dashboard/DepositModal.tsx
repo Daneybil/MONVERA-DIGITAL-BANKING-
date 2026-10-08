@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { auth } from '../../services/firebase';
 import confetti from 'canvas-confetti';
 import {
   X,
@@ -44,6 +45,12 @@ export const DepositModal: React.FC = () => {
       return;
     }
 
+    // Ensure active customer exists
+    if (!currentUser) {
+      setErrorMessage('Authentication required: Please sign in to your Monvera account before depositing funds.');
+      return;
+    }
+
     setErrorMessage(null);
     setIsProcessing(true);
 
@@ -81,6 +88,20 @@ export const DepositModal: React.FC = () => {
           setPaymentRef(res.transaction.referenceNumber);
           await refreshBalance();
           await refreshNotifications();
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('monvera_transaction_created', {
+                detail: { userId: currentUser.id, transaction: res.transaction },
+              })
+            );
+            if (res.balanceMetrics) {
+              window.dispatchEvent(
+                new CustomEvent('monvera_balance_updated', {
+                  detail: { userId: currentUser.id, balanceMetrics: res.balanceMetrics },
+                })
+              );
+            }
+          }
           confetti({
             particleCount: 80,
             spread: 70,

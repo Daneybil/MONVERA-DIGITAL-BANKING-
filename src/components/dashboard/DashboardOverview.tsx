@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { auth } from '../../services/firebase';
 import { Transaction, BalanceMetrics } from '../../types';
 import {
   Wallet,
@@ -26,6 +27,7 @@ import {
   Sparkles,
   FileText,
   Banknote,
+  ShieldAlert,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
@@ -33,30 +35,20 @@ import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { firestoreSync } from '../../services/firestoreSync';
 
 export const DashboardOverview: React.FC = () => {
-  const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
+  const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance, lastUpdateTimestamp } = useAuth();
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
   const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
   const [hideBalances, setHideBalances] = useState<boolean>(false);
   const [copiedAcc, setCopiedAcc] = useState<boolean>(false);
   const [isKycModalOpen, setIsKycModalOpen] = useState<boolean>(false);
 
-  // Effective balance metrics: live authoritative balanceMetrics from Firestore when available.
-  // If Firestore balance data is temporarily unavailable or in background transit,
-  // preserve the last known valid balance from secure cache.
+  const effectiveUid = auth.currentUser?.uid || currentUser?.id;
+
+  // Authoritative balance metrics: live authoritative balanceMetrics from Firestore.
+  // Direct reading of accounts/{auth.currentUser.uid} without localStorage fallback.
   const balanceMetrics: BalanceMetrics = useMemo(() => {
     if (liveBalanceMetrics) {
       return liveBalanceMetrics;
-    }
-    if (typeof window !== 'undefined' && currentUser?.id) {
-      try {
-        const raw = localStorage.getItem(`monvera_balances_${currentUser.id}`);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed.checkingBalance === 'number') {
-            return parsed;
-          }
-        }
-      } catch {}
     }
     return {
       checkingBalance: 0,
@@ -69,8 +61,8 @@ export const DashboardOverview: React.FC = () => {
       loanBalance: 0,
       accounts: [
         {
-          id: `acc_chk_${currentUser?.id || 'default'}`,
-          userId: currentUser?.id || '',
+          id: `acc_chk_${effectiveUid || 'default'}`,
+          userId: effectiveUid || '',
           type: 'CHECKING',
           accountNumber: currentUser?.permanentAccountNumber || '1000000000',
           routingNumber: '021000021',
@@ -84,8 +76,8 @@ export const DashboardOverview: React.FC = () => {
           nickname: 'Monvera Premier Checking',
         },
         {
-          id: `acc_sav_${currentUser?.id || 'default'}`,
-          userId: currentUser?.id || '',
+          id: `acc_sav_${effectiveUid || 'default'}`,
+          userId: effectiveUid || '',
           type: 'SAVINGS',
           accountNumber: (currentUser?.permanentAccountNumber && currentUser.permanentAccountNumber.length >= 7)
             ? `10${currentUser.permanentAccountNumber.slice(2, -3)}991`
@@ -102,21 +94,59 @@ export const DashboardOverview: React.FC = () => {
         },
       ],
     };
-  }, [liveBalanceMetrics, currentUser]);
+  }, [liveBalanceMetrics, effectiveUid, currentUser]);
 
   useEffect(() => {
+    const currentEffectiveUid = auth.currentUser?.uid || currentUser?.id;
+
     async function loadTx() {
-      if (currentUser?.id) {
+      if (currentEffectiveUid) {
         try {
-          const fsTxs = await firestoreSync.getTransactionsForUser(currentUser.id, currentUser.permanentAccountNumber);
-          setRecentTransactions((fsTxs || []).slice(0, 8));
+          const res = await api.getTransactions({ userId: currentEffectiveUid });
+          if (res?.transactions && res.transactions.length > 0) {
+            setRecentTransactions(res.transactions.slice(0, 8));
+          } else {
+            const fsTxs = await firestoreSync.getTransactionsForUser(currentEffectiveUid, currentUser?.permanentAccountNumber);
+            setRecentTransactions((fsTxs || []).slice(0, 8));
+          }
         } catch {
-          // Fallback
+          try {
+            const fsTxs = await firestoreSync.getTransactionsForUser(currentEffectiveUid, currentUser?.permanentAccountNumber);
+            setRecentTransactions((fsTxs || []).slice(0, 8));
+          } catch {}
         }
       }
     }
+
+    refreshBalance();
     loadTx();
-  }, [currentUser?.id]);
+
+    const handleTxCreated = (e: any) => {
+      const detail = e?.detail;
+      if (!detail || !currentEffectiveUid || !detail.userId || detail.userId === currentEffectiveUid) {
+        loadTx();
+        refreshBalance();
+      }
+    };
+
+    const handleBalanceUpdated = (e: any) => {
+      const detail = e?.detail;
+      if (!detail || !currentEffectiveUid || !detail.userId || detail.userId === currentEffectiveUid) {
+        refreshBalance();
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_transaction_created', handleTxCreated);
+      window.addEventListener('monvera_balance_updated', handleBalanceUpdated);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_transaction_created', handleTxCreated);
+        window.removeEventListener('monvera_balance_updated', handleBalanceUpdated);
+      }
+    };
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, lastUpdateTimestamp, refreshBalance]);
 
   if (!currentUser) {
     return (
@@ -178,6 +208,36 @@ export const DashboardOverview: React.FC = () => {
 
       {/* KYC Verification Callout Banner (Appears automatically for unverified/pending accounts) */}
       <KycBanner />
+
+      {/* Account Restricted / Frozen Alert Banner */}
+      {currentUser.status === 'frozen' && (
+        <div className="p-5 sm:p-6 rounded-3xl bg-rose-50 border-2 border-rose-300 shadow-md flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 animate-in fade-in">
+          <div className="flex items-start sm:items-center gap-3.5">
+            <div className="w-12 h-12 rounded-2xl bg-rose-600 text-white flex items-center justify-center shrink-0 shadow-sm">
+              <ShieldAlert className="w-6 h-6 stroke-[2.5]" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-base sm:text-lg font-black text-rose-950">
+                  Account Restricted / Frozen
+                </h3>
+                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-black uppercase tracking-wider bg-rose-200 text-rose-900 border border-rose-300">
+                  Compliance Action
+                </span>
+              </div>
+              <p className="text-xs sm:text-sm text-rose-800 font-semibold mt-0.5 leading-relaxed">
+                Your account is currently subject to a temporary compliance restriction. Outbound wire transfers and withdrawals are locked. Please reach out to Monvera Support for resolution.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setCurrentView('profile')}
+            className="px-5 py-2.5 rounded-xl bg-rose-900 hover:bg-rose-800 text-white font-black text-xs transition-colors shrink-0 cursor-pointer shadow-xs"
+          >
+            Compliance Status
+          </button>
+        </div>
+      )}
 
       {/* --- HERO BALANCE CARD (EXPANDED LENGTH & BOLD HIGH-CONTRAST TYPOGRAPHY) --- */}
       <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-7 sm:p-10 lg:p-12 text-white shadow-2xl border-4 border-slate-800">
@@ -611,19 +671,24 @@ export const DashboardOverview: React.FC = () => {
                 const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
 
                 const isRecipient =
+                  (effectiveUid && tx.recipientUserId === effectiveUid) ||
+                  (!tx.recipientUserId && effectiveUid && tx.userId === effectiveUid) ||
                   tx.recipientUserId === currentUser?.id ||
                   (!tx.recipientUserId && tx.userId === currentUser?.id) ||
                   (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
 
                 const isSender =
-                  (tx.senderUserId === currentUser?.id && tx.recipientUserId !== currentUser?.id) ||
+                  (effectiveUid && tx.senderUserId === effectiveUid && tx.recipientUserId !== effectiveUid) ||
+                  (currentUser?.id && tx.senderUserId === currentUser.id && tx.recipientUserId !== currentUser.id) ||
                   (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
 
                 const isAdminTransferCredit =
                   (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
                    tx.senderAccountNumber === '1000000001' ||
                    tx.senderName?.includes('Bennett Johnson')) &&
-                  (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
+                  (isRecipient ||
+                   (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
+                   (currentUser?.id && (tx.userId === currentUser.id || tx.recipientUserId === currentUser.id)));
 
                 const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
                 const isDeposit =

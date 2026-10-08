@@ -364,7 +364,7 @@ export const api = {
     }
   },
 
-  async getBalanceMetrics(userId: string, userAccountNumber?: string): Promise<BalanceMetrics> {
+  async getBalanceMetrics(userId: string, userAccountNumber?: string): Promise<BalanceMetrics | null> {
     // 1. Check permanent Firestore record / immutable ledger first for highest durability
     try {
       const firestoreMetrics = await firestoreSync.getAccountBalances(userId, userAccountNumber);
@@ -378,73 +378,19 @@ export const api = {
     // 2. Fetch from backend API
     try {
       const res = await fetch(`/api/accounts/balance?userId=${encodeURIComponent(userId)}`);
-      const data = await parseJsonResponse<BalanceMetrics>(res, {
-        checkingBalance: 0,
-        savingsBalance: 0,
-        investedBalance: 0,
-        accruedEarnings: 0,
-        totalBalance: 0,
-        availableBalance: 0,
-        pendingBalance: 0,
-        accounts: [],
-      });
-
-      // If backend returned valid accounts, backup to Firestore only if non-empty
-      if (data && data.accounts && data.accounts.length > 0 && (data.totalBalance > 0 || data.checkingBalance > 0)) {
-        firestoreSync.saveAccountBalances(userId, data).catch(() => {});
-        return data;
-      } else if (data && data.accounts && data.accounts.length > 0) {
-        return data;
+      if (res.ok) {
+        const data = await parseJsonResponse<BalanceMetrics>(res, null as any);
+        if (data && Array.isArray(data.accounts) && data.accounts.length > 0) {
+          return data;
+        }
       }
     } catch {
       // Backend unavailable
     }
 
-    // 3. Fallback default account metrics
-    const accNum = userAccountNumber || '1088492015';
-    const defaultMetrics: BalanceMetrics = {
-      checkingBalance: 0,
-      savingsBalance: 0,
-      investedBalance: 0,
-      accruedEarnings: 0,
-      totalBalance: 0,
-      availableBalance: 0,
-      pendingBalance: 0,
-      accounts: [
-        {
-          id: `acc_chk_${userId}`,
-          userId,
-          type: 'CHECKING',
-          accountNumber: accNum,
-          routingNumber: '021000021',
-          currency: 'USD',
-          balance: 0,
-          availableBalance: 0,
-          investedBalance: 0,
-          pendingBalance: 0,
-          interestRateAPY: 1.25,
-          status: 'ACTIVE',
-          nickname: 'Monvera Premier Checking',
-        },
-        {
-          id: `acc_sav_${userId}`,
-          userId,
-          type: 'SAVINGS',
-          accountNumber: `10${accNum.slice(2, -3)}991`,
-          routingNumber: '021000021',
-          currency: 'USD',
-          balance: 0,
-          availableBalance: 0,
-          investedBalance: 0,
-          pendingBalance: 0,
-          interestRateAPY: 4.85,
-          status: 'ACTIVE',
-          nickname: 'Monvera High-Yield Treasury',
-        },
-      ],
-    };
-
-    return defaultMetrics;
+    // 3. DO NOT fabricate 0 balance metrics when upstream is rate-limited or temporarily unavailable.
+    // Return null to allow caller to preserve the last known authoritative balance.
+    return null;
   },
 
   async lookupRecipient(
@@ -481,17 +427,38 @@ export const api = {
       };
     }
 
-    // 1. Direct Cloud Directory Query (Fastest, case-insensitive, multi-field)
+    // 1. Authoritative Backend Server API Resolution (checks canonical Firebase UIDs, accounts, emails, usernames)
+    try {
+      const res = await fetch(
+        `/api/accounts/lookup?query=${encodeURIComponent(identifier)}&currentUserId=${encodeURIComponent(currentUserId || '')}`
+      );
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data && typeof data === 'object') {
+          if (data.valid === true) {
+            return data as RecipientLookupResult;
+          } else if (data.isAmbiguous) {
+            return { valid: false, error: data.error || 'Multiple accounts found matching identifier.' };
+          }
+        }
+      }
+    } catch {
+      console.warn('[API] Express backend lookup unreachable, falling back to direct Firestore query...');
+    }
+
+    // 2. Direct Cloud Directory Query (Fastest, case-insensitive, multi-field via Firestore)
     try {
       const fsUser = await firestoreSync.findRecipient(identifier);
       if (fsUser) {
-        if (currentUserId && (fsUser.id === currentUserId || (fsUser as any).uid === currentUserId)) {
+        const canonicalId = fsUser.id || (fsUser as any).uid;
+        if (currentUserId && canonicalId === currentUserId) {
           return { valid: false, error: 'You cannot send an external transfer to yourself.' };
         }
         const accNum = fsUser.permanentAccountNumber || (fsUser as any).accountNumber || '1088492015';
         return {
           valid: true,
-          recipientId: fsUser.id || (fsUser as any).uid,
+          recipientId: canonicalId,
           firstName: fsUser.firstName || 'Monvera',
           lastName: fsUser.lastName || 'Customer',
           username: fsUser.username || cleanInput,
@@ -506,123 +473,9 @@ export const api = {
       console.warn('[API] Cloud recipient lookup note:', fsErr);
     }
 
-    // 2. Query Express Backend Server API
-    try {
-      const res = await fetch(
-        `/api/accounts/lookup?query=${encodeURIComponent(identifier)}&currentUserId=${encodeURIComponent(currentUserId || '')}`
-      );
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const data = await res.json();
-        if (data && typeof data === 'object' && data.valid === true) {
-          return data as RecipientLookupResult;
-        }
-      }
-    } catch {
-      console.warn('[API] Express backend lookup unreachable, checking built-in seed users...');
-    }
-
-    // 3. Backup Layer: Local Directory Cache & Built-in Verification
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        const cachedRaw = localStorage.getItem('monvera_accounts_directory');
-        if (cachedRaw) {
-          const directory: UserProfile[] = JSON.parse(cachedRaw);
-          if (Array.isArray(directory)) {
-            const foundCached = directory.find(
-              (u) =>
-                (u.permanentAccountNumber && u.permanentAccountNumber.replace(/[-\s]/g, '') === cleanInput) ||
-                (u.username && u.username.toLowerCase() === cleanInput) ||
-                (u.email && u.email.toLowerCase() === cleanInput) ||
-                `${u.firstName || ''} ${u.lastName || ''}`.toLowerCase().trim() === cleanInput
-            );
-            if (foundCached) {
-              if (currentUserId && foundCached.id === currentUserId) {
-                return { valid: false, error: 'You cannot send an external transfer to yourself.' };
-              }
-              const accNum = foundCached.permanentAccountNumber || '1088492015';
-              return {
-                valid: true,
-                recipientId: foundCached.id || `usr_${cleanInput}`,
-                firstName: foundCached.firstName || 'Monvera',
-                lastName: foundCached.lastName || 'Customer',
-                username: foundCached.username || cleanInput,
-                avatarUrl: foundCached.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-                permanentAccountNumber: accNum,
-                maskedAccountNumber: `•••• ${accNum.slice(-4)}`,
-                membershipTier: foundCached.membershipTier || 'Premier',
-                verified: true,
-              };
-            }
-          }
-        }
-      }
-    } catch {}
-
-    const foundSeed = SEED_USERS.find(
-      (u) =>
-        u.permanentAccountNumber.replace(/[-\s]/g, '') === cleanInput ||
-        (u.username && u.username.toLowerCase() === cleanInput) ||
-        (u.email && u.email.toLowerCase() === cleanInput)
-    );
-
-    if (foundSeed) {
-      if (currentUserId && foundSeed.id === currentUserId) {
-        return { valid: false, error: 'You cannot send an external transfer to yourself.' };
-      }
-      return {
-        valid: true,
-        recipientId: foundSeed.id,
-        firstName: foundSeed.firstName,
-        lastName: foundSeed.lastName,
-        username: foundSeed.username,
-        avatarUrl: foundSeed.avatarUrl,
-        permanentAccountNumber: foundSeed.permanentAccountNumber,
-        maskedAccountNumber: `•••• ${foundSeed.permanentAccountNumber.slice(-4)}`,
-        membershipTier: foundSeed.membershipTier,
-        verified: true,
-      };
-    }
-
-    // 4. Resilient Monvera Account Resolution for valid 10-digit account numbers or handles
-    if (/^\d{8,14}$/.test(cleanInput)) {
-      const generatedId = `usr_acc_${cleanInput}`;
-      if (currentUserId && (currentUserId === generatedId || currentUserId.includes(cleanInput))) {
-        return { valid: false, error: 'You cannot send an external transfer to yourself.' };
-      }
-      return {
-        valid: true,
-        recipientId: generatedId,
-        firstName: 'Monvera',
-        lastName: 'Account Holder',
-        username: `acc_${cleanInput.slice(-4)}`,
-        avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-        permanentAccountNumber: cleanInput,
-        maskedAccountNumber: `•••• ${cleanInput.slice(-4)}`,
-        membershipTier: 'Premier',
-        verified: true,
-      };
-    }
-
-    if (cleanInput.length >= 3 && !/^\d+$/.test(cleanInput)) {
-      const capitalized = cleanInput.charAt(0).toUpperCase() + cleanInput.slice(1);
-      return {
-        valid: true,
-        recipientId: `usr_${cleanInput}`,
-        firstName: capitalized,
-        lastName: 'Customer',
-        username: cleanInput,
-        avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-        permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
-        maskedAccountNumber: '•••• 8812',
-        membershipTier: 'Premier',
-        verified: true,
-      };
-    }
-
     return {
       valid: false,
-      error: `No Monvera account found with username or account number "${identifier}".`,
+      error: `No Monvera account found with username, email, or account number "${identifier}".`,
     };
   },
 
@@ -732,6 +585,7 @@ export const api = {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({
+        senderUserId: data.senderUserId,
         recipientUserId: recipientId,
         recipientAccountNumber: recipientAcc,
         recipientUsername: (data as any).recipientUsername,
@@ -1017,12 +871,51 @@ export const api = {
 
   async confirmStripeSession(
     sessionId: string
-  ): Promise<{ success: boolean; balanceMetrics?: BalanceMetrics; status?: string }> {
+  ): Promise<{
+    success: boolean;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    status?: string;
+    isDuplicate?: boolean;
+    error?: string;
+  }> {
     try {
-      const res = await fetch(`/api/stripe/confirm-session?session_id=${encodeURIComponent(sessionId)}`);
-      return await parseJsonResponse(res, { success: false });
-    } catch {
-      return { success: false };
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch(`/api/stripe/confirm-session?session_id=${encodeURIComponent(sessionId)}`, {
+        method: 'GET',
+        headers: authHeaders,
+      });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        status?: string;
+        isDuplicate?: boolean;
+        error?: string;
+      }>(res, { success: false, error: 'Stripe confirmation service unavailable' });
+
+      if (parsed.success && parsed.transaction && typeof window !== 'undefined') {
+        try {
+          if (parsed.balanceMetrics) {
+            localStorage.setItem(`monvera_balances_${parsed.transaction.userId}`, JSON.stringify(parsed.balanceMetrics));
+            localStorage.setItem('monvera_account_balances', JSON.stringify(parsed.balanceMetrics));
+            window.dispatchEvent(
+              new CustomEvent('monvera_balance_updated', {
+                detail: { userId: parsed.transaction.userId, balanceMetrics: parsed.balanceMetrics },
+              })
+            );
+          }
+          window.dispatchEvent(
+            new CustomEvent('monvera_transaction_created', {
+              detail: { userId: parsed.transaction.userId, transaction: parsed.transaction },
+            })
+          );
+        } catch {}
+      }
+
+      return parsed;
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Network error confirming Stripe session.' };
     }
   },
 
@@ -1061,11 +954,11 @@ export const api = {
     }
 
     // Authoritative return from server API without redundant client Firestore query
-    if (backendSuccess && apiTxs.length > 0) {
+    if (backendSuccess) {
       return { transactions: apiTxs };
     }
 
-    // Resilient fallback to Firestore only if backend is unavailable or returns 0 records
+    // Resilient fallback to Firestore only if backend network request genuinely failed
     if (params?.userId) {
       try {
         const firestoreTxs = await firestoreSync.getTransactionsForUser(params.userId);
@@ -1490,15 +1383,8 @@ export const api = {
       } catch {}
     }
 
-    // 1. Fetch from permanent Firestore notifications
-    if (userId) {
-      try {
-        const fsNotifs = await firestoreSync.getNotificationsForUser(userId, userAccountNumber, userEmail);
-        fsNotifs.forEach((n) => notifMap.set(n.id, n));
-      } catch {}
-    }
-
-    // 2. Fetch from backend Express API
+    // 1. Fetch from backend Express API
+    let fetchedFromBackend = false;
     try {
       const queryParams = new URLSearchParams();
       if (userId) queryParams.set('userId', userId);
@@ -1506,11 +1392,22 @@ export const api = {
       if (userEmail) queryParams.set('email', userEmail);
       const url = `/api/notifications${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
       const res = await fetch(url);
-      const data = await parseJsonResponse<{ notifications: NotificationItem[] }>(res, { notifications: [] });
-      if (data && Array.isArray(data.notifications)) {
-        data.notifications.forEach((n) => notifMap.set(n.id, n));
+      if (res.ok) {
+        const data = await parseJsonResponse<{ notifications: NotificationItem[] }>(res, { notifications: [] });
+        if (data && Array.isArray(data.notifications)) {
+          data.notifications.forEach((n) => notifMap.set(n.id, n));
+          fetchedFromBackend = true;
+        }
       }
     } catch {}
+
+    // 2. Fallback to direct client Firestore notifications ONLY if backend request failed
+    if (!fetchedFromBackend && userId) {
+      try {
+        const fsNotifs = await firestoreSync.getNotificationsForUser(userId, userAccountNumber, userEmail);
+        fsNotifs.forEach((n) => notifMap.set(n.id, n));
+      } catch {}
+    }
 
     const sorted = Array.from(notifMap.values()).sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()

@@ -20,6 +20,7 @@ import {
   executeServerPendingWithdrawalReversals,
   reverseServerFirestoreWithdrawal,
   checkUserHasOutstandingLoan,
+  resolveRecipientUser,
 } from './server/firestoreTransactions';
 
 const app = express();
@@ -61,13 +62,50 @@ app.get('/api/auth/users', (req: Request, res: Response) => {
   res.json({ users: userList });
 });
 
-app.get('/api/auth/me', (req: Request, res: Response) => {
+app.get('/api/auth/me', async (req: Request, res: Response) => {
   const userId = (req.query.userId as string) || 'usr_eleanor';
-  const user = db.users.get(userId);
+  let user = db.users.get(userId);
+  if (!user) {
+    try {
+      const uSnap = await adminFirestore.collection('users').doc(userId).get();
+      if (uSnap.exists) {
+        user = { ...uSnap.data(), id: userId } as any;
+      }
+    } catch {}
+  }
   if (!user) {
     return res.status(404).json({ error: 'User not found' });
   }
-  const balanceMetrics = db.getUserBalanceMetrics(user.id);
+
+  let balanceMetrics: any = null;
+  try {
+    const accSnap = await adminFirestore.collection('accounts').doc(userId).get();
+    if (accSnap.exists) {
+      const ad = accSnap.data()!;
+      const chk = Number(ad.checkingBalance ?? 0);
+      const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
+      const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
+      const accrued = Number(ad.accruedEarnings ?? 0);
+      balanceMetrics = {
+        checkingBalance: chk,
+        savingsBalance: sav,
+        investedBalance: inv,
+        accruedEarnings: accrued,
+        totalBalance: Number(ad.totalBalance ?? (chk + sav + inv + accrued)),
+        availableBalance: Number(ad.availableBalance ?? chk),
+        pendingBalance: Number(ad.pendingBalance ?? 0),
+        loanBalance: Number(ad.loanBalance ?? 0),
+        accounts: ad.accounts || [],
+      };
+    } else if (db.users.has(user.id)) {
+      balanceMetrics = db.getUserBalanceMetrics(user.id);
+    }
+  } catch {
+    if (db.users.has(user.id)) {
+      balanceMetrics = db.getUserBalanceMetrics(user.id);
+    }
+  }
+
   res.json({ user, balanceMetrics });
 });
 
@@ -427,94 +465,102 @@ app.post('/api/kyc/approve', (req: Request, res: Response) => {
 });
 
 // --- ACCOUNT & BALANCE METRICS ---
-app.get('/api/accounts/balance', (req: Request, res: Response) => {
+app.get('/api/accounts/balance', async (req: Request, res: Response) => {
   const userId = req.query.userId as string;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-  const metrics = db.getUserBalanceMetrics(userId);
-  res.json(metrics);
+  try {
+    const accSnap = await adminFirestore.collection('accounts').doc(userId).get();
+    if (accSnap.exists) {
+      const ad = accSnap.data()!;
+      const chk = Number(ad.checkingBalance ?? 0);
+      const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
+      const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
+      const accrued = Number(ad.accruedEarnings ?? 0);
+      const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
+      const avail = Number(ad.availableBalance ?? chk);
+      return res.json({
+        checkingBalance: chk,
+        savingsBalance: sav,
+        investedBalance: inv,
+        accruedEarnings: accrued,
+        totalBalance: total,
+        availableBalance: avail,
+        pendingBalance: Number(ad.pendingBalance ?? 0),
+        loanBalance: Number(ad.loanBalance ?? 0),
+        accounts: ad.accounts || [],
+      });
+    } else {
+      return res.status(404).json({
+        error: `Authoritative account ledger not found for user ${userId}.`,
+        code: 'ACCOUNT_NOT_FOUND',
+      });
+    }
+  } catch (e: any) {
+    const errCode = e?.code || e?.status || 'UNKNOWN';
+    const isQuota = errCode === 8 || String(e?.message).includes('RESOURCE_EXHAUSTED') || errCode === 'RESOURCE_EXHAUSTED';
+    console.error('[/api/accounts/balance error reading Firestore]', e);
+    return res.status(isQuota ? 503 : 500).json({
+      error: isQuota
+        ? 'Authoritative account balances temporarily unavailable due to upstream Firestore quota limits.'
+        : 'Failed to retrieve authoritative account balances from Firestore ledger.',
+      code: isQuota ? 'RESOURCE_EXHAUSTED' : 'FIRESTORE_ERROR',
+    });
+  }
 });
 
 // Lookup recipient by Account Number OR Username before transfer confirmation
-app.get('/api/accounts/lookup', (req: Request, res: Response) => {
+app.get('/api/accounts/lookup', async (req: Request, res: Response) => {
   const { accountNumber, username, query: rawQuery, currentUserId } = req.query;
   const rawInput = (rawQuery || accountNumber || username || '') as string;
   
   if (!rawInput.trim()) {
-    return res.status(400).json({ error: 'Account number or username is required' });
+    return res.status(400).json({ valid: false, error: 'Account number or username is required' });
   }
 
   const cleanInput = rawInput.trim().replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
-  
-  // Look up by permanent account number, username, email, ID, or full name
-  const recipient = Array.from(db.users.values()).find(
-    (u) =>
-      u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanInput ||
-      (u.username && u.username.toLowerCase() === cleanInput) ||
-      (u.email && u.email.toLowerCase() === cleanInput) ||
-      (u.id && u.id.toLowerCase() === cleanInput) ||
-      `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanInput
-  );
 
-  if (!recipient) {
-    if (/^\d{8,14}$/.test(cleanInput)) {
-      const generatedId = `usr_acc_${cleanInput}`;
-      if (currentUserId && (currentUserId === generatedId || (currentUserId as string).includes(cleanInput))) {
-        return res.status(400).json({ valid: false, error: 'You cannot send an external transfer to yourself.' });
+  try {
+    const resolution = await resolveRecipientUser(rawInput.trim());
+    if (!resolution || !resolution.success || !resolution.uid) {
+      if (resolution && resolution.isAmbiguous) {
+        return res.status(400).json({ valid: false, error: resolution.error, isAmbiguous: true });
       }
-      return res.json({
-        valid: true,
-        recipientId: generatedId,
-        firstName: 'Monvera',
-        lastName: 'Account Holder',
-        username: `acc_${cleanInput.slice(-4)}`,
-        avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-        permanentAccountNumber: cleanInput,
-        maskedAccountNumber: `•••• ${cleanInput.slice(-4)}`,
-        membershipTier: 'Premier',
-        verified: true,
-      });
+      return res.status(404).json({ valid: false, error: resolution?.error || `No Monvera account found with username or account number "${rawInput}".` });
     }
 
-    if (cleanInput.length >= 3 && !/^\d+$/.test(cleanInput)) {
-      const capitalized = cleanInput.charAt(0).toUpperCase() + cleanInput.slice(1);
-      return res.json({
-        valid: true,
-        recipientId: `usr_${cleanInput}`,
-        firstName: capitalized,
-        lastName: 'Customer',
-        username: cleanInput,
-        avatarUrl: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-        permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
-        maskedAccountNumber: '•••• 8812',
-        membershipTier: 'Premier',
-        verified: true,
-      });
+    const recipientUid = resolution.uid;
+    const recipientData = resolution.data || {};
+
+    if (
+      currentUserId &&
+      (recipientUid === currentUserId ||
+        (recipientData.permanentAccountNumber &&
+          recipientData.permanentAccountNumber.replace(/[-\s]/g, '') === currentUserId))
+    ) {
+      return res.status(400).json({ valid: false, error: 'You cannot send an external transfer to yourself.' });
     }
 
-    return res.status(404).json({ valid: false, error: `No Monvera account found with username or account number "${rawInput}".` });
-  }
+    if (recipientData.status === 'frozen') {
+      return res.status(400).json({ valid: false, error: 'Recipient account is temporarily restricted.' });
+    }
 
-  if (currentUserId && recipient.id === currentUserId) {
-    return res.status(400).json({ valid: false, error: 'You cannot send an external transfer to yourself.' });
+    const accNum = recipientData.permanentAccountNumber || recipientData.accountNumber || '1000000000';
+    return res.json({
+      valid: true,
+      recipientId: recipientUid,
+      firstName: recipientData.firstName || 'Monvera',
+      lastName: recipientData.lastName || 'Customer',
+      username: recipientData.username || cleanInput,
+      avatarUrl: recipientData.avatarUrl || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
+      permanentAccountNumber: accNum,
+      maskedAccountNumber: `•••• ${accNum.slice(-4)}`,
+      membershipTier: recipientData.membershipTier || 'Premier',
+      verified: true,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ valid: false, error: err?.message || 'Server error looking up recipient.' });
   }
-
-  if (recipient.status === 'frozen') {
-    return res.status(400).json({ valid: false, error: 'Recipient account is temporarily restricted.' });
-  }
-
-  res.json({
-    valid: true,
-    recipientId: recipient.id,
-    firstName: recipient.firstName,
-    lastName: recipient.lastName,
-    username: recipient.username,
-    avatarUrl: recipient.avatarUrl,
-    permanentAccountNumber: recipient.permanentAccountNumber,
-    maskedAccountNumber: `•••• ${recipient.permanentAccountNumber.slice(-4)}`,
-    membershipTier: recipient.membershipTier,
-    verified: true,
-  });
 });
 
 // --- TRANSFERS ---
@@ -522,6 +568,7 @@ app.get('/api/accounts/lookup', (req: Request, res: Response) => {
 app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const authUid = req.auth!.uid;
   const {
+    senderUserId,
     recipientUserId,
     recipientAccountNumber,
     recipientUsername,
@@ -533,6 +580,13 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
     referenceId,
     idempotencyKey,
   } = req.body;
+
+  // Identity consistency check: verified Firebase Authentication UID is the ONLY authoritative sender identity
+  if (senderUserId && senderUserId !== authUid) {
+    return res.status(403).json({
+      error: 'Session identity mismatch: Authenticated user does not match requested sender.',
+    });
+  }
 
   const rawTarget = (recipientIdentifier || recipientAccountNumber || recipientUsername || recipientUserId || '') as string;
   const transferRef = (referenceNumber || referenceId || idempotencyKey || '') as string;
@@ -631,15 +685,15 @@ app.post('/api/transfers/internal', (req: Request, res: Response) => {
 // --- DEPOSITS & PAYMENT GATEWAY VERIFICATION ---
 app.post('/api/deposits/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { amount, method, destinationAccountType, providerPaymentId, referenceNumber, metadata } = req.body;
-  const userId = req.auth?.uid || req.body.userId;
+  const targetUserId = req.body.userId || req.auth?.uid;
 
-  if (!userId || !amount || Number(amount) <= 0) {
+  if (!targetUserId || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Valid user ID and positive amount are required.' });
   }
 
   try {
     const result = await executeServerDeposit({
-      userId,
+      userId: targetUserId,
       amount: Number(amount),
       method: method || 'CARD',
       destinationAccountType: destinationAccountType || 'CHECKING',
@@ -655,7 +709,7 @@ app.post('/api/deposits/create', optionalFirebaseAuth, async (req: Authenticated
     // Mirror to memory db for local consistency
     try {
       db.processDeposit({
-        userId,
+        userId: targetUserId,
         amount: Number(amount),
         method: method || 'CARD',
         destinationAccountType: destinationAccountType || 'CHECKING',
@@ -885,55 +939,98 @@ app.post('/api/webhooks/test-simulate', (req: Request, res: Response) => {
 });
 
 // Confirm session callback endpoint for client return
-app.get('/api/stripe/confirm-session', async (req: Request, res: Response) => {
-  const sessionId = req.query.session_id as string;
+const handleStripeSessionConfirmation = async (req: AuthenticatedRequest, res: Response) => {
+  const sessionId = ((req.query.session_id || req.body?.session_id || req.body?.sessionId) as string)?.trim();
   if (!sessionId) {
-    return res.status(400).json({ error: 'Session ID is required.' });
+    return res.status(400).json({ success: false, error: 'Session ID is required.' });
   }
 
   const stripe = getStripe();
   if (!stripe) {
-    return res.status(400).json({ error: 'Stripe is not configured.' });
+    return res.status(400).json({ success: false, error: 'Stripe is not configured on this server.' });
   }
 
   try {
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     if (session.payment_status === 'paid') {
-      const userId = session.client_reference_id || session.metadata?.userId;
+      const targetUserId = session.client_reference_id || session.metadata?.userId;
       const amountStr = session.metadata?.amount;
       const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
       const destinationAccountType: 'CHECKING' | 'SAVINGS' = session.metadata?.destinationAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
 
-      if (userId && amount > 0) {
-        // Check if already deposited
-        const existingTx = db.transactions.find(
-          (t) => t.paymentProviderRef === `STRIPE-${session.id}`
-        );
-
-        if (!existingTx) {
-          db.processDeposit({
-            userId,
-            amount,
-            method: 'CARD',
-            destinationAccountType,
-            providerPaymentId: `STRIPE-${session.id}`,
-            metadata: {
-              stripeSessionId: session.id,
-              stripePaymentStatus: session.payment_status,
-            },
-          });
-        }
-
-        const metrics = db.getUserBalanceMetrics(userId);
-        return res.json({ success: true, balanceMetrics: metrics });
+      if (!targetUserId || isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ success: false, error: 'Invalid Stripe session: missing customer identity or deposit amount.' });
       }
+
+      // Authorization verification: if caller is authenticated, ensure caller matches target customer or is admin
+      const callerUid = req.auth?.uid;
+      let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+      if (!isCallerAdmin && callerUid) {
+        try {
+          const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+          if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+            isCallerAdmin = true;
+          }
+        } catch {}
+      }
+      if (callerUid && callerUid !== targetUserId && !isCallerAdmin) {
+        const sessionOwner = session.client_reference_id || session.metadata?.userId;
+        if (sessionOwner !== targetUserId) {
+          return res.status(403).json({ success: false, error: 'Unauthorized: This checkout session belongs to another customer account.' });
+        }
+      }
+
+      // Authoritative Firestore deposit settlement
+      const result = await executeServerDeposit({
+        userId: targetUserId,
+        amount,
+        method: 'CARD',
+        destinationAccountType,
+        providerPaymentId: `STRIPE-${session.id}`,
+        metadata: {
+          stripeSessionId: session.id,
+          stripePaymentStatus: session.payment_status,
+          currency: session.currency,
+          checkoutCompletedAt: new Date().toISOString(),
+        },
+      });
+
+      if (!result.success) {
+        return res.status(400).json({ success: false, error: result.error });
+      }
+
+      // Mirror to memory db only for non-authoritative local cache consistency
+      try {
+        db.processDeposit({
+          userId: targetUserId,
+          amount,
+          method: 'CARD',
+          destinationAccountType,
+          providerPaymentId: `STRIPE-${session.id}`,
+          metadata: {
+            stripeSessionId: session.id,
+            stripePaymentStatus: session.payment_status,
+          },
+        });
+      } catch {}
+
+      return res.json({
+        success: true,
+        transaction: result.transaction,
+        balanceMetrics: result.balanceMetrics,
+        isDuplicate: result.isDuplicate,
+      });
     }
 
-    res.json({ success: false, status: session.payment_status });
+    return res.json({ success: false, status: session.payment_status, error: `Payment not completed (status: ${session.payment_status})` });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to verify session' });
+    console.error('[/api/stripe/confirm-session] Error verifying Stripe session:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to verify session' });
   }
-});
+};
+
+app.get('/api/stripe/confirm-session', optionalFirebaseAuth, handleStripeSessionConfirmation);
+app.post('/api/stripe/confirm-session', optionalFirebaseAuth, handleStripeSessionConfirmation);
 
 // --- WITHDRAWALS ---
 app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {

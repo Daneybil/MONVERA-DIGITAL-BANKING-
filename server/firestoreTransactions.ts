@@ -84,156 +84,226 @@ function buildDefaultAccounts(userId: string, checking: number, savings: number,
   ];
 }
 
-/**
- * Resolves the canonical Firebase Authentication UID for a user document or candidate ID.
- * Ensures account numbers, directory IDs, legacy IDs, or usernames never substitute the real Auth UID.
- * Uses Firebase Admin Auth as authority to avoid unnecessary Firestore collection queries.
- */
-async function getCanonicalAuthUid(candidate: { id: string; data: any }): Promise<string> {
-  const data = candidate.data || {};
-
-  // 1. Explicit uid / authUid / firebaseUid field on document
-  const explicitUid = data.uid || data.authUid || data.firebaseUid || data.userId;
-  if (explicitUid && typeof explicitUid === 'string' && !explicitUid.startsWith('usr_') && explicitUid.length >= 15) {
-    if (adminAuth) {
-      try {
-        const authUser = await adminAuth.getUser(explicitUid);
-        if (authUser?.uid) return authUser.uid;
-      } catch {}
-    }
-    return explicitUid;
+export function isCanonicalAuthUid(candidateId?: string): boolean {
+  if (!candidateId || typeof candidateId !== 'string') return false;
+  const clean = candidateId.trim();
+  if (clean.length < 20 || clean.length > 128) return false;
+  if (/^\d+$/.test(clean)) return false; // Account numbers are not UIDs
+  if (
+    clean.startsWith('usr_') ||
+    clean.startsWith('acc_') ||
+    clean.startsWith('test_') ||
+    clean.startsWith('probe_') ||
+    clean.startsWith('admin_') ||
+    clean.startsWith('monvera_')
+  ) {
+    return false;
   }
+  return /^[A-Za-z0-9_-]{20,128}$/.test(clean);
+}
 
-  // 2. Resolve via email against Firebase Auth (the single source of truth for user authentication)
-  if (data.email && typeof data.email === 'string' && adminAuth) {
-    try {
-      const authUser = await adminAuth.getUserByEmail(data.email.trim());
-      if (authUser?.uid) return authUser.uid;
-    } catch {}
-  }
-
-  // 3. Document ID itself if it is a real Firebase Auth UID (not a legacy usr_ / acc_ / mock prefix)
-  if (candidate.id && !candidate.id.startsWith('usr_') && !candidate.id.startsWith('acc_') && candidate.id.length >= 15) {
-    if (adminAuth) {
-      try {
-        const authUser = await adminAuth.getUser(candidate.id);
-        if (authUser?.uid) return authUser.uid;
-      } catch {}
-    }
-    return candidate.id;
-  }
-
-  return explicitUid || candidate.id;
+export interface RecipientResolveResult {
+  success: boolean;
+  uid?: string;
+  data?: any;
+  error?: string;
+  isAmbiguous?: boolean;
 }
 
 /**
- * Resolves a recipient user document from Firestore users collection and verifies canonical Auth UID
+ * Resolves a recipient user document from Firestore users collection and verifies canonical Auth UID.
+ * Enforces strict uniqueness: if multiple users match the same username/email/account number,
+ * it halts immediately with an ambiguity error to prevent misplaced transfers.
  */
-export async function resolveRecipientUser(rawTarget: string): Promise<{ uid: string; data: any } | null> {
-  if (!rawTarget) return null;
+export async function resolveRecipientUser(rawTarget: string): Promise<RecipientResolveResult> {
+  if (!rawTarget || !rawTarget.trim()) {
+    return { success: false, error: 'Recipient account number, username, email, or customer ID is required.' };
+  }
   const targetStr = rawTarget.trim();
-  const cleanTarget = targetStr.replace(/^@/, '').toLowerCase();
+  const cleanNoAt = targetStr.replace(/^@/, '').trim();
+  const cleanTarget = cleanNoAt.toLowerCase();
   const cleanDigits = targetStr.replace(/[-\s]/g, '');
 
   const usersCol = adminFirestore.collection('users');
+  const accountsCol = adminFirestore.collection('accounts');
 
-  // Check 0: If target is directly an email, query adminAuth first (zero Firestore read cost)
-  if (targetStr.includes('@') && adminAuth) {
+  // Strategy 1: Direct document ID lookup in users/accounts or Firebase Admin Auth if target is a canonical Firebase UID
+  if (isCanonicalAuthUid(targetStr)) {
     try {
-      const authUser = await adminAuth.getUserByEmail(cleanTarget);
-      if (authUser?.uid) {
-        const uSnap = await usersCol.doc(authUser.uid).get();
-        const data = uSnap.exists ? uSnap.data() : { email: authUser.email, uid: authUser.uid };
-        return { uid: authUser.uid, data: { ...data, email: authUser.email, uid: authUser.uid } };
-      }
-    } catch {}
-  }
+      let authUser: any = null;
+      try {
+        authUser = await adminAuth.getUser(targetStr);
+      } catch {}
 
-  // Check 0b: If target is a real Firebase UID, verify in adminAuth (zero Firestore read cost)
-  if (!targetStr.startsWith('usr_') && !targetStr.startsWith('acc_') && targetStr.length >= 15 && adminAuth) {
-    try {
-      const authUser = await adminAuth.getUser(targetStr);
-      if (authUser?.uid) {
-        const uSnap = await usersCol.doc(authUser.uid).get();
-        const data = uSnap.exists ? uSnap.data() : { email: authUser.email, uid: authUser.uid };
-        return { uid: authUser.uid, data: { ...data, uid: authUser.uid } };
-      }
-    } catch {}
-  }
+      const directUserSnap = await usersCol.doc(targetStr).get();
+      const directAccSnap = await accountsCol.doc(targetStr).get();
 
-  let candidate: { id: string; data: any } | null = null;
+      if (directUserSnap.exists || directAccSnap.exists || authUser) {
+        const userData = directUserSnap.exists ? directUserSnap.data() || {} : {};
+        const accData = directAccSnap.exists ? directAccSnap.data() || {} : {};
+        const canonicalUid = targetStr;
+        const permanentAcc = userData.permanentAccountNumber || accData.permanentAccountNumber || accData.accountNumber || '1000000000';
+        const fName = userData.firstName || authUser?.displayName?.split(' ')[0] || 'Monvera';
+        const lName = userData.lastName || authUser?.displayName?.split(' ').slice(1).join(' ') || 'Customer';
 
-  // 1. Direct document ID lookup in users (O(1) single doc read)
-  if (targetStr.length >= 5) {
-    const directSnap = await usersCol.doc(targetStr).get();
-    if (directSnap.exists) {
-      candidate = { id: directSnap.id, data: directSnap.data() };
-    }
-  }
-
-  // 2. Query by permanentAccountNumber or accountNumber (single indexed query)
-  if (!candidate && cleanDigits && cleanDigits.length >= 6) {
-    const qAcc = await usersCol.where('permanentAccountNumber', '==', cleanDigits).limit(1).get();
-    if (!qAcc.empty) {
-      candidate = { id: qAcc.docs[0].id, data: qAcc.docs[0].data() };
-    } else {
-      const qAccLegacy = await usersCol.where('accountNumber', '==', cleanDigits).limit(1).get();
-      if (!qAccLegacy.empty) {
-        candidate = { id: qAccLegacy.docs[0].id, data: qAccLegacy.docs[0].data() };
-      }
-    }
-  }
-
-  // 3. Query by usernameLower, username, or email (single indexed query)
-  if (!candidate && cleanTarget) {
-    if (cleanTarget.includes('@')) {
-      const qEmail = await usersCol.where('email', '==', cleanTarget).limit(1).get();
-      if (!qEmail.empty) {
-        candidate = { id: qEmail.docs[0].id, data: qEmail.docs[0].data() };
-      }
-    } else {
-      const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).limit(1).get();
-      if (!qUserLower.empty) {
-        candidate = { id: qUserLower.docs[0].id, data: qUserLower.docs[0].data() };
-      } else {
-        const qUser = await usersCol.where('username', '==', cleanTarget).limit(1).get();
-        if (!qUser.empty) {
-          candidate = { id: qUser.docs[0].id, data: qUser.docs[0].data() };
-        }
-      }
-    }
-  }
-
-  if (!candidate) return null;
-
-  // Resolve CANONICAL Firebase Authentication UID
-  const canonicalUid = await getCanonicalAuthUid(candidate);
-
-  // If candidate was found under a legacy ID, ensure canonical user document exists or merge data
-  if (canonicalUid !== candidate.id) {
-    try {
-      const canonicalUserSnap = await usersCol.doc(canonicalUid).get();
-      if (!canonicalUserSnap.exists) {
-        await usersCol.doc(canonicalUid).set(
-          {
-            ...candidate.data,
+        return {
+          success: true,
+          uid: canonicalUid,
+          data: {
+            ...accData,
+            ...userData,
             id: canonicalUid,
             uid: canonicalUid,
-            updatedAt: new Date().toISOString(),
+            firstName: fName,
+            lastName: lName,
+            fullName: userData.fullName || `${fName} ${lName}`.trim(),
+            permanentAccountNumber: permanentAcc,
+            email: userData.email || authUser?.email || accData.email,
+            username: userData.username || cleanTarget,
           },
-          { merge: true }
-        );
+        };
       }
     } catch {}
+  }
+
+  // Strategy 2: Exact Account Number Lookup (permanentAccountNumber or legacy accountNumber)
+  if (cleanDigits && /^\d{6,14}$/.test(cleanDigits)) {
+    const matchesMap = new Map<string, { uid: string; data: any }>();
+    try {
+      const qPerm = await usersCol.where('permanentAccountNumber', '==', cleanDigits).get();
+      qPerm.docs.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+        if (uid) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+      });
+      const qLegacy = await usersCol.where('accountNumber', '==', cleanDigits).get();
+      qLegacy.docs.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+        if (uid) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+      });
+      const qAcc = await accountsCol.where('permanentAccountNumber', '==', cleanDigits).get();
+      qAcc.docs.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = isCanonicalAuthUid(d.userId) ? d.userId : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+        if (uid && !matchesMap.has(uid)) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+      });
+    } catch {}
+
+    const matches = Array.from(matchesMap.values());
+    if (matches.length > 1) {
+      return {
+        success: false,
+        error: `Multiple customer profiles found for account number ${cleanDigits}. Recipient resolution is ambiguous. Transaction aborted.`,
+        isAmbiguous: true,
+      };
+    }
+    if (matches.length === 1) {
+      const matched = matches[0];
+      return {
+        success: true,
+        uid: matched.uid,
+        data: matched.data,
+      };
+    }
+  }
+
+  // Strategy 3: Email Lookup
+  if (cleanTarget.includes('@')) {
+    const emailMatchesMap = new Map<string, { uid: string; data: any }>();
+    try {
+      const qEmail = await usersCol.where('email', '==', cleanTarget).get();
+      qEmail.docs.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+        if (uid) emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+      });
+      if (targetStr.toLowerCase() !== cleanTarget) {
+        const qEmailRaw = await usersCol.where('email', '==', targetStr.toLowerCase()).get();
+        qEmailRaw.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+          if (uid && !emailMatchesMap.has(uid)) emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+      }
+      try {
+        const authUser = await adminAuth.getUserByEmail(cleanTarget);
+        if (authUser && isCanonicalAuthUid(authUser.uid) && !emailMatchesMap.has(authUser.uid)) {
+          const uDoc = await usersCol.doc(authUser.uid).get();
+          const uData = uDoc.exists ? uDoc.data() || {} : {};
+          emailMatchesMap.set(authUser.uid, {
+            uid: authUser.uid,
+            data: { ...uData, id: authUser.uid, uid: authUser.uid, email: cleanTarget },
+          });
+        }
+      } catch {}
+    } catch {}
+
+    const matches = Array.from(emailMatchesMap.values());
+    if (matches.length > 1) {
+      return {
+        success: false,
+        error: `Multiple customer accounts found for email "${cleanTarget}". Recipient resolution is ambiguous. Please specify their permanent account number.`,
+        isAmbiguous: true,
+      };
+    }
+    if (matches.length === 1) {
+      const matched = matches[0];
+      return {
+        success: true,
+        uid: matched.uid,
+        data: matched.data,
+      };
+    }
+  }
+
+  // Strategy 4: Username Lookup with Duplicate Ambiguity Detection
+  if (cleanTarget.length >= 2) {
+    const usernameMatchesMap = new Map<string, { uid: string; data: any }>();
+    try {
+      const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).get();
+      qUserLower.docs.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+        if (uid) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+      });
+      const qUser = await usersCol.where('username', '==', cleanTarget).get();
+      qUser.docs.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+        if (uid) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+      });
+      if (cleanNoAt !== cleanTarget) {
+        const qRaw = await usersCol.where('username', '==', cleanNoAt).get();
+        qRaw.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
+          if (uid && !usernameMatchesMap.has(uid)) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+      }
+    } catch {}
+
+    const matches = Array.from(usernameMatchesMap.values());
+    if (matches.length > 1) {
+      return {
+        success: false,
+        error: `Multiple customer accounts found matching username "@${cleanNoAt}". To protect your funds, please specify the recipient's exact permanent account number or email address.`,
+        isAmbiguous: true,
+      };
+    }
+    if (matches.length === 1) {
+      const matched = matches[0];
+      return {
+        success: true,
+        uid: matched.uid,
+        data: matched.data,
+      };
+    }
   }
 
   return {
-    uid: canonicalUid,
-    data: {
-      ...candidate.data,
-      id: canonicalUid,
-      uid: canonicalUid,
-    },
+    success: false,
+    error: `Recipient "${rawTarget}" not found in Monvera directory. Please verify the account number, username, or email.`,
   };
 }
 
@@ -250,15 +320,15 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
 
   // 1. Resolve recipient BEFORE modifying balances
   const recipientRecord = await resolveRecipientUser(recipientIdentifier);
-  if (!recipientRecord) {
+  if (!recipientRecord || !recipientRecord.success || !recipientRecord.uid) {
     return {
       success: false,
-      error: `Recipient "${recipientIdentifier}" not found in Monvera directory.`,
+      error: recipientRecord?.error || `Recipient "${recipientIdentifier}" not found in Monvera directory.`,
     };
   }
 
   const recipientUid = recipientRecord.uid;
-  const recipientData = recipientRecord.data;
+  const recipientData = recipientRecord.data || {};
 
   // 2. Validate sender is not recipient
   if (senderUid === recipientUid) {
@@ -271,6 +341,15 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
   // 3. Resolve sender profile info
   const senderDocSnap = await adminFirestore.collection('users').doc(senderUid).get();
   const senderData = senderDocSnap.exists ? senderDocSnap.data()! : {};
+
+  // Check account freeze status
+  if (senderData.status === 'frozen') {
+    return {
+      success: false,
+      error: 'Your account is currently restricted/frozen. Outgoing transfers and withdrawals are disabled. Please contact compliance support.',
+    };
+  }
+
   const senderName = `${senderData.firstName || ''} ${senderData.lastName || ''}`.trim() || senderData.username || 'Monvera Member';
   const senderAcc = senderData.permanentAccountNumber || senderData.accountNumber || '1000000000';
 
@@ -442,6 +521,7 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
         amount: transferAmount,
         currency: 'USD',
         status: 'COMPLETED',
+        userId: senderUid,
         senderUserId: senderUid,
         senderName,
         senderAccountNumber: senderAcc,
@@ -531,6 +611,15 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
   const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
   const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+
+  // Check account freeze status
+  if (userData.status === 'frozen') {
+    return {
+      success: false,
+      error: 'Your account is currently restricted/frozen. Outgoing transfers and withdrawals are disabled. Please contact compliance support.',
+    };
+  }
+
   const userAcc = userData.permanentAccountNumber || userData.accountNumber || '1000000000';
 
   const finalRef = referenceNumber || `MV-WTH-${Math.floor(100000000 + Math.random() * 900000000)}`;
@@ -963,11 +1052,15 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
 
   // 1. Fetch user profile metadata from Firestore to enrich records
   let userAcc = '1000000000';
+  let userName = 'Monvera Client';
   try {
     const uSnap = await adminFirestore.collection('users').doc(userId).get();
     if (uSnap.exists) {
       const ud = uSnap.data()!;
       userAcc = ud.permanentAccountNumber || ud.accountNumber || '1000000000';
+      const first = ud.firstName || '';
+      const last = ud.lastName || '';
+      userName = `${first} ${last}`.trim() || ud.username || 'Monvera Client';
     }
   } catch {}
 
@@ -1104,6 +1197,8 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
 
       const nowIso = new Date().toISOString();
       const targetAccountName = isChecking ? 'Premier Checking' : 'High-Yield Treasury';
+      const targetAccObj = updatedAccounts.find((a) => a.type === targetAccountType);
+      const targetAccountNumber = targetAccObj?.accountNumber || userAcc;
 
       finalTx = {
         id: txId,
@@ -1113,8 +1208,12 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
         currency: 'USD',
         status: 'COMPLETED',
         userId,
-        senderUserId: userId,
+        senderUserId: undefined,
         recipientUserId: userId,
+        recipientAccountNumber: targetAccountNumber,
+        senderAccountNumber: providerPaymentId || 'EXTERNAL_GATEWAY',
+        recipientName: userName,
+        senderName: methodLabel || 'Direct Deposit Gateway',
         fee: 0.0,
         description: `Deposit to ${targetAccountName} via ${methodLabel}`,
         category: 'Deposits',
@@ -1123,6 +1222,11 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
         completedAt: nowIso,
         metadata: {
           destinationAccountType: targetAccountType,
+          recipientAccountType: targetAccountType,
+          destinationAccount: targetAccountName,
+          toAccount: targetAccountName,
+          recipientAccountNumber: targetAccountNumber,
+          recipientName: userName,
           depositMethod: method,
           ...metadata,
         },
@@ -1207,10 +1311,10 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
 
   // 1. Resolve recipient from Firestore
   const recipientRecord = await resolveRecipientUser(targetIdentifier);
-  if (!recipientRecord) {
+  if (!recipientRecord || !recipientRecord.success || !recipientRecord.uid) {
     return {
       success: false,
-      error: `Recipient "${targetIdentifier}" not found in Monvera directory. Please verify account number or customer ID.`,
+      error: recipientRecord?.error || `Recipient "${targetIdentifier}" not found in Monvera directory. Please verify account number or customer ID.`,
     };
   }
 
@@ -1456,8 +1560,11 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
 
   // 1. Resolve target customer from Firestore
   const targetRecord = await resolveRecipientUser(targetUserId);
-  const targetUid = targetRecord ? targetRecord.uid : targetUserId;
-  const targetData = targetRecord ? targetRecord.data : {};
+  if (!targetRecord || !targetRecord.success || !targetRecord.uid) {
+    return { success: false, error: targetRecord?.error || `Customer "${targetUserId}" not found in Monvera directory.` };
+  }
+  const targetUid = targetRecord.uid;
+  const targetData = targetRecord.data || {};
   const targetDisplayName = `${targetData.firstName || ''} ${targetData.lastName || ''}`.trim() || targetData.username || 'Developer Sandbox Account';
   const targetAcc = targetData.permanentAccountNumber || targetData.accountNumber || 'Sandbox';
 
@@ -2136,9 +2243,9 @@ export async function executeServerLoanRepayment(
       let isAuthorizedOwner = loanData.userId === userId;
       if (!isAuthorizedOwner) {
         const callerRecord = await resolveRecipientUser(userId);
-        const callerUid = callerRecord?.uid || userId;
+        const callerUid = (callerRecord && callerRecord.success && callerRecord.uid) ? callerRecord.uid : userId;
         const loanUserRecord = await resolveRecipientUser(loanData.userId || loanData.permanentAccountNumber || loanData.applicantEmail);
-        const loanUid = loanUserRecord?.uid || loanData.userId;
+        const loanUid = (loanUserRecord && loanUserRecord.success && loanUserRecord.uid) ? loanUserRecord.uid : loanData.userId;
         if (callerUid === loanUid || loanData.userId === callerUid || userId === loanUid) {
           isAuthorizedOwner = true;
         }

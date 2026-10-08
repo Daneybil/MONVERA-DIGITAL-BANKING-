@@ -227,7 +227,7 @@ export const firestoreSync = {
       if (snapshot.exists()) {
         const data = snapshot.data();
         return {
-          id: data.id || uid,
+          id: uid,
           username: data.username || data.email?.split('@')[0] || 'customer',
           firstName: data.firstName || '',
           lastName: data.lastName || '',
@@ -575,16 +575,6 @@ export const firestoreSync = {
     // Initial load
     this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
 
-    // Real-time window and storage event listener for instant multi-tab & client updates
-    const handleNotificationEvent = () => {
-      this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
-    };
-
-    if (typeof window !== 'undefined') {
-      window.addEventListener('monvera_notification_created', handleNotificationEvent);
-      window.addEventListener('storage', handleNotificationEvent);
-    }
-
     let fsUnsubscribe = () => {};
     if (db) {
       try {
@@ -592,8 +582,13 @@ export const firestoreSync = {
         const qNotifs = query(notifCol, where('userId', '==', userId));
         fsUnsubscribe = onSnapshot(
           qNotifs,
-          () => {
-            this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
+          (snap) => {
+            const list: NotificationItem[] = [];
+            snap.forEach((d) => {
+              list.push({ id: d.id, ...(d.data() as any) });
+            });
+            list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            onUpdate(list);
           },
           (err) => {
             console.warn('[Firestore] notifications subscription note:', err);
@@ -605,10 +600,6 @@ export const firestoreSync = {
     }
 
     return () => {
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('monvera_notification_created', handleNotificationEvent);
-        window.removeEventListener('storage', handleNotificationEvent);
-      }
       fsUnsubscribe();
     };
   },
@@ -951,8 +942,9 @@ export const firestoreSync = {
       const snap = await getDoc(accRef);
       let data = snap.exists() ? snap.data() : null;
 
-      // Resilient check: If accounts/{userId} is missing, check legacy accounts/{userAccountNumber}
-      if (!data && userAccountNumber) {
+      // Resilient check: If accounts/{userId} is missing or has $0 balance, check legacy accounts/{userAccountNumber}
+      const isZeroOrMissing = !data || (Number(data.checkingBalance ?? 0) === 0 && Number(data.totalBalance ?? 0) === 0);
+      if (isZeroOrMissing && userAccountNumber) {
         const cleanAcc = userAccountNumber.replace(/[-\s]/g, '');
         if (cleanAcc && cleanAcc !== userId) {
           try {
@@ -960,7 +952,9 @@ export const firestoreSync = {
             const legacySnap = await getDoc(legacyRef);
             if (legacySnap.exists()) {
               const legacyData = legacySnap.data();
-              data = legacyData;
+              if (Number(legacyData?.checkingBalance ?? 0) > 0 || Number(legacyData?.totalBalance ?? 0) > 0) {
+                data = legacyData;
+              }
             }
           } catch {}
         }
@@ -1152,37 +1146,21 @@ export const firestoreSync = {
     const cleanDigits = cleanNoAt.replace(/[-\s]/g, '');
     const cleanLower = cleanNoAt.toLowerCase();
 
-    // 0. Check localStorage cached directory first for instant zero-latency match
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        const cachedRaw = localStorage.getItem('monvera_accounts_directory');
-        if (cachedRaw) {
-          const directory: UserProfile[] = JSON.parse(cachedRaw);
-          if (Array.isArray(directory)) {
-            const match = directory.find((u) => {
-              const uAcc = (u.permanentAccountNumber || (u as any).accountNumber || '').replace(/[-\s]/g, '');
-              const uUser = (u.username || '').replace(/^@/, '').toLowerCase();
-              const uEmail = (u.email || '').toLowerCase();
-              const uId = (u.id || (u as any).uid || '').toLowerCase();
-              const uName = `${u.firstName || ''} ${u.lastName || ''}`.toLowerCase().trim();
-              return (
-                (cleanDigits && uAcc === cleanDigits) ||
-                (cleanLower && uUser === cleanLower) ||
-                (cleanLower && uEmail === cleanLower) ||
-                (raw && uId === raw.toLowerCase()) ||
-                (cleanLower.length >= 3 && uName === cleanLower)
-              );
-            });
-            if (match) return match;
-          }
-        }
-      }
-    } catch {}
-
     if (!db) return null;
     const usersCol = collection(db, 'users');
 
-    // 1. Direct indexed queries for rapid matching with isolated error handling
+    // 1. Direct document ID lookup in users (canonical Firebase Auth UID)
+    if (raw.length >= 20) {
+      try {
+        const directDoc = await getDoc(doc(db, 'users', raw));
+        if (directDoc.exists()) {
+          const docData = directDoc.data() as UserProfile;
+          return { ...docData, id: directDoc.id };
+        }
+      } catch {}
+    }
+
+    // 2. Direct indexed queries for rapid matching with isolated error handling and ambiguity detection
     const queryQueries = [
       ...(cleanDigits ? [
         query(usersCol, where('permanentAccountNumber', '==', cleanDigits)),
@@ -1199,27 +1177,33 @@ export const firestoreSync = {
     for (const q of queryQueries) {
       try {
         const snap = await getDocs(q);
+        if (snap.docs.length > 1) {
+          console.warn('[Firestore] Ambiguous recipient search query: multiple matches found for', raw);
+          return null; // Ambiguous: require exact unique identifier
+        }
         if (!snap.empty) {
           const docData = snap.docs[0].data() as UserProfile;
+          const canonicalId = snap.docs[0].id || docData.id;
           return {
-            id: snap.docs[0].id || docData.id,
             ...docData,
+            id: canonicalId,
           };
         }
       } catch {}
     }
 
-    // 2. Check direct document ID lookup
+    // 3. Fallback direct document ID lookup
     if (raw.length >= 6) {
       try {
         const directDoc = await getDoc(doc(db, 'users', raw));
         if (directDoc.exists()) {
-          return { id: directDoc.id, ...directDoc.data() } as UserProfile;
+          const docData = directDoc.data() as UserProfile;
+          return { ...docData, id: directDoc.id };
         }
       } catch {}
     }
 
-    // 3. Direct document ID lookup in accounts if cleanDigits matches account document key
+    // 4. Direct document ID lookup in accounts if cleanDigits matches account document key
     if (cleanDigits && cleanDigits.length >= 6) {
       try {
         const directAcc = await getDoc(doc(db, 'accounts', cleanDigits));
@@ -1650,7 +1634,7 @@ export const firestoreSync = {
           if (snap.exists()) {
             const data = snap.data();
             const profile: UserProfile = {
-              id: data.id || userId,
+              id: userId,
               username: data.username || data.email?.split('@')[0] || 'customer',
               firstName: data.firstName || '',
               lastName: data.lastName || '',
