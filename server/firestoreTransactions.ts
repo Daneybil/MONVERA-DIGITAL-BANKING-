@@ -350,6 +350,14 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
     };
   }
 
+  // Check recipient freeze status
+  if (recipientData.status === 'frozen') {
+    return {
+      success: false,
+      error: 'Unable to complete transfer: The recipient account is currently restricted/frozen. Transfers to frozen accounts are disabled.',
+    };
+  }
+
   const senderName = `${senderData.firstName || ''} ${senderData.lastName || ''}`.trim() || senderData.username || 'Monvera Member';
   const senderAcc = senderData.permanentAccountNumber || senderData.accountNumber || '1000000000';
 
@@ -1029,6 +1037,7 @@ export interface DepositParams {
   providerPaymentId?: string;
   referenceNumber?: string;
   metadata?: Record<string, any>;
+  allowFrozenSettlement?: boolean;
 }
 
 export interface DepositResult {
@@ -1053,16 +1062,28 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
   // 1. Fetch user profile metadata from Firestore to enrich records
   let userAcc = '1000000000';
   let userName = 'Monvera Client';
+  let isUserFrozen = false;
   try {
     const uSnap = await adminFirestore.collection('users').doc(userId).get();
     if (uSnap.exists) {
       const ud = uSnap.data()!;
+      if (ud.status === 'frozen') {
+        isUserFrozen = true;
+      }
       userAcc = ud.permanentAccountNumber || ud.accountNumber || '1000000000';
       const first = ud.firstName || '';
       const last = ud.lastName || '';
       userName = `${first} ${last}`.trim() || ud.username || 'Monvera Client';
     }
   } catch {}
+
+  // Enforce deposit restriction for frozen accounts unless it is an existing verified settlement
+  if (isUserFrozen && !providerPaymentId?.startsWith('STRIPE-') && !params.allowFrozenSettlement) {
+    return {
+      success: false,
+      error: 'Your account is currently restricted/frozen. New deposits are disabled. Please contact compliance support.',
+    };
+  }
 
   const finalRef = referenceNumber || providerPaymentId || `MV-DEP-${Math.floor(100000000 + Math.random() * 900000000)}`;
   const txId = `tx_dep_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
@@ -2179,6 +2200,16 @@ export async function executeServerLoanRepayment(
     return { success: false, error: 'Loan ID, user ID, and a positive repayment amount are required.' };
   }
 
+  // Check account freeze status before any repayment debit
+  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return {
+      success: false,
+      error: 'Your account is currently restricted/frozen. Loan repayments are disabled while the account is frozen. Please contact compliance support.',
+    };
+  }
+
   const repayAmount = Number(Number(amount).toFixed(2));
   const loanRef = adminFirestore.collection('loans').doc(loanId);
   const accRef = adminFirestore.collection('accounts').doc(userId);
@@ -2468,6 +2499,16 @@ export async function executeServerInvestmentCreation(
 
   if (!userId) {
     return { success: false, error: 'Customer user ID is required.' };
+  }
+
+  // Check account freeze status before creating investment
+  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return {
+      success: false,
+      error: 'Your account is currently restricted/frozen. New term investments are disabled while the account is frozen. Please contact compliance support.',
+    };
   }
 
   const validTerms: InvestmentTermDays[] = [60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360];

@@ -2185,27 +2185,50 @@ export const api = {
     userEmail?: string
   ): Promise<{ loans: LoanApplication[] }> {
     try {
+      const authHeaders = await getAuthHeaders();
       const queryParams = new URLSearchParams();
       if (userId) queryParams.set('userId', userId);
       if (userAccountNumber) queryParams.set('accountNumber', userAccountNumber);
       if (userEmail) queryParams.set('email', userEmail);
       const url = `/api/loans${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: authHeaders });
       const data = await parseJsonResponse<{ loans: LoanApplication[] }>(res, { loans: [] });
       
-      // Also merge with Firestore permanent loans
+      // When queried for a specific user, ensure strict scoping to that user's UID
       if (userId) {
         const fsLoans = await firestoreSync.getLoansForUser(userId, userAccountNumber, userEmail);
         const map = new Map<string, LoanApplication>();
-        (data.loans || []).forEach((l) => map.set(l.id, l));
-        fsLoans.forEach((l) => map.set(l.id, l));
-        return { loans: Array.from(map.values()) };
+        // Only accept loans that match the requested userId
+        (data.loans || []).forEach((l) => {
+          if (l && l.id && l.userId === userId) map.set(l.id, l);
+        });
+        // Authoritative Firestore loans override any stale in-memory data
+        fsLoans.forEach((l) => {
+          if (l && l.id && l.userId === userId) map.set(l.id, l);
+        });
+        return {
+          loans: Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          ),
+        };
       } else {
-        const fsLoans = await firestoreSync.getAllLoans();
-        const map = new Map<string, LoanApplication>();
-        (data.loans || []).forEach((l) => map.set(l.id, l));
-        fsLoans.forEach((l) => map.set(l.id, l));
-        return { loans: Array.from(map.values()) };
+        // Full loan listings only for authorized administrators
+        const currentEmail = auth.currentUser?.email?.toLowerCase().trim();
+        const currentUid = auth.currentUser?.uid;
+        const isCallerAdmin = currentEmail === 'daneybil2020@gmail.com' || currentEmail === 'admin@monvera.com' || currentUid === 'usr_admin' || currentUid === 'admin';
+        if (isCallerAdmin) {
+          const fsLoans = await firestoreSync.getAllLoans().catch(() => []);
+          const map = new Map<string, LoanApplication>();
+          (data.loans || []).forEach((l) => map.set(l.id, l));
+          fsLoans.forEach((l) => map.set(l.id, l));
+          return {
+            loans: Array.from(map.values()).sort(
+              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            ),
+          };
+        }
+        // Non-admin callers without a userId must never trigger a full-collection query
+        return { loans: [] };
       }
     } catch {
       return { loans: [] };

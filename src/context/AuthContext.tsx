@@ -204,10 +204,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [activeModal, setActiveModal] = useState<'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null>(null);
 
   const setCurrentView = useCallback((view: AppView) => {
-    setCurrentViewState(view);
+    const targetView = (view === 'security' as any) ? 'profile' : view;
+    setCurrentViewState(targetView);
     try {
       if (typeof window !== 'undefined') {
-        if (view === 'admin') {
+        if (targetView === 'admin') {
           if (window.location.pathname.toLowerCase() !== '/monveramv') {
             window.history.pushState(null, '', '/MonveraMV');
           }

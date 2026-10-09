@@ -107,10 +107,10 @@ export const SecurityProtocolsPage: React.FC = () => {
         </button>
         {currentUser ? (
           <button
-            onClick={() => setCurrentView('security')}
+            onClick={() => setCurrentView('profile')}
             className="px-6 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-base transition-colors shadow-lg"
           >
-            Configure Your Security Settings
+            View Your Account Clearance
           </button>
         ) : (
           <button

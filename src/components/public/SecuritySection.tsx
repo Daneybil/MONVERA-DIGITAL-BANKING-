@@ -107,12 +107,12 @@ export const SecuritySection: React.FC = () => {
           </div>
           <button
             onClick={() => {
-              if (currentUser) setCurrentView('security');
+              if (currentUser) setCurrentView('profile');
               else openModal('auth_login');
             }}
             className="w-full md:w-auto whitespace-nowrap px-7 py-4 rounded-xl text-base font-black text-white bg-gradient-to-b from-emerald-600 via-emerald-700 to-emerald-800 hover:from-emerald-500 hover:to-emerald-700 border-2 border-emerald-400 border-b-[5px] border-b-emerald-950 shadow-xl active:translate-y-1 active:border-b-[2px] transition-all cursor-pointer flex-shrink-0"
           >
-            {currentUser ? 'Open Security Center' : 'Review Security Protocols'}
+            {currentUser ? 'View Account Clearance' : 'Review Security Protocols'}
           </button>
         </div>
 

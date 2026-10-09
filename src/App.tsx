@@ -23,7 +23,6 @@ import { TransactionsView } from './components/dashboard/TransactionsView';
 import { InvestmentsView } from './components/dashboard/InvestmentsView';
 import { CardsView } from './components/dashboard/CardsView';
 import { LoansView } from './components/dashboard/LoansView';
-import { SecurityView } from './components/dashboard/SecurityView';
 import { ProfileView } from './components/dashboard/ProfileView';
 import { BusinessBankingView } from './components/dashboard/BusinessBankingView';
 import { AdminDashboard } from './components/admin/AdminDashboard';
@@ -361,8 +360,7 @@ const AppContent: React.FC = () => {
         {currentView === 'investments' && <InvestmentsView />}
         {currentView === 'cards' && <CardsView />}
         {currentView === 'loans' && <LoansView />}
-        {currentView === 'security' && <SecurityView />}
-        {currentView === 'profile' && <ProfileView />}
+        {(currentView === 'profile' || currentView === 'security') && <ProfileView />}
         {currentView === 'business' && <BusinessBankingView />}
 
         {/* Global Modals */}

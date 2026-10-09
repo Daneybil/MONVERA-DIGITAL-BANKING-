@@ -654,11 +654,31 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
 });
 
 // Internal Transfer (between Checking & Savings)
-app.post('/api/transfers/internal', (req: Request, res: Response) => {
-  const { userId, fromAccountType, toAccountType, amount, description } = req.body;
+app.post('/api/transfers/internal', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { userId: reqUserId, fromAccountType, toAccountType, amount, description } = req.body;
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+  const userId = (callerUid && !isCallerAdmin) ? callerUid : (reqUserId || callerUid);
 
   if (!userId || !fromAccountType || !toAccountType || !amount || amount <= 0) {
     return res.status(400).json({ error: 'All transfer fields are required.' });
+  }
+
+  // Check account freeze status
+  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return res.status(403).json({
+      error: 'Your account is currently restricted/frozen. Internal transfers are disabled. Please contact compliance support.',
+    });
   }
 
   const metrics = db.getUserBalanceMetrics(userId);
@@ -685,10 +705,29 @@ app.post('/api/transfers/internal', (req: Request, res: Response) => {
 // --- DEPOSITS & PAYMENT GATEWAY VERIFICATION ---
 app.post('/api/deposits/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { amount, method, destinationAccountType, providerPaymentId, referenceNumber, metadata } = req.body;
-  const targetUserId = req.body.userId || req.auth?.uid;
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (req.body.userId || callerUid);
 
   if (!targetUserId || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Valid user ID and positive amount are required.' });
+  }
+
+  // Check account freeze status
+  const userDocSnap = await adminFirestore.collection('users').doc(targetUserId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return res.status(403).json({
+      error: 'Your account is currently restricted/frozen. New deposits are disabled. Please contact compliance support.',
+    });
   }
 
   try {
@@ -731,11 +770,31 @@ app.post('/api/deposits/create', optionalFirebaseAuth, async (req: Authenticated
 });
 
 // --- STRIPE INTEGRATION (DEPOSITS) ---
-app.post('/api/stripe/create-checkout-session', async (req: Request, res: Response) => {
-  const { userId, amount, destinationAccountType, origin: clientOrigin } = req.body;
+app.post('/api/stripe/create-checkout-session', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { userId: reqUserId, amount, destinationAccountType, origin: clientOrigin } = req.body;
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (reqUserId || callerUid);
 
-  if (!userId || !amount || Number(amount) <= 0) {
+  if (!targetUserId || !amount || Number(amount) <= 0) {
     return res.status(400).json({ error: 'Valid user ID and deposit amount are required.' });
+  }
+
+  // Check account freeze status before generating checkout session
+  const userDocSnap = await adminFirestore.collection('users').doc(targetUserId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return res.status(403).json({
+      error: 'Your account is currently restricted/frozen. New deposits are disabled. Please contact compliance support.',
+    });
   }
 
   const numAmount = Number(amount);
@@ -751,7 +810,7 @@ app.post('/api/stripe/create-checkout-session', async (req: Request, res: Respon
 
   try {
     const origin = clientOrigin || req.headers.origin || `http://localhost:${PORT}`;
-    const user = db.users.get(userId);
+    const user = db.users.get(targetUserId);
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -772,9 +831,9 @@ app.post('/api/stripe/create-checkout-session', async (req: Request, res: Respon
       ],
       mode: 'payment',
       customer_email: user?.email,
-      client_reference_id: userId,
+      client_reference_id: targetUserId,
       metadata: {
-        userId,
+        userId: targetUserId,
         amount: String(numAmount),
         destinationAccountType: destinationAccountType || 'CHECKING',
         customerAccountNumber: user?.permanentAccountNumber || '',
@@ -1314,10 +1373,29 @@ app.get('/api/investments', optionalFirebaseAuth, async (req: AuthenticatedReque
 
 app.post('/api/investments/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { termDays, amount, userAccountNumber, clientRequestId, fallbackUser } = req.body;
-  const userId = req.auth?.uid || req.body.userId;
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+  const userId = (callerUid && !isCallerAdmin) ? callerUid : (req.auth?.uid || req.body.userId);
 
   if (!userId || !termDays || !amount) {
     return res.status(400).json({ error: 'User ID, term duration, and amount are required.' });
+  }
+
+  // Check account freeze status before investment creation
+  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return res.status(403).json({
+      error: 'Your account is currently restricted/frozen. New investments are disabled while the account is frozen. Please contact compliance support.',
+    });
   }
 
   try {
@@ -1667,7 +1745,22 @@ app.post('/api/admin/customers/:id/toggle-status', (req: Request, res: Response)
   res.json({ success: true, user });
 });
 
-app.post('/api/user/unfreeze', (req: Request, res: Response) => {
+app.post('/api/user/unfreeze', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+
+  if (!isCallerAdmin) {
+    return res.status(403).json({ error: 'Customer self-unfreeze is disabled. Only authorized compliance administrators can unfreeze accounts.' });
+  }
+
   const { userId, reason } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
@@ -1904,13 +1997,73 @@ app.get('/api/admin/audit-logs', (req: Request, res: Response) => {
 });
 
 // --- LOANS & CREDIT FACILITY API ---
-app.get('/api/loans', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
-  let loanList = Array.from(db.loans.values());
-  if (userId) {
-    loanList = loanList.filter((l) => l.userId === userId);
+app.get('/api/loans', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth!.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
   }
-  res.json({ loans: loanList });
+
+  const requestedUserId = req.query.userId as string | undefined;
+
+  // Ordinary customers must receive only loans belonging to their authenticated Firebase UID.
+  // Reject requests attempting to access another user's loans.
+  if (!isCallerAdmin) {
+    if (requestedUserId && requestedUserId !== callerUid) {
+      return res.status(403).json({
+        error: 'FORBIDDEN: You are not authorized to view another customer\'s loans.',
+      });
+    }
+  }
+
+  const targetUserId = isCallerAdmin ? requestedUserId : callerUid;
+
+  try {
+    const loanMap = new Map<string, any>();
+
+    if (targetUserId) {
+      // Query authoritative Firestore for the specific user
+      const fsSnap = await adminFirestore.collection('loans').where('userId', '==', targetUserId).get();
+      fsSnap.forEach((doc) => {
+        const data = doc.data();
+        if (data && data.id) loanMap.set(data.id, data);
+      });
+
+      // Also merge in-memory loans if matched by userId
+      Array.from(db.loans.values()).forEach((l) => {
+        if (l.userId === targetUserId && !loanMap.has(l.id)) {
+          loanMap.set(l.id, l);
+        }
+      });
+    } else if (isCallerAdmin) {
+      // Full loan listings only for authorized administrators
+      const fsSnap = await adminFirestore.collection('loans').get();
+      fsSnap.forEach((doc) => {
+        const data = doc.data();
+        if (data && data.id) loanMap.set(data.id, data);
+      });
+
+      Array.from(db.loans.values()).forEach((l) => {
+        if (!loanMap.has(l.id)) {
+          loanMap.set(l.id, l);
+        }
+      });
+    }
+
+    const loanList = Array.from(loanMap.values()).sort(
+      (a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+
+    return res.json({ loans: loanList });
+  } catch (err: any) {
+    console.error('[/api/loans Error]', err);
+    return res.status(500).json({ error: 'Failed to retrieve loan records.' });
+  }
 });
 
 app.get('/api/loans/eligibility', (req: Request, res: Response) => {
@@ -1932,7 +2085,25 @@ app.post('/api/loans/apply', optionalFirebaseAuth, async (req: AuthenticatedRequ
   }
 
   const callerUid = req.auth?.uid;
-  const effectiveUserId = callerUid || userId;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+  const effectiveUserId = (callerUid && !isCallerAdmin) ? callerUid : (callerUid || userId);
+
+  // Check account freeze status before loan application
+  const userDocSnap = await adminFirestore.collection('users').doc(effectiveUserId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return res.status(403).json({
+      error: 'Your account is currently restricted/frozen. Loan applications are disabled. Please contact compliance support.',
+    });
+  }
 
   // 1. Authoritative server-side check in Firestore
   const outstandingCheck = await checkUserHasOutstandingLoan({
@@ -2017,10 +2188,29 @@ app.post('/api/admin/loans/reject', (req: Request, res: Response) => {
 
 app.post('/api/loans/repay', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { loanId, amount, sourceAccountId, note, referenceNumber, fallbackLoan, fallbackUser } = req.body;
-  const userId = req.auth?.uid || req.body.userId;
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+  const userId = (callerUid && !isCallerAdmin) ? callerUid : (req.auth?.uid || req.body.userId);
 
   if (!loanId || !userId || !amount) {
     return res.status(400).json({ error: 'loanId, userId, and repayment amount are required.' });
+  }
+
+  // Check account freeze status before loan repayment
+  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  if (userData.status === 'frozen') {
+    return res.status(403).json({
+      error: 'Your account is currently restricted/frozen. Loan repayments are disabled while the account is frozen. Please contact compliance support.',
+    });
   }
 
   try {

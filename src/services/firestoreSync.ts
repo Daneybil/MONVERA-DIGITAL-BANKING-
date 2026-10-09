@@ -507,24 +507,7 @@ export const firestoreSync = {
           } catch {}
         }
 
-        // Check local storage for active loans
-        try {
-          const raw = localStorage.getItem('monvera_permanent_loans');
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-              parsed.forEach((l: LoanApplication) => {
-                const matches = l.userId === userId ||
-                  (userAccountNumber && l.permanentAccountNumber === userAccountNumber) ||
-                  (userEmail && l.applicantEmail?.toLowerCase() === userEmail.toLowerCase());
-                if (matches && !candidateLoans.some((x) => x.id === l.id)) {
-                  candidateLoans.push(l);
-                }
-              });
-            }
-          }
-        } catch {}
-
+        // Candidate loans are strictly gathered from authoritative Firestore queries
         candidateLoans.forEach((lData) => {
           if (lData.status === 'ACTIVE' || lData.status === 'APPROVED') {
             const hasLoanNotif = notifs.some(
@@ -2387,14 +2370,6 @@ export const firestoreSync = {
   async saveLoanApplication(loan: LoanApplication): Promise<{ success: boolean; error?: string }> {
     if (!loan || !loan.id) return { success: false, error: 'Invalid loan payload' };
 
-    // 1. Save to local permanent cache
-    try {
-      const localStr = localStorage.getItem('monvera_permanent_loans');
-      const existing: LoanApplication[] = localStr ? JSON.parse(localStr) : [];
-      const updated = [loan, ...existing.filter((l) => l.id !== loan.id)];
-      localStorage.setItem('monvera_permanent_loans', JSON.stringify(updated));
-    } catch {}
-
     if (!db) return { success: true };
 
     const path = `loans/${loan.id}`;
@@ -2441,90 +2416,99 @@ export const firestoreSync = {
 
   async getLoansForUser(
     userId: string,
-    userAccountNumber?: string,
-    userEmail?: string
+    _userAccountNumber?: string,
+    _userEmail?: string
   ): Promise<LoanApplication[]> {
-    if (!userId) return [];
-    const userCleanAcc = (userAccountNumber || '').replace(/[-\s]/g, '');
-    const cleanEmail = (userEmail || '').toLowerCase().trim();
-
-    let localList: LoanApplication[] = [];
-    try {
-      const localStr = localStorage.getItem('monvera_permanent_loans');
-      if (localStr) {
-        const parsed: LoanApplication[] = JSON.parse(localStr);
-        localList = parsed.filter((l) => {
-          const lCleanAcc = (l.permanentAccountNumber || '').replace(/[-\s]/g, '');
-          const lEmail = (l.applicantEmail || '').toLowerCase().trim();
-          return (
-            l.userId === userId ||
-            (userCleanAcc && lCleanAcc === userCleanAcc) ||
-            (cleanEmail && lEmail === cleanEmail)
-          );
-        });
-      }
-    } catch {}
-
-    if (!db) return localList;
+    if (!userId || !userId.trim()) return [];
+    if (!db) return [];
 
     const path = 'loans';
     try {
       const colRef = collection(db, 'loans');
-      const q = query(colRef, where('userId', '==', userId));
+      const q = query(colRef, where('userId', '==', userId.trim()));
       const snap = await getDocs(q);
-      const map = new Map<string, LoanApplication>();
-      localList.forEach((l) => map.set(l.id, l));
+      const list: LoanApplication[] = [];
       snap.forEach((d) => {
         const item = d.data() as LoanApplication;
-        map.set(item.id || d.id, item);
+        if (item && item.id && item.userId === userId.trim()) {
+          list.push(item);
+        }
       });
-      return Array.from(map.values()).sort(
+      return list.sort(
         (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
       );
     } catch (err) {
       handleFirestoreError(err, OperationType.LIST, path);
-      return localList;
+      return [];
     }
   },
 
   async getAllLoans(): Promise<LoanApplication[]> {
-    let localList: LoanApplication[] = [];
-    try {
-      const localStr = localStorage.getItem('monvera_permanent_loans');
-      if (localStr) localList = JSON.parse(localStr);
-    } catch {}
-
-    if (!db) return localList;
+    if (!db) return [];
 
     const path = 'loans';
     try {
       const colRef = collection(db, 'loans');
       const snap = await getDocs(colRef);
-      const map = new Map<string, LoanApplication>();
-      localList.forEach((l) => map.set(l.id, l));
+      const list: LoanApplication[] = [];
       snap.forEach((d) => {
         const item = d.data() as LoanApplication;
-        map.set(item.id || d.id, item);
+        if (item && item.id) {
+          list.push(item);
+        }
       });
-      return Array.from(map.values()).sort(
+      return list.sort(
         (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
       );
     } catch (err) {
       handleFirestoreError(err, OperationType.LIST, path);
-      return localList;
+      return [];
     }
   },
 
   subscribeToLoans(onUpdate: (loans: LoanApplication[]) => void, userId?: string): () => void {
     if (!db) {
-      this.getAllLoans().then(onUpdate);
       return () => {};
     }
     try {
       const colRef = collection(db, 'loans');
-      const qLoans = userId ? query(colRef, where('userId', '==', userId)) : colRef;
+
+      // 1. Scoped customer subscription: query strictly by authenticated Firebase UID
+      if (userId && userId.trim()) {
+        const qLoans = query(colRef, where('userId', '==', userId.trim()));
+        const unsubscribe = onSnapshot(
+          qLoans,
+          (snap) => {
+            const list: LoanApplication[] = [];
+            snap.forEach((d) => {
+              const item = d.data() as LoanApplication;
+              if (item && item.userId === userId.trim()) {
+                list.push(item);
+              }
+            });
+            list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            onUpdate(list);
+          },
+          (error) => {
+            console.warn('[Firestore loans subscription notice]:', error);
+          }
+        );
+        return unsubscribe;
+      }
+
+      // 2. Full collection subscription is strictly restricted to verified administrators
+      const currentEmail = auth.currentUser?.email?.toLowerCase().trim();
+      const currentUid = auth.currentUser?.uid;
+      const isCallerAdmin = currentEmail === 'daneybil2020@gmail.com' || currentEmail === 'admin@monvera.com' || currentUid === 'usr_admin' || currentUid === 'admin';
+
+      if (!isCallerAdmin) {
+        // A missing UID must never trigger a full-collection query or listener for non-admin
+        onUpdate([]);
+        return () => {};
+      }
+
       const unsubscribe = onSnapshot(
-        qLoans,
+        colRef,
         (snap) => {
           const list: LoanApplication[] = [];
           snap.forEach((d) => list.push(d.data() as LoanApplication));

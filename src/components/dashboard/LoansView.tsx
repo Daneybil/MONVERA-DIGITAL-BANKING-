@@ -150,21 +150,7 @@ export const LoansView: React.FC = () => {
     description: 'A minimum of $2,000.00 in account transaction volume or deposits is required to unlock your first credit facility.',
   });
 
-  const [loans, setLoans] = useState<LoanApplication[]>(() => {
-    if (typeof window === 'undefined') return [];
-    try {
-      const raw = localStorage.getItem('monvera_permanent_loans');
-      if (raw) {
-        const parsed: LoanApplication[] = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          return parsed.sort(
-            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          );
-        }
-      }
-    } catch {}
-    return [];
-  });
+  const [loans, setLoans] = useState<LoanApplication[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
@@ -195,7 +181,10 @@ export const LoansView: React.FC = () => {
   };
 
   const loadData = async () => {
-    if (!currentUser) return;
+    if (!currentUser?.id) {
+      setLoans([]);
+      return;
+    }
     setIsLoading(true);
     try {
       const [eligRes, loansRes] = await Promise.all([
@@ -205,14 +194,15 @@ export const LoansView: React.FC = () => {
 
       if (eligRes) setEligibility(eligRes);
       if (loansRes && Array.isArray(loansRes.loans)) {
-        setLoans((prev) => {
-          const map = new Map<string, LoanApplication>();
-          prev.forEach((l) => map.set(l.id, l));
-          loansRes.loans.forEach((l) => map.set(l.id, l));
-          return Array.from(map.values()).sort(
+        // Strictly filter to current authenticated user's UID only
+        const userOnlyLoans = loansRes.loans.filter((l) => l && l.userId === currentUser.id);
+        setLoans(
+          userOnlyLoans.sort(
             (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          );
-        });
+          )
+        );
+      } else {
+        setLoans([]);
       }
     } catch (err) {
       console.error('Error loading loan info:', err);
@@ -222,77 +212,52 @@ export const LoansView: React.FC = () => {
   };
 
   useEffect(() => {
+    // If not authenticated or logged out, immediately clear loans state and return
+    if (!currentUser?.id) {
+      setLoans([]);
+      setIsLoading(false);
+      return;
+    }
+
+    // Immediately clear previous user's loan state upon new user sign-in to eliminate stale records
+    setLoans([]);
+
     loadData();
 
-    if (currentUser?.id) {
-      const userCleanAcc = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
-      const userEmail = (currentUser.email || '').toLowerCase().trim();
+    // Subscribe ONLY to current user's loans using authenticated Firebase UID
+    const unsubscribe = firestoreSync.subscribeToLoans((userLoans) => {
+      const userOnlyLoans = userLoans.filter((l) => l && l.userId === currentUser.id);
+      setLoans(
+        userOnlyLoans.sort(
+          (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        )
+      );
+    }, currentUser.id);
 
-      const unsubscribe = firestoreSync.subscribeToLoans((allLoans) => {
-        const userLoans = allLoans.filter((l) => {
-          const lCleanAcc = (l.permanentAccountNumber || '').replace(/[-\s]/g, '');
-          const lEmail = (l.applicantEmail || '').toLowerCase().trim();
-          return (
-            l.userId === currentUser.id ||
-            (userCleanAcc && lCleanAcc === userCleanAcc) ||
-            (userEmail && lEmail === userEmail)
+    const handleLoanUpdated = (e: any) => {
+      const updatedLoan = e.detail?.loan;
+      if (updatedLoan && updatedLoan.userId === currentUser.id) {
+        setLoans((prev) => {
+          const map = new Map<string, LoanApplication>();
+          prev.filter((l) => l.userId === currentUser.id).forEach((l) => map.set(l.id, l));
+          map.set(updatedLoan.id, updatedLoan);
+          return Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
           );
         });
-        if (userLoans.length > 0) {
-          setLoans((prev) => {
-            const map = new Map<string, LoanApplication>();
-            prev.forEach((l) => map.set(l.id, l));
-            userLoans.forEach((l) => map.set(l.id, l));
-            return Array.from(map.values()).sort(
-              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-            );
-          });
-        }
-      }, currentUser.id);
+      }
+      loadData();
+    };
 
-      const handleLoanUpdated = (e: any) => {
-        const updatedLoan = e.detail?.loan;
-        if (updatedLoan) {
-          setLoans((prev) => {
-            const map = new Map<string, LoanApplication>();
-            prev.forEach((l) => map.set(l.id, l));
-            map.set(updatedLoan.id, updatedLoan);
-            return Array.from(map.values()).sort(
-              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-            );
-          });
-        }
-        loadData();
-      };
+    window.addEventListener('monvera_loan_updated', handleLoanUpdated);
 
-      const handleStorageChange = (e: StorageEvent) => {
-        if (e.key === 'monvera_permanent_loans' && e.newValue) {
-          try {
-            const list = JSON.parse(e.newValue);
-            if (Array.isArray(list)) {
-              setLoans((prev) => {
-                const map = new Map<string, LoanApplication>();
-                prev.forEach((l) => map.set(l.id, l));
-                list.forEach((l: LoanApplication) => map.set(l.id, l));
-                return Array.from(map.values()).sort(
-                  (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-                );
-              });
-            }
-          } catch {}
-        }
-      };
-
-      window.addEventListener('monvera_loan_updated', handleLoanUpdated);
-      window.addEventListener('storage', handleStorageChange);
-
-      return () => {
-        unsubscribe();
-        window.removeEventListener('monvera_loan_updated', handleLoanUpdated);
-        window.removeEventListener('storage', handleStorageChange);
-      };
-    }
-  }, [currentUser]);
+    return () => {
+      unsubscribe();
+      window.removeEventListener('monvera_loan_updated', handleLoanUpdated);
+      // Immediately clear previous user's loan state upon teardown
+      setLoans([]);
+    };
+  }, [currentUser?.id]);
 
   // Set default source account when repayment modal opens
   useEffect(() => {

@@ -108,7 +108,6 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
 
   const securityGovernanceItems: NavMenuItem[] = [
     { id: 'profile', label: 'Profile', sublabel: 'Verified KYC identity & daily limits', icon: User, actionType: 'view' },
-    { id: 'security', label: 'Security', sublabel: 'Hardware 2FA, passkeys & device logs', icon: ShieldCheck, actionType: 'view', badge: 'Encrypted' },
   ];
 
   const allNavItems = [...coreBankingItems, ...wealthItems, ...securityGovernanceItems];
@@ -427,18 +426,6 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
                     >
                       <User className="w-4 h-4 text-slate-500" />
                       <span>Profile & Account Settings</span>
-                    </button>
-
-                    <button
-                      id="menu-btn-security"
-                      onClick={() => {
-                        setCurrentView('security');
-                        setPersonaMenuOpen(false);
-                      }}
-                      className="w-full text-left px-3.5 py-2.5 text-xs font-bold text-slate-800 hover:text-slate-950 hover:bg-slate-50 rounded-xl flex items-center gap-2.5 transition-colors cursor-pointer"
-                    >
-                      <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                      <span>Security & Clearance</span>
                     </button>
 
                     {(currentUser.role === 'admin' || currentUser.role === 'super_admin') && (

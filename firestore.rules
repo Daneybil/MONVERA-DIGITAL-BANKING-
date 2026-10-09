@@ -72,13 +72,50 @@ service cloud.firestore {
 
     // Loans & credit facilities collection
     match /loans/{loanId} {
-      allow get, list, create, update: if true;
-      allow delete: if isSignedIn();
+      // Read: Admin or authenticated borrower who owns the record
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+
+      // Create: Admin or authenticated customer creating their own initial application
+      // Must have status == 'PENDING' and no privileged financial or approval fields set
+      allow create: if isAdmin() || (
+        isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'PENDING' &&
+        (!('disbursedAmount' in request.resource.data) || request.resource.data.disbursedAmount == 0) &&
+        (!('totalRepaid' in request.resource.data) || request.resource.data.totalRepaid == 0) &&
+        (!('approvedAt' in request.resource.data) || request.resource.data.approvedAt == '') &&
+        (!('approvedBy' in request.resource.data) || request.resource.data.approvedBy == '') &&
+        (!('disbursedAt' in request.resource.data) || request.resource.data.disbursedAt == '') &&
+        (!('rejectedAt' in request.resource.data) || request.resource.data.rejectedAt == '') &&
+        (!('rejectedBy' in request.resource.data) || request.resource.data.rejectedBy == '') &&
+        (!('repaymentHistory' in request.resource.data) || request.resource.data.repaymentHistory.size() == 0)
+      );
+
+      // Update: Admin or owner updating non-privileged fields only
+      // Customers cannot change status, disbursement, repayments, or other server-controlled fields
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == resource.data.status &&
+        request.resource.data.disbursedAmount == resource.data.disbursedAmount &&
+        request.resource.data.disbursedAt == resource.data.disbursedAt &&
+        request.resource.data.approvedAt == resource.data.approvedAt &&
+        request.resource.data.approvedBy == resource.data.approvedBy &&
+        request.resource.data.rejectedAt == resource.data.rejectedAt &&
+        request.resource.data.rejectedBy == resource.data.rejectedBy &&
+        request.resource.data.totalRepaid == resource.data.totalRepaid &&
+        request.resource.data.remainingBalance == resource.data.remainingBalance &&
+        request.resource.data.repaymentHistory == resource.data.repaymentHistory
+      );
+
+      // Delete: Admins only (customers cannot delete loans to evade debt)
+      allow delete: if isAdmin();
     }
 
     // Default match
     match /{document=**} {
-      allow read, write: if isSignedIn();
+      allow read, write: if false;
     }
   }
 }
