@@ -1535,44 +1535,61 @@ export const api = {
     }
   },
 
-  async toggleCustomerStatus(id: string, data: { adminId?: string; reason?: string; targetStatus?: 'active' | 'frozen' }): Promise<{ success: boolean; user?: UserProfile }> {
+  async toggleCustomerStatus(id: string, data: { adminId?: string; reason?: string; targetStatus?: 'active' | 'frozen' }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
     try {
-      // 1. Determine target status
-      let determinedStatus: 'active' | 'frozen' = data.targetStatus || 'frozen';
-      if (!data.targetStatus) {
-        const frozenRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_frozen_accounts') : null;
-        const isCurrentlyFrozen = frozenRaw && JSON.parse(frozenRaw).includes(id);
-        determinedStatus = isCurrentlyFrozen ? 'active' : 'frozen';
-      }
+      const headers = await getAuthHeaders();
 
-      // 2. Persist to Firestore and local registry immediately
-      await firestoreSync.updateUserStatus(id, determinedStatus);
-
-      // 3. Call server endpoint to update backend state & audit logs
+      // Call authoritative server endpoint to verify admin credentials, resolve canonical UID, and persist to Firestore
       const res = await fetch(`/api/admin/customers/${encodeURIComponent(id)}/toggle-status`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...data, targetStatus: determinedStatus }),
+        headers,
+        body: JSON.stringify(data),
       });
-      const parsed = await parseJsonResponse<any>(res, { success: true });
+
+      const parsed = await parseJsonResponse<any>(res, { success: false });
+      if (!res.ok || !parsed?.success) {
+        return { success: false, error: parsed?.error || 'Failed to toggle customer status.' };
+      }
+
+      const canonicalUid = parsed.canonicalUid || id;
+      const effectiveStatus: 'active' | 'frozen' = parsed.status || (parsed.user?.status as any) || 'frozen';
+
+      // Update local mirrors and dispatch event for immediate UI reflection
+      await firestoreSync.updateUserStatus(canonicalUid, effectiveStatus);
+      if (id !== canonicalUid) {
+        await firestoreSync.updateUserStatus(id, effectiveStatus);
+      }
+
       return {
         success: true,
-        user: parsed?.user || ({ id, status: determinedStatus } as UserProfile),
+        user: parsed.user || ({ id: canonicalUid, status: effectiveStatus } as UserProfile),
       };
-    } catch {
-      return { success: false };
+    } catch (err: any) {
+      console.error('[api.toggleCustomerStatus] Error:', err);
+      return { success: false, error: err?.message || 'Network error toggling customer status.' };
     }
   },
 
   async unfreezeUserAccount(userId: string, data: { pinOrPassword?: string; reason?: string }): Promise<{ success: boolean; error?: string }> {
     try {
-      await firestoreSync.updateUserStatus(userId, 'active');
+      const headers = await getAuthHeaders();
       const res = await fetch(`/api/user/unfreeze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ userId, ...data }),
       });
-      return await parseJsonResponse(res, { success: true });
+      const parsed = await parseJsonResponse<any>(res, { success: false });
+      if (!res.ok || !parsed?.success) {
+        return { success: false, error: parsed?.error || 'Failed to unfreeze account.' };
+      }
+
+      const canonicalUid = parsed.canonicalUid || userId;
+      await firestoreSync.updateUserStatus(canonicalUid, 'active');
+      if (userId !== canonicalUid) {
+        await firestoreSync.updateUserStatus(userId, 'active');
+      }
+
+      return { success: true };
     } catch {
       return { success: false, error: 'Failed to unfreeze account.' };
     }
@@ -1617,7 +1634,7 @@ export const api = {
           createdAt: now,
         }),
         kycStatus: 'verified',
-        status: 'active',
+        status: existing?.status === 'frozen' ? 'frozen' : (existing?.status || 'active'),
         kycVerifiedAt: now,
         dailyTransactionLimit: 1000000,
         kycRejectionReason: '',
@@ -2542,9 +2559,10 @@ export const api = {
     adminId?: string;
   }): Promise<{ success: boolean; loan?: LoanApplication; error?: string }> {
     try {
+      const headers = await getAuthHeaders();
       const res = await fetch('/api/admin/loans/reject', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(data),
       });
       const result = await parseJsonResponse<{ success: boolean; loan?: LoanApplication; error?: string }>(res, {

@@ -378,11 +378,12 @@ export const AdminDashboard: React.FC = () => {
     const now = new Date().toISOString();
 
     // 1. Instant optimistic UI update (0ms lag for Admin)
+    const effectiveStatus = existingCust?.status === 'frozen' ? 'frozen' : (existingCust?.status || 'active');
     const optimisticVerified = existingCust
       ? {
           ...existingCust,
           kycStatus: 'verified' as const,
-          status: 'active' as const,
+          status: effectiveStatus as UserStatus,
           dailyTransactionLimit: 1000000,
           kycVerifiedAt: now,
           kycRejectionReason: '',
@@ -409,7 +410,7 @@ export const AdminDashboard: React.FC = () => {
       updateUser({
         ...currentUser,
         kycStatus: 'verified',
-        status: 'active',
+        status: effectiveStatus,
         dailyTransactionLimit: 1000000,
         kycVerifiedAt: now,
         kycRejectionReason: '',

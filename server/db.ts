@@ -1805,7 +1805,7 @@ export class MonveraDatabase {
         membershipTier: 'Premier',
         twoFactorEnabled: false,
         createdAt: new Date().toISOString(),
-        status: 'active',
+        status: userProfile?.status || 'active',
         kycStatus: 'pending',
       };
       this.users.set(userId, user);

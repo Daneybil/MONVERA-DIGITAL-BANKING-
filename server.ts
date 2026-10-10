@@ -3,7 +3,7 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
-import { UserProfile, InvestmentTermDays } from './src/types';
+import { UserProfile, InvestmentTermDays, LoanApplication } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, AuthenticatedRequest } from './server/authMiddleware';
 import { adminFirestore } from './server/firebaseAdmin';
@@ -1697,52 +1697,115 @@ app.get('/api/admin/customers', (req: Request, res: Response) => {
   res.json({ customers });
 });
 
-app.post('/api/admin/customers/:id/toggle-status', (req: Request, res: Response) => {
+app.post('/api/admin/customers/:id/toggle-status', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const { adminId, reason, targetStatus } = req.body;
-  let user = db.users.get(id);
-  if (!user) {
-    user = Array.from(db.users.values()).find((u) => u.id === id || u.email === id);
+
+  // 1. Verify caller has administrative privileges
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
   }
 
+  if (!isCallerAdmin) {
+    return res.status(403).json({ error: 'FORBIDDEN: Only authorized compliance administrators can change customer freeze status.' });
+  }
+
+  // 2. Resolve target customer to canonical Firebase Auth UID
+  const resolved = await resolveRecipientUser(id);
+  if (!resolved.success || !resolved.uid) {
+    if (resolved.isAmbiguous) {
+      return res.status(400).json({ error: resolved.error || 'Ambiguous customer match. Target could not be uniquely resolved.' });
+    }
+    return res.status(404).json({ error: resolved.error || `Customer "${id}" could not be found in Monvera directory.` });
+  }
+
+  const canonicalUid = resolved.uid;
+
+  // 3. Determine next status
+  let nextStatus: 'active' | 'frozen';
+  if (targetStatus === 'active' || targetStatus === 'frozen') {
+    nextStatus = targetStatus;
+  } else {
+    // Read authoritative status from Firestore
+    const userDocSnap = await adminFirestore.collection('users').doc(canonicalUid).get();
+    const currentStatus = userDocSnap.exists ? (userDocSnap.data()?.status || 'active') : 'active';
+    nextStatus = currentStatus === 'frozen' ? 'active' : 'frozen';
+  }
+
+  const nowIso = new Date().toISOString();
+
+  // 4. Authoritatively persist status to Firestore users/{canonicalUid} via Firebase Admin
+  try {
+    await adminFirestore.collection('users').doc(canonicalUid).set(
+      {
+        status: nextStatus,
+        statusUpdatedAt: nowIso,
+        statusUpdatedBy: adminId || callerUid || 'usr_admin',
+        freezeReason: nextStatus === 'frozen' ? (reason || 'Administrative compliance audit') : null,
+      },
+      { merge: true }
+    );
+  } catch (err: any) {
+    console.error('Failed to persist customer status to Firestore:', err);
+    return res.status(500).json({ error: 'Failed to persist status change to authoritative database.' });
+  }
+
+  // 5. Update in-memory DB cache and target identifier mappings
+  let user = db.users.get(canonicalUid);
   if (!user) {
+    user = db.users.get(id);
+  }
+  if (!user) {
+    user = Array.from(db.users.values()).find((u) => u.id === canonicalUid || u.id === id || u.email === id);
+  }
+
+  if (user) {
+    user.status = nextStatus;
+    db.users.set(canonicalUid, user);
+  } else {
+    const existingData = resolved.data || {};
     const placeholderUser: UserProfile = {
-      id,
-      username: `user_${id.slice(0, 6)}`,
-      firstName: 'Account',
-      lastName: 'Holder',
-      email: `${id}@monvera.internal`,
-      phone: '+1 (555) 000-0000',
-      permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
-      status: targetStatus || 'frozen',
-      role: 'customer',
-      membershipTier: 'Premier',
-      twoFactorEnabled: false,
-      createdAt: new Date().toISOString(),
-      kycStatus: 'unverified',
-      country: 'United States',
+      id: canonicalUid,
+      username: existingData.username || `user_${canonicalUid.slice(0, 6)}`,
+      firstName: existingData.firstName || 'Account',
+      lastName: existingData.lastName || 'Holder',
+      email: existingData.email || `${canonicalUid}@monvera.internal`,
+      phone: existingData.phone || '+1 (555) 000-0000',
+      permanentAccountNumber: existingData.permanentAccountNumber || `10${Math.floor(10000000 + Math.random() * 90000000)}`,
+      status: nextStatus,
+      role: existingData.role || 'customer',
+      membershipTier: existingData.membershipTier || 'Premier',
+      twoFactorEnabled: existingData.twoFactorEnabled || false,
+      createdAt: existingData.createdAt || nowIso,
+      kycStatus: existingData.kycStatus || 'unverified',
+      country: existingData.country || 'United States',
       dailyTransactionLimit: 1000000,
     };
-    db.users.set(id, placeholderUser);
+    db.users.set(canonicalUid, placeholderUser);
     user = placeholderUser;
-  } else {
-    user.status = targetStatus || (user.status === 'active' ? 'frozen' : 'active');
   }
 
   db.auditLogs.unshift({
     id: `aud_${Date.now()}`,
-    adminId: adminId || 'usr_admin',
+    adminId: adminId || callerUid || 'usr_admin',
     adminName: 'Monvera Compliance Admin',
-    action: user.status === 'frozen' ? 'CUSTOMER_ACCOUNT_RESTRICTED' : 'CUSTOMER_ACCOUNT_UNFROZEN',
-    targetUserId: user.id,
+    action: nextStatus === 'frozen' ? 'CUSTOMER_ACCOUNT_RESTRICTED' : 'CUSTOMER_ACCOUNT_UNFROZEN',
+    targetUserId: canonicalUid,
     targetAccountNumber: user.permanentAccountNumber,
-    reason: reason || (user.status === 'frozen' ? 'Account placed on administrative freeze' : 'Administrative hold lifted'),
-    timestamp: new Date().toISOString(),
+    reason: reason || (nextStatus === 'frozen' ? 'Account placed on administrative freeze' : 'Administrative hold lifted'),
+    timestamp: nowIso,
     ipAddress: '127.0.0.1 (Admin Console)',
     result: 'SUCCESS',
   });
 
-  res.json({ success: true, user });
+  res.json({ success: true, user, status: nextStatus, canonicalUid });
 });
 
 app.post('/api/user/unfreeze', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
@@ -1764,9 +1827,34 @@ app.post('/api/user/unfreeze', optionalFirebaseAuth, async (req: AuthenticatedRe
   const { userId, reason } = req.body;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-  let user = db.users.get(userId);
+  // Resolve canonical UID
+  const resolved = await resolveRecipientUser(userId);
+  if (!resolved.success || !resolved.uid) {
+    return res.status(404).json({ error: resolved.error || `Customer "${userId}" could not be found.` });
+  }
+
+  const canonicalUid = resolved.uid;
+  const nowIso = new Date().toISOString();
+
+  // Persist unfreeze to Firestore users/{canonicalUid}
+  try {
+    await adminFirestore.collection('users').doc(canonicalUid).set(
+      {
+        status: 'active',
+        statusUpdatedAt: nowIso,
+        statusUpdatedBy: callerUid || 'usr_admin',
+        freezeReason: null,
+      },
+      { merge: true }
+    );
+  } catch (err: any) {
+    console.error('Failed to unfreeze in Firestore:', err);
+    return res.status(500).json({ error: 'Failed to update authoritative database.' });
+  }
+
+  let user = db.users.get(canonicalUid);
   if (!user) {
-    user = Array.from(db.users.values()).find((u) => u.id === userId || u.email === userId);
+    user = Array.from(db.users.values()).find((u) => u.id === canonicalUid || u.email === canonicalUid);
   }
 
   if (user) {
@@ -1775,18 +1863,18 @@ app.post('/api/user/unfreeze', optionalFirebaseAuth, async (req: AuthenticatedRe
 
   db.auditLogs.unshift({
     id: `aud_${Date.now()}`,
-    adminId: userId,
-    adminName: user ? `${user.firstName} ${user.lastName}` : 'Customer Self-Unfreeze',
+    adminId: callerUid || 'usr_admin',
+    adminName: 'Monvera Compliance Admin',
     action: 'CUSTOMER_ACCOUNT_UNFROZEN',
-    targetUserId: userId,
+    targetUserId: canonicalUid,
     targetAccountNumber: user?.permanentAccountNumber || '1000000000',
-    reason: reason || 'Customer completed security verification',
-    timestamp: new Date().toISOString(),
-    ipAddress: '127.0.0.1 (Customer Portal)',
+    reason: reason || 'Administrative compliance unfreeze',
+    timestamp: nowIso,
+    ipAddress: '127.0.0.1 (Admin Console)',
     result: 'SUCCESS',
   });
 
-  res.json({ success: true, status: 'active', user });
+  res.json({ success: true, status: 'active', user, canonicalUid });
 });
 
 // Admin KYC Approval & Rejection Endpoints
@@ -2178,12 +2266,83 @@ app.post('/api/admin/loans/approve', optionalFirebaseAuth, async (req: Authentic
   }
 });
 
-app.post('/api/admin/loans/reject', (req: Request, res: Response) => {
+app.post('/api/admin/loans/reject', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { loanId, reason, adminId } = req.body;
   if (!loanId) return res.status(400).json({ error: 'loanId is required.' });
-  const result = db.adminRejectLoan({ loanId, reason: reason || 'Application declined by compliance', adminId: adminId || 'usr_admin' });
-  if (!result.success) return res.status(400).json({ error: result.error });
-  res.json(result);
+
+  const callerUid = req.auth?.uid;
+  let isCallerAdmin = req.auth?.role === 'admin' || req.auth?.role === 'super_admin' || req.auth?.email === 'daneybil2020@gmail.com' || req.auth?.email === 'admin@monvera.com';
+  if (!isCallerAdmin && callerUid) {
+    try {
+      const uDoc = await adminFirestore.collection('users').doc(callerUid).get();
+      if (uDoc.exists && (uDoc.data()?.role === 'admin' || uDoc.data()?.role === 'super_admin')) {
+        isCallerAdmin = true;
+      }
+    } catch {}
+  }
+
+  if (!isCallerAdmin) {
+    return res.status(403).json({ error: 'FORBIDDEN: Only authorized compliance administrators can reject loan applications.' });
+  }
+
+  const effectiveAdminId = adminId || callerUid || 'usr_admin';
+  const nowIso = new Date().toISOString();
+  const rejectionReason = reason || 'Application declined by compliance';
+
+  // 1. Authoritatively update Firestore loan document
+  let loanData: LoanApplication | null = null;
+  try {
+    const loanDocRef = adminFirestore.collection('loans').doc(loanId);
+    const loanSnap = await loanDocRef.get();
+    if (loanSnap.exists) {
+      loanData = loanSnap.data() as LoanApplication;
+      await loanDocRef.set(
+        {
+          status: 'REJECTED',
+          rejectedAt: nowIso,
+          rejectionReason,
+          rejectedBy: effectiveAdminId,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      loanData.status = 'REJECTED';
+      loanData.rejectedAt = nowIso;
+      loanData.rejectionReason = rejectionReason;
+      loanData.rejectedBy = effectiveAdminId;
+      loanData.updatedAt = nowIso;
+
+      // Dispatch security notification to borrower
+      if (loanData.userId) {
+        const notifId = `notif_${Date.now()}_loan_rej`;
+        await adminFirestore.collection('notifications').doc(notifId).set(
+          {
+            id: notifId,
+            userId: loanData.userId,
+            title: 'Loan Application Update',
+            message: `Your credit facility application (#${loanId.slice(-6).toUpperCase()}) was declined. Reason: "${rejectionReason}".`,
+            type: 'SYSTEM',
+            severity: 'error',
+            read: false,
+            createdAt: nowIso,
+            referenceId: loanId,
+          },
+          { merge: true }
+        );
+      }
+    }
+  } catch (fsErr) {
+    console.error('[/api/admin/loans/reject] Firestore error:', fsErr);
+    return res.status(500).json({ error: 'Failed to persist loan rejection to authoritative database.' });
+  }
+
+  // 2. Sync to in-memory db
+  const result = db.adminRejectLoan({ loanId, reason: rejectionReason, adminId: effectiveAdminId });
+  if (!result.success && !loanData) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json({ success: true, loan: loanData || result.loan });
 });
 
 app.post('/api/loans/repay', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {

@@ -402,7 +402,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     );
 
-    // 2. Real-time Firestore profile listener under users/{effectiveUid} for instant KYC status reflection
+    // 2. Real-time Firestore profile listener under users/{effectiveUid} for instant KYC status reflection & frozen enforcement
     const unsubProfile = firestoreSync.subscribeToUserProfile(
       effectiveUid,
       (updatedProfile) => {
@@ -412,9 +412,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             const effectiveKyc = (prev.kycStatus === 'verified' && updatedProfile.kycStatus !== 'verified')
               ? 'verified'
               : (updatedProfile.kycStatus || prev.kycStatus);
+            // Invariant: authoritatively accept the Firestore status (whether frozen or active)
+            const effectiveStatus = updatedProfile.status || prev.status || 'active';
             return {
               ...prev,
               ...updatedProfile,
+              status: effectiveStatus,
               kycStatus: effectiveKyc,
               dailyTransactionLimit: effectiveKyc === 'verified' ? 1000000 : (updatedProfile.dailyTransactionLimit || prev.dailyTransactionLimit),
               avatarUrl: getPersistedAvatar(updatedProfile.id, updatedProfile.avatarUrl || prev.avatarUrl),
@@ -484,9 +487,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             const effectiveKyc = (prev.kycStatus === 'verified' && targetKyc !== 'verified')
               ? 'verified'
               : (targetKyc || prev.kycStatus);
+            // Invariant: If account is frozen, a KYC event must NEVER unfreeze it
+            const effectiveStatus = prev.status === 'frozen' ? 'frozen' : (detail.user.status || prev.status || 'active');
             return {
               ...prev,
               ...detail.user,
+              status: effectiveStatus,
               kycStatus: effectiveKyc,
               dailyTransactionLimit: effectiveKyc === 'verified' ? 1000000 : (detail.user.dailyTransactionLimit || prev.dailyTransactionLimit),
               avatarUrl: getPersistedAvatar(detail.userId, detail.user.avatarUrl || prev?.avatarUrl),
@@ -499,11 +505,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (prev.kycStatus === 'verified' && detail.kycStatus !== 'verified') {
               return prev;
             }
+            // Invariant: Preserve frozen status
+            const effectiveStatus = prev.status === 'frozen' ? 'frozen' : (prev.status || 'active');
             return {
               ...(prev as any),
               kycStatus: detail.kycStatus,
               dailyTransactionLimit: detail.kycStatus === 'verified' ? 1000000 : (prev?.dailyTransactionLimit || 25000),
-              status: 'active',
+              status: effectiveStatus,
             };
           });
         }
@@ -1708,10 +1716,16 @@ const unenrollTotpMfa = async (): Promise<{
         // storage fallback
       }
     }
-    setCurrentUser(user);
-    setAvailableUsers((prev) => prev.map((u) => (u.id === user.id ? user : u)));
-    // Also sync to Firestore
-    firestoreSync.saveUserProfile(user.id, user).catch((err) => {
+    // Invariant: Do not silently overwrite frozen status with active during ordinary profile/avatar updates
+    const effectiveStatus = currentUser?.status === 'frozen' && user.status === 'active' ? 'frozen' : (user.status || currentUser?.status || 'active');
+    const safeUser: UserProfile = {
+      ...user,
+      status: effectiveStatus,
+    };
+    setCurrentUser(safeUser);
+    setAvailableUsers((prev) => prev.map((u) => (u.id === user.id ? safeUser : u)));
+    // Also sync to Firestore without modifying frozen status
+    firestoreSync.saveUserProfile(user.id, safeUser).catch((err) => {
       console.warn('[Firestore] Background update error:', err);
     });
   };
