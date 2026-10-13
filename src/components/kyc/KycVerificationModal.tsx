@@ -41,10 +41,11 @@ interface KycVerificationModalProps {
 export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOpen, onClose }) => {
   const { currentUser, updateUser, refreshNotifications } = useAuth();
 
-  // Full Legal Name
+  // Full Legal Name: prioritized from newest valid legal name
   const [fullName, setFullName] = useState(
-    currentUser?.kycFullName ||
-      (currentUser?.firstName && currentUser?.lastName ? `${currentUser.firstName} ${currentUser.lastName}` : '')
+    currentUser?.firstName && currentUser?.lastName
+      ? `${currentUser.firstName} ${currentUser.lastName}`.trim()
+      : (currentUser?.kycFullName || currentUser?.fullName || '')
   );
   const [country, setCountry] = useState(currentUser?.kycCountry || currentUser?.country || 'United States');
   const [phone, setPhone] = useState(currentUser?.kycPhone || currentUser?.phone || '');
@@ -97,10 +98,11 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
   // Synchronize state when user changes
   useEffect(() => {
     if (currentUser) {
-      setFullName(
-        currentUser.kycFullName ||
-          (currentUser.firstName && currentUser.lastName ? `${currentUser.firstName} ${currentUser.lastName}` : '')
-      );
+      const derivedName =
+        currentUser.firstName && currentUser.lastName
+          ? `${currentUser.firstName} ${currentUser.lastName}`.trim()
+          : (currentUser.kycFullName || currentUser.fullName || '');
+      setFullName(derivedName);
       setCountry(currentUser.kycCountry || currentUser.country || 'United States');
       setPhone(currentUser.kycPhone || currentUser.phone || '');
       setEmail(currentUser.kycEmail || currentUser.email || '');
@@ -366,7 +368,6 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
         };
 
         updateUser(updatedUser);
-        await firestoreSync.saveUserProfile(currentUser.id, updatedUser);
         refreshNotifications();
 
         setSubmittedSuccess(true);

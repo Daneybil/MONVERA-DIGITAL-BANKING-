@@ -7,76 +7,164 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    // Cryptographic token & verified administrator check
     function isAdmin() {
       return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'admin' ||
+        request.auth.token.role == 'super_admin' ||
         request.auth.token.email == 'daneybil2020@gmail.com' ||
-        request.auth.token.email == 'admin@monvera.com' ||
-        request.auth.uid == 'usr_admin' ||
-        request.auth.uid == 'admin'
+        request.auth.token.email == 'admin@monvera.com'
       );
     }
 
-    // User profiles collection: accessible for profile display, directory matching, and admin governance
+    // 1. User Profiles Collection: users/{userId}
+    // Full profile reads restricted to the authentic owner or verified admin.
+    // Listing the entire collection is restricted to administrators.
+    // Privilege escalation prevention: Customers cannot modify roles, freeze status, or transaction limits.
+    // KYC Integrity: Customers cannot change kycStatus, kycVerifiedAt, or kycItemReviews.
+    // Legal Name Locking: If verified, customers cannot modify legal names without compliance review.
     match /users/{userId} {
-      allow get, list, create, update: if true;
+      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow list: if isAdmin();
+
+      allow create: if isAdmin() || (
+        isSignedIn() &&
+        request.auth.uid == userId &&
+        (!('role' in request.resource.data) || request.resource.data.role == 'customer') &&
+        (!('status' in request.resource.data) || request.resource.data.status == 'active') &&
+        (!('dailyTransactionLimit' in request.resource.data) || request.resource.data.dailyTransactionLimit <= 1000000) &&
+        (!('kycStatus' in request.resource.data) || request.resource.data.kycStatus == 'unverified') &&
+        (!('kycVerifiedAt' in request.resource.data) || request.resource.data.kycVerifiedAt == null) &&
+        (!('kycItemReviews' in request.resource.data) || request.resource.data.kycItemReviews == null)
+      );
+
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        request.auth.uid == userId &&
+        // Prevent role tampering
+        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role || (resource.data.role == null && request.resource.data.role == 'customer')) &&
+        // Prevent account status/freeze tampering
+        (!('status' in request.resource.data) || request.resource.data.status == resource.data.status) &&
+        // Prevent dailyTransactionLimit escalation
+        (!('dailyTransactionLimit' in request.resource.data) || request.resource.data.dailyTransactionLimit == resource.data.dailyTransactionLimit) &&
+        // Prevent KYC status self-promotion / tampering
+        (!('kycStatus' in request.resource.data) || request.resource.data.kycStatus == resource.data.kycStatus || (resource.data.kycStatus == null && request.resource.data.kycStatus == 'unverified')) &&
+        (!('kycVerifiedAt' in request.resource.data) || request.resource.data.kycVerifiedAt == resource.data.kycVerifiedAt) &&
+        (!('kycItemReviews' in request.resource.data) || request.resource.data.kycItemReviews == resource.data.kycItemReviews) &&
+        // Legal Name Locking: Verified customers cannot alter legal names directly
+        (resource.data.kycStatus != 'verified' || (
+          (!('firstName' in request.resource.data) || request.resource.data.firstName == resource.data.firstName) &&
+          (!('lastName' in request.resource.data) || request.resource.data.lastName == resource.data.lastName) &&
+          (!('fullName' in request.resource.data) || request.resource.data.fullName == resource.data.fullName) &&
+          (!('kycFullName' in request.resource.data) || request.resource.data.kycFullName == resource.data.kycFullName)
+        ))
+      );
+
       allow delete: if false;
+
+      // KYC Documents Subcollection: Private documents restricted to owner and administrator
+      match /kyc_documents/{docId} {
+        allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+        allow create, update, delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      }
     }
 
-    // Account balances collection: durable persistence for customer funds
+    // 2. Account Balances Collection: accounts/{userId}
+    // Restricted to authentic account owner and administrators.
+    // Direct client balance modifications are completely blocked;
+    // all balance adjustments occur authoritatively via Firebase Admin SDK.
     match /accounts/{userId} {
-      allow get, list, create, update: if true;
-      allow delete: if false;
+      allow get: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
     }
 
-    // Transactions collection: readable and writable for permanent ledger durability
+    // 3. Transactions Collection: transactions/{transactionId}
+    // Financial ledger integrity: Direct client writes, updates, or deletions are strictly prohibited.
+    // Authenticated customers can read only transactions where they are owner, sender, or recipient.
     match /transactions/{transactionId} {
-      allow get, list, create, update: if true;
-      allow delete: if false;
+      allow read: if isAdmin() || (
+        isSignedIn() && (
+          resource.data.userId == request.auth.uid ||
+          resource.data.senderUserId == request.auth.uid ||
+          resource.data.recipientUserId == request.auth.uid
+        )
+      );
+      allow create, update, delete: if isAdmin();
     }
 
-    // Support messages collection for WhatsApp live chat
-    match /support_messages/{messageId} {
-      allow get, list, create, update: if true;
-      allow delete: if true;
-    }
-
-    // Support typing indicator status
-    match /support_typing/{userId} {
-      allow get, list, create, update: if true;
-      allow delete: if true;
-    }
-
-    // Support tickets collection
-    match /support_tickets/{ticketId} {
-      allow get, list, create, update: if true;
-      allow delete: if true;
-    }
-
-    // Investments collection
+    // 4. Term Investments Collection: investments/{investmentId}
+    // Ownership enforced: Only the investment owner or administrator can view investment details.
+    // Financial fields (principal, returns, status) cannot be manipulated by client SDK.
     match /investments/{investmentId} {
-      allow get, list, create, update: if true;
-      allow delete: if false;
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create, update, delete: if isAdmin();
     }
 
-    // Cards collection
+    // 5. Debit & Virtual Cards Collection: cards/{cardId}
+    // Access restricted to the authentic card owner.
+    // Customers can manage only their own cards (freeze toggle, self spending limits).
     match /cards/{cardId} {
-      allow get, list, create, update: if true;
-      allow delete: if false;
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isAdmin() || (
+        isSignedIn() &&
+        request.resource.data.userId == request.auth.uid
+      );
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == request.auth.uid
+      );
+      allow delete: if isAdmin();
     }
 
-    // Notifications collection
+    // 6. Notifications Collection: notifications/{notificationId}
+    // Private notifications: Customers can access, update read status, and dismiss only their own notifications.
     match /notifications/{notificationId} {
-      allow get, list, create, update: if true;
-      allow delete: if true;
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isAdmin() || (
+        isSignedIn() &&
+        request.resource.data.userId == request.auth.uid
+      );
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == request.auth.uid
+      );
+      allow delete: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
     }
 
-    // Loans & credit facilities collection
+    // 7. Support Messages & Live Chat Collections
+    // Private support thread between the customer and compliance/support administrators.
+    match /support_messages/{messageId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isAdmin() || (isSignedIn() && request.resource.data.userId == request.auth.uid);
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.userId == request.auth.uid
+      );
+      allow delete: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+    }
+
+    match /support_typing/{userId} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow write: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+    }
+
+    match /support_tickets/{ticketId} {
+      allow read, write: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+    }
+
+    // 8. Loans & Credit Facilities Collection: loans/{loanId}
+    // Read: Admin or authenticated borrower who owns the record.
+    // Create: Enforces initial 'PENDING' status and zero disbursement/repayment fields.
+    // Update: Non-privileged owner updates only; financial fields and status are frozen from client tampering.
+    // Delete: Administrators only.
     match /loans/{loanId} {
-      // Read: Admin or authenticated borrower who owns the record
       allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
 
-      // Create: Admin or authenticated customer creating their own initial application
-      // Must have status == 'PENDING' and no privileged financial or approval fields set
       allow create: if isAdmin() || (
         isSignedIn() &&
         request.resource.data.userId == request.auth.uid &&
@@ -91,8 +179,6 @@ service cloud.firestore {
         (!('repaymentHistory' in request.resource.data) || request.resource.data.repaymentHistory.size() == 0)
       );
 
-      // Update: Admin or owner updating non-privileged fields only
-      // Customers cannot change status, disbursement, repayments, or other server-controlled fields
       allow update: if isAdmin() || (
         isSignedIn() &&
         resource.data.userId == request.auth.uid &&
@@ -109,14 +195,12 @@ service cloud.firestore {
         request.resource.data.repaymentHistory == resource.data.repaymentHistory
       );
 
-      // Delete: Admins only (customers cannot delete loans to evade debt)
       allow delete: if isAdmin();
     }
 
-    // Default match
+    // Default Fallback: Fail closed on all unspecified collections and paths
     match /{document=**} {
       allow read, write: if false;
     }
   }
 }
-

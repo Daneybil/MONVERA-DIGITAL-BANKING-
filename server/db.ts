@@ -63,7 +63,8 @@ export class MonveraDatabase {
       dailyTransactionLimit: 10000000,
     };
     this.users.set(adminId, adminUser);
-    this.userPasswords.set(adminId, 'Password123!');
+    // Note: Do not store plaintext administrator passwords in memory or source code.
+    // Legitimate administrator authentication is verified authoritatively via Firebase Authentication ID tokens.
 
     // Initialize Bank Accounts for Admin
     this.initUserAccounts(adminId, adminAccNum);
@@ -1811,15 +1812,34 @@ export class MonveraDatabase {
       this.users.set(userId, user);
     }
 
+    const userCountry = user.kycCountry || user.country || 'United States';
+    const isUS = userCountry.toLowerCase().includes('united states') ||
+                 userCountry.toUpperCase() === 'US' ||
+                 userCountry.toUpperCase() === 'USA';
+
+    const hasIdentity = !!(user.kycDocumentImage || user.kycDocumentNumber);
+    const hasAddress = !!(user.kycProofOfAddressImage || user.kycStreetAddress || user.address);
+    const hasLiveness = !!user.kycLiveSelfieImage;
+    const hasSsn = !!(user.kycSsn || user.kycSsnImage);
+
+    const missingDocs: string[] = [];
+    if (!hasIdentity) missingDocs.push('Government Identity Document');
+    if (!hasAddress) missingDocs.push('Proof of Address Document');
+    if (!hasLiveness) missingDocs.push('Biometric Live Selfie');
+    if (isUS && !hasSsn) missingDocs.push('US Social Security / Tax ID');
+
+    if (missingDocs.length > 0) {
+      return {
+        success: false,
+        error: `Cannot approve KYC: Required documents are missing from customer submission: ${missingDocs.join(', ')}.`,
+      };
+    }
+
     const now = new Date().toISOString();
     user.kycStatus = 'verified';
     user.kycVerifiedAt = now;
     user.dailyTransactionLimit = 1000000;
     user.kycRejectionReason = undefined;
-
-    const isUS = (user.kycCountry || user.country || '').toLowerCase().includes('united states') ||
-                 (user.kycCountry || user.country || '').toUpperCase() === 'US' ||
-                 (user.kycCountry || user.country || '').toUpperCase() === 'USA';
 
     user.kycItemReviews = {
       identity: { status: 'approved', reviewedAt: now, reviewedBy: adminId || 'usr_admin' },

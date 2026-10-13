@@ -484,59 +484,6 @@ export const firestoreSync = {
         } catch {}
       }
 
-      // Auto-reconcile notifications for active approved loans if missing
-      try {
-        const loansCol = collection(db, 'loans');
-        const candidateLoans: LoanApplication[] = [];
-        try {
-          const qLoans = query(loansCol, where('userId', '==', userId));
-          const loansSnap = await getDocs(qLoans);
-          loansSnap.forEach((lDoc) => candidateLoans.push(lDoc.data() as LoanApplication));
-        } catch {}
-
-        if (userAccountNumber) {
-          try {
-            const qAcc = query(loansCol, where('permanentAccountNumber', '==', userAccountNumber));
-            const snapAcc = await getDocs(qAcc);
-            snapAcc.forEach((lDoc) => {
-              const lData = lDoc.data() as LoanApplication;
-              if (!candidateLoans.some((x) => x.id === lData.id)) {
-                candidateLoans.push(lData);
-              }
-            });
-          } catch {}
-        }
-
-        // Candidate loans are strictly gathered from authoritative Firestore queries
-        candidateLoans.forEach((lData) => {
-          if (lData.status === 'ACTIVE' || lData.status === 'APPROVED') {
-            const hasLoanNotif = notifs.some(
-              (n) =>
-                n.referenceId === lData.id ||
-                n.id.includes(lData.id) ||
-                (n.title && n.title.includes('Loan Approved') && n.message?.includes(Number(lData.amount || 0).toLocaleString('en-US')))
-            );
-            if (!hasLoanNotif) {
-              const loanNotif: NotificationItem = {
-                id: `notif_loan_appr_${lData.id}`,
-                userId,
-                title: '🎉 Loan Approved & Disbursed!',
-                message: `Congratulations! Your credit facility for $${Number(lData.amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} has been approved and the capital has been credited directly into your Checking Account.`,
-                type: 'TRANSACTION',
-                severity: 'success',
-                read: false,
-                createdAt: lData.approvedAt || lData.updatedAt || new Date().toISOString(),
-                referenceId: lData.id,
-              };
-              notifs.unshift(loanNotif);
-              this.saveNotification(loanNotif).catch(() => {});
-            }
-          }
-        });
-      } catch (errNotifLoans) {
-        console.warn('[Firestore] Note checking loan notifications:', errNotifLoans);
-      }
-
       return notifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     } catch (err) {
       console.warn('[Firestore] Error fetching user notifications:', err);

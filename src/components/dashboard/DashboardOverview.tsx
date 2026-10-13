@@ -103,11 +103,8 @@ export const DashboardOverview: React.FC = () => {
       if (currentEffectiveUid) {
         try {
           const res = await api.getTransactions({ userId: currentEffectiveUid });
-          if (res?.transactions && res.transactions.length > 0) {
+          if (res?.transactions) {
             setRecentTransactions(res.transactions.slice(0, 8));
-          } else {
-            const fsTxs = await firestoreSync.getTransactionsForUser(currentEffectiveUid, currentUser?.permanentAccountNumber);
-            setRecentTransactions((fsTxs || []).slice(0, 8));
           }
         } catch {
           try {

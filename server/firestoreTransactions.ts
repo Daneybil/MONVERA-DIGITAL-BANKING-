@@ -845,7 +845,7 @@ export async function reverseServerFirestoreWithdrawal(
     return { success: false, error: `Transaction status is ${existingTx.status}, not PENDING.` };
   }
 
-  const effectiveUserId = userId || existingTx.userId || existingTx.senderUserId;
+  const effectiveUserId = existingTx.userId || existingTx.senderUserId || userId;
   if (!effectiveUserId) {
     return { success: false, error: 'Could not determine customer ID for withdrawal reversal.' };
   }

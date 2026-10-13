@@ -146,23 +146,38 @@ export const AdminDashboard: React.FC = () => {
           effectiveKycStatus = u.kycStatus || existing.kycStatus || 'unverified';
         }
 
+        const authoritative = isExistingFirestore ? existing : (isIncomingFirestore ? u : null);
+        const secondary = isExistingFirestore ? u : (isIncomingFirestore ? existing : null);
+
+        // Precedence: Authoritative Firestore record takes absolute precedence over local or server memory
+        const base = secondary || existing;
+        const top = authoritative || u;
+
         const mergedObj = {
-          ...existing,
-          ...u,
-          status: ((shouldBeFrozen || existing.status === 'frozen' || u.status === 'frozen') ? 'frozen' : (u.status || existing.status || 'active')) as UserStatus,
+          ...base,
+          ...top,
+          status: ((shouldBeFrozen || existing.status === 'frozen' || u.status === 'frozen') ? 'frozen' : (top.status || base.status || 'active')) as UserStatus,
           kycStatus: effectiveKycStatus,
           kycVerifiedAt: (effectiveKycStatus === 'verified')
-            ? (u.kycVerifiedAt || existing.kycVerifiedAt || new Date().toISOString())
-            : (u.kycVerifiedAt || existing.kycVerifiedAt),
-          kycDocumentImage: u.kycDocumentImage || existing.kycDocumentImage,
-          kycDocumentBackImage: u.kycDocumentBackImage || existing.kycDocumentBackImage,
-          kycProofOfAddressImage: u.kycProofOfAddressImage || existing.kycProofOfAddressImage,
-          kycLiveSelfieImage: u.kycLiveSelfieImage || existing.kycLiveSelfieImage,
-          kycSsn: u.kycSsn || existing.kycSsn,
-          kycSsnImage: u.kycSsnImage || existing.kycSsnImage,
-          kycDocumentNumber: u.kycDocumentNumber || existing.kycDocumentNumber,
-          kycDocumentType: u.kycDocumentType || existing.kycDocumentType,
-          balanceMetrics: resolveCustomerBalances(u.id, accKey, u.balanceMetrics || existing.balanceMetrics),
+            ? (top.kycVerifiedAt || base.kycVerifiedAt || new Date().toISOString())
+            : (top.kycVerifiedAt || base.kycVerifiedAt),
+          kycFullName: top.kycFullName || base.kycFullName || `${top.firstName || base.firstName || ''} ${top.lastName || base.lastName || ''}`.trim(),
+          kycFirstName: top.kycFirstName || base.kycFirstName || top.firstName || base.firstName,
+          kycLastName: top.kycLastName || base.kycLastName || top.lastName || base.lastName,
+          firstName: top.firstName || base.firstName,
+          lastName: top.lastName || base.lastName,
+          fullName: top.fullName || base.fullName || `${top.firstName || base.firstName || ''} ${top.lastName || base.lastName || ''}`.trim(),
+          kycDocumentImage: top.kycDocumentImage || base.kycDocumentImage,
+          kycDocumentBackImage: top.kycDocumentBackImage || base.kycDocumentBackImage,
+          kycProofOfAddressImage: top.kycProofOfAddressImage || base.kycProofOfAddressImage,
+          kycLiveSelfieImage: top.kycLiveSelfieImage || base.kycLiveSelfieImage,
+          kycSsn: top.kycSsn || base.kycSsn,
+          kycSsnImage: top.kycSsnImage || base.kycSsnImage,
+          kycDocumentNumber: top.kycDocumentNumber || base.kycDocumentNumber,
+          kycDocumentType: top.kycDocumentType || base.kycDocumentType,
+          kycItemReviews: top.kycItemReviews || base.kycItemReviews,
+          kycRejectionReason: top.kycRejectionReason !== undefined ? top.kycRejectionReason : base.kycRejectionReason,
+          balanceMetrics: resolveCustomerBalances(u.id, accKey, top.balanceMetrics || base.balanceMetrics),
         };
         userMap.set(u.id, mergedObj);
         return;
@@ -175,23 +190,32 @@ export const AdminDashboard: React.FC = () => {
           if (exAcc && exAcc === accKey) {
             const isExFirestore = firestoreCustomerIds.has(id);
             const resolvedKyc = (isExFirestore ? ex.kycStatus : (ex.kycStatus === 'verified' || u.kycStatus === 'verified' ? 'verified' : (u.kycStatus || ex.kycStatus || 'unverified'))) as KycStatus;
+            const topAcc = isExFirestore ? ex : u;
+            const baseAcc = isExFirestore ? u : ex;
             userMap.set(id, {
-              ...ex,
-              ...u,
+              ...baseAcc,
+              ...topAcc,
               kycStatus: resolvedKyc,
               kycVerifiedAt: resolvedKyc === 'verified' ? (ex.kycVerifiedAt || u.kycVerifiedAt) : undefined,
+              kycFullName: topAcc.kycFullName || baseAcc.kycFullName,
+              kycFirstName: topAcc.kycFirstName || baseAcc.kycFirstName,
+              kycLastName: topAcc.kycLastName || baseAcc.kycLastName,
+              firstName: topAcc.firstName || baseAcc.firstName,
+              lastName: topAcc.lastName || baseAcc.lastName,
+              fullName: topAcc.fullName || baseAcc.fullName,
               kycDocumentImage: u.kycDocumentImage || ex.kycDocumentImage,
               kycDocumentBackImage: u.kycDocumentBackImage || ex.kycDocumentBackImage,
               kycProofOfAddressImage: u.kycProofOfAddressImage || ex.kycProofOfAddressImage,
               kycLiveSelfieImage: u.kycLiveSelfieImage || ex.kycLiveSelfieImage,
               kycSsn: u.kycSsn || ex.kycSsn,
               kycSsnImage: u.kycSsnImage || ex.kycSsnImage,
-              balanceMetrics: resolveCustomerBalances(id, accKey, u.balanceMetrics || ex.balanceMetrics),
+              balanceMetrics: resolveCustomerBalances(id, accKey, topAcc.balanceMetrics || baseAcc.balanceMetrics),
             });
             return;
           }
         }
       }
+
 
       // Add as distinct customer account (never deduplicate by email so all registered accounts are visible)
       u.balanceMetrics = resolveCustomerBalances(u.id, accKey, u.balanceMetrics);
@@ -689,8 +713,8 @@ export const AdminDashboard: React.FC = () => {
     { id: 'audit', label: 'Audit Trail', icon: FileText },
   ];
 
-  // Temporary Testing Access: Bypassed for testing state (set to false to restore strict authentication gate)
-  const isTestingAuthBypass = true;
+  // Strict Administrator Authentication Gate: Requires verified Firebase session with authorized credentials
+  const isTestingAuthBypass = false;
 
   const isAdmin = isTestingAuthBypass || Boolean(
     currentUser &&

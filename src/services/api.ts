@@ -213,6 +213,36 @@ export const api = {
     return res.json();
   },
 
+  async updateUserProfile(data: {
+    userId: string;
+    firstName?: string;
+    lastName?: string;
+    phone?: string;
+    dateOfBirth?: string;
+    country?: string;
+    address?: string;
+    streetAddress?: string;
+    maritalStatus?: string;
+    businessName?: string;
+  }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
+    try {
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch('/api/user/profile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify(data),
+      });
+      const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
+      return parsed;
+    } catch (err: any) {
+      console.error('[API] updateUserProfile error:', err);
+      return { success: false, error: err?.message || 'Network error updating profile.' };
+    }
+  },
+
   async submitKyc(data: {
     userId: string;
     fullName?: string;
@@ -239,100 +269,59 @@ export const api = {
   }): Promise<{ success: boolean; user?: UserProfile; error?: string }> {
     let serverUser: UserProfile | undefined;
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch('/api/kyc/submit', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify({ ...data, autoApprove: false }),
       });
       const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
       if (parsed.success && parsed.user) {
         serverUser = parsed.user;
-      } else if (parsed.error && parsed.error !== 'Authentication service offline' && !parsed.error.includes('offline')) {
-        // Explicit rejection error from server
-        return parsed;
-      }
-    } catch (fetchErr) {
-      console.warn('[API] /api/kyc/submit endpoint unreachable, saving to Firestore & local storage:', fetchErr);
-    }
-
-    // Direct Firestore and Local persistence: Guarantees KYC never disappears
-    try {
-      const now = new Date().toISOString();
-      const cleanFullName = data.fullName?.trim() || `${data.firstName || ''} ${data.lastName || ''}`.trim();
-      const nameParts = cleanFullName.split(' ');
-      const derivedFirstName = data.firstName || nameParts[0] || '';
-      const derivedLastName = data.lastName || nameParts.slice(1).join(' ') || '';
-
-      const kycDataToSave: Partial<UserProfile> = {
-        id: data.userId,
-        kycStatus: data.autoApprove ? 'verified' : 'pending',
-        kycFullName: cleanFullName,
-        kycFirstName: derivedFirstName,
-        kycLastName: derivedLastName,
-        firstName: derivedFirstName,
-        lastName: derivedLastName,
-        kycCountry: data.country,
-        country: data.country,
-        kycPhone: data.phone,
-        kycEmail: data.email,
-        kycDateOfBirth: data.dateOfBirth,
-        kycDocumentType: data.documentType,
-        kycDocumentNumber: data.documentNumber.trim(),
-        kycDocumentImage: data.documentImage,
-        kycDocumentBackImage: data.documentBackImage,
-        kycLiveSelfieImage: data.liveSelfieImage,
-        kycStreetAddress: data.streetAddress,
-        kycProofOfAddressType: data.proofOfAddressType,
-        kycProofOfAddressImage: data.proofOfAddressImage,
-        kycSsn: data.ssn,
-        kycSsnImage: data.ssnImage,
-        kycSubmittedAt: now,
-        kycVerifiedAt: data.autoApprove ? now : undefined,
-        kycReviewDurationMinutes: data.reviewDurationMinutes || 10,
-        kycRejectionReason: undefined,
-        kycItemReviews: {
-          identity: { status: data.autoApprove ? 'approved' : 'pending' },
-          proofOfAddress: { status: data.autoApprove ? 'approved' : 'pending' },
-          liveness: { status: data.autoApprove ? 'approved' : 'pending' },
-          ...(data.ssn ? { ssn: { status: data.autoApprove ? 'approved' : 'pending' } } : {}),
-        },
-      };
-
-      const finalUser = {
-        ...(serverUser || {}),
-        ...kycDataToSave,
-      } as UserProfile;
-
-      // Persist to Firestore cloud database
-      await firestoreSync.saveUserProfile(data.userId, finalUser);
-
-      // Persist to local accounts directory
-      try {
-        const dirRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_accounts_directory') : null;
-        if (dirRaw) {
-          const dirList: UserProfile[] = JSON.parse(dirRaw);
-          const idx = dirList.findIndex((u) => u.id === data.userId);
-          if (idx >= 0) {
-            dirList[idx] = { ...dirList[idx], ...finalUser };
-          } else {
-            dirList.push(finalUser);
-          }
-          localStorage.setItem('monvera_accounts_directory', JSON.stringify(dirList));
+        
+        // Update local accounts directory for responsive feedback
+        if (typeof window !== 'undefined') {
+          try {
+            const dirRaw = localStorage.getItem('monvera_accounts_directory');
+            const dirList: UserProfile[] = dirRaw ? JSON.parse(dirRaw) : [];
+            const idx = dirList.findIndex((u) => u.id === data.userId);
+            if (idx >= 0) {
+              dirList[idx] = { ...dirList[idx], ...serverUser };
+            } else {
+              dirList.push(serverUser);
+            }
+            localStorage.setItem('monvera_accounts_directory', JSON.stringify(dirList));
+            localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId: data.userId, kycStatus: 'pending', timestamp: Date.now() }));
+            window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+              detail: { userId: data.userId, kycStatus: 'pending', user: serverUser }
+            }));
+          } catch {}
         }
-      } catch {}
 
-      return {
-        success: true,
-        user: finalUser,
-      };
-    } catch (fallbackErr: any) {
-      console.error('[API] Failed to submit KYC via fallback:', fallbackErr);
+        return {
+          success: true,
+          user: serverUser,
+        };
+      } else if (parsed.error) {
+        return { success: false, error: parsed.error };
+      }
+    } catch (fetchErr: any) {
+      console.error('[API] /api/kyc/submit error:', fetchErr);
       return {
         success: false,
-        error: fallbackErr?.message || 'Unable to record KYC verification submission. Please try again.',
+        error: fetchErr?.message || 'Unable to submit verification documents to compliance desk. Please check your network.',
       };
     }
+
+    return {
+      success: false,
+      error: 'KYC submission could not be processed. Please try again.',
+    };
   },
+
 
   async approveKyc(data: {
     userId: string;
@@ -1495,7 +1484,8 @@ export const api = {
   // Admin Endpoints
   async getAdminOverview(): Promise<AdminSystemOverview> {
     try {
-      const res = await fetch('/api/admin/overview');
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/admin/overview', { headers });
       return await parseJsonResponse(res, {
         totalCustomers: 4,
         activeAccounts: 12,
@@ -1528,7 +1518,8 @@ export const api = {
 
   async getAdminCustomers(): Promise<{ customers: (UserProfile & { balanceMetrics: BalanceMetrics })[] }> {
     try {
-      const res = await fetch('/api/admin/customers');
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/admin/customers', { headers });
       return await parseJsonResponse(res, { customers: [] });
     } catch {
       return { customers: [] };
@@ -1609,101 +1600,43 @@ export const api = {
     }
 
     try {
-      // 1. Authoritatively obtain user profile from Firestore first (KYC FIX #1)
-      const fsProfile = await firestoreSync.getUserProfile(userId);
-      const existing = fsProfile || providedUser;
-      const now = new Date().toISOString();
-      const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
-                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
-                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'USA';
-
-      // 2. Prepare verified profile - strictly preserving ALL submitted KYC documents and profile fields
-      const updatedProfile: UserProfile = {
-        ...(existing || {
-          id: userId,
-          username: `user_${userId.slice(0, 6)}`,
-          firstName: '',
-          lastName: '',
-          email: '',
-          phone: '',
-          permanentAccountNumber: '1000000000',
-          country: 'United States',
-          role: 'customer',
-          membershipTier: 'Premier',
-          twoFactorEnabled: false,
-          createdAt: now,
-        }),
-        kycStatus: 'verified',
-        status: existing?.status === 'frozen' ? 'frozen' : (existing?.status || 'active'),
-        kycVerifiedAt: now,
-        dailyTransactionLimit: 1000000,
-        kycRejectionReason: '',
-        kycItemReviews: {
-          identity: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
-          proofOfAddress: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
-          liveness: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId },
-          ...(isUS || existing?.kycSsn
-            ? { ssn: { status: 'approved', reviewedAt: now, reviewedBy: effectiveAdminId } }
-            : {}),
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch('/api/admin/kyc/approve', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
         },
-      };
-
-      // 3. PERSIST DIRECTLY TO AUTHORITATIVE FIRESTORE (KYC FIX #4)
-      const saveRes = await firestoreSync.saveUserProfile(userId, updatedProfile);
-      if (!saveRes.success) {
-        throw new Error(saveRes.error || 'Failed to persist verified KYC status to Firestore.');
-      }
-
-      // 4. VERIFY THE WRITE (KYC FIX #4: Confirm profile is verified in Firestore)
-      const verifiedCheck = await firestoreSync.getUserProfile(userId);
-      if (!verifiedCheck || verifiedCheck.kycStatus !== 'verified') {
-        throw new Error('Firestore verification failed: profile write was not confirmed as verified.');
-      }
-
-      // 5. Update local cache ONLY AFTER Firestore write & verification succeed
-      if (typeof window !== 'undefined') {
-        try {
-          const raw = localStorage.getItem('monvera_accounts_directory');
-          const directory: any[] = raw ? JSON.parse(raw) : [];
-          const idx = directory.findIndex((u: any) => u.id === userId);
-          if (idx >= 0) {
-            directory[idx] = { ...directory[idx], ...updatedProfile };
-          } else {
-            directory.push(updatedProfile);
-          }
-          localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
-          localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId, kycStatus: 'verified', timestamp: Date.now() }));
-          window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
-            detail: { userId, kycStatus: 'verified', user: updatedProfile }
-          }));
-        } catch {}
-      }
-
-      // 6. Concurrently notify user and update server ledger
-      Promise.allSettled([
-        firestoreSync.saveNotification({
-          id: `notif_kyc_app_${Date.now()}`,
-          userId: userId,
-          title: 'KYC Verification Approved by Compliance',
-          message: 'Your banking profile has been officially verified by Monvera Compliance Operations. Full account limits ($1,000,000/day) and verified status are active.',
-          type: 'SECURITY',
-          severity: 'success',
-          read: false,
-          createdAt: now,
-        }),
-        fetch('/api/admin/kyc/approve', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId, adminId: effectiveAdminId, userProfile: updatedProfile }),
-        }),
-      ]).catch((err) => {
-        console.warn('[adminApproveKyc] Background sync notice:', err);
+        body: JSON.stringify({ userId, adminId: effectiveAdminId, userProfile: providedUser }),
       });
+      const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
 
-      return { success: true, user: updatedProfile };
+      if (parsed.success && parsed.user) {
+        const verifiedUser = parsed.user;
+        if (typeof window !== 'undefined') {
+          try {
+            const raw = localStorage.getItem('monvera_accounts_directory');
+            const directory: any[] = raw ? JSON.parse(raw) : [];
+            const idx = directory.findIndex((u: any) => u.id === userId);
+            if (idx >= 0) {
+              directory[idx] = { ...directory[idx], ...verifiedUser };
+            } else {
+              directory.push(verifiedUser);
+            }
+            localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
+            localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId, kycStatus: 'verified', timestamp: Date.now() }));
+            window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+              detail: { userId, kycStatus: 'verified', user: verifiedUser }
+            }));
+          } catch {}
+        }
+        return { success: true, user: verifiedUser };
+      } else {
+        return { success: false, error: parsed.error || 'KYC approval was rejected by server compliance.' };
+      }
     } catch (err: any) {
       console.error('[adminApproveKyc] Error:', err);
-      return { success: false, error: err?.message || 'KYC approval failed' };
+      return { success: false, error: err?.message || 'Network error approving KYC.' };
     }
   },
 
@@ -1723,90 +1656,43 @@ export const api = {
     }
 
     try {
-      const fsProfile = await firestoreSync.getUserProfile(userId);
-      const existing = fsProfile || providedUser;
-      const now = new Date().toISOString();
-      const isUS = (existing?.kycCountry || existing?.country || '').toLowerCase().includes('united states') ||
-                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'US' ||
-                   (existing?.kycCountry || existing?.country || '').toUpperCase() === 'USA';
-
-      const updatedProfile: UserProfile = {
-        ...(existing || {
-          id: userId,
-          username: `user_${userId.slice(0, 6)}`,
-          firstName: '',
-          lastName: '',
-          email: '',
-          phone: '',
-          permanentAccountNumber: '1000000000',
-          country: 'United States',
-          role: 'customer',
-          membershipTier: 'Premier',
-          twoFactorEnabled: false,
-          createdAt: now,
-        }),
-        kycStatus: 'action_required',
-        kycRejectionReason: rejectionReason,
-        dailyTransactionLimit: 25000,
-        status: existing?.status || 'active',
-        kycItemReviews: {
-          identity: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason },
-          proofOfAddress: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason },
-          liveness: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason },
-          ...(isUS || existing?.kycSsn
-            ? { ssn: { status: 'rejected', reviewedAt: now, reviewedBy: effectiveAdminId, reason: rejectionReason } }
-            : {}),
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch('/api/admin/kyc/reject', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
         },
-      };
-
-      const saveRes = await firestoreSync.saveUserProfile(userId, updatedProfile);
-      if (!saveRes.success) {
-        throw new Error(saveRes.error || 'Failed to save KYC rejection status to Firestore.');
-      }
-
-      if (typeof window !== 'undefined') {
-        try {
-          const raw = localStorage.getItem('monvera_accounts_directory');
-          const directory: any[] = raw ? JSON.parse(raw) : [];
-          const idx = directory.findIndex((u: any) => u.id === userId);
-          if (idx >= 0) {
-            directory[idx] = { ...directory[idx], ...updatedProfile };
-          } else {
-            directory.push(updatedProfile);
-          }
-          localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
-          localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId, kycStatus: 'action_required', timestamp: Date.now() }));
-          window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
-            detail: { userId, kycStatus: 'action_required', user: updatedProfile }
-          }));
-        } catch {}
-      }
-
-      Promise.allSettled([
-        firestoreSync.saveUserProfile(userId, updatedProfile),
-        firestoreSync.saveNotification({
-          id: `notif_kyc_rej_${Date.now()}`,
-          userId: userId,
-          title: 'KYC Document Verification Status',
-          message: `Your identity verification requires attention. Reason: ${rejectionReason}. Please review and re-submit the required documents in your Profile.`,
-          type: 'SECURITY',
-          severity: 'warning',
-          read: false,
-          createdAt: now,
-        }),
-        fetch('/api/admin/kyc/reject', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId, reason: rejectionReason, adminId: effectiveAdminId, userProfile: updatedProfile }),
-        }),
-      ]).catch((err) => {
-        console.warn('[adminRejectKyc] Background sync notice:', err);
+        body: JSON.stringify({ userId, reason: rejectionReason, adminId: effectiveAdminId, userProfile: providedUser }),
       });
+      const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
 
-      return { success: true, user: updatedProfile };
+      if (parsed.success && parsed.user) {
+        const rejectedUser = parsed.user;
+        if (typeof window !== 'undefined') {
+          try {
+            const raw = localStorage.getItem('monvera_accounts_directory');
+            const directory: any[] = raw ? JSON.parse(raw) : [];
+            const idx = directory.findIndex((u: any) => u.id === userId);
+            if (idx >= 0) {
+              directory[idx] = { ...directory[idx], ...rejectedUser };
+            } else {
+              directory.push(rejectedUser);
+            }
+            localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
+            localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId, kycStatus: 'action_required', timestamp: Date.now() }));
+            window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+              detail: { userId, kycStatus: 'action_required', user: rejectedUser }
+            }));
+          } catch {}
+        }
+        return { success: true, user: rejectedUser };
+      } else {
+        return { success: false, error: parsed.error || 'KYC rejection failed on server.' };
+      }
     } catch (err: any) {
       console.error('[adminRejectKyc] Error:', err);
-      return { success: false, error: err?.message || 'KYC rejection failed' };
+      return { success: false, error: err?.message || 'KYC rejection network error' };
     }
   },
 
@@ -1823,141 +1709,46 @@ export const api = {
     }
 
     try {
-      const existing = data.userProfile || (await firestoreSync.getUserProfile(data.userId));
-      const now = new Date().toISOString();
-      const currentReviews = existing?.kycItemReviews || {};
-      const updatedReviews = {
-        ...currentReviews,
-        [data.itemName]: {
-          status: data.status,
-          reviewedAt: now,
-          reviewedBy: data.adminId || 'usr_admin',
-          reason: data.reason,
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch('/api/admin/kyc/review-item', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
         },
-      };
-
-      const requiredKeys = ['identity', 'proofOfAddress', 'liveness'];
-      if (existing?.kycSsn) requiredKeys.push('ssn');
-      const hasRejected = requiredKeys.some((k) => (updatedReviews as any)[k]?.status === 'rejected');
-      const allApproved = requiredKeys.every((k) => (updatedReviews as any)[k]?.status === 'approved');
-
-      let newKycStatus = existing?.kycStatus || 'pending';
-      let newRejectionReason = existing?.kycRejectionReason;
-      let newLimit = existing?.dailyTransactionLimit || 25000;
-      let newVerifiedAt = existing?.kycVerifiedAt;
-
-      if (hasRejected) {
-        newKycStatus = 'action_required';
-        newRejectionReason = data.reason || 'Document requires correction';
-      } else if (allApproved) {
-        newKycStatus = 'verified';
-        newVerifiedAt = now;
-        newLimit = 1000000;
-        newRejectionReason = '';
-      } else {
-        newKycStatus = 'pending';
-      }
-
-      const updatedProfile: UserProfile = {
-        ...(existing || {
-          id: data.userId,
-          username: `user_${data.userId.slice(0, 6)}`,
-          firstName: '',
-          lastName: '',
-          email: '',
-          phone: '',
-          permanentAccountNumber: '1000000000',
-          country: 'United States',
-          role: 'customer',
-          membershipTier: 'Premier',
-          twoFactorEnabled: false,
-          createdAt: now,
-          status: 'active',
-        }),
-        kycStatus: newKycStatus as any,
-        kycItemReviews: updatedReviews,
-        kycRejectionReason: newRejectionReason,
-        dailyTransactionLimit: newLimit,
-        kycVerifiedAt: newVerifiedAt,
-      };
-
-      if (typeof window !== 'undefined') {
-        try {
-          const raw = localStorage.getItem('monvera_accounts_directory');
-          const directory: any[] = raw ? JSON.parse(raw) : [];
-          const idx = directory.findIndex((u: any) => u.id === data.userId);
-          if (idx >= 0) {
-            directory[idx] = { ...directory[idx], ...updatedProfile };
-          } else {
-            directory.push(updatedProfile);
-          }
-          localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
-          localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId: data.userId, kycStatus: newKycStatus, timestamp: Date.now() }));
-          window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
-            detail: { userId: data.userId, kycStatus: newKycStatus, user: updatedProfile }
-          }));
-        } catch {}
-      }
-
-      const itemFriendlyNames: Record<string, string> = {
-        identity: 'Government Identity Document',
-        proofOfAddress: 'Proof of Address Document',
-        liveness: 'Biometric Liveness Selfie',
-        ssn: 'Social Security / Tax ID',
-      };
-      const itemNameLabel = itemFriendlyNames[data.itemName] || data.itemName;
-
-      const notifPromise = allApproved
-        ? firestoreSync.saveNotification({
-            id: `notif_kyc_app_${Date.now()}`,
-            userId: data.userId,
-            title: 'KYC Verification Approved by Compliance',
-            message: 'All your submitted KYC verification documents have been officially approved by Monvera Compliance Operations. All account limits ($1,000,000/day) and verified status are now active.',
-            type: 'SECURITY',
-            severity: 'success',
-            read: false,
-            createdAt: now,
-          })
-        : data.status === 'rejected'
-        ? firestoreSync.saveNotification({
-            id: `notif_kyc_item_rej_${Date.now()}`,
-            userId: data.userId,
-            title: `Action Required: ${itemNameLabel}`,
-            message: `Your ${itemNameLabel} was rejected by compliance: "${data.reason || 'Document does not meet regulatory standards'}". Please resubmit this specific document.`,
-            type: 'SECURITY',
-            severity: 'warning',
-            read: false,
-            createdAt: now,
-          })
-        : firestoreSync.saveNotification({
-            id: `notif_kyc_item_app_${Date.now()}`,
-            userId: data.userId,
-            title: `Document Approved: ${itemNameLabel}`,
-            message: `Your ${itemNameLabel} has been reviewed and approved by compliance. Remaining documents are being finalized.`,
-            type: 'SECURITY',
-            severity: 'info',
-            read: false,
-            createdAt: now,
-          });
-
-      Promise.allSettled([
-        firestoreSync.saveUserProfile(data.userId, updatedProfile),
-        notifPromise,
-        fetch('/api/admin/kyc/review-item', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...data, userProfile: updatedProfile }),
-        }),
-      ]).catch((err) => {
-        console.warn('[adminReviewKycItem] Background sync notice:', err);
+        body: JSON.stringify(data),
       });
+      const parsed = await parseJsonResponse<{ success: boolean; user?: UserProfile; error?: string }>(res, { success: false });
 
-      return { success: true, user: updatedProfile };
+      if (parsed.success && parsed.user) {
+        const updatedUser = parsed.user;
+        if (typeof window !== 'undefined') {
+          try {
+            const raw = localStorage.getItem('monvera_accounts_directory');
+            const directory: any[] = raw ? JSON.parse(raw) : [];
+            const idx = directory.findIndex((u: any) => u.id === data.userId);
+            if (idx >= 0) {
+              directory[idx] = { ...directory[idx], ...updatedUser };
+            } else {
+              directory.push(updatedUser);
+            }
+            localStorage.setItem('monvera_accounts_directory', JSON.stringify(directory));
+            localStorage.setItem('monvera_kyc_sync_event', JSON.stringify({ userId: data.userId, kycStatus: updatedUser.kycStatus, timestamp: Date.now() }));
+            window.dispatchEvent(new CustomEvent('monvera_kyc_status_updated', {
+              detail: { userId: data.userId, kycStatus: updatedUser.kycStatus, user: updatedUser }
+            }));
+          } catch {}
+        }
+        return { success: true, user: updatedUser };
+      } else {
+        return { success: false, error: parsed.error || 'KYC item review failed on server.' };
+      }
     } catch (err: any) {
       console.error('[adminReviewKycItem] Error:', err);
       return { success: false, error: err?.message || 'KYC item review failed' };
     }
   },
+
 
   async adminUpdateTransactionStatus(
     dataOrTxId:
@@ -1978,9 +1769,10 @@ export const api = {
         : dataOrTxId;
 
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(`/api/admin/transactions/${encodeURIComponent(payload.txId)}/update-status`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify(payload),
       });
       return await parseJsonResponse(res, { success: false, error: 'Transaction update service unavailable' });
@@ -2175,9 +1967,10 @@ export const api = {
     reason?: string;
   }): Promise<{ success: boolean; newBalance?: number; error?: string }> {
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch('/api/admin/dev-topup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify(data),
       });
       return await parseJsonResponse(res, { success: false, error: 'Dev topup service unavailable' });
@@ -2188,7 +1981,8 @@ export const api = {
 
   async getAdminAuditLogs(): Promise<{ auditLogs: AdminAuditLog[] }> {
     try {
-      const res = await fetch('/api/admin/audit-logs');
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch('/api/admin/audit-logs', { headers: authHeaders });
       return await parseJsonResponse(res, { auditLogs: [] });
     } catch {
       return { auditLogs: [] };

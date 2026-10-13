@@ -2,6 +2,8 @@ import React, { useState, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { firestoreSync } from '../../services/firestoreSync';
+import { KycVerificationModal } from '../kyc/KycVerificationModal';
+import { UserProfile } from '../../types';
 import {
   User,
   ShieldCheck,
@@ -136,21 +138,8 @@ export const ProfileView: React.FC = () => {
   const [profileSuccessMsg, setProfileSuccessMsg] = useState<string | null>(null);
   const [profileErrorMsg, setProfileErrorMsg] = useState<string | null>(null);
 
-  // KYC Verification Form State
-  const [selectedJurisdiction, setSelectedJurisdiction] = useState<'US' | 'INTERNATIONAL'>('US');
-  const [documentType, setDocumentType] = useState('Passport');
-  const [documentNumber, setDocumentNumber] = useState('');
-  const [ssnNumber, setSsnNumber] = useState('');
-  const [internationalPhone, setInternationalPhone] = useState(currentUser?.phone || '+1 (555) 234-8901');
-  const [issuingCountry, setIssuingCountry] = useState(currentUser?.country || 'United States');
-  const [proofOfAddress, setProofOfAddress] = useState('Utility Bill / Bank Statement');
-  const [selfieAttached, setSelfieAttached] = useState(true);
-  const [proofAttached, setProofAttached] = useState(true);
-  
-  const [isSubmittingKyc, setIsSubmittingKyc] = useState(false);
-  const [kycSuccessMsg, setKycSuccessMsg] = useState<string | null>(null);
-  const [kycDeclinedMsg, setKycDeclinedMsg] = useState<string | null>(null);
-  const [showDeclineDetails, setShowDeclineDetails] = useState(false);
+  // KYC Verification Modal State
+  const [isKycModalOpen, setIsKycModalOpen] = useState(false);
 
   if (!currentUser) return null;
 
@@ -343,7 +332,7 @@ export const ProfileView: React.FC = () => {
     setIsEditingProfile(true);
   };
 
-  // Save non-sensitive profile changes safely
+  // Save profile changes safely with legal name synchronization
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
@@ -362,11 +351,16 @@ export const ProfileView: React.FC = () => {
     setProfileSuccessMsg(null);
 
     try {
-      const updatedUser = {
+      const cleanFullName = `${trimmedFirst} ${trimmedLast}`.trim();
+      const updatedUser: UserProfile = {
         ...currentUser,
         firstName: trimmedFirst,
         lastName: trimmedLast,
-        name: `${trimmedFirst} ${trimmedLast}`,
+        name: cleanFullName,
+        fullName: cleanFullName,
+        kycFullName: cleanFullName,
+        kycFirstName: trimmedFirst,
+        kycLastName: trimmedLast,
         phone: editPhone.trim(),
         dateOfBirth: editDateOfBirth.trim(),
         country: editCountry.trim(),
@@ -378,11 +372,24 @@ export const ProfileView: React.FC = () => {
       // 1. Immediately update local state
       updateUser(updatedUser);
 
-      // 2. Persist to Firestore safely
-      const res = await firestoreSync.saveUserProfile(currentUser.id, {
+      // 2. Persist to authoritative server endpoint
+      const serverRes = await api.updateUserProfile({
+        userId: currentUser.id,
         firstName: trimmedFirst,
         lastName: trimmedLast,
-        fullName: `${trimmedFirst} ${trimmedLast}`,
+        phone: editPhone.trim(),
+        dateOfBirth: editDateOfBirth.trim(),
+        country: editCountry.trim(),
+        streetAddress: editStreetAddress.trim(),
+        maritalStatus: editMaritalStatus.trim(),
+        businessName: editBusinessName.trim() || undefined,
+      });
+
+      // 3. Persist to Firestore safely
+      const fsPayload: Record<string, any> = {
+        firstName: trimmedFirst,
+        lastName: trimmedLast,
+        fullName: cleanFullName,
         phone: editPhone.trim(),
         dateOfBirth: editDateOfBirth.trim(),
         country: editCountry.trim(),
@@ -390,13 +397,21 @@ export const ProfileView: React.FC = () => {
         streetAddress: editStreetAddress.trim(),
         maritalStatus: editMaritalStatus.trim(),
         businessName: editBusinessName.trim() || undefined,
-      });
+      };
 
-      if (res.success) {
+      if (!isKycVerified) {
+        fsPayload.kycFullName = cleanFullName;
+        fsPayload.kycFirstName = trimmedFirst;
+        fsPayload.kycLastName = trimmedLast;
+      }
+
+      const res = await firestoreSync.saveUserProfile(currentUser.id, fsPayload);
+
+      if (res.success || serverRes.success) {
         setProfileSuccessMsg('Personal profile details updated and saved successfully.');
         setIsEditingProfile(false);
       } else {
-        setProfileErrorMsg(res.error || 'Failed to persist profile changes to Firestore.');
+        setProfileErrorMsg(res.error || serverRes.error || 'Failed to persist profile changes.');
       }
     } catch (err: any) {
       setProfileErrorMsg(err?.message || 'An unexpected error occurred while saving profile changes.');
@@ -405,120 +420,6 @@ export const ProfileView: React.FC = () => {
     }
   };
 
-  // Format SSN live
-  const handleSsnChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    let val = e.target.value.replace(/\D/g, '');
-    if (val.length > 9) val = val.slice(0, 9);
-    
-    // Auto-format XXX-XX-XXXX
-    let formatted = val;
-    if (val.length > 5) {
-      formatted = `${val.slice(0, 3)}-${val.slice(3, 5)}-${val.slice(5)}`;
-    } else if (val.length > 3) {
-      formatted = `${val.slice(0, 3)}-${val.slice(3)}`;
-    }
-    setSsnNumber(formatted);
-  };
-
-  // Handle KYC Document Submission with strict US vs International validation
-  const handleSubmitKyc = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setKycSuccessMsg(null);
-    setKycDeclinedMsg(null);
-    setShowDeclineDetails(false);
-
-    // 1. Validation Logic
-    const cleanDocNum = documentNumber.trim();
-    if (!cleanDocNum || cleanDocNum.length < 5) {
-      setKycDeclinedMsg(
-        'Verification Declined: The government-issued ID number provided is too short or invalid. Please provide a valid Passport or Driver’s License identification number.'
-      );
-      setShowDeclineDetails(true);
-      return;
-    }
-
-    if (selectedJurisdiction === 'US') {
-      const rawSsn = ssnNumber.replace(/\D/g, '');
-      // Validate 9 digits, not all zeros or test dummies like 000000000
-      if (rawSsn.length !== 9 || rawSsn === '000000000' || rawSsn === '111111111') {
-        setKycDeclinedMsg(
-          'Verification Declined: The Social Security Number (SSN) provided is incomplete or could not be validated against official US SSA/FinCEN registries. A valid 9-digit SSN is mandatory for US accounts.'
-        );
-        setShowDeclineDetails(true);
-        return;
-      }
-
-      if (!selfieAttached) {
-        setKycDeclinedMsg('Verification Declined: Live biometric selfie photo is required for US accounts.');
-        setShowDeclineDetails(true);
-        return;
-      }
-    } else {
-      // International validation
-      if (!internationalPhone || internationalPhone.trim().length < 8) {
-        setKycDeclinedMsg(
-          'Verification Declined: A valid international telephone number with country code is required for non-US account registration.'
-        );
-        setShowDeclineDetails(true);
-        return;
-      }
-
-      if (!proofAttached) {
-        setKycDeclinedMsg(
-          'Verification Declined: Proof of address documentation (bank statement or utility bill) is required for international accounts.'
-        );
-        setShowDeclineDetails(true);
-        return;
-      }
-
-      if (!selfieAttached) {
-        setKycDeclinedMsg('Verification Declined: Live biometric facial selfie capture is required.');
-        setShowDeclineDetails(true);
-        return;
-      }
-    }
-
-    // 2. Accurate Submission & Approval
-    setIsSubmittingKyc(true);
-    try {
-      const res = await api.submitKyc({
-        userId: currentUser.id,
-        documentType: `${documentType} (${selectedJurisdiction === 'US' ? 'United States' : issuingCountry})`,
-        documentNumber: cleanDocNum,
-        country: selectedJurisdiction === 'US' ? 'United States' : issuingCountry,
-        proofOfAddress,
-        autoApprove: true,
-      });
-
-      if (res.success && res.user) {
-        const approvedUser = {
-          ...currentUser,
-          ...res.user,
-          kycStatus: 'verified' as const,
-          kycDocumentType: `${documentType} (${selectedJurisdiction === 'US' ? 'United States' : issuingCountry})`,
-          kycDocumentNumber: cleanDocNum,
-          kycCountry: selectedJurisdiction === 'US' ? 'United States' : issuingCountry,
-          kycSsn: selectedJurisdiction === 'US' ? ssnNumber : undefined,
-          kycVerifiedAt: new Date().toISOString(),
-          dailyTransactionLimit: 1000000,
-        };
-        updateUser(approvedUser);
-        await firestoreSync.saveUserProfile(currentUser.id, approvedUser);
-        setKycSuccessMsg(
-          'Identity verification accepted and approved! Your Royal Blue Verified Badge is now active, granting permanent regulatory clearance and full $1,000,000 daily transaction limits.'
-        );
-        refreshNotifications();
-      } else {
-        setKycDeclinedMsg(res.error || 'Verification submission could not be processed. Please check your data and retry.');
-        setShowDeclineDetails(true);
-      }
-    } catch (err: any) {
-      setKycDeclinedMsg(err?.message || 'A network error occurred during verification submission.');
-      setShowDeclineDetails(true);
-    } finally {
-      setIsSubmittingKyc(false);
-    }
-  };
 
   return (
     <div id="profile-management-view" className="space-y-8 animate-in fade-in duration-150 text-slate-900">
@@ -1424,9 +1325,19 @@ export const ProfileView: React.FC = () => {
                 <BlueVerifiedBadge className="w-4 h-4" />
                 <span>Verified</span>
               </span>
+            ) : currentUser.kycStatus === 'pending' ? (
+              <span className="text-xs font-black px-3 py-1 rounded-full bg-amber-100 text-amber-950 border border-amber-300 flex items-center gap-1.5">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-700" />
+                <span>Under Review</span>
+              </span>
+            ) : currentUser.kycStatus === 'action_required' || currentUser.kycStatus === 'rejected' ? (
+              <span className="text-xs font-black px-3 py-1 rounded-full bg-rose-100 text-rose-950 border border-rose-300 flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+                <span>Action Required</span>
+              </span>
             ) : (
-              <span className="text-xs font-black px-3 py-1 rounded-full bg-amber-100 text-amber-950 border border-amber-300">
-                Action Required
+              <span className="text-xs font-black px-3 py-1 rounded-full bg-slate-100 text-slate-800 border border-slate-300">
+                Unverified
               </span>
             )}
           </div>
@@ -1442,7 +1353,7 @@ export const ProfileView: React.FC = () => {
                     <BlueVerifiedBadge className="w-4 h-4" />
                   </div>
                   <p className="text-sky-900 font-semibold leading-relaxed">
-                    Your institutional KYC credentials have been validated and approved under global FinCEN / Bank Secrecy Act standards. Your full $1,000,000 daily transaction limit and international transfer capabilities are active.
+                    Your institutional KYC credentials have been validated and approved under global FinCEN / Bank Secrecy Act standards. Your full $1,000,000 daily transaction limit and international transfer capabilities are active. Legal name is locked under compliance security.
                   </p>
                 </div>
               </div>
@@ -1451,14 +1362,14 @@ export const ProfileView: React.FC = () => {
                 <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200">
                   <span className="text-slate-700 block text-xs font-extrabold uppercase tracking-wider">Document on File</span>
                   <span className="font-black text-slate-900 block mt-1">
-                    {currentUser.kycDocumentType || 'Passport (United States)'}
+                    {currentUser.kycDocumentType || 'Passport'}
                   </span>
                 </div>
 
                 <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200">
                   <span className="text-slate-700 block text-xs font-extrabold uppercase tracking-wider">Document Number</span>
                   <span className="font-mono font-black text-slate-900 block mt-1">
-                    {currentUser.kycDocumentNumber || 'US-PASS-99042811'}
+                    {currentUser.kycDocumentNumber || 'Verified ID on record'}
                   </span>
                 </div>
 
@@ -1477,197 +1388,109 @@ export const ProfileView: React.FC = () => {
                 </div>
               </div>
             </div>
-          ) : (
-            /* Unverified Account Verification Form with US vs International Toggle */
+          ) : currentUser.kycStatus === 'pending' ? (
+            /* Pending Compliance Review Card */
             <div className="space-y-4">
-              
-              {/* Jurisdiction Selector Tabs */}
-              <div className="grid grid-cols-2 gap-2 p-1.5 rounded-2xl bg-slate-100 border border-slate-200">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedJurisdiction('US');
-                    setIssuingCountry('United States');
-                  }}
-                  className={`py-2 px-3 rounded-xl text-xs font-black transition-all cursor-pointer ${
-                    selectedJurisdiction === 'US'
-                      ? 'bg-slate-900 text-white shadow-xs'
-                      : 'text-slate-700 hover:text-slate-900'
-                  }`}
-                >
-                  United States (US Resident)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedJurisdiction('INTERNATIONAL');
-                    if (issuingCountry === 'United States') setIssuingCountry('United Kingdom');
-                  }}
-                  className={`py-2 px-3 rounded-xl text-xs font-black transition-all cursor-pointer ${
-                    selectedJurisdiction === 'INTERNATIONAL'
-                      ? 'bg-slate-900 text-white shadow-xs'
-                      : 'text-slate-700 hover:text-slate-900'
-                  }`}
-                >
-                  International (Rest of World)
-                </button>
+              <div className="p-5 rounded-2xl bg-amber-50 border-2 border-amber-200 flex items-start gap-4">
+                <RefreshCw className="w-6 h-6 text-amber-600 shrink-0 mt-0.5 animate-spin" />
+                <div className="space-y-1.5 text-sm text-amber-950">
+                  <span className="font-black text-base block">Verification Submission Under Compliance Review</span>
+                  <p className="font-semibold text-amber-900 leading-relaxed">
+                    Your identification documents, proof of address, and biometric selfie have been transmitted securely to Monvera Compliance Operations. Our certified regulatory analysts are adjudicating your application.
+                  </p>
+                  {currentUser.kycSubmittedAt && (
+                    <p className="text-xs text-amber-800 font-mono mt-1">
+                      Submitted on: {new Date(currentUser.kycSubmittedAt).toLocaleString()}
+                    </p>
+                  )}
+                </div>
               </div>
 
-              {/* Success Approved Banner */}
-              {kycSuccessMsg && (
-                <div className="p-4 rounded-2xl bg-sky-50 border-2 border-sky-300 text-sm text-sky-950 flex items-start gap-3">
-                  <BlueVerifiedBadge className="w-5 h-5 shrink-0 mt-0.5" />
-                  <span className="font-bold leading-relaxed">{kycSuccessMsg}</span>
-                </div>
-              )}
-
-              {/* Decline Error Banner */}
-              {kycDeclinedMsg && (
-                <div className="p-4 rounded-2xl bg-red-50 border-2 border-red-300 text-sm text-red-950 flex items-start gap-3">
-                  <XCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
-                  <div className="space-y-1">
-                    <span className="font-black text-red-900 block">Verification Request Rejected</span>
-                    <p className="font-semibold text-red-800 leading-relaxed">{kycDeclinedMsg}</p>
+              <button
+                type="button"
+                onClick={() => setIsKycModalOpen(true)}
+                className="w-full py-3 px-4 rounded-2xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-extrabold flex items-center justify-center gap-2 transition-all cursor-pointer shadow-xs"
+              >
+                <FileCheck className="w-4 h-4 text-sky-400" />
+                <span>View Submitted Documents</span>
+              </button>
+            </div>
+          ) : currentUser.kycStatus === 'action_required' || currentUser.kycStatus === 'rejected' ? (
+            /* Action Required / Resubmission Card */
+            <div className="space-y-4">
+              <div className="p-5 rounded-2xl bg-rose-50 border-2 border-rose-200 flex items-start gap-4">
+                <AlertTriangle className="w-6 h-6 text-rose-600 shrink-0 mt-0.5" />
+                <div className="space-y-1.5 text-sm text-rose-950">
+                  <span className="font-black text-base block">Document Correction Required</span>
+                  <p className="font-semibold text-rose-900 leading-relaxed">
+                    Monvera Compliance Desk reviewed your submission and requested corrections:
+                  </p>
+                  <div className="p-3 bg-white/80 rounded-xl border border-rose-300 font-mono text-xs font-bold text-rose-950 mt-1">
+                    "{currentUser.kycRejectionReason || 'Document could not be verified by compliance.'}"
                   </div>
                 </div>
-              )}
+              </div>
 
-              <form onSubmit={handleSubmitKyc} className="space-y-4">
-                
-                {/* Field 1: Document Type & ID Number */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-extrabold text-slate-800 block">
-                      Government ID Type
-                    </label>
-                    <select
-                      value={documentType}
-                      onChange={(e) => setDocumentType(e.target.value)}
-                      className="w-full px-3.5 py-2.5 text-xs font-bold rounded-xl border-2 border-slate-200 bg-slate-50 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500 text-slate-900"
-                    >
-                      <option value="Passport">Passport</option>
-                      <option value="Driver's License">Driver's License</option>
-                      <option value="National Identity Card">National Identity Card</option>
-                      <option value="State Identification Card">State Identification Card</option>
-                    </select>
+              <button
+                type="button"
+                onClick={() => setIsKycModalOpen(true)}
+                className="w-full py-3.5 px-4 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white text-sm font-extrabold flex items-center justify-center gap-2.5 transition-all cursor-pointer shadow-md"
+              >
+                <Upload className="w-4 h-4" />
+                <span>Update & Resubmit Verification Documents</span>
+              </button>
+            </div>
+          ) : (
+            /* Unverified Call-to-Action Card */
+            <div className="space-y-4">
+              <div className="p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-3">
+                <div className="flex items-center gap-2.5 text-slate-900 font-extrabold text-sm">
+                  <ShieldCheck className="w-5 h-5 text-sky-600" />
+                  <span>Institutional Clearance Benefits</span>
+                </div>
+                <p className="text-xs text-slate-600 font-semibold leading-relaxed">
+                  Verify your account using your government ID, proof of address, and live selfie to unlock institutional limits, global wire transfers, and verified member credentials.
+                </p>
+                <div className="grid grid-cols-2 gap-2 text-xs font-bold text-slate-700 pt-1">
+                  <div className="flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>$1,000,000 / day limits</span>
                   </div>
-
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-extrabold text-slate-800 block">
-                      Document Number
-                    </label>
-                    <input
-                      type="text"
-                      value={documentNumber}
-                      onChange={(e) => setDocumentNumber(e.target.value)}
-                      placeholder={selectedJurisdiction === 'US' ? 'e.g. US-PASS-99841029' : 'e.g. GB-ID-8840192'}
-                      className="w-full px-3.5 py-2.5 text-xs font-bold rounded-xl border-2 border-slate-200 bg-slate-50 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500 font-mono text-slate-900"
-                    />
+                  <div className="flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>International Transfers</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>Royal Blue Verified Badge</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>FinCEN Regulatory Clearance</span>
                   </div>
                 </div>
+              </div>
 
-                {/* Field 2: US SSN (if US) OR International Country & Phone */}
-                {selectedJurisdiction === 'US' ? (
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-extrabold text-slate-800 flex items-center justify-between">
-                      <span>Social Security Number (SSN - 9 Digits)</span>
-                      <span className="text-sky-700 font-mono text-[11px]">Format: XXX-XX-XXXX</span>
-                    </label>
-                    <input
-                      type="text"
-                      value={ssnNumber}
-                      onChange={handleSsnChange}
-                      placeholder="e.g. 123-45-6789"
-                      maxLength={11}
-                      className="w-full px-3.5 py-2.5 text-xs font-bold rounded-xl border-2 border-slate-200 bg-slate-50 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500 font-mono text-slate-900"
-                    />
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-extrabold text-slate-800 block">
-                        Country of Legal Residence
-                      </label>
-                      <input
-                        type="text"
-                        value={issuingCountry}
-                        onChange={(e) => setIssuingCountry(e.target.value)}
-                        placeholder="e.g. United Kingdom, Canada, Germany"
-                        className="w-full px-3.5 py-2.5 text-xs font-bold rounded-xl border-2 border-slate-200 bg-slate-50 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500 text-slate-900"
-                      />
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-extrabold text-slate-800 block">
-                        International Phone Number
-                      </label>
-                      <input
-                        type="text"
-                        value={internationalPhone}
-                        onChange={(e) => setInternationalPhone(e.target.value)}
-                        placeholder="+44 7911 123456"
-                        className="w-full px-3.5 py-2.5 text-xs font-bold rounded-xl border-2 border-slate-200 bg-slate-50 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500 font-mono text-slate-900"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {/* Field 3: Proof of Address & Biometric Selfie Verification */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="p-3.5 rounded-xl border-2 border-slate-200 bg-slate-50 space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                        <Upload className="w-3.5 h-3.5 text-sky-700" />
-                        <span>Proof of Address</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setProofAttached(!proofAttached)}
-                        className={`text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer ${
-                          proofAttached ? 'bg-sky-100 text-sky-900' : 'bg-slate-200 text-slate-700'
-                        }`}
-                      >
-                        {proofAttached ? 'Attached' : 'Missing'}
-                      </button>
-                    </div>
-                    <p className="text-[11px] font-semibold text-slate-600">Utility bill or bank statement</p>
-                  </div>
-
-                  <div className="p-3.5 rounded-xl border-2 border-slate-200 bg-slate-50 space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                        <Camera className="w-3.5 h-3.5 text-sky-700" />
-                        <span>Biometric Live Selfie</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setSelfieAttached(!selfieAttached)}
-                        className={`text-[11px] font-bold px-2 py-0.5 rounded cursor-pointer ${
-                          selfieAttached ? 'bg-sky-100 text-sky-900' : 'bg-slate-200 text-slate-700'
-                        }`}
-                      >
-                        {selfieAttached ? 'Verified' : 'Missing'}
-                      </button>
-                    </div>
-                    <p className="text-[11px] font-semibold text-slate-600">Real-time facial identity match</p>
-                  </div>
-                </div>
-
-                {/* Submit Verification Button */}
-                <button
-                  type="submit"
-                  disabled={isSubmittingKyc || !documentNumber.trim()}
-                  className="w-full py-3.5 px-4 rounded-2xl bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white text-sm font-extrabold flex items-center justify-center gap-2.5 transition-all shadow-md cursor-pointer"
-                >
-                  <FileCheck className="w-4 h-4" />
-                  <span>{isSubmittingKyc ? 'Verifying with Global Registries...' : 'Submit Identity & Activate Verification'}</span>
-                </button>
-              </form>
+              <button
+                type="button"
+                onClick={() => setIsKycModalOpen(true)}
+                className="w-full py-3.5 px-4 rounded-2xl bg-sky-700 hover:bg-sky-800 text-white text-sm font-extrabold flex items-center justify-center gap-2.5 transition-all cursor-pointer shadow-md"
+              >
+                <FileCheck className="w-4 h-4" />
+                <span>Begin Identity Verification</span>
+              </button>
             </div>
           )}
         </div>
 
       </div>
+
+      {/* Render KycVerificationModal */}
+      <KycVerificationModal
+        isOpen={isKycModalOpen}
+        onClose={() => setIsKycModalOpen(false)}
+      />
+
 
     </div>
   );

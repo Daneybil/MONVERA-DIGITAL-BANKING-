@@ -23,6 +23,7 @@ export interface UserProfile {
   id: string;
   username: string; // Unique Monvera handle e.g. "eleanor", "marcus"
   name?: string;
+  fullName?: string;
   firstName: string;
   lastName: string;
   email: string;

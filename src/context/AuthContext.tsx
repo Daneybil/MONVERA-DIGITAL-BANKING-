@@ -529,14 +529,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     };
 
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        refreshProfile();
-        refreshBalance();
-        refreshNotifications();
-        api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
-      }
-    };
+    // Note: With active Firestore onSnapshot listeners for accounts/{uid}, users/{uid},
+    // loans, and notifications, repetitive document polling on window focus/visibilitychange
+    // is redundant and rapidly exhausts Firestore free quotas. Reversals are checked upon initial mount.
 
     const handleBalanceUpdated = (e: any) => {
       const detail = e.detail;
@@ -599,8 +594,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     window.addEventListener('monvera_balance_updated', handleBalanceUpdated);
     window.addEventListener('monvera_notification_created', handleNotificationCreated);
     window.addEventListener('storage', handleStorageEvent);
-    window.addEventListener('focus', refreshProfile);
-    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       unsubBalance();
@@ -617,8 +610,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.removeEventListener('monvera_balance_updated', handleBalanceUpdated);
       window.removeEventListener('monvera_notification_created', handleNotificationCreated);
       window.removeEventListener('storage', handleStorageEvent);
-      window.removeEventListener('focus', refreshProfile);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, refreshBalance, refreshNotifications, refreshProfile]);
 
@@ -1718,17 +1709,52 @@ const unenrollTotpMfa = async (): Promise<{
     }
     // Invariant: Do not silently overwrite frozen status with active during ordinary profile/avatar updates
     const effectiveStatus = currentUser?.status === 'frozen' && user.status === 'active' ? 'frozen' : (user.status || currentUser?.status || 'active');
+
+    // Legal Name Synchronization: when unverified, synchronize all legal name representations
+    const isUnverified = (currentUser?.kycStatus || user.kycStatus) !== 'verified';
+    const cleanFirst = user.firstName || currentUser?.firstName || '';
+    const cleanLast = user.lastName || currentUser?.lastName || '';
+    const cleanFull = `${cleanFirst} ${cleanLast}`.trim();
+
     const safeUser: UserProfile = {
       ...user,
       status: effectiveStatus,
+      ...(isUnverified && cleanFull ? {
+        fullName: cleanFull,
+        kycFullName: cleanFull,
+        kycFirstName: cleanFirst,
+        kycLastName: cleanLast,
+      } : {}),
     };
     setCurrentUser(safeUser);
+    cacheUserInDirectory(safeUser);
     setAvailableUsers((prev) => prev.map((u) => (u.id === user.id ? safeUser : u)));
-    // Also sync to Firestore without modifying frozen status
-    firestoreSync.saveUserProfile(user.id, safeUser).catch((err) => {
-      console.warn('[Firestore] Background update error:', err);
-    });
+
+    // Safely sync non-sensitive fields to Firestore
+    if (user.id) {
+      const fsPayload: Record<string, any> = {
+        firstName: safeUser.firstName,
+        lastName: safeUser.lastName,
+        fullName: safeUser.fullName,
+        phone: safeUser.phone,
+        dateOfBirth: safeUser.dateOfBirth,
+        country: safeUser.country,
+        address: safeUser.streetAddress || (safeUser as any).address,
+        streetAddress: safeUser.streetAddress || (safeUser as any).address,
+        maritalStatus: safeUser.maritalStatus,
+        businessName: safeUser.businessName,
+      };
+      if (isUnverified) {
+        fsPayload.kycFullName = safeUser.kycFullName;
+        fsPayload.kycFirstName = safeUser.kycFirstName;
+        fsPayload.kycLastName = safeUser.kycLastName;
+      }
+      firestoreSync.saveUserProfile(user.id, fsPayload).catch((err) => {
+        console.warn('[Firestore] Background update notice:', err);
+      });
+    }
   };
+
 
   const openModal = (
     modal: 'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null

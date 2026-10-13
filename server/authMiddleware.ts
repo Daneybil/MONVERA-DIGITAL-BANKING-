@@ -1,5 +1,6 @@
+import 'dotenv/config';
 import { Request, Response, NextFunction } from 'express';
-import { adminAuth, adminFirestore } from './firebaseAdmin';
+import { adminAuth } from './firebaseAdmin';
 
 export interface AuthenticatedRequest extends Request {
   auth?: {
@@ -78,6 +79,73 @@ export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Resp
 }
 
 /**
+ * Reads configured administrator emails from server environment variables.
+ * Fails closed if not explicitly configured in server environment.
+ */
+export function getConfiguredAdminEmails(): string[] {
+  const envEmails = process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '';
+  return envEmails
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Reads configured administrator UIDs from server environment variables.
+ * Fails closed if not explicitly configured in server environment.
+ */
+export function getConfiguredAdminUids(): string[] {
+  const envUids = process.env.ADMIN_UIDS || process.env.ADMIN_UID || '';
+  return envUids
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Verifies if a verified Firebase Auth caller has administrator privileges.
+ * Derived strictly from verified token UID/email against server configuration or cryptographic custom claims.
+ * Does NOT trust unverified client parameters or mutable Firestore user documents.
+ */
+export async function isCallerAdministrator(
+  uid?: string,
+  email?: string,
+  decodedClaims?: Record<string, any>
+): Promise<boolean> {
+  if (!uid && !email) return false;
+
+  const normalizedEmail = (email || '').toLowerCase().trim();
+  const configuredEmails = getConfiguredAdminEmails();
+  const configuredUids = getConfiguredAdminUids();
+
+  // Fail closed if server has no administrator configuration set and no cryptographic custom claims
+  const hasEnvConfig = configuredEmails.length > 0 || configuredUids.length > 0;
+  if (!hasEnvConfig && !decodedClaims?.admin && !decodedClaims?.role) {
+    console.warn('[isCallerAdministrator] Missing configuration: ADMIN_EMAILS and ADMIN_UIDS are empty. Administrator access is failing closed.');
+    return false;
+  }
+
+  // 1. Explicit server-side configured administrator emails
+  if (normalizedEmail && configuredEmails.includes(normalizedEmail)) {
+    return true;
+  }
+
+  // 2. Explicit server-side configured administrator UIDs
+  if (uid && configuredUids.includes(uid)) {
+    return true;
+  }
+
+  // 3. Cryptographically verified Firebase Custom Claims on the token (minted only by backend Admin SDK)
+  if (decodedClaims) {
+    if (decodedClaims.admin === true || decodedClaims.role === 'admin' || decodedClaims.role === 'super_admin') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Express middleware to authenticate and authorize administrator requests.
  * Requires a valid Firebase Bearer token and verifies admin privileges.
  */
@@ -109,30 +177,15 @@ export async function requireAdminAuth(req: AuthenticatedRequest, res: Response,
     const email = (decodedToken.email || '').toLowerCase().trim();
     const uid = decodedToken.uid;
 
-    // Temporary Testing Bypass: Allows verified Firebase sessions to authorize Admin Transfers during testing
-    // Set isTestingAdminAuthBypass to false to enforce strict production admin role verification
-    const isTestingAdminAuthBypass = true;
+    // Production security enforcement: testing bypass disabled
+    const isTestingAdminAuthBypass = false;
     if (isTestingAdminAuthBypass) {
       return next();
     }
 
-    // Check against authorized admin identities from project configuration & firestore rules
-    if (
-      email === 'daneybil2020@gmail.com' ||
-      email === 'admin@monvera.com' ||
-      uid === 'usr_admin' ||
-      uid === 'admin'
-    ) {
+    const hasAdminAccess = await isCallerAdministrator(uid, email, decodedToken);
+    if (hasAdminAccess) {
       return next();
-    }
-
-    // Verify role in Firestore users collection
-    const userDoc = await adminFirestore.collection('users').doc(uid).get();
-    if (userDoc.exists) {
-      const uData = userDoc.data();
-      if (uData?.role === 'super_admin' || uData?.role === 'admin') {
-        return next();
-      }
     }
 
     return res.status(403).json({

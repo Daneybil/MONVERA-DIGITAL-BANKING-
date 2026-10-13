@@ -246,7 +246,6 @@ export const LoansView: React.FC = () => {
           );
         });
       }
-      loadData();
     };
 
     window.addEventListener('monvera_loan_updated', handleLoanUpdated);
