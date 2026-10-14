@@ -860,6 +860,41 @@ app.get('/api/accounts/balance', async (req: Request, res: Response) => {
       const accrued = Number(ad.accruedEarnings ?? 0);
       const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
       const avail = Number(ad.availableBalance ?? chk);
+      const accountsList = (Array.isArray(ad.accounts) && ad.accounts.length > 0)
+        ? ad.accounts
+        : [
+            {
+              id: `acc_chk_${userId}`,
+              userId,
+              type: 'CHECKING',
+              accountNumber: ad.permanentAccountNumber || '1000000000',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: chk,
+              availableBalance: avail,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 1.25,
+              status: 'ACTIVE',
+              nickname: 'Monvera Premier Checking',
+            },
+            {
+              id: `acc_sav_${userId}`,
+              userId,
+              type: 'SAVINGS',
+              accountNumber: ad.permanentAccountNumber && String(ad.permanentAccountNumber).length >= 7 ? `10${String(ad.permanentAccountNumber).slice(2, -3)}991` : '1000000991',
+              routingNumber: '021000021',
+              currency: 'USD',
+              balance: sav,
+              availableBalance: sav,
+              investedBalance: 0,
+              pendingBalance: 0,
+              interestRateAPY: 4.85,
+              status: 'ACTIVE',
+              nickname: 'Monvera High-Yield Treasury',
+            },
+          ];
+
       return res.json({
         checkingBalance: chk,
         savingsBalance: sav,
@@ -869,7 +904,7 @@ app.get('/api/accounts/balance', async (req: Request, res: Response) => {
         availableBalance: avail,
         pendingBalance: Number(ad.pendingBalance ?? 0),
         loanBalance: Number(ad.loanBalance ?? 0),
-        accounts: ad.accounts || [],
+        accounts: accountsList,
       });
     } else {
       return res.status(404).json({

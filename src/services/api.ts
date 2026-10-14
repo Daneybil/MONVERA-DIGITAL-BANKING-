@@ -369,7 +369,41 @@ export const api = {
       const res = await fetch(`/api/accounts/balance?userId=${encodeURIComponent(userId)}`);
       if (res.ok) {
         const data = await parseJsonResponse<BalanceMetrics>(res, null as any);
-        if (data && Array.isArray(data.accounts) && data.accounts.length > 0) {
+        if (data && (typeof data.checkingBalance === 'number' || typeof data.totalBalance === 'number')) {
+          if (!Array.isArray(data.accounts) || data.accounts.length === 0) {
+            data.accounts = [
+              {
+                id: `acc_chk_${userId}`,
+                userId,
+                type: 'CHECKING',
+                accountNumber: userAccountNumber || '1000000000',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: Number(data.checkingBalance ?? 0),
+                availableBalance: Number(data.availableBalance ?? data.checkingBalance ?? 0),
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 1.25,
+                status: 'ACTIVE',
+                nickname: 'Monvera Premier Checking',
+              },
+              {
+                id: `acc_sav_${userId}`,
+                userId,
+                type: 'SAVINGS',
+                accountNumber: userAccountNumber && userAccountNumber.length >= 7 ? `10${userAccountNumber.slice(2, -3)}991` : '1000000991',
+                routingNumber: '021000021',
+                currency: 'USD',
+                balance: Number(data.savingsBalance ?? 0),
+                availableBalance: Number(data.savingsBalance ?? 0),
+                investedBalance: 0,
+                pendingBalance: 0,
+                interestRateAPY: 4.85,
+                status: 'ACTIVE',
+                nickname: 'Monvera High-Yield Treasury',
+              },
+            ];
+          }
           return data;
         }
       }

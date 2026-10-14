@@ -922,136 +922,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     let finalMetricsToSet = realFsMetrics;
     if (!finalMetricsToSet) {
-      // Legitimate base account initialization in Firestore with zero balance for verified session
+      // If client Firestore read failed or was unavailable, fetch from authoritative backend API
       try {
-        const accDocRef = doc(db, 'accounts', uid);
-        const existingAccSnap = await getDoc(accDocRef);
-        if (existingAccSnap.exists()) {
-          const ad = existingAccSnap.data();
-          finalMetricsToSet = {
-            checkingBalance: Number(ad.checkingBalance ?? 0),
-            savingsBalance: Number(ad.savingsBalance ?? 0),
-            investedBalance: Number(ad.investedBalance ?? 0),
-            accruedEarnings: Number(ad.accruedEarnings ?? 0),
-            totalBalance: Number(ad.totalBalance ?? 0),
-            availableBalance: Number(ad.availableBalance ?? ad.checkingBalance ?? 0),
-            pendingBalance: Number(ad.pendingBalance ?? 0),
-            loanBalance: Number(ad.loanBalance ?? 0),
-            accounts: ad.accounts || [],
-          };
-        } else {
-          // Check for legacy account by permanentAccountNumber before creating $0
-          let legacyData: any = null;
-          if (finalUser.permanentAccountNumber) {
-            const cleanAcc = finalUser.permanentAccountNumber.replace(/[-\s]/g, '');
-            if (cleanAcc && cleanAcc !== uid) {
-              try {
-                const legacySnap = await getDoc(doc(db, 'accounts', cleanAcc));
-                if (legacySnap.exists()) {
-                  legacyData = legacySnap.data();
-                }
-              } catch {}
-            }
-          }
-
-          if (legacyData && (Number(legacyData.checkingBalance ?? 0) > 0 || Number(legacyData.totalBalance ?? 0) > 0)) {
-            // Adopt the legacy account non-zero balance into accounts/{uid}
-            const adoptedMetrics: BalanceMetrics = {
-              checkingBalance: Number(legacyData.checkingBalance ?? 0),
-              savingsBalance: Number(legacyData.savingsBalance ?? 0),
-              investedBalance: Number(legacyData.investedBalance ?? 0),
-              accruedEarnings: Number(legacyData.accruedEarnings ?? 0),
-              totalBalance: Number(legacyData.totalBalance ?? 0),
-              availableBalance: Number(legacyData.availableBalance ?? legacyData.checkingBalance ?? 0),
-              pendingBalance: Number(legacyData.pendingBalance ?? 0),
-              loanBalance: Number(legacyData.loanBalance ?? 0),
-              accounts: legacyData.accounts || [],
-            };
-            const nowIso = new Date().toISOString();
-            await setDoc(accDocRef, {
-              userId: uid,
-              ...adoptedMetrics,
-              permanentAccountNumber: finalUser.permanentAccountNumber || '1000000000',
-              updatedAt: nowIso,
-            }, { merge: true });
-            finalMetricsToSet = adoptedMetrics;
-          } else {
-            // Check for identity ambiguity before writing zero balance:
-            let hasAmbiguity = false;
-            if (finalUser.username) {
-              try {
-                const qSameUser = query(collection(db, 'users'), where('usernameLower', '==', finalUser.username.toLowerCase().trim()));
-                const sameUserSnap = await getDocs(qSameUser);
-                if (sameUserSnap.docs.length > 1) {
-                  hasAmbiguity = true;
-                  console.warn('[Auth] Ambiguous identity detected for username:', finalUser.username, '- Skipping zero account write.');
-                }
-              } catch {}
-            }
-
-            // Genuinely new user with no financial history and no identity ambiguity:
-            if (!hasAmbiguity && (!cachedBalances || cachedBalances.totalBalance === 0)) {
-              const nowIso = new Date().toISOString();
-              const initMetrics: BalanceMetrics = {
-                checkingBalance: 0,
-                savingsBalance: 0,
-                investedBalance: 0,
-                accruedEarnings: 0,
-                totalBalance: 0,
-                availableBalance: 0,
-                pendingBalance: 0,
-                loanBalance: 0,
-                accounts: [
-                  {
-                    id: `acc_chk_${uid}`,
-                    userId: uid,
-                    type: 'CHECKING',
-                    accountNumber: finalUser.permanentAccountNumber || '1000000000',
-                    routingNumber: '021000021',
-                    currency: 'USD',
-                    balance: 0,
-                    availableBalance: 0,
-                    investedBalance: 0,
-                    pendingBalance: 0,
-                    interestRateAPY: 1.25,
-                    status: 'ACTIVE',
-                    nickname: 'Monvera Premier Checking',
-                  },
-                  {
-                    id: `acc_sav_${uid}`,
-                    userId: uid,
-                    type: 'SAVINGS',
-                    accountNumber: (finalUser.permanentAccountNumber && finalUser.permanentAccountNumber.length >= 7)
-                      ? `10${finalUser.permanentAccountNumber.slice(2, -3)}991`
-                      : '1000000991',
-                    routingNumber: '021000021',
-                    currency: 'USD',
-                    balance: 0,
-                    availableBalance: 0,
-                    investedBalance: 0,
-                    pendingBalance: 0,
-                    interestRateAPY: 4.85,
-                    status: 'ACTIVE',
-                    nickname: 'Monvera High-Yield Treasury',
-                  },
-                ],
-              };
-              await setDoc(accDocRef, {
-                userId: uid,
-                ...initMetrics,
-                permanentAccountNumber: finalUser.permanentAccountNumber || '1000000000',
-                createdAt: nowIso,
-                updatedAt: nowIso,
-              }, { merge: true });
-              finalMetricsToSet = initMetrics;
-            } else if (cachedBalances && cachedBalances.totalBalance > 0) {
-              finalMetricsToSet = cachedBalances;
-            }
-          }
+        const backendMetrics = await api.getBalanceMetrics(uid, finalUser.permanentAccountNumber);
+        if (backendMetrics && (typeof backendMetrics.checkingBalance === 'number' || typeof backendMetrics.totalBalance === 'number')) {
+          finalMetricsToSet = backendMetrics;
         }
-      } catch (accInitErr) {
-        console.warn('[Auth] Base account initialization note:', accInitErr);
+      } catch (backendBalanceErr) {
+        console.warn('[Auth] Authoritative backend balance fetch note:', backendBalanceErr);
       }
+    }
+
+    if (!finalMetricsToSet) {
+      console.warn(`[Auth] Authoritative account ledger document accounts/${uid} was not found. Financial records preserved.`);
+    } else {
+      cacheUserBalances(uid, finalMetricsToSet);
     }
 
     if (finalMetricsToSet) {
