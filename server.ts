@@ -7,7 +7,7 @@ import { serverNotificationDispatcher } from './server/services/notificationDisp
 import { UserProfile, InvestmentTermDays, LoanApplication } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, AuthenticatedRequest } from './server/authMiddleware';
-import { adminFirestore } from './server/firebaseAdmin';
+import { adminFirestore, isFirebaseAdminConfigured } from './server/firebaseAdmin';
 import {
   executeServerTransfer,
   executeServerWithdrawal,
@@ -850,6 +850,13 @@ app.get('/api/accounts/balance', async (req: Request, res: Response) => {
   const userId = req.query.userId as string;
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
+  if (!isFirebaseAdminConfigured()) {
+    return res.status(503).json({
+      error: 'Authoritative account balances temporarily unavailable: Firebase Admin credentials not configured on backend.',
+      code: 'FIRESTORE_NOT_CONFIGURED',
+    });
+  }
+
   try {
     const accSnap = await adminFirestore.collection('accounts').doc(userId).get();
     if (accSnap.exists) {
@@ -1558,24 +1565,31 @@ if (!process.env.VERCEL) {
   // Initial safety sync on startup after 5 seconds
   setTimeout(async () => {
     try {
+      if (!isFirebaseAdminConfigured()) {
+        console.warn('[Auto-Reversal] Startup check skipped: Firebase Admin service account is not configured.');
+        return;
+      }
       const reversed = await executeServerPendingWithdrawalReversals();
       if (reversed > 0) {
         console.log(`[Auto-Reversal] Reversed ${reversed} expired pending withdrawal(s) on startup.`);
       }
-    } catch (e) {
-      console.error('[Auto-Reversal] Startup check error:', e);
+    } catch (e: any) {
+      console.error('[Auto-Reversal] Startup check error:', e?.message || e);
     }
   }, 5000);
 
   // Low-frequency safety reconciliation interval (every 10 minutes instead of every 15 seconds)
   setInterval(async () => {
     try {
+      if (!isFirebaseAdminConfigured()) {
+        return;
+      }
       const reversed = await executeServerPendingWithdrawalReversals();
       if (reversed > 0) {
         console.log(`[Auto-Reversal] Automatically reversed ${reversed} pending Firestore withdrawal(s).`);
       }
-    } catch (e) {
-      console.error('[Auto-Reversal] Reconciliation check error:', e);
+    } catch (e: any) {
+      console.error('[Auto-Reversal] Reconciliation check error:', e?.message || e);
     }
   }, 10 * 60 * 1000);
 }

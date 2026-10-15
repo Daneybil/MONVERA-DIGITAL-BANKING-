@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Request, Response, NextFunction } from 'express';
-import { adminAuth } from './firebaseAdmin';
+import { adminAuth, isFirebaseAdminConfigured } from './firebaseAdmin';
 
 export interface AuthenticatedRequest extends Request {
   auth?: {
@@ -18,6 +18,11 @@ export interface AuthenticatedRequest extends Request {
  * Rejects requests without a valid Firebase ID token with 401 Unauthorized.
  */
 export async function requireFirebaseAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!isFirebaseAdminConfigured()) {
+    return res.status(503).json({
+      error: 'SERVICE_UNAVAILABLE: Authentication service is unavailable because Firebase Admin credentials are not configured.',
+    });
+  }
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -56,6 +61,9 @@ export async function requireFirebaseAuth(req: AuthenticatedRequest, res: Respon
  * Optional helper for endpoints that allow both Firebase ID token auth AND admin fallback
  */
 export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
+  if (!isFirebaseAdminConfigured()) {
+    return next();
+  }
   const authHeader = req.headers.authorization;
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -150,6 +158,11 @@ export async function isCallerAdministrator(
  * Requires a valid Firebase Bearer token and verifies admin privileges.
  */
 export async function requireAdminAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!isFirebaseAdminConfigured()) {
+    return res.status(503).json({
+      error: 'SERVICE_UNAVAILABLE: Administrator authentication service is unavailable because Firebase Admin credentials are not configured.',
+    });
+  }
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {

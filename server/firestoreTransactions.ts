@@ -1,4 +1,4 @@
-import { adminFirestore, adminAuth } from './firebaseAdmin';
+import { adminFirestore, adminAuth, isFirebaseAdminConfigured } from './firebaseAdmin';
 import {
   Transaction,
   BankAccount,
@@ -983,6 +983,10 @@ export function scheduleTargetedWithdrawalReversal(txId: string, userId: string,
  * and reverses them atomically.
  */
 export async function executeServerPendingWithdrawalReversals(): Promise<number> {
+  if (!isFirebaseAdminConfigured()) {
+    return 0;
+  }
+
   const now = Date.now();
   let count = 0;
 
