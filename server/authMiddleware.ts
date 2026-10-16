@@ -94,7 +94,7 @@ export function getConfiguredAdminEmails(): string[] {
   const envEmails = process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '';
   return envEmails
     .split(',')
-    .map((e) => e.trim().toLowerCase())
+    .map((e) => e.replace(/^["']|["']$/g, '').trim().toLowerCase())
     .filter(Boolean);
 }
 
@@ -106,7 +106,7 @@ export function getConfiguredAdminUids(): string[] {
   const envUids = process.env.ADMIN_UIDS || process.env.ADMIN_UID || '';
   return envUids
     .split(',')
-    .map((u) => u.trim())
+    .map((u) => u.replace(/^["']|["']$/g, '').trim())
     .filter(Boolean);
 }
 

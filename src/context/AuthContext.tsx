@@ -947,7 +947,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setNotifications(notifRes.notifications);
     }
 
-    const isUserAdmin = finalUser.role === 'super_admin' || finalUser.role === 'admin' || finalUser.email?.toLowerCase() === 'admin@monvera.com' || finalUser.email?.toLowerCase() === 'daneybil2020@gmail.com';
+    let isUserAdmin = finalUser.role === 'super_admin' || finalUser.role === 'admin';
+    if (!isUserAdmin && firebaseUser) {
+      try {
+        const adminCheck = await api.verifyAdminSession();
+        if (adminCheck.isAdmin) {
+          isUserAdmin = true;
+          finalUser.role = 'admin';
+        }
+      } catch {}
+    }
     if (isUserAdmin) {
       setCurrentView('admin');
     } else {

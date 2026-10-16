@@ -2444,9 +2444,8 @@ export const firestoreSync = {
       }
 
       // 2. Full collection subscription is strictly restricted to verified administrators
-      const currentEmail = auth.currentUser?.email?.toLowerCase().trim();
       const currentUid = auth.currentUser?.uid;
-      const isCallerAdmin = currentEmail === 'daneybil2020@gmail.com' || currentEmail === 'admin@monvera.com' || currentUid === 'usr_admin' || currentUid === 'admin';
+      const isCallerAdmin = currentUid === 'usr_admin' || currentUid === 'admin' || (auth.currentUser as any)?.role === 'admin' || (auth.currentUser as any)?.role === 'super_admin';
 
       if (!isCallerAdmin) {
         // A missing UID must never trigger a full-collection query or listener for non-admin

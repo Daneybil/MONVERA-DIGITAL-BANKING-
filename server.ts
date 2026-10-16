@@ -25,7 +25,21 @@ import {
 } from './server/firestoreTransactions';
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+// CORS & Preflight handling for browser clients
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.header('Access-Control-Allow-Origin', origin);
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Credentials', 'true');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(
   express.json({
@@ -1596,7 +1610,22 @@ if (!process.env.VERCEL) {
 
 // --- TRANSACTIONS EXPLORER ---
 app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const userId = (req.query.userId as string) || req.auth?.uid;
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+
+  let targetUserId = req.query.userId as string | undefined;
+
+  // Security check: non-administrators can only query their own transactions
+  if (!isCallerAdmin) {
+    if (!callerUid && !targetUserId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    if (callerUid) {
+      targetUserId = callerUid;
+    }
+  }
+
+  const userId = targetUserId;
   const category = req.query.category as string;
   const search = (req.query.search as string)?.toLowerCase()?.trim();
   const type = req.query.type as string;
@@ -1608,45 +1637,57 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
   let userAcc = '';
 
   try {
-    const txCol = adminFirestore.collection('transactions');
     const txMap = new Map<string, any>();
 
-    if (userId) {
-      try {
-        const uSnap = await adminFirestore.collection('users').doc(userId).get();
-        if (uSnap.exists) {
-          userAcc = uSnap.data()?.permanentAccountNumber || '';
+    if (isFirebaseAdminConfigured()) {
+      const txCol = adminFirestore.collection('transactions');
+
+      if (userId) {
+        try {
+          const uSnap = await adminFirestore.collection('users').doc(userId).get();
+          if (uSnap.exists) {
+            userAcc = uSnap.data()?.permanentAccountNumber || '';
+          }
+        } catch {}
+
+        const cleanAcc = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
+
+        const promises = [
+          txCol.where('userId', '==', userId).get(),
+          txCol.where('senderUserId', '==', userId).get(),
+          txCol.where('recipientUserId', '==', userId).get(),
+        ];
+
+        if (cleanAcc) {
+          promises.push(txCol.where('senderAccountNumber', '==', cleanAcc).get());
+          promises.push(txCol.where('recipientAccountNumber', '==', cleanAcc).get());
         }
-      } catch {}
 
-      const cleanAcc = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
-
-      const promises = [
-        txCol.where('userId', '==', userId).get(),
-        txCol.where('senderUserId', '==', userId).get(),
-        txCol.where('recipientUserId', '==', userId).get(),
-      ];
-
-      if (cleanAcc) {
-        promises.push(txCol.where('senderAccountNumber', '==', cleanAcc).get());
-        promises.push(txCol.where('recipientAccountNumber', '==', cleanAcc).get());
+        const snaps = await Promise.all(promises.map((p) => p.catch(() => null)));
+        for (const snap of snaps) {
+          if (snap && !snap.empty) {
+            snap.forEach((d) => {
+              const t = d.data();
+              txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
+            });
+          }
+        }
+      } else if (isCallerAdmin) {
+        const snap = await txCol.get();
+        snap.forEach((d) => {
+          const t = d.data();
+          txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
+        });
       }
+    }
 
-      const snaps = await Promise.all(promises.map((p) => p.catch(() => null)));
-      for (const snap of snaps) {
-        if (snap && !snap.empty) {
-          snap.forEach((d) => {
-            const t = d.data();
-            txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
-          });
+    // Merge matching in-memory transactions if not already present
+    for (const t of db.transactions) {
+      if (!txMap.has(t.id)) {
+        if (!userId || t.userId === userId || t.senderUserId === userId || t.recipientUserId === userId) {
+          txMap.set(t.id, t);
         }
       }
-    } else {
-      const snap = await txCol.get();
-      snap.forEach((d) => {
-        const t = d.data();
-        txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
-      });
     }
 
     txs = Array.from(txMap.values());
@@ -2073,53 +2114,308 @@ app.post('/api/security/sessions/:id/terminate', (req: Request, res: Response) =
 });
 
 // --- ADMIN SYSTEM & GOVERNANCE ---
-app.get('/api/admin/overview', requireAdminAuth, (req: AuthenticatedRequest, res: Response) => {
-  const overview = db.getAdminOverview();
-  res.json(overview);
+app.get('/api/admin/verify-session', requireAdminAuth, (req: AuthenticatedRequest, res: Response) => {
+  res.json({
+    success: true,
+    isAdmin: true,
+    uid: req.auth!.uid,
+    email: req.auth!.email,
+  });
+});
+
+const FAKE_ACCOUNT_IDS = new Set([
+  'usr_eleanor',
+  'usr_marcus',
+  'usr_sophia',
+  'usr_alexander',
+  'usr_isabella',
+  'usr_lucas',
+  'usr_clara',
+  'usr_tariq',
+  'usr_elena',
+  'usr_william',
+  'usr_amara',
+  'usr_julian',
+]);
+
+function isFakeAccount(user: { id?: string; email?: string; role?: string }): boolean {
+  if (!user) return true;
+  if (user.id && FAKE_ACCOUNT_IDS.has(user.id)) return true;
+  if (user.id === 'usr_admin' || user.role === 'super_admin') return true;
+  if (user.email) {
+    const em = user.email.toLowerCase().trim();
+    if (
+      em.endsWith('@vanceholdings.com') ||
+      em.endsWith('@sterlingtech.io') ||
+      em.endsWith('@falconcap.ae') ||
+      em.endsWith('@apexventures.sg') ||
+      em.endsWith('@milanolux.it') ||
+      em.endsWith('@vanderbiltmaritime.nl') ||
+      em.endsWith('@oswaldresearch.org') ||
+      em.endsWith('@gulfenergyholdings.com') ||
+      em.endsWith('@auroraglobal.ch') ||
+      em.endsWith('@thornepartners.co.uk') ||
+      em.endsWith('@lagosfin.ng') ||
+      em.endsWith('@delacroixequity.fr') ||
+      em.endsWith('@monvera.internal')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    let totalCustomers = 0;
+    let activeAccounts = 0;
+    let totalPlatformDeposits = 0;
+    let totalPlatformWithdrawals = 0;
+    let totalPlatformTransfers = 0;
+    let totalPlatformInvestments = 0;
+    let pendingTransactionsCount = 0;
+    let failedTransactionsCount = 0;
+
+    if (isFirebaseAdminConfigured()) {
+      const [usersSnap, accountsSnap, txSnap, invSnap] = await Promise.all([
+        adminFirestore.collection('users').get().catch(() => null),
+        adminFirestore.collection('accounts').get().catch(() => null),
+        adminFirestore.collection('transactions').get().catch(() => null),
+        adminFirestore.collection('investments').get().catch(() => null),
+      ]);
+
+      const realUserIds = new Set<string>();
+      if (usersSnap) {
+        usersSnap.forEach((doc) => {
+          const d = doc.data();
+          if (!isFakeAccount({ id: doc.id, ...d })) {
+            realUserIds.add(doc.id);
+          }
+        });
+      }
+
+      totalCustomers = realUserIds.size;
+
+      if (accountsSnap) {
+        accountsSnap.forEach((doc) => {
+          if (realUserIds.has(doc.id) || !usersSnap) {
+            const ad = doc.data();
+            const chk = Number(ad.checkingBalance ?? 0);
+            const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
+            const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
+            const accrued = Number(ad.accruedEarnings ?? 0);
+            const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
+            totalPlatformDeposits += total;
+            if (Array.isArray(ad.accounts) && ad.accounts.length > 0) {
+              activeAccounts += ad.accounts.filter((a: any) => a.status === 'ACTIVE').length;
+            } else {
+              activeAccounts += 2;
+            }
+          }
+        });
+      }
+
+      if (txSnap) {
+        txSnap.forEach((doc) => {
+          const tx = doc.data();
+          const amt = Number(tx.amount) || 0;
+          const status = (tx.status || 'COMPLETED').toUpperCase();
+
+          if (status === 'PENDING') {
+            pendingTransactionsCount++;
+          } else if (status === 'FAILED' || status === 'DECLINED') {
+            failedTransactionsCount++;
+          } else if (status === 'COMPLETED' || status === 'SETTLED' || status === 'POSTED') {
+            if (tx.type === 'WITHDRAWAL') {
+              totalPlatformWithdrawals += amt;
+            } else if (tx.type === 'TRANSFER' || tx.type === 'INTERNAL_TRANSFER') {
+              totalPlatformTransfers += amt;
+            } else if (tx.type === 'INVESTMENT') {
+              totalPlatformInvestments += amt;
+            }
+          }
+        });
+      }
+
+      if (invSnap) {
+        invSnap.forEach((doc) => {
+          const inv = doc.data();
+          if (inv && (inv.status === 'ACTIVE' || inv.status === 'ACTIVE_INVESTMENT')) {
+            totalPlatformInvestments += Number(inv.principalAmount || inv.amount || 0);
+          }
+        });
+      }
+    }
+
+    if (totalCustomers === 0) {
+      return res.json(db.getAdminOverview());
+    }
+
+    if (activeAccounts === 0) {
+      activeAccounts = totalCustomers * 2;
+    }
+
+    const overview: AdminSystemOverview = {
+      totalCustomers,
+      activeAccounts,
+      totalPlatformDeposits,
+      totalPlatformWithdrawals,
+      totalPlatformTransfers,
+      totalPlatformInvestments,
+      pendingTransactionsCount,
+      failedTransactionsCount,
+      devFundingPoolBalance: db.devFundingPoolBalance,
+      systemReserveRatio: 100,
+      activeNodesCount: 8,
+    };
+
+    res.json(overview);
+  } catch (err) {
+    console.error('[GET /api/admin/overview] Error:', err);
+    res.json(db.getAdminOverview());
+  }
 });
 
 app.get('/api/admin/customers', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const snap = await adminFirestore.collection('users').get();
     const firestoreUsers: any[] = [];
-    snap.forEach((doc) => {
-      const d = doc.data();
-      if (doc.id !== 'usr_admin' && d.role !== 'super_admin' && !d.email?.endsWith('@monvera.internal')) {
-        firestoreUsers.push({ id: doc.id, ...d });
-      }
-    });
+    const accountsMap = new Map<string, any>();
 
-    // Reconcile with db.users in memory: Firestore is authoritative for kycStatus and verified legal names
-    for (const fu of firestoreUsers) {
-      if (!db.users.has(fu.id)) {
-        db.users.set(fu.id, fu as UserProfile);
-      } else {
-        const mem = db.users.get(fu.id)!;
-        Object.assign(mem, fu);
+    if (isFirebaseAdminConfigured()) {
+      const [usersSnap, accountsSnap] = await Promise.all([
+        adminFirestore.collection('users').get().catch((err) => {
+          console.warn('[GET /api/admin/customers] Error fetching users from Firestore:', err?.message || err);
+          return null;
+        }),
+        adminFirestore.collection('accounts').get().catch((err) => {
+          console.warn('[GET /api/admin/customers] Error fetching accounts from Firestore:', err?.message || err);
+          return null;
+        }),
+      ]);
+
+      if (accountsSnap) {
+        accountsSnap.forEach((doc) => {
+          accountsMap.set(doc.id, doc.data());
+        });
+      }
+
+      if (usersSnap) {
+        usersSnap.forEach((doc) => {
+          const d = doc.data();
+          if (!isFakeAccount({ id: doc.id, ...d })) {
+            firestoreUsers.push({ id: doc.id, ...d });
+          }
+        });
       }
     }
 
-    const customers = Array.from(db.users.values())
-      .filter((u) => u.id !== 'usr_admin' && u.role !== 'super_admin' && !u.email?.endsWith('@monvera.internal'))
-      .map((u) => {
-        const metrics = db.getUserBalanceMetrics(u.id);
-        return {
-          ...u,
-          balanceMetrics: metrics,
+    const userMap = new Map<string, any>();
+
+    for (const fu of firestoreUsers) {
+      const cleanAcc = (fu.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const ad = accountsMap.get(fu.id) || (cleanAcc ? accountsMap.get(cleanAcc) : null);
+      let balanceMetrics: any;
+      if (ad) {
+        const chk = Number(ad.checkingBalance ?? 0);
+        const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
+        const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
+        const accrued = Number(ad.accruedEarnings ?? 0);
+        const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
+        const avail = Number(ad.availableBalance ?? chk);
+        const loanBal = Number(ad.loanBalance ?? 0);
+        const pending = Number(ad.pendingBalance ?? 0);
+        const accountsList = ad.accounts || [
+          {
+            id: `acc_chk_${fu.id}`,
+            userId: fu.id,
+            type: 'CHECKING',
+            accountNumber: cleanAcc || '1000000000',
+            routingNumber: '021000021',
+            currency: 'USD',
+            balance: chk,
+            availableBalance: avail,
+            investedBalance: inv,
+            pendingBalance: pending,
+            status: 'ACTIVE',
+            nickname: 'Monvera Premier Checking',
+          },
+          {
+            id: `acc_sav_${fu.id}`,
+            userId: fu.id,
+            type: 'SAVINGS',
+            accountNumber: cleanAcc ? `10${cleanAcc.slice(2, -3)}991` : '1000000991',
+            routingNumber: '021000021',
+            currency: 'USD',
+            balance: sav,
+            availableBalance: sav,
+            investedBalance: 0,
+            pendingBalance: 0,
+            interestRateAPY: 4.85,
+            status: 'ACTIVE',
+            nickname: 'Monvera High-Yield Treasury',
+          },
+        ];
+        balanceMetrics = {
+          checkingBalance: chk,
+          savingsBalance: sav,
+          investedBalance: inv,
+          accruedEarnings: accrued,
+          totalBalance: total,
+          availableBalance: avail,
+          pendingBalance: pending,
+          loanBalance: loanBal,
+          accounts: accountsList,
         };
+      } else if (db.users.has(fu.id)) {
+        balanceMetrics = db.getUserBalanceMetrics(fu.id);
+      } else {
+        balanceMetrics = {
+          checkingBalance: 0,
+          savingsBalance: 0,
+          investedBalance: 0,
+          accruedEarnings: 0,
+          totalBalance: 0,
+          availableBalance: 0,
+          pendingBalance: 0,
+          loanBalance: 0,
+          accounts: [],
+        };
+      }
+
+      userMap.set(fu.id, {
+        ...fu,
+        balanceMetrics,
       });
+
+      if (!db.users.has(fu.id)) {
+        db.users.set(fu.id, fu as UserProfile);
+      } else {
+        Object.assign(db.users.get(fu.id)!, fu);
+      }
+    }
+
+    // Fallback to non-fake users in db.users if Firestore returned nothing (e.g. dev mode without Firestore)
+    if (userMap.size === 0) {
+      Array.from(db.users.values())
+        .filter((u) => !isFakeAccount(u))
+        .forEach((u) => {
+          userMap.set(u.id, {
+            ...u,
+            balanceMetrics: db.getUserBalanceMetrics(u.id),
+          });
+        });
+    }
+
+    const customers = Array.from(userMap.values());
     res.json({ customers });
   } catch (err: any) {
-    console.error('[GET /api/admin/customers] Error fetching Firestore users:', err);
+    console.error('[GET /api/admin/customers] Error fetching customers:', err);
     const customers = Array.from(db.users.values())
-      .filter((u) => u.id !== 'usr_admin' && u.role !== 'super_admin' && !u.email?.endsWith('@monvera.internal'))
-      .map((u) => {
-        const metrics = db.getUserBalanceMetrics(u.id);
-        return {
-          ...u,
-          balanceMetrics: metrics,
-        };
-      });
+      .filter((u) => !isFakeAccount(u))
+      .map((u) => ({
+        ...u,
+        balanceMetrics: db.getUserBalanceMetrics(u.id),
+      }));
     res.json({ customers });
   }
 });

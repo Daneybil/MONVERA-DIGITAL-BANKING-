@@ -72,6 +72,29 @@ export const AdminDashboard: React.FC = () => {
   const [adminLoans, setAdminLoans] = useState<LoanApplication[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
+  const [isServerAdminVerified, setIsServerAdminVerified] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    async function verifyAdminSession() {
+      if (!auth?.currentUser) {
+        if (isMounted) setIsServerAdminVerified(false);
+        return;
+      }
+      if (currentUser?.role === 'super_admin' || currentUser?.role === 'admin') {
+        if (isMounted) setIsServerAdminVerified(true);
+        return;
+      }
+      const check = await api.verifyAdminSession();
+      if (isMounted) {
+        setIsServerAdminVerified(check.isAdmin);
+      }
+    }
+    verifyAdminSession();
+    return () => {
+      isMounted = false;
+    };
+  }, [auth?.currentUser, currentUser?.role]);
 
   // Helper to merge Firestore users and server customers seamlessly without duplicate accounts
   const mergeCustomers = (
@@ -721,8 +744,7 @@ export const AdminDashboard: React.FC = () => {
     auth?.currentUser &&
     (currentUser.role === 'super_admin' ||
      currentUser.role === 'admin' ||
-     currentUser.email?.toLowerCase() === 'daneybil2020@gmail.com' ||
-     currentUser.email?.toLowerCase() === 'admin@monvera.com')
+     isServerAdminVerified === true)
   );
 
   if (!isAdmin) {

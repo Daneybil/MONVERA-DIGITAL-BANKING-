@@ -1516,6 +1516,23 @@ export const api = {
   },
 
   // Admin Endpoints
+  async verifyAdminSession(): Promise<{ isAdmin: boolean; error?: string }> {
+    try {
+      const headers = await getAuthHeaders();
+      if (!headers['Authorization']) {
+        return { isAdmin: false, error: 'No authentication token available' };
+      }
+      const res = await fetch('/api/admin/verify-session', { headers });
+      if (res.ok) {
+        const data = await parseJsonResponse<{ success: boolean; isAdmin?: boolean }>(res, { success: false, isAdmin: false });
+        return { isAdmin: !!data.isAdmin };
+      }
+      return { isAdmin: false };
+    } catch {
+      return { isAdmin: false };
+    }
+  },
+
   async getAdminOverview(): Promise<AdminSystemOverview> {
     try {
       const headers = await getAuthHeaders();
@@ -2057,11 +2074,8 @@ export const api = {
           ),
         };
       } else {
-        // Full loan listings only for authorized administrators
-        const currentEmail = auth.currentUser?.email?.toLowerCase().trim();
-        const currentUid = auth.currentUser?.uid;
-        const isCallerAdmin = currentEmail === 'daneybil2020@gmail.com' || currentEmail === 'admin@monvera.com' || currentUid === 'usr_admin' || currentUid === 'admin';
-        if (isCallerAdmin) {
+        // Full loan listings only for authorized administrators (validated by backend /api/loans)
+        if (data.loans && data.loans.length > 0) {
           const fsLoans = await firestoreSync.getAllLoans().catch(() => []);
           const map = new Map<string, LoanApplication>();
           (data.loans || []).forEach((l) => map.set(l.id, l));
@@ -2072,8 +2086,7 @@ export const api = {
             ),
           };
         }
-        // Non-admin callers without a userId must never trigger a full-collection query
-        return { loans: [] };
+        return data;
       }
     } catch {
       return { loans: [] };
