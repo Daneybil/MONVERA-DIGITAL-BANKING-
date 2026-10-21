@@ -79,6 +79,7 @@ export const SendMoneyModal: React.FC = () => {
 
   // Lookup state
   const [isLookingUp, setIsLookingUp] = useState(false);
+  const [isExecuting, setIsExecuting] = useState(false);
   const [lookupResult, setLookupResult] = useState<RecipientLookupResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [completedTx, setCompletedTx] = useState<Transaction | null>(null);
@@ -101,6 +102,7 @@ export const SendMoneyModal: React.FC = () => {
       setLookupResult(null);
       setErrorMessage(null);
       setCompletedTx(null);
+      setIsExecuting(false);
     }
   }, [activeModal]);
 
@@ -262,6 +264,8 @@ export const SendMoneyModal: React.FC = () => {
   };
 
   const handleExecuteTransfer = async () => {
+    if (isExecuting) return;
+    setIsExecuting(true);
     setStep('PROCESSING');
     setErrorMessage(null);
 
@@ -270,17 +274,15 @@ export const SendMoneyModal: React.FC = () => {
       if (!auth?.currentUser) {
         setErrorMessage('Authentication required: Please sign in to your Monvera account before transferring funds.');
         setStep('CONFIRM');
-        return;
-      }
-      if (currentUser && auth.currentUser.uid !== currentUser.id) {
-        setErrorMessage('Session identity mismatch: Authenticated user does not match the active customer profile. Please sign out and sign back in.');
-        setStep('CONFIRM');
+        setIsExecuting(false);
         return;
       }
     }
 
     try {
       const transferAmount = parseNumericAmount(amount);
+      const idempotencyKey = `MV-TRF-${Date.now()}-${Math.floor(100000 + Math.random() * 900000)}`;
+
       if (isAdmin) {
         // Execute Administrator Transfer via secure backend ledger system
         const res = await api.sendAdminTransfer({
@@ -308,8 +310,9 @@ export const SendMoneyModal: React.FC = () => {
         }
       } else {
         // Standard Customer Peer Transfer
+        const effectiveSender = auth?.currentUser?.uid || currentUser?.id || 'usr_customer';
         const res = await api.sendMonveraTransfer({
-          senderUserId: currentUser!.id,
+          senderUserId: effectiveSender,
           recipientUserId: lookupResult?.recipientId,
           recipientAccountNumber: lookupResult?.permanentAccountNumber,
           recipientUsername: lookupResult?.username,
@@ -318,6 +321,8 @@ export const SendMoneyModal: React.FC = () => {
           amount: transferAmount,
           description: memo || `Transfer to ${lookupResult?.firstName} ${lookupResult?.lastName} (@${lookupResult?.username || 'user'})`,
           category,
+          referenceNumber: idempotencyKey,
+          idempotencyKey,
         });
 
         if (res.success && res.transaction) {
@@ -339,6 +344,8 @@ export const SendMoneyModal: React.FC = () => {
     } catch {
       setErrorMessage('Network or server error during transfer processing.');
       setStep('CONFIRM');
+    } finally {
+      setIsExecuting(false);
     }
   };
 
@@ -680,7 +687,8 @@ export const SendMoneyModal: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleExecuteTransfer}
-                  className="w-2/3 py-4 rounded-2xl font-black text-base text-white bg-emerald-600 hover:bg-emerald-700 transition-colors shadow-lg hover:shadow-xl flex items-center justify-center gap-2 cursor-pointer"
+                  disabled={isExecuting}
+                  className="w-2/3 py-4 rounded-2xl font-black text-base text-white bg-emerald-600 hover:bg-emerald-700 transition-colors shadow-lg hover:shadow-xl flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <span>Authorize & Send</span>
                   <ArrowRight className="w-5 h-5 text-white" />

@@ -492,6 +492,9 @@ async function runKycFinalAcceptanceTestSuite() {
       username: `user_${incompleteUid.slice(0, 6)}`,
       firstName: 'Missing',
       lastName: 'Documents',
+      email: `${incompleteUid}@test.com`,
+      phone: '+1 555-0100',
+      permanentAccountNumber: '1099999999',
       country: 'United States',
       status: 'active',
       role: 'customer',
@@ -604,10 +607,10 @@ async function runKycFinalAcceptanceTestSuite() {
     const isExistingFirestore = firestoreCustomerIds.has(staleLocalUser.id);
     
     // Exact logic from AdminDashboard mergeCustomers:
-    let effectiveKycStatus = 'unverified';
+    let effectiveKycStatus: any = 'unverified';
     if (isExistingFirestore) {
-      effectiveKycStatus = existing.kycStatus || 'unverified';
-    } else if (existing.kycStatus === 'verified' || staleLocalUser.kycStatus === 'verified') {
+      effectiveKycStatus = (existing as any)?.kycStatus || 'unverified';
+    } else if ((existing as any)?.kycStatus === 'verified' || (staleLocalUser as any).kycStatus === 'verified') {
       effectiveKycStatus = 'verified';
     }
 

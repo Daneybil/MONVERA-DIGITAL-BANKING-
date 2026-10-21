@@ -1553,7 +1553,10 @@ export class MonveraDatabase {
     }
 
     const now = new Date().toISOString();
-    if (params.fullName) user.kycFullName = params.fullName;
+    if (params.fullName) {
+      user.kycFullName = params.fullName;
+      user.fullName = params.fullName;
+    }
     if (params.firstName) user.firstName = params.firstName;
     if (params.lastName) user.lastName = params.lastName;
     user.kycFirstName = params.firstName || user.firstName;
@@ -1564,15 +1567,25 @@ export class MonveraDatabase {
       user.phone = params.phone;
       user.kycPhone = params.phone;
     }
-    if (params.email) user.kycEmail = params.email;
-    if (params.dateOfBirth) user.kycDateOfBirth = params.dateOfBirth;
+    if (params.email) {
+      user.email = params.email;
+      user.kycEmail = params.email;
+    }
+    if (params.dateOfBirth) {
+      user.dateOfBirth = params.dateOfBirth;
+      user.kycDateOfBirth = params.dateOfBirth;
+    }
 
     user.kycDocumentType = params.documentType;
     user.kycDocumentNumber = params.documentNumber.trim();
     if (params.documentImage) user.kycDocumentImage = params.documentImage;
     if (params.documentBackImage) user.kycDocumentBackImage = params.documentBackImage;
     if (params.liveSelfieImage) user.kycLiveSelfieImage = params.liveSelfieImage;
-    if (params.streetAddress) user.kycStreetAddress = params.streetAddress;
+    if (params.streetAddress) {
+      user.kycStreetAddress = params.streetAddress;
+      user.streetAddress = params.streetAddress;
+      (user as any).address = params.streetAddress;
+    }
     if (params.proofOfAddressType) user.kycProofOfAddressType = params.proofOfAddressType;
     if (params.proofOfAddressImage) user.kycProofOfAddressImage = params.proofOfAddressImage;
     if (params.ssn) user.kycSsn = params.ssn;
@@ -1754,6 +1767,20 @@ export class MonveraDatabase {
       user.dailyTransactionLimit = 1000000;
       user.kycRejectionReason = undefined;
 
+      const verifiedLegalName =
+        user.kycFullName ||
+        (user.kycFirstName && user.kycLastName ? `${user.kycFirstName} ${user.kycLastName}`.trim() : '') ||
+        `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
+        'Verified Client';
+      user.fullName = verifiedLegalName;
+      user.kycFullName = verifiedLegalName;
+      if (user.kycFirstName) user.firstName = user.kycFirstName;
+      if (user.kycLastName) user.lastName = user.kycLastName;
+      if (user.kycStreetAddress) {
+        user.streetAddress = user.kycStreetAddress;
+        (user as any).address = user.kycStreetAddress;
+      }
+
       this.notifications.unshift({
         id: `notif_kyc_all_app_${Date.now()}`,
         userId: user.id,
@@ -1818,7 +1845,7 @@ export class MonveraDatabase {
                  userCountry.toUpperCase() === 'USA';
 
     const hasIdentity = !!(user.kycDocumentImage || user.kycDocumentNumber);
-    const hasAddress = !!(user.kycProofOfAddressImage || user.kycStreetAddress || user.address);
+    const hasAddress = !!(user.kycProofOfAddressImage || user.kycStreetAddress || (user as any).address || user.streetAddress);
     const hasLiveness = !!user.kycLiveSelfieImage;
     const hasSsn = !!(user.kycSsn || user.kycSsnImage);
 
@@ -1840,6 +1867,20 @@ export class MonveraDatabase {
     user.kycVerifiedAt = now;
     user.dailyTransactionLimit = 1000000;
     user.kycRejectionReason = undefined;
+
+    const verifiedLegalName =
+      user.kycFullName ||
+      (user.kycFirstName && user.kycLastName ? `${user.kycFirstName} ${user.kycLastName}`.trim() : '') ||
+      `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
+      'Verified Client';
+    user.fullName = verifiedLegalName;
+    user.kycFullName = verifiedLegalName;
+    if (user.kycFirstName) user.firstName = user.kycFirstName;
+    if (user.kycLastName) user.lastName = user.kycLastName;
+    if (user.kycStreetAddress) {
+      user.streetAddress = user.kycStreetAddress;
+      (user as any).address = user.kycStreetAddress;
+    }
 
     user.kycItemReviews = {
       identity: { status: 'approved', reviewedAt: now, reviewedBy: adminId || 'usr_admin' },
@@ -2234,6 +2275,14 @@ export class MonveraDatabase {
       };
     }
 
+    if (loan.status === 'REJECTED' || loan.status === 'CANCELLED' || loan.status === 'PAID') {
+      return { success: false, error: `INVALID_STATUS: Loan application is currently ${loan.status.toLowerCase()} and cannot be approved.` };
+    }
+
+    if (loan.status !== 'PENDING') {
+      return { success: false, error: `INVALID_STATUS: Only pending loan applications can be approved (current status: ${loan.status}).` };
+    }
+
     const user = this.ensureUserExists(loan.userId, {
       email: loan.applicantEmail,
       firstName: loan.applicantName.split(' ')[0] || 'Valued',
@@ -2324,10 +2373,28 @@ export class MonveraDatabase {
     adminId: string;
   }): { success: boolean; loan?: LoanApplication; error?: string } {
     const loan = this.loans.get(params.loanId);
-    if (!loan) return { success: false, error: 'Loan record not found.' };
+    if (!loan) return { success: false, error: 'LOAN_NOT_FOUND: Loan record not found.' };
 
-    const user = this.users.get(loan.userId);
-    if (!user) return { success: false, error: 'Customer account not found.' };
+    if (loan.status === 'ACTIVE' || loan.status === 'APPROVED') {
+      return { success: false, error: 'INVALID_STATUS: Cannot reject a loan that has already been approved and disbursed.' };
+    }
+    if (loan.status === 'CANCELLED' || loan.status === 'PAID') {
+      return { success: false, error: `INVALID_STATUS: Loan application is currently ${loan.status.toLowerCase()} and cannot be rejected.` };
+    }
+    if (loan.status === 'REJECTED') {
+      return { success: true, loan }; // Idempotent
+    }
+    if (loan.status !== 'PENDING') {
+      return { success: false, error: `INVALID_STATUS: Only pending loan applications can be rejected (current status: ${loan.status}).` };
+    }
+
+    const user = this.users.get(loan.userId) || this.ensureUserExists(loan.userId, {
+      email: loan.applicantEmail,
+      firstName: loan.applicantName.split(' ')[0] || 'Valued',
+      lastName: loan.applicantName.split(' ').slice(1).join(' ') || 'Client',
+      permanentAccountNumber: loan.permanentAccountNumber,
+      phone: loan.applicantPhone,
+    });
 
     const now = new Date().toISOString();
     const rejectionReason = params.reason || 'Insufficient platform transaction volume or additional documentation required.';

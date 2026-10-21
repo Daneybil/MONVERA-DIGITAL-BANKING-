@@ -1,4 +1,5 @@
 import { adminFirestore, adminAuth, isFirebaseAdminConfigured } from './firebaseAdmin';
+import { db } from './db';
 import {
   Transaction,
   BankAccount,
@@ -7,6 +8,8 @@ import {
   NotificationItem,
   InvestmentPlan,
   InvestmentTermDays,
+  CardItem,
+  UserProfile,
 } from '../src/types';
 
 export interface TransferParams {
@@ -124,27 +127,46 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
   const cleanTarget = cleanNoAt.toLowerCase();
   const cleanDigits = targetStr.replace(/[-\s]/g, '');
 
-  const usersCol = adminFirestore.collection('users');
-  const accountsCol = adminFirestore.collection('accounts');
+  if (isFirebaseAdminConfigured()) {
+    const usersCol = adminFirestore.collection('users');
+    const accountsCol = adminFirestore.collection('accounts');
 
-  // Strategy 1: Direct document ID lookup in users/accounts or Firebase Admin Auth if target is a canonical Firebase UID
-  if (isCanonicalAuthUid(targetStr)) {
+    // Strategy 1: Direct document ID lookup in users/accounts or Firebase Admin Auth
     try {
-      let authUser: any = null;
-      try {
-        authUser = await adminAuth.getUser(targetStr);
-      } catch {}
-
       const directUserSnap = await usersCol.doc(targetStr).get();
-      const directAccSnap = await accountsCol.doc(targetStr).get();
+      if (directUserSnap.exists) {
+        const userData = directUserSnap.data() || {};
+        const canonicalUid = directUserSnap.id;
+        const permanentAcc = userData.permanentAccountNumber || userData.accountNumber || '1000000000';
+        const fName = userData.firstName || 'Monvera';
+        const lName = userData.lastName || 'Customer';
 
-      if (directUserSnap.exists || directAccSnap.exists || authUser) {
-        const userData = directUserSnap.exists ? directUserSnap.data() || {} : {};
-        const accData = directAccSnap.exists ? directAccSnap.data() || {} : {};
-        const canonicalUid = targetStr;
-        const permanentAcc = userData.permanentAccountNumber || accData.permanentAccountNumber || accData.accountNumber || '1000000000';
-        const fName = userData.firstName || authUser?.displayName?.split(' ')[0] || 'Monvera';
-        const lName = userData.lastName || authUser?.displayName?.split(' ').slice(1).join(' ') || 'Customer';
+        return {
+          success: true,
+          uid: canonicalUid,
+          data: {
+            ...userData,
+            id: canonicalUid,
+            uid: canonicalUid,
+            firstName: fName,
+            lastName: lName,
+            fullName: userData.fullName || `${fName} ${lName}`.trim(),
+            permanentAccountNumber: permanentAcc,
+            email: userData.email,
+            username: userData.username || cleanTarget,
+          },
+        };
+      }
+
+      const directAccSnap = await accountsCol.doc(targetStr).get();
+      if (directAccSnap.exists) {
+        const accData = directAccSnap.data() || {};
+        const canonicalUid = accData.userId || directAccSnap.id;
+        const uSnap = await usersCol.doc(canonicalUid).get();
+        const userData = uSnap.exists ? uSnap.data() || {} : {};
+        const permanentAcc = accData.permanentAccountNumber || accData.accountNumber || userData.permanentAccountNumber || '1000000000';
+        const fName = userData.firstName || 'Monvera';
+        const lName = userData.lastName || 'Customer';
 
         return {
           success: true,
@@ -158,147 +180,242 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
             lastName: lName,
             fullName: userData.fullName || `${fName} ${lName}`.trim(),
             permanentAccountNumber: permanentAcc,
-            email: userData.email || authUser?.email || accData.email,
+            email: userData.email || accData.email,
             username: userData.username || cleanTarget,
           },
         };
       }
-    } catch {}
-  }
 
-  // Strategy 2: Exact Account Number Lookup (permanentAccountNumber or legacy accountNumber)
-  if (cleanDigits && /^\d{6,14}$/.test(cleanDigits)) {
-    const matchesMap = new Map<string, { uid: string; data: any }>();
-    try {
-      const qPerm = await usersCol.where('permanentAccountNumber', '==', cleanDigits).get();
-      qPerm.docs.forEach((doc) => {
-        const d = doc.data() || {};
-        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-        if (uid) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-      });
-      const qLegacy = await usersCol.where('accountNumber', '==', cleanDigits).get();
-      qLegacy.docs.forEach((doc) => {
-        const d = doc.data() || {};
-        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-        if (uid) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-      });
-      const qAcc = await accountsCol.where('permanentAccountNumber', '==', cleanDigits).get();
-      qAcc.docs.forEach((doc) => {
-        const d = doc.data() || {};
-        const uid = isCanonicalAuthUid(d.userId) ? d.userId : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-        if (uid && !matchesMap.has(uid)) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-      });
-    } catch {}
-
-    const matches = Array.from(matchesMap.values());
-    if (matches.length > 1) {
-      return {
-        success: false,
-        error: `Multiple customer profiles found for account number ${cleanDigits}. Recipient resolution is ambiguous. Transaction aborted.`,
-        isAmbiguous: true,
-      };
-    }
-    if (matches.length === 1) {
-      const matched = matches[0];
-      return {
-        success: true,
-        uid: matched.uid,
-        data: matched.data,
-      };
-    }
-  }
-
-  // Strategy 3: Email Lookup
-  if (cleanTarget.includes('@')) {
-    const emailMatchesMap = new Map<string, { uid: string; data: any }>();
-    try {
-      const qEmail = await usersCol.where('email', '==', cleanTarget).get();
-      qEmail.docs.forEach((doc) => {
-        const d = doc.data() || {};
-        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-        if (uid) emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-      });
-      if (targetStr.toLowerCase() !== cleanTarget) {
-        const qEmailRaw = await usersCol.where('email', '==', targetStr.toLowerCase()).get();
-        qEmailRaw.docs.forEach((doc) => {
-          const d = doc.data() || {};
-          const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-          if (uid && !emailMatchesMap.has(uid)) emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-        });
-      }
       try {
-        const authUser = await adminAuth.getUserByEmail(cleanTarget);
-        if (authUser && isCanonicalAuthUid(authUser.uid) && !emailMatchesMap.has(authUser.uid)) {
-          const uDoc = await usersCol.doc(authUser.uid).get();
-          const uData = uDoc.exists ? uDoc.data() || {} : {};
-          emailMatchesMap.set(authUser.uid, {
+        const authUser = await adminAuth.getUser(targetStr);
+        if (authUser) {
+          const uSnap = await usersCol.doc(authUser.uid).get();
+          const uData = uSnap.exists ? uSnap.data() || {} : {};
+          const fName = uData.firstName || authUser.displayName?.split(' ')[0] || 'Monvera';
+          const lName = uData.lastName || authUser.displayName?.split(' ').slice(1).join(' ') || 'Customer';
+          return {
+            success: true,
             uid: authUser.uid,
-            data: { ...uData, id: authUser.uid, uid: authUser.uid, email: cleanTarget },
-          });
+            data: {
+              ...uData,
+              id: authUser.uid,
+              uid: authUser.uid,
+              firstName: fName,
+              lastName: lName,
+              fullName: uData.fullName || `${fName} ${lName}`.trim(),
+              permanentAccountNumber: uData.permanentAccountNumber || '1000000000',
+              email: uData.email || authUser.email,
+              username: uData.username || cleanTarget,
+            },
+          };
         }
       } catch {}
     } catch {}
 
-    const matches = Array.from(emailMatchesMap.values());
-    if (matches.length > 1) {
-      return {
-        success: false,
-        error: `Multiple customer accounts found for email "${cleanTarget}". Recipient resolution is ambiguous. Please specify their permanent account number.`,
-        isAmbiguous: true,
-      };
+    // Strategy 2: Exact Account Number Lookup (permanentAccountNumber or legacy accountNumber)
+    if (cleanDigits && /^\d{6,14}$/.test(cleanDigits)) {
+      const matchesMap = new Map<string, { uid: string; data: any }>();
+      try {
+        const qPerm = await usersCol.where('permanentAccountNumber', '==', cleanDigits).get();
+        qPerm.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = d.uid || d.id || doc.id;
+          if (uid && uid !== 'usr_admin') matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+        const qLegacy = await usersCol.where('accountNumber', '==', cleanDigits).get();
+        qLegacy.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = d.uid || d.id || doc.id;
+          if (uid && uid !== 'usr_admin') matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+        const qAcc = await accountsCol.where('permanentAccountNumber', '==', cleanDigits).get();
+        qAcc.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = d.userId || d.uid || doc.id;
+          if (uid && uid !== 'usr_admin' && !matchesMap.has(uid)) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+        const directAccNumSnap = await accountsCol.doc(cleanDigits).get();
+        if (directAccNumSnap.exists) {
+          const d = directAccNumSnap.data() || {};
+          const uid = d.userId || d.uid || cleanDigits;
+          if (uid && uid !== 'usr_admin' && !matchesMap.has(uid)) {
+            matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+          }
+        }
+      } catch {}
+
+      const matches = Array.from(matchesMap.values());
+      if (matches.length > 1) {
+        return {
+          success: false,
+          error: `Multiple customer profiles found for account number ${cleanDigits}. Recipient resolution is ambiguous. Transaction aborted.`,
+          isAmbiguous: true,
+        };
+      }
+      if (matches.length === 1) {
+        const matched = matches[0];
+        return {
+          success: true,
+          uid: matched.uid,
+          data: matched.data,
+        };
+      }
     }
-    if (matches.length === 1) {
-      const matched = matches[0];
-      return {
-        success: true,
-        uid: matched.uid,
-        data: matched.data,
-      };
+
+    // Strategy 3: Email Lookup
+    if (cleanTarget.includes('@')) {
+      const emailMatchesMap = new Map<string, { uid: string; data: any }>();
+      try {
+        const qEmail = await usersCol.where('email', '==', cleanTarget).get();
+        qEmail.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = d.uid || d.id || doc.id;
+          if (uid && uid !== 'usr_admin') emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+        if (targetStr.toLowerCase() !== cleanTarget) {
+          const qEmailRaw = await usersCol.where('email', '==', targetStr.toLowerCase()).get();
+          qEmailRaw.docs.forEach((doc) => {
+            const d = doc.data() || {};
+            const uid = d.uid || d.id || doc.id;
+            if (uid && uid !== 'usr_admin' && !emailMatchesMap.has(uid)) emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+          });
+        }
+        try {
+          const authUser = await adminAuth.getUserByEmail(cleanTarget);
+          if (authUser && authUser.uid !== 'usr_admin' && !emailMatchesMap.has(authUser.uid)) {
+            const uDoc = await usersCol.doc(authUser.uid).get();
+            const uData = uDoc.exists ? uDoc.data() || {} : {};
+            emailMatchesMap.set(authUser.uid, {
+              uid: authUser.uid,
+              data: { ...uData, id: authUser.uid, uid: authUser.uid, email: cleanTarget },
+            });
+          }
+        } catch {}
+      } catch {}
+
+      const matches = Array.from(emailMatchesMap.values());
+      if (matches.length > 1) {
+        return {
+          success: false,
+          error: `Multiple customer accounts found for email "${cleanTarget}". Recipient resolution is ambiguous. Please specify their permanent account number.`,
+          isAmbiguous: true,
+        };
+      }
+      if (matches.length === 1) {
+        const matched = matches[0];
+        return {
+          success: true,
+          uid: matched.uid,
+          data: matched.data,
+        };
+      }
+    }
+
+    // Strategy 4: Username Lookup with Duplicate Ambiguity Detection
+    if (cleanTarget.length >= 2) {
+      const usernameMatchesMap = new Map<string, { uid: string; data: any }>();
+      try {
+        const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).get();
+        qUserLower.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = d.uid || d.id || doc.id;
+          if (uid && uid !== 'usr_admin') usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+        const qUser = await usersCol.where('username', '==', cleanTarget).get();
+        qUser.docs.forEach((doc) => {
+          const d = doc.data() || {};
+          const uid = d.uid || d.id || doc.id;
+          if (uid && uid !== 'usr_admin') usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+        });
+        if (cleanNoAt !== cleanTarget) {
+          const qRaw = await usersCol.where('username', '==', cleanNoAt).get();
+          qRaw.docs.forEach((doc) => {
+            const d = doc.data() || {};
+            const uid = d.uid || d.id || doc.id;
+            if (uid && uid !== 'usr_admin' && !usernameMatchesMap.has(uid)) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
+          });
+        }
+      } catch {}
+
+      const matches = Array.from(usernameMatchesMap.values());
+      if (matches.length > 1) {
+        return {
+          success: false,
+          error: `Multiple customer accounts found matching username "@${cleanNoAt}". To protect your funds, please specify the recipient's exact permanent account number or email address.`,
+          isAmbiguous: true,
+        };
+      }
+      if (matches.length === 1) {
+        const matched = matches[0];
+        const memUser = db.users.get(matched.uid);
+        const mergedData = {
+          ...(memUser || {}),
+          ...matched.data,
+          firstName: matched.data.firstName || memUser?.firstName,
+          lastName: matched.data.lastName || memUser?.lastName,
+          permanentAccountNumber: matched.data.permanentAccountNumber || memUser?.permanentAccountNumber,
+          username: matched.data.username || memUser?.username,
+        };
+        return {
+          success: true,
+          uid: matched.uid,
+          data: mergedData,
+        };
+      }
+
+      // Fallback scan: case-insensitive username or account lookup across Firestore profiles
+      try {
+        const fallbackSnap = await usersCol.limit(60).get();
+        for (const doc of fallbackSnap.docs) {
+          const d = doc.data() || {};
+          const uid = d.uid || d.id || doc.id;
+          if (uid && uid !== 'usr_admin') {
+            const uName = (d.username || '').toLowerCase().replace(/^@/, '');
+            const uAcc = (d.permanentAccountNumber || d.accountNumber || '').replace(/[-\s]/g, '');
+            const uEmail = (d.email || '').toLowerCase();
+            if (uName === cleanTarget || (cleanDigits && uAcc === cleanDigits) || (cleanTarget.includes('@') && uEmail === cleanTarget)) {
+              const memUser = db.users.get(uid);
+              const mergedData = {
+                ...(memUser || {}),
+                ...d,
+                firstName: d.firstName || memUser?.firstName,
+                lastName: d.lastName || memUser?.lastName,
+                permanentAccountNumber: d.permanentAccountNumber || memUser?.permanentAccountNumber,
+                username: d.username || memUser?.username,
+                id: uid,
+                uid,
+              };
+              return {
+                success: true,
+                uid,
+                data: mergedData,
+              };
+            }
+          }
+        }
+      } catch {}
     }
   }
 
-  // Strategy 4: Username Lookup with Duplicate Ambiguity Detection
-  if (cleanTarget.length >= 2) {
-    const usernameMatchesMap = new Map<string, { uid: string; data: any }>();
-    try {
-      const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).get();
-      qUserLower.docs.forEach((doc) => {
-        const d = doc.data() || {};
-        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-        if (uid) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-      });
-      const qUser = await usersCol.where('username', '==', cleanTarget).get();
-      qUser.docs.forEach((doc) => {
-        const d = doc.data() || {};
-        const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-        if (uid) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-      });
-      if (cleanNoAt !== cleanTarget) {
-        const qRaw = await usersCol.where('username', '==', cleanNoAt).get();
-        qRaw.docs.forEach((doc) => {
-          const d = doc.data() || {};
-          const uid = isCanonicalAuthUid(d.uid) ? d.uid : (isCanonicalAuthUid(doc.id) ? doc.id : null);
-          if (uid && !usernameMatchesMap.has(uid)) usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
-        });
-      }
-    } catch {}
-
-    const matches = Array.from(usernameMatchesMap.values());
-    if (matches.length > 1) {
-      return {
-        success: false,
-        error: `Multiple customer accounts found matching username "@${cleanNoAt}". To protect your funds, please specify the recipient's exact permanent account number or email address.`,
-        isAmbiguous: true,
-      };
-    }
-    if (matches.length === 1) {
-      const matched = matches[0];
-      return {
-        success: true,
-        uid: matched.uid,
-        data: matched.data,
-      };
-    }
+  // Strategy 5: In-Memory / Seed DB Fallback
+  const inMemUsers = Array.from(db.users.values()).filter((u) => u.id !== 'usr_admin' && u.role !== 'super_admin');
+  const matchedInMem = inMemUsers.find((u) => {
+    const acc = (u.permanentAccountNumber || '').replace(/[-\s]/g, '');
+    const uname = (u.username || '').toLowerCase().replace(/^@/, '');
+    const em = (u.email || '').toLowerCase();
+    return (
+      u.id === targetStr ||
+      (cleanDigits && acc === cleanDigits) ||
+      (cleanTarget && uname === cleanTarget) ||
+      (cleanTarget && em === cleanTarget)
+    );
+  });
+  if (matchedInMem) {
+    return {
+      success: true,
+      uid: matchedInMem.id,
+      data: matchedInMem,
+    };
   }
 
   return {
@@ -339,8 +456,18 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
   }
 
   // 3. Resolve sender profile info
-  const senderDocSnap = await adminFirestore.collection('users').doc(senderUid).get();
-  const senderData = senderDocSnap.exists ? senderDocSnap.data()! : {};
+  let senderData: any = {};
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const senderDocSnap = await adminFirestore.collection('users').doc(senderUid).get();
+      if (senderDocSnap.exists) {
+        senderData = senderDocSnap.data()!;
+      }
+    } catch {}
+  }
+  if (!senderData.id && db.users.has(senderUid)) {
+    senderData = db.users.get(senderUid)!;
+  }
 
   // Check account freeze status
   if (senderData.status === 'frozen') {
@@ -364,164 +491,307 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
   const recipientName = `${recipientData.firstName || ''} ${recipientData.lastName || ''}`.trim() || recipientData.username || 'Monvera Recipient';
   const recipientAcc = recipientData.permanentAccountNumber || recipientData.accountNumber || '1088492015';
 
+  // Check account number identity to prevent self-transfers
+  const senderAccClean = senderAcc.replace(/[-\s]/g, '');
+  const recipAccClean = recipientAcc.replace(/[-\s]/g, '');
+  if (senderAccClean && recipAccClean && senderAccClean === recipAccClean) {
+    return {
+      success: false,
+      error: 'You cannot transfer funds to your own account. Use internal account transfer instead.',
+    };
+  }
+
+  // Validate applicable daily transfer limits
+  const dailyLimit = Number(senderData.dailyTransactionLimit ?? 1000000);
+  if (dailyLimit > 0 && transferAmount > dailyLimit) {
+    return {
+      success: false,
+      error: `Transfer amount ($${transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}) exceeds your daily transfer limit of $${dailyLimit.toLocaleString('en-US', { minimumFractionDigits: 2 })}.`,
+    };
+  }
+
   // 4. Idempotency reference resolution
   const finalRef = referenceNumber || `MV-TRF-${Math.floor(100000000 + Math.random() * 900000000)}`;
   const txId = `tx_mv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-
-  // References
-  const senderAccRef = adminFirestore.collection('accounts').doc(senderUid);
-  const recipientAccRef = adminFirestore.collection('accounts').doc(recipientUid);
-  const txRef = adminFirestore.collection('transactions').doc(txId);
 
   let finalTx: Transaction | null = null;
   let finalSenderMetrics: BalanceMetrics | null = null;
   let finalRecipientMetrics: BalanceMetrics | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
-      // Check idempotency by referenceNumber
-      const existingRefQuery = await transaction.get(
-        adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
-      );
+    if (isFirebaseAdminConfigured()) {
+      // References
+      const senderAccRef = adminFirestore.collection('accounts').doc(senderUid);
+      const recipientAccRef = adminFirestore.collection('accounts').doc(recipientUid);
+      const txRef = adminFirestore.collection('transactions').doc(txId);
 
-      if (!existingRefQuery.empty) {
-        const existingTx = existingRefQuery.docs[0].data() as Transaction;
-        if (existingTx.status === 'COMPLETED') {
-          // Idempotent short-circuit
-          finalTx = existingTx;
-          const sSnap = await transaction.get(senderAccRef);
-          if (sSnap.exists) {
-            const sd = sSnap.data()!;
-            finalSenderMetrics = {
-              checkingBalance: Number(sd.checkingBalance ?? 0),
-              savingsBalance: Number(sd.savingsBalance ?? 0),
-              investedBalance: Number(sd.investedBalance ?? 0),
-              accruedEarnings: Number(sd.accruedEarnings ?? 0),
-              totalBalance: Number(sd.totalBalance ?? 0),
-              availableBalance: Number(sd.availableBalance ?? sd.checkingBalance ?? 0),
-              pendingBalance: Number(sd.pendingBalance ?? 0),
-              loanBalance: Number(sd.loanBalance ?? 0),
-              accounts: sd.accounts || [],
-            };
-          }
-          const rSnap = await transaction.get(recipientAccRef);
-          if (rSnap.exists) {
-            const rd = rSnap.data()!;
-            finalRecipientMetrics = {
-              checkingBalance: Number(rd.checkingBalance ?? 0),
-              savingsBalance: Number(rd.savingsBalance ?? 0),
-              investedBalance: Number(rd.investedBalance ?? 0),
-              accruedEarnings: Number(rd.accruedEarnings ?? 0),
-              totalBalance: Number(rd.totalBalance ?? 0),
-              availableBalance: Number(rd.availableBalance ?? rd.checkingBalance ?? 0),
-              pendingBalance: Number(rd.pendingBalance ?? 0),
-              loanBalance: Number(rd.loanBalance ?? 0),
-              accounts: rd.accounts || [],
-            };
-          }
-          return;
-        }
-      }
-
-      // Read sender account
-      const senderAccSnap = await transaction.get(senderAccRef);
-      // Read recipient account
-      const recipientAccSnap = await transaction.get(recipientAccRef);
-
-      let senderChecking = 0;
-      let senderSavings = 0;
-      let senderInvested = 0;
-      let senderAccrued = 0;
-      let senderAccounts: BankAccount[] = [];
-
-      if (senderAccSnap.exists) {
-        const sd = senderAccSnap.data()!;
-        senderChecking = Number(sd.checkingBalance ?? sd.availableBalance ?? 0);
-        senderSavings = Number(sd.savingsBalance ?? sd.savings ?? 0);
-        senderInvested = Number(sd.investedBalance ?? sd.investmentBalance ?? 0);
-        senderAccrued = Number(sd.accruedEarnings ?? 0);
-        if (Array.isArray(sd.accounts) && sd.accounts.length > 0) {
-          senderAccounts = sd.accounts;
-        }
-      } else {
-        // No account document created yet -> insufficient balance
-        throw new Error(`INSUFFICIENT_FUNDS: Insufficient checking balance ($0.00). Transfer requires $${transferAmount.toFixed(2)}.`);
-      }
-
-      // Validate sender available balance
-      if (senderChecking < transferAmount) {
-        throw new Error(
-          `INSUFFICIENT_FUNDS: Insufficient checking balance ($${senderChecking.toFixed(2)}). Transfer requires $${transferAmount.toFixed(2)}.`
+      await adminFirestore.runTransaction(async (transaction) => {
+        // Check idempotency by referenceNumber
+        const existingRefQuery = await transaction.get(
+          adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
         );
-      }
 
-      let recipientChecking = 0;
-      let recipientSavings = 0;
-      let recipientInvested = 0;
-      let recipientAccrued = 0;
-      let recipientAccounts: BankAccount[] = [];
-
-      if (recipientAccSnap.exists) {
-        const rd = recipientAccSnap.data()!;
-        recipientChecking = Number(rd.checkingBalance ?? rd.availableBalance ?? 0);
-        recipientSavings = Number(rd.savingsBalance ?? rd.savings ?? 0);
-        recipientInvested = Number(rd.investedBalance ?? rd.investmentBalance ?? 0);
-        recipientAccrued = Number(rd.accruedEarnings ?? 0);
-        if (Array.isArray(rd.accounts) && rd.accounts.length > 0) {
-          recipientAccounts = rd.accounts;
+        if (!existingRefQuery.empty) {
+          const existingTx = existingRefQuery.docs[0].data() as Transaction;
+          if (existingTx.status === 'COMPLETED') {
+            finalTx = existingTx;
+            const sSnap = await transaction.get(senderAccRef);
+            if (sSnap.exists) {
+              const sd = sSnap.data()!;
+              finalSenderMetrics = {
+                checkingBalance: Number(sd.checkingBalance ?? 0),
+                savingsBalance: Number(sd.savingsBalance ?? 0),
+                investedBalance: Number(sd.investedBalance ?? 0),
+                accruedEarnings: Number(sd.accruedEarnings ?? 0),
+                totalBalance: Number(sd.totalBalance ?? 0),
+                availableBalance: Number(sd.availableBalance ?? sd.checkingBalance ?? 0),
+                pendingBalance: Number(sd.pendingBalance ?? 0),
+                loanBalance: Number(sd.loanBalance ?? 0),
+                accounts: sd.accounts || [],
+              };
+            }
+            const rSnap = await transaction.get(recipientAccRef);
+            if (rSnap.exists) {
+              const rd = rSnap.data()!;
+              finalRecipientMetrics = {
+                checkingBalance: Number(rd.checkingBalance ?? 0),
+                savingsBalance: Number(rd.savingsBalance ?? 0),
+                investedBalance: Number(rd.investedBalance ?? 0),
+                accruedEarnings: Number(rd.accruedEarnings ?? 0),
+                totalBalance: Number(rd.totalBalance ?? 0),
+                availableBalance: Number(rd.availableBalance ?? rd.checkingBalance ?? 0),
+                pendingBalance: Number(rd.pendingBalance ?? 0),
+                loanBalance: Number(rd.loanBalance ?? 0),
+                accounts: rd.accounts || [],
+              };
+            }
+            return;
+          }
         }
+
+        // Read sender account
+        let senderAccSnap = await transaction.get(senderAccRef);
+        let actualSenderRef = senderAccRef;
+        if (!senderAccSnap.exists && senderAcc && senderAcc !== senderUid) {
+          const legacySenderSnap = await transaction.get(adminFirestore.collection('accounts').doc(senderAcc));
+          if (legacySenderSnap.exists) {
+            senderAccSnap = legacySenderSnap;
+            actualSenderRef = adminFirestore.collection('accounts').doc(senderAcc);
+          }
+        }
+
+        // Read recipient account
+        let recipientAccSnap = await transaction.get(recipientAccRef);
+        let actualRecipientRef = recipientAccRef;
+        if (!recipientAccSnap.exists && recipientAcc && recipientAcc !== recipientUid) {
+          const legacyRecipSnap = await transaction.get(adminFirestore.collection('accounts').doc(recipientAcc));
+          if (legacyRecipSnap.exists) {
+            recipientAccSnap = legacyRecipSnap;
+            actualRecipientRef = adminFirestore.collection('accounts').doc(recipientAcc);
+          }
+        }
+
+        let senderChecking = 0;
+        let senderSavings = 0;
+        let senderInvested = 0;
+        let senderAccrued = 0;
+        let senderAccounts: BankAccount[] = [];
+
+        if (senderAccSnap.exists) {
+          const sd = senderAccSnap.data()!;
+          senderChecking = Number(sd.checkingBalance ?? sd.availableBalance ?? 0);
+          senderSavings = Number(sd.savingsBalance ?? sd.savings ?? 0);
+          senderInvested = Number(sd.investedBalance ?? sd.investmentBalance ?? 0);
+          senderAccrued = Number(sd.accruedEarnings ?? 0);
+          if (Array.isArray(sd.accounts) && sd.accounts.length > 0) {
+            senderAccounts = sd.accounts;
+          }
+        } else if (db.users.has(senderUid)) {
+          const inMem = db.getUserBalanceMetrics(senderUid);
+          senderChecking = inMem.checkingBalance;
+          senderSavings = inMem.savingsBalance;
+          senderInvested = inMem.investedBalance;
+          senderAccrued = inMem.accruedEarnings;
+          senderAccounts = inMem.accounts;
+        } else {
+          throw new Error(`INSUFFICIENT_FUNDS: Insufficient checking balance ($0.00). Transfer requires $${transferAmount.toFixed(2)}.`);
+        }
+
+        // Validate sender available balance
+        if (senderChecking < transferAmount) {
+          throw new Error(
+            `INSUFFICIENT_FUNDS: Insufficient checking balance ($${senderChecking.toFixed(2)}). Transfer requires $${transferAmount.toFixed(2)}.`
+          );
+        }
+
+        let recipientChecking = 0;
+        let recipientSavings = 0;
+        let recipientInvested = 0;
+        let recipientAccrued = 0;
+        let recipientAccounts: BankAccount[] = [];
+
+        if (recipientAccSnap.exists) {
+          const rd = recipientAccSnap.data()!;
+          recipientChecking = Number(rd.checkingBalance ?? rd.availableBalance ?? 0);
+          recipientSavings = Number(rd.savingsBalance ?? rd.savings ?? 0);
+          recipientInvested = Number(rd.investedBalance ?? rd.investmentBalance ?? 0);
+          recipientAccrued = Number(rd.accruedEarnings ?? 0);
+          if (Array.isArray(rd.accounts) && rd.accounts.length > 0) {
+            recipientAccounts = rd.accounts;
+          }
+        } else if (db.users.has(recipientUid)) {
+          const inMem = db.getUserBalanceMetrics(recipientUid);
+          recipientChecking = inMem.checkingBalance;
+          recipientSavings = inMem.savingsBalance;
+          recipientInvested = inMem.investedBalance;
+          recipientAccrued = inMem.accruedEarnings;
+          recipientAccounts = inMem.accounts;
+        }
+
+        // Calculate new sender balances
+        const newSenderChecking = Number((senderChecking - transferAmount).toFixed(2));
+        const newSenderTotal = Number((newSenderChecking + senderSavings + senderInvested + senderAccrued).toFixed(2));
+        const newSenderAvailable = newSenderChecking;
+
+        const updatedSenderAccounts = senderAccounts.length > 0
+          ? senderAccounts.map((a) =>
+              a.type === 'CHECKING'
+                ? { ...a, balance: newSenderChecking, availableBalance: newSenderAvailable }
+                : a
+            )
+          : buildDefaultAccounts(senderUid, newSenderChecking, senderSavings, senderInvested, senderAcc);
+
+        finalSenderMetrics = {
+          checkingBalance: newSenderChecking,
+          savingsBalance: senderSavings,
+          investedBalance: senderInvested,
+          accruedEarnings: senderAccrued,
+          totalBalance: newSenderTotal,
+          availableBalance: newSenderAvailable,
+          pendingBalance: 0,
+          accounts: updatedSenderAccounts,
+        };
+
+        // Calculate new recipient balances
+        const newRecipientChecking = Number((recipientChecking + transferAmount).toFixed(2));
+        const newRecipientTotal = Number((newRecipientChecking + recipientSavings + recipientInvested + recipientAccrued).toFixed(2));
+        const newRecipientAvailable = newRecipientChecking;
+
+        const updatedRecipientAccounts = recipientAccounts.length > 0
+          ? recipientAccounts.map((a) =>
+              a.type === 'CHECKING'
+                ? { ...a, balance: newRecipientChecking, availableBalance: newRecipientAvailable }
+                : a
+            )
+          : buildDefaultAccounts(recipientUid, newRecipientChecking, recipientSavings, recipientInvested, recipientAcc);
+
+        finalRecipientMetrics = {
+          checkingBalance: newRecipientChecking,
+          savingsBalance: recipientSavings,
+          investedBalance: recipientInvested,
+          accruedEarnings: recipientAccrued,
+          totalBalance: newRecipientTotal,
+          availableBalance: newRecipientAvailable,
+          pendingBalance: 0,
+          accounts: updatedRecipientAccounts,
+        };
+
+        const nowIso = new Date().toISOString();
+
+        finalTx = {
+          id: txId,
+          referenceNumber: finalRef,
+          type: 'TRANSFER',
+          amount: transferAmount,
+          currency: 'USD',
+          status: 'COMPLETED',
+          userId: senderUid,
+          senderUserId: senderUid,
+          senderName,
+          senderAccountNumber: senderAcc,
+          recipientUserId: recipientUid,
+          recipientName,
+          recipientAccountNumber: recipientAcc,
+          fee: 0.0,
+          description: description || `Transfer to ${recipientName}`,
+          category: (category as any) || 'Transfers',
+          createdAt: nowIso,
+          completedAt: nowIso,
+        };
+
+        // Atomic commit: write sender account
+        transaction.set(
+          actualSenderRef,
+          {
+            userId: senderUid,
+            permanentAccountNumber: senderAcc,
+            ...finalSenderMetrics,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+        if (actualSenderRef.id !== senderAccRef.id) {
+          transaction.set(
+            senderAccRef,
+            {
+              userId: senderUid,
+              permanentAccountNumber: senderAcc,
+              ...finalSenderMetrics,
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          );
+        }
+
+        // Atomic commit: write recipient account
+        transaction.set(
+          actualRecipientRef,
+          {
+            userId: recipientUid,
+            permanentAccountNumber: recipientAcc,
+            ...finalRecipientMetrics,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+        if (actualRecipientRef.id !== recipientAccRef.id) {
+          transaction.set(
+            recipientAccRef,
+            {
+              userId: recipientUid,
+              permanentAccountNumber: recipientAcc,
+              ...finalRecipientMetrics,
+              updatedAt: nowIso,
+            },
+            { merge: true }
+          );
+        }
+
+        // Atomic commit: write transaction ledger record
+        transaction.set(txRef, finalTx, { merge: true });
+      });
+    } else {
+      // In-memory fallback if Firebase Admin is unconfigured
+      const senderMetrics = db.getUserBalanceMetrics(senderUid);
+      if (senderMetrics.checkingBalance < transferAmount) {
+        throw new Error(`INSUFFICIENT_FUNDS: Insufficient checking balance ($${senderMetrics.checkingBalance.toFixed(2)}). Transfer requires $${transferAmount.toFixed(2)}.`);
       }
 
-      // Calculate new sender balances
-      const newSenderChecking = Number((senderChecking - transferAmount).toFixed(2));
-      const newSenderTotal = Number((newSenderChecking + senderSavings + senderInvested + senderAccrued).toFixed(2));
-      const newSenderAvailable = newSenderChecking;
+      const sChkId = `acc_chk_${senderUid}`;
+      const rChkId = `acc_chk_${recipientUid}`;
+      if (db.accounts.has(sChkId)) {
+        db.accounts.get(sChkId)!.balance -= transferAmount;
+        db.accounts.get(sChkId)!.availableBalance -= transferAmount;
+      }
+      if (db.accounts.has(rChkId)) {
+        db.accounts.get(rChkId)!.balance += transferAmount;
+        db.accounts.get(rChkId)!.availableBalance += transferAmount;
+      }
 
-      const updatedSenderAccounts = senderAccounts.length > 0
-        ? senderAccounts.map((a) =>
-            a.type === 'CHECKING'
-              ? { ...a, balance: newSenderChecking, availableBalance: newSenderAvailable }
-              : a
-          )
-        : buildDefaultAccounts(senderUid, newSenderChecking, senderSavings, senderInvested, senderAcc);
-
-      finalSenderMetrics = {
-        checkingBalance: newSenderChecking,
-        savingsBalance: senderSavings,
-        investedBalance: senderInvested,
-        accruedEarnings: senderAccrued,
-        totalBalance: newSenderTotal,
-        availableBalance: newSenderAvailable,
-        pendingBalance: 0,
-        accounts: updatedSenderAccounts,
-      };
-
-      // Calculate new recipient balances
-      const newRecipientChecking = Number((recipientChecking + transferAmount).toFixed(2));
-      const newRecipientTotal = Number((newRecipientChecking + recipientSavings + recipientInvested + recipientAccrued).toFixed(2));
-      const newRecipientAvailable = newRecipientChecking;
-
-      const updatedRecipientAccounts = recipientAccounts.length > 0
-        ? recipientAccounts.map((a) =>
-            a.type === 'CHECKING'
-              ? { ...a, balance: newRecipientChecking, availableBalance: newRecipientAvailable }
-              : a
-          )
-        : buildDefaultAccounts(recipientUid, newRecipientChecking, recipientSavings, recipientInvested, recipientAcc);
-
-      finalRecipientMetrics = {
-        checkingBalance: newRecipientChecking,
-        savingsBalance: recipientSavings,
-        investedBalance: recipientInvested,
-        accruedEarnings: recipientAccrued,
-        totalBalance: newRecipientTotal,
-        availableBalance: newRecipientAvailable,
-        pendingBalance: 0,
-        accounts: updatedRecipientAccounts,
-      };
+      finalSenderMetrics = db.getUserBalanceMetrics(senderUid);
+      finalRecipientMetrics = db.getUserBalanceMetrics(recipientUid);
 
       const nowIso = new Date().toISOString();
-
       finalTx = {
         id: txId,
         referenceNumber: finalRef,
@@ -542,34 +812,22 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
         createdAt: nowIso,
         completedAt: nowIso,
       };
-
-      // Atomic commit: write sender account
-      transaction.set(
-        senderAccRef,
-        {
-          userId: senderUid,
-          ...finalSenderMetrics,
-          updatedAt: nowIso,
-        },
-        { merge: true }
-      );
-
-      // Atomic commit: write recipient account
-      transaction.set(
-        recipientAccRef,
-        {
-          userId: recipientUid,
-          ...finalRecipientMetrics,
-          updatedAt: nowIso,
-        },
-        { merge: true }
-      );
-
-      // Atomic commit: write transaction ledger record
-      transaction.set(txRef, finalTx, { merge: true });
-    });
+    }
 
     if (finalTx) {
+      // Keep in-memory ledger synchronized
+      db.transactions.unshift(finalTx);
+      const sChkId = `acc_chk_${senderUid}`;
+      const rChkId = `acc_chk_${recipientUid}`;
+      if (db.accounts.has(sChkId) && finalSenderMetrics) {
+        db.accounts.get(sChkId)!.balance = finalSenderMetrics.checkingBalance;
+        db.accounts.get(sChkId)!.availableBalance = finalSenderMetrics.availableBalance;
+      }
+      if (db.accounts.has(rChkId) && finalRecipientMetrics) {
+        db.accounts.get(rChkId)!.balance = finalRecipientMetrics.checkingBalance;
+        db.accounts.get(rChkId)!.availableBalance = finalRecipientMetrics.availableBalance;
+      }
+
       return {
         success: true,
         transaction: finalTx,
@@ -1948,6 +2206,8 @@ export async function executeServerLoanDisbursement(
           status: 'PENDING',
           createdAt: fallbackLoan.createdAt || now,
         };
+      } else if (db.loans.has(loanId)) {
+        loanData = { ...db.loans.get(loanId)! };
       } else {
         throw new Error('LOAN_NOT_FOUND: Loan record not found.');
       }
@@ -1985,6 +2245,15 @@ export async function executeServerLoanDisbursement(
           };
         }
         return; // Idempotent: do not credit money again!
+      }
+
+      // Validate loan eligibility for approval
+      if (loanData.status === 'REJECTED' || loanData.status === 'CANCELLED' || loanData.status === 'PAID') {
+        throw new Error(`INVALID_STATUS: Loan application is currently ${loanData.status.toLowerCase()} and cannot be approved.`);
+      }
+
+      if (loanData.status !== 'PENDING') {
+        throw new Error(`INVALID_STATUS: Only pending loan applications can be approved (current status: ${loanData.status}).`);
       }
 
       // 2. Validate loan amount
@@ -2986,4 +3255,375 @@ export async function executeServerInvestmentMaturity(
     };
   }
 }
+
+export interface CardIssuanceParams {
+  userId: string;
+  cardHolderName?: string;
+  phone?: string;
+  cardType?: 'PHYSICAL' | 'VIRTUAL';
+  cardTier?: string;
+  brand?: 'VISA' | 'MASTERCARD';
+  spendingLimitMonthly?: number;
+  spendingLimitDaily?: number;
+  colorScheme?: string;
+  clientRequestId?: string;
+  userAccountNumber?: string;
+  fallbackBalances?: BalanceMetrics;
+  fallbackUser?: Partial<UserProfile>;
+}
+
+export interface CardIssuanceResult {
+  success: boolean;
+  card?: CardItem;
+  transaction?: Transaction;
+  balanceMetrics?: BalanceMetrics;
+  isDuplicate?: boolean;
+  error?: string;
+}
+
+/**
+ * Server-authoritative instant card issuance inside a single atomic Firestore transaction.
+ * Deducts the $2.00 issuance fee from the customer's checking balance, persists the card,
+ * and records the fee transaction in the ledger.
+ */
+export async function executeServerCardIssuance(
+  params: CardIssuanceParams
+): Promise<CardIssuanceResult> {
+  const {
+    userId,
+    cardHolderName,
+    phone,
+    cardType,
+    cardTier,
+    brand,
+    spendingLimitMonthly,
+    spendingLimitDaily,
+    colorScheme,
+    clientRequestId,
+    userAccountNumber,
+    fallbackBalances,
+    fallbackUser,
+  } = params;
+
+  if (!userId) {
+    return { success: false, error: 'Customer user ID is required.' };
+  }
+
+  // 1. Verify account freeze / restrictions
+  try {
+    const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+    if (userDocSnap.exists) {
+      const uData = userDocSnap.data()!;
+      if (uData.status === 'frozen') {
+        return {
+          success: false,
+          error: 'Your account is currently restricted/frozen. Card issuance is disabled while the account is frozen. Please contact compliance support.',
+        };
+      }
+    }
+  } catch (err: any) {
+    console.warn('[executeServerCardIssuance] User check warning:', err?.message || err);
+  }
+
+  if (db.users.has(userId) && db.users.get(userId)?.status === 'frozen') {
+    return {
+      success: false,
+      error: 'Your account is currently restricted/frozen. Card issuance is disabled while the account is frozen. Please contact compliance support.',
+    };
+  }
+
+  const feeAmount = 2.00; // $2.00 card issuance fee
+  const nowIso = new Date().toISOString();
+  const accRef = adminFirestore.collection('accounts').doc(userId);
+
+  let finalCard: CardItem | null = null;
+  let finalTx: Transaction | null = null;
+  let finalMetrics: BalanceMetrics | null = null;
+  let isDuplicate = false;
+
+  try {
+    await adminFirestore.runTransaction(async (transaction) => {
+      // 2. Idempotency Check: if clientRequestId was provided, check if transaction already completed
+      if (clientRequestId) {
+        let existingDoc: any = null;
+        const existingRefQuery = await transaction.get(
+          adminFirestore.collection('transactions').where('referenceNumber', '==', clientRequestId).limit(1)
+        );
+        if (!existingRefQuery.empty) {
+          existingDoc = existingRefQuery.docs[0];
+        } else {
+          const existingReqQuery = await transaction.get(
+            adminFirestore.collection('transactions').where('clientRequestId', '==', clientRequestId).limit(1)
+          );
+          if (!existingReqQuery.empty) {
+            existingDoc = existingReqQuery.docs[0];
+          }
+        }
+
+        if (existingDoc) {
+          const existingTx = existingDoc.data() as Transaction;
+          if (existingTx.status === 'COMPLETED') {
+            isDuplicate = true;
+            finalTx = existingTx;
+            const existingCardId = existingTx.metadata?.cardId;
+            if (existingCardId) {
+              const cardSnap = await transaction.get(adminFirestore.collection('cards').doc(existingCardId));
+              if (cardSnap.exists) {
+                finalCard = cardSnap.data() as CardItem;
+              } else if (db.cards.has(existingCardId)) {
+                finalCard = db.cards.get(existingCardId)!;
+              }
+            }
+            const accSnap = await transaction.get(accRef);
+            if (accSnap.exists) {
+              const ad = accSnap.data()!;
+              finalMetrics = {
+                checkingBalance: Number(ad.checkingBalance ?? 0),
+                savingsBalance: Number(ad.savingsBalance ?? 0),
+                investedBalance: Number(ad.investedBalance ?? 0),
+                accruedEarnings: Number(ad.accruedEarnings ?? 0),
+                totalBalance: Number(ad.totalBalance ?? 0),
+                availableBalance: Number(ad.availableBalance ?? ad.checkingBalance ?? 0),
+                pendingBalance: Number(ad.pendingBalance ?? 0),
+                loanBalance: Number(ad.loanBalance ?? 0),
+                accounts: ad.accounts || [],
+              };
+            }
+            return; // Idempotent replay: avoid double-debiting fee
+          }
+        }
+      }
+
+      // 3. Read customer account balances
+      const accSnap = await transaction.get(accRef);
+      let currentChecking = 0;
+      let currentSavings = 0;
+      let currentInvested = 0;
+      let currentAccrued = 0;
+      let currentLoanBal = 0;
+      let userAcc = userAccountNumber || '1000000000';
+      let accountsList: BankAccount[] = [];
+
+      if (accSnap.exists) {
+        const ad = accSnap.data()!;
+        currentChecking = Number(ad.checkingBalance ?? ad.availableBalance ?? 0);
+        currentSavings = Number(ad.savingsBalance ?? 0);
+        currentInvested = Number(ad.investedBalance ?? 0);
+        currentAccrued = Number(ad.accruedEarnings ?? 0);
+        currentLoanBal = Number(ad.loanBalance ?? 0);
+        userAcc = ad.permanentAccountNumber || ad.accountNumber || userAcc;
+        if (Array.isArray(ad.accounts) && ad.accounts.length > 0) {
+          accountsList = ad.accounts;
+        }
+      } else if (fallbackBalances) {
+        currentChecking = Number(fallbackBalances.checkingBalance ?? 0);
+        currentSavings = Number(fallbackBalances.savingsBalance ?? 0);
+        currentInvested = Number(fallbackBalances.investedBalance ?? 0);
+        currentAccrued = Number(fallbackBalances.accruedEarnings ?? 0);
+        currentLoanBal = Number(fallbackBalances.loanBalance ?? 0);
+        if (Array.isArray(fallbackBalances.accounts)) {
+          accountsList = fallbackBalances.accounts;
+        }
+      } else if (db.accounts.has(`acc_chk_${userId}`)) {
+        const mem = db.getUserBalanceMetrics(userId);
+        currentChecking = Number(mem.checkingBalance ?? 0);
+        currentSavings = Number(mem.savingsBalance ?? 0);
+        currentInvested = Number(mem.investedBalance ?? 0);
+        currentAccrued = Number(mem.accruedEarnings ?? 0);
+        currentLoanBal = Number(mem.loanBalance ?? 0);
+        if (Array.isArray(mem.accounts)) {
+          accountsList = mem.accounts;
+        }
+      } else {
+        throw new Error('ACCOUNT_NOT_FOUND: Customer account balance record not found.');
+      }
+
+      // 4. Validate sufficient available checking funds
+      if (currentChecking < feeAmount) {
+        throw new Error(
+          `INSUFFICIENT_FUNDS: Insufficient checking balance ($${currentChecking.toFixed(2)}). A $${feeAmount.toFixed(
+            2
+          )} card issuance fee is required. Please deposit funds first.`
+        );
+      }
+
+      // 5. Compute new balances
+      const newChecking = Number((currentChecking - feeAmount).toFixed(2));
+      const newAvailable = Number((currentChecking - feeAmount).toFixed(2));
+      const newTotal = Number((newChecking + currentSavings + currentInvested + currentAccrued).toFixed(2));
+
+      let foundChecking = false;
+      const updatedAccountsList = accountsList.map((a) => {
+        if (a.type === 'CHECKING') {
+          foundChecking = true;
+          return { ...a, balance: newChecking, availableBalance: newAvailable };
+        }
+        return a;
+      });
+
+      if (!foundChecking) {
+        updatedAccountsList.unshift({
+          id: `acc_chk_${userId}`,
+          userId,
+          type: 'CHECKING',
+          accountNumber: userAcc,
+          routingNumber: '021000021',
+          currency: 'USD',
+          balance: newChecking,
+          availableBalance: newAvailable,
+          investedBalance: 0,
+          pendingBalance: 0,
+          interestRateAPY: 1.25,
+          status: 'ACTIVE',
+          nickname: 'Monvera Premier Checking',
+        });
+      }
+
+      finalMetrics = {
+        checkingBalance: newChecking,
+        savingsBalance: currentSavings,
+        investedBalance: currentInvested,
+        accruedEarnings: currentAccrued,
+        totalBalance: newTotal,
+        availableBalance: newAvailable,
+        pendingBalance: 0,
+        loanBalance: currentLoanBal,
+        accounts: updatedAccountsList,
+      };
+
+      // 6. Generate 16-digit card number and security details
+      const chosenBrand = brand || (cardTier?.toLowerCase().includes('mastercard') ? 'MASTERCARD' : 'VISA');
+      const prefix = chosenBrand === 'MASTERCARD' ? '5' : '4';
+      const part1 = prefix + Math.floor(100 + Math.random() * 900);
+      const part2 = Math.floor(1000 + Math.random() * 9000).toString();
+      const part3 = Math.floor(1000 + Math.random() * 9000).toString();
+      const part4 = Math.floor(1000 + Math.random() * 9000).toString();
+      const last4 = part4;
+      const completeNumber = `${part1} ${part2} ${part3} ${part4}`;
+      const maskedNumber = `•••• •••• •••• ${last4}`;
+      const fullNumberMasked = `${part1} •••• •••• ${last4}`;
+
+      const now = new Date();
+      const expMonth = String(now.getMonth() + 1).padStart(2, '0');
+      const expYear = String((now.getFullYear() + 5) % 100).padStart(2, '0');
+      const expiryDate = `${expMonth}/${expYear}`;
+      const cvv = String(Math.floor(100 + Math.random() * 900));
+
+      const cardId = `crd_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const defaultName = fallbackUser ? `${fallbackUser.firstName || ''} ${fallbackUser.lastName || ''}`.trim() : '';
+      const holderName = (cardHolderName || defaultName || 'Valued Client').toUpperCase().trim();
+      const dailyLimit = spendingLimitDaily || 20000;
+      const monthlyLimit = spendingLimitMonthly || 20000;
+      const brandName = chosenBrand === 'MASTERCARD' ? 'Mastercard' : 'Visa';
+      const defaultTier = cardTier || `Monvera ${brandName} Elite`;
+
+      finalCard = {
+        id: cardId,
+        userId,
+        cardHolderName: holderName,
+        cardNumber: completeNumber,
+        maskedNumber,
+        fullNumberMasked,
+        expiryDate,
+        cvvMasked: cvv,
+        cardType: cardType || 'PHYSICAL',
+        cardTier: defaultTier,
+        brand: chosenBrand,
+        status: 'ACTIVE',
+        spendingLimitDaily: dailyLimit,
+        spendingLimitMonthly: monthlyLimit,
+        currentDailySpend: 0,
+        internationalEnabled: true,
+        onlineEnabled: true,
+        atmEnabled: true,
+        contactlessEnabled: true,
+        colorScheme: (colorScheme as any) || 'obsidian',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      // 7. Create permanent Transaction ledger record
+      const txId = `tx_crd_fee_${cardId}`;
+      const txRefNum = clientRequestId || `MV-CRD-${cardId}`;
+      finalTx = {
+        id: txId,
+        referenceNumber: txRefNum,
+        clientRequestId: clientRequestId || txRefNum,
+        type: 'FEE',
+        category: 'Transfers',
+        amount: feeAmount,
+        fee: 0,
+        currency: 'USD',
+        status: 'COMPLETED',
+        userId,
+        senderUserId: userId,
+        senderAccountId: `acc_chk_${userId}`,
+        senderAccountNumber: userAcc,
+        recipientName: 'Monvera Card Issuance Facility',
+        recipientAccountNumber: 'MVB-CRD-001',
+        description: `Monvera ${brandName} Card Issuance Fee ($${feeAmount.toFixed(2)})`,
+        createdAt: nowIso,
+        completedAt: nowIso,
+        metadata: {
+          cardId,
+          brand: chosenBrand,
+          cardTier: defaultTier,
+          cardType: cardType || 'PHYSICAL',
+          phone: phone || fallbackUser?.phone,
+        },
+      };
+
+      // 8. Create notification record
+      const notifId = `notif_${Date.now()}_card_created`;
+      const notifItem: NotificationItem = {
+        id: notifId,
+        userId,
+        title: `${brandName} Card Issued & Activated`,
+        message: `Your new ${defaultTier} (${brandName} • ${completeNumber}) has been successfully issued. $${feeAmount.toFixed(
+          2
+        )} card issuance fee debited from your checking balance.`,
+        type: 'TRANSACTION',
+        severity: 'success',
+        read: false,
+        createdAt: nowIso,
+        referenceId: txRefNum,
+      };
+
+      // 9. Atomic commits in Firestore transaction
+      transaction.set(
+        accRef,
+        {
+          userId,
+          permanentAccountNumber: userAcc,
+          ...finalMetrics,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      transaction.set(adminFirestore.collection('cards').doc(cardId), finalCard, { merge: true });
+      transaction.set(adminFirestore.collection('transactions').doc(txId), finalTx, { merge: true });
+      transaction.set(adminFirestore.collection('notifications').doc(notifId), notifItem, { merge: true });
+    });
+
+    if (finalCard && finalTx) {
+      return {
+        success: true,
+        card: finalCard,
+        transaction: finalTx,
+        balanceMetrics: finalMetrics || undefined,
+        isDuplicate,
+      };
+    }
+
+    return { success: false, error: 'Card issuance completed without returning records.' };
+  } catch (err: any) {
+    const errMsg = err?.message || String(err);
+    console.error('[executeServerCardIssuance] Error:', errMsg);
+    return {
+      success: false,
+      error: errMsg.replace(/^[A-Z_]+:\s*/, ''),
+    };
+  }
+}
+
 

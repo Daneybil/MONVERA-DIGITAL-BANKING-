@@ -452,8 +452,10 @@ export const api = {
 
     // 1. Authoritative Backend Server API Resolution (checks canonical Firebase UIDs, accounts, emails, usernames)
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(
-        `/api/accounts/lookup?query=${encodeURIComponent(identifier)}&currentUserId=${encodeURIComponent(currentUserId || '')}`
+        `/api/accounts/lookup?query=${encodeURIComponent(identifier)}&currentUserId=${encodeURIComponent(currentUserId || '')}`,
+        { headers: authHeaders }
       );
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
@@ -463,6 +465,8 @@ export const api = {
             return data as RecipientLookupResult;
           } else if (data.isAmbiguous) {
             return { valid: false, error: data.error || 'Multiple accounts found matching identifier.' };
+          } else if (data.error) {
+            return { valid: false, error: data.error };
           }
         }
       }
@@ -512,155 +516,91 @@ export const api = {
     amount: number;
     description?: string;
     category?: Transaction['category'];
+    referenceNumber?: string;
+    idempotencyKey?: string;
   }): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
     const transferAmount = Number(data.amount);
     if (!transferAmount || isNaN(transferAmount) || transferAmount <= 0) {
       return { success: false, error: 'Transfer amount must be greater than $0.00.' };
     }
-    if (!data.senderUserId) {
+    const effectiveSenderUid = (auth?.currentUser?.uid || data.senderUserId);
+    if (!effectiveSenderUid) {
       return { success: false, error: 'Sender user ID is required.' };
     }
 
-    const targetIdentifier = (data.recipientIdentifier || data.recipientAccountNumber || data.recipientUsername || '').trim();
+    const targetIdentifier = (data.recipientIdentifier || data.recipientAccountNumber || data.recipientUsername || data.recipientUserId || '').trim();
     if (!targetIdentifier && !data.recipientUserId) {
       return { success: false, error: 'Recipient account number or identifier is required.' };
     }
 
-    // 1. Resolve Recipient Details FIRST before ANY debit or transaction creation
-    let recipientId = data.recipientUserId;
-    let recipientName = data.recipientName;
-    let recipientAcc = data.recipientAccountNumber;
-
-    if (!recipientId || !recipientName) {
-      try {
-        const fsUser = await firestoreSync.findRecipient(targetIdentifier);
-        if (fsUser) {
-          recipientId = fsUser.id || (fsUser as any).uid;
-          recipientName = `${fsUser.firstName || ''} ${fsUser.lastName || ''}`.trim() || fsUser.username;
-          recipientAcc = recipientAcc || fsUser.permanentAccountNumber || (fsUser as any).accountNumber;
-        }
-      } catch {}
-    }
-
-    if (!recipientId || !recipientName) {
-      const cleanTarget = targetIdentifier.replace(/^@/, '').replace(/[-\s]/g, '').toLowerCase();
-      const seedUser = SEED_USERS.find(
-        (u) =>
-          u.permanentAccountNumber.replace(/[-\s]/g, '').toLowerCase() === cleanTarget ||
-          (u.username && u.username.toLowerCase() === cleanTarget) ||
-          (u.email && u.email.toLowerCase() === cleanTarget) ||
-          `${u.firstName || ''} ${u.lastName || ''}`.trim().toLowerCase() === cleanTarget
-      );
-      if (seedUser) {
-        recipientId = seedUser.id;
-        recipientName = `${seedUser.firstName} ${seedUser.lastName}`;
-        recipientAcc = recipientAcc || seedUser.permanentAccountNumber;
-      }
-    }
-
-    // 2. Validate recipient BEFORE any financial operations
-    if (!recipientId) {
-      return {
-        success: false,
-        error: 'Recipient account could not be found. Please verify the account number, username, or email.',
-      };
-    }
-
-    if (recipientId === data.senderUserId) {
-      return {
-        success: false,
-        error: 'You cannot transfer funds to your own account. Use internal account transfer instead.',
-      };
-    }
-
-    // 3. Find sender details and check authoritative sender balance
-    let senderName = 'Monvera Customer';
-    let senderAcc = '1000000000';
-    try {
-      const senderProfile = await firestoreSync.getUserProfile(data.senderUserId);
-      if (senderProfile) {
-        senderName = `${senderProfile.firstName || ''} ${senderProfile.lastName || ''}`.trim() || senderProfile.username || 'Monvera Customer';
-        senderAcc = senderProfile.permanentAccountNumber || (senderProfile as any).accountNumber || '1000000000';
-      } else {
-        const senderSeed = SEED_USERS.find((u) => u.id === data.senderUserId);
-        if (senderSeed) {
-          senderName = `${senderSeed.firstName} ${senderSeed.lastName}`;
-          senderAcc = senderSeed.permanentAccountNumber;
-        }
-      }
-    } catch {}
-
-    const senderMetrics = await firestoreSync.getAccountBalances(data.senderUserId, senderAcc) || await this.getBalanceMetrics(data.senderUserId);
-    const currentSenderChecking = Number(senderMetrics?.checkingBalance || 0);
-
-    if (currentSenderChecking < transferAmount) {
-      return {
-        success: false,
-        error: `Insufficient checking balance ($${currentSenderChecking.toFixed(2)}). Transfer requires $${transferAmount.toFixed(2)}.`,
-      };
-    }
-
-    // 4. Call authoritative server-side transfer endpoint with verified Firebase Auth ID token
-    const refNum = (data as any).referenceNumber || (data as any).referenceId || (data as any).idempotencyKey;
+    const refNum = data.referenceNumber || data.idempotencyKey || `MV-TRF-${Date.now()}-${Math.floor(100000 + Math.random() * 900000)}`;
     const authHeaders = await getAuthHeaders();
 
-    const response = await fetch('/api/transfers/monvera', {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({
-        senderUserId: data.senderUserId,
-        recipientUserId: recipientId,
-        recipientAccountNumber: recipientAcc,
-        recipientUsername: (data as any).recipientUsername,
-        recipientIdentifier: targetIdentifier,
-        amount: transferAmount,
-        description: data.description,
-        category: data.category,
-        referenceNumber: refNum,
-      }),
-    });
+    try {
+      const response = await fetch('/api/transfers/monvera', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          senderUserId: effectiveSenderUid,
+          recipientUserId: data.recipientUserId,
+          recipientAccountNumber: data.recipientAccountNumber,
+          recipientUsername: data.recipientUsername,
+          recipientIdentifier: targetIdentifier,
+          amount: transferAmount,
+          description: data.description,
+          category: data.category,
+          referenceNumber: refNum,
+          idempotencyKey: refNum,
+        }),
+      });
 
-    const parsed = await parseJsonResponse<{
-      success: boolean;
-      transaction?: Transaction;
-      balanceMetrics?: BalanceMetrics;
-      recipientBalanceMetrics?: BalanceMetrics;
-      error?: string;
-    }>(response, { success: false, error: 'Transfer failed' });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        recipientBalanceMetrics?: BalanceMetrics;
+        error?: string;
+      }>(response, { success: false, error: 'Transfer failed' });
 
-    if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+      if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+        return {
+          success: false,
+          error: parsed.error || 'Transfer failed. Neither account balance was modified.',
+        };
+      }
+
+      const updatedSenderMetrics = parsed.balanceMetrics;
+      const finalTx = parsed.transaction;
+
+      // Post-transaction non-blocking alerts & local state dispatch
+      if (typeof window !== 'undefined') {
+        try {
+          localStorage.setItem(`monvera_balances_${effectiveSenderUid}`, JSON.stringify(updatedSenderMetrics));
+          localStorage.setItem('monvera_account_balances', JSON.stringify(updatedSenderMetrics));
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId: effectiveSenderUid, balanceMetrics: updatedSenderMetrics },
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent('monvera_transaction_created', {
+              detail: { userId: effectiveSenderUid, transaction: finalTx },
+            })
+          );
+        } catch {}
+      }
+
+      return {
+        success: true,
+        transaction: finalTx,
+        balanceMetrics: updatedSenderMetrics,
+      };
+    } catch (err: any) {
       return {
         success: false,
-        error: parsed.error || 'Transfer failed. Neither account balance was modified.',
+        error: err?.message || 'Network error communicating with transfer service.',
       };
     }
-
-    const updatedSenderMetrics = parsed.balanceMetrics;
-    const finalTx = parsed.transaction;
-
-    // Post-transaction non-blocking alerts & local state dispatch
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem(`monvera_balances_${data.senderUserId}`, JSON.stringify(updatedSenderMetrics));
-        localStorage.setItem('monvera_account_balances', JSON.stringify(updatedSenderMetrics));
-        window.dispatchEvent(
-          new CustomEvent('monvera_balance_updated', {
-            detail: { userId: data.senderUserId, balanceMetrics: updatedSenderMetrics },
-          })
-        );
-        window.dispatchEvent(
-          new CustomEvent('monvera_transaction_created', {
-            detail: { userId: data.senderUserId, transaction: finalTx },
-          })
-        );
-      } catch {}
-    }
-
-    return {
-      success: true,
-      transaction: finalTx,
-      balanceMetrics: updatedSenderMetrics,
-    };
   },
 
   async sendInternalTransfer(data: {
@@ -964,7 +904,8 @@ export const api = {
       if (params?.startDate) query.append('startDate', params.startDate);
       if (params?.endDate) query.append('endDate', params.endDate);
 
-      const res = await fetch(`/api/transactions?${query.toString()}`);
+      const headers = await getAuthHeaders();
+      const res = await fetch(`/api/transactions?${query.toString()}`, { headers });
       if (res.ok) {
         const data = await parseJsonResponse<{ transactions: Transaction[] }>(res, { transactions: [] });
         if (data && Array.isArray(data.transactions)) {
@@ -1202,12 +1143,15 @@ export const api = {
     if (!userId) return { cards: [] };
 
     // 1. Authoritative Firestore Cards
-    const fsCards = await firestoreSync.getUserCards(userId);
+    const fsCards = await firestoreSync.getUserCards(userId).catch(() => []);
 
     // 2. Fetch server cards if available and merge
     try {
-      const res = await fetch(`/api/cards?userId=${encodeURIComponent(userId)}`);
-      const data = await parseJsonResponse(res, { cards: [] });
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch(`/api/cards?userId=${encodeURIComponent(userId)}`, {
+        headers: authHeaders,
+      });
+      const data = await parseJsonResponse<{ cards: CardItem[] }>(res, { cards: [] });
       const map = new Map<string, CardItem>();
       (data.cards || []).forEach((c: CardItem) => {
         if (c && c.id) map.set(c.id, c);
@@ -1232,6 +1176,7 @@ export const api = {
     spendingLimitDaily?: number;
     colorScheme?: string;
     userAccountNumber?: string;
+    clientRequestId?: string;
     fallbackBalances?: BalanceMetrics;
     fallbackUser?: any;
   }): Promise<{
@@ -1239,114 +1184,87 @@ export const api = {
     card?: CardItem;
     transaction?: Transaction;
     balanceMetrics?: BalanceMetrics;
+    isDuplicate?: boolean;
     error?: string;
   }> {
     if (!data.userId) {
       return { success: false, error: 'User ID is required.' };
     }
 
-    let backendResult: any = null;
-    let fallbackToFirestore = false;
-
-    // 1. Attempt backend issuance
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch('/api/cards/create', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify(data),
       });
-      backendResult = await parseJsonResponse(res, { success: false, error: 'Card issuing service unavailable' });
 
-      if (backendResult?.success && backendResult?.card) {
-        // Also save to Firestore & local storage for permanent persistence
-        firestoreSync.saveCard(backendResult.card).catch(() => {});
-        if (backendResult.balanceMetrics) {
+      const result = await parseJsonResponse<{
+        success: boolean;
+        card?: CardItem;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        isDuplicate?: boolean;
+        error?: string;
+      }>(res, { success: false, error: 'Card issuing service unavailable' });
+
+      if (!res.ok || !result.success) {
+        return {
+          success: false,
+          error: result.error || `Card issuance failed (${res.status})`,
+        };
+      }
+
+      if (result.success && result.card) {
+        if (typeof window !== 'undefined') {
           try {
-            localStorage.setItem(`monvera_balances_${data.userId}`, JSON.stringify(backendResult.balanceMetrics));
-            localStorage.setItem('monvera_account_balances', JSON.stringify(backendResult.balanceMetrics));
+            if (result.balanceMetrics) {
+              window.dispatchEvent(
+                new CustomEvent('monvera_balance_updated', {
+                  detail: { balanceMetrics: result.balanceMetrics, userId: data.userId },
+                })
+              );
+            }
             window.dispatchEvent(
-              new CustomEvent('monvera_balance_updated', {
-                detail: { balanceMetrics: backendResult.balanceMetrics, userId: data.userId },
+              new CustomEvent('monvera_card_created', {
+                detail: { card: result.card, userId: data.userId },
               })
             );
+            const syncChannel = new BroadcastChannel('monvera_sync_channel');
+            syncChannel.postMessage({
+              balanceMetrics: result.balanceMetrics,
+              transaction: result.transaction,
+              card: result.card,
+              userId: data.userId,
+            });
+            syncChannel.close();
           } catch {}
         }
-        if (backendResult.transaction) {
-          firestoreSync.saveTransaction(backendResult.transaction).catch(() => {});
-        }
-        // Save notification so notification bell receives info immediately
-        const brandName = backendResult.card.brand === 'MASTERCARD' ? 'Mastercard' : 'Visa';
-        const notif: NotificationItem = {
-          id: `notif_${Date.now()}_card_created`,
-          userId: data.userId,
-          title: `${brandName} Card Issued & Activated`,
-          message: `Your new ${backendResult.card.cardTier} (${brandName} • ${
-            backendResult.card.cardNumber || backendResult.card.maskedNumber
-          }) has been successfully created and linked. $2.00 card creation fee deducted immediately from your dashboard balance.`,
-          type: 'TRANSACTION',
-          severity: 'success',
-          read: false,
-          createdAt: new Date().toISOString(),
-        };
-        firestoreSync.saveNotification(notif).catch(() => {});
-
-        window.dispatchEvent(
-          new CustomEvent('monvera_card_created', {
-            detail: { card: backendResult.card, userId: data.userId },
-          })
-        );
-        return backendResult;
+        return result;
       }
 
-      if (backendResult?.error) {
-        const errStr = String(backendResult.error).toLowerCase();
-        // If error is user not found, backend offline, or balance mismatch, fall back to authoritative Firestore engine
-        if (backendResult.isBackendUnavailable || errStr.includes('user account not found') || errStr.includes('not found')) {
-          fallbackToFirestore = true;
-        } else if (errStr.includes('insufficient')) {
-          // Verify if authoritative Firestore has sufficient balance ($2.00 fee) in checking
-          const fsBalances = await firestoreSync.getAccountBalances(data.userId, data.userAccountNumber);
-          if (fsBalances && Number(fsBalances.checkingBalance) >= 2.0) {
-            fallbackToFirestore = true;
-          } else if (data.fallbackBalances && Number(data.fallbackBalances.checkingBalance) >= 2.0) {
-            fallbackToFirestore = true;
-          } else {
-            return {
-              success: false,
-              error: backendResult.error || 'Insufficient checking balance to cover the $2.00 card issuance fee.',
-            };
-          }
-        } else {
-          fallbackToFirestore = true;
-        }
-      } else {
-        fallbackToFirestore = true;
-      }
-    } catch {
-      fallbackToFirestore = true;
+      return { success: false, error: result.error || 'Failed to issue card.' };
+    } catch (err: any) {
+      console.error('[createCard] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error communicating with card issuance service.',
+      };
     }
-
-    // 2. Authoritative Resilient Card Issuance Engine (Guarantees instant debit and no permission error)
-    if (fallbackToFirestore || !backendResult?.success) {
-      console.log('[API] Executing resilient direct engine for card creation...');
-      const fsRes = await firestoreSync.createCardDirect(data);
-      return fsRes;
-    }
-
-    return backendResult || { success: false, error: 'Card creation failed.' };
   },
 
   async toggleCardFreeze(id: string, userId?: string): Promise<{ success: boolean; card?: CardItem; error?: string }> {
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(`/api/cards/${encodeURIComponent(id)}/toggle-freeze`, {
         method: 'POST',
+        headers: authHeaders,
       });
       const data = await parseJsonResponse<{ success: boolean; card?: CardItem; error?: string }>(res, {
         success: false,
         error: 'Card service unavailable',
       });
       if (data?.success && data?.card) {
-        await firestoreSync.saveCard(data.card);
         return data;
       }
     } catch {}
@@ -1366,9 +1284,10 @@ export const api = {
     userId?: string
   ): Promise<{ success: boolean; card?: CardItem; error?: string }> {
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(`/api/cards/${encodeURIComponent(id)}/update-limits`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders,
         body: JSON.stringify(limits),
       });
       const data = await parseJsonResponse<{ success: boolean; card?: CardItem; error?: string }>(res, {
@@ -1376,7 +1295,6 @@ export const api = {
         error: 'Card update service unavailable',
       });
       if (data?.success && data?.card) {
-        await firestoreSync.saveCard(data.card);
         return data;
       }
     } catch {}
@@ -2410,32 +2328,44 @@ export const api = {
         success: false,
         error: 'Rejection service offline',
       });
+
+      if (!res.ok || !result.success) {
+        return {
+          success: false,
+          error: result.error || `Loan rejection failed (${res.status})`,
+        };
+      }
+
       if (result.success && result.loan) {
-        await firestoreSync.saveLoanApplication(result.loan);
+        // Dispatch local events so customer views and admin views update immediately
+        if (typeof window !== 'undefined') {
+          try {
+            window.dispatchEvent(
+              new CustomEvent('monvera_loan_updated', {
+                detail: { loan: result.loan },
+              })
+            );
+            const bc = new BroadcastChannel('monvera_sync_channel');
+            bc.postMessage({
+              type: 'LOAN_REJECTED',
+              loan: result.loan,
+            });
+            bc.close();
+          } catch {}
+        }
         return result;
       }
-    } catch {
-      // Backend unreachable fallback
-    }
 
-    try {
-      const allLoans = await firestoreSync.getAllLoans();
-      const existingLoan = allLoans.find((l) => l.id === data.loanId);
-      if (!existingLoan) {
-        return { success: false, error: 'Loan not found.' };
-      }
-      const now = new Date().toISOString();
-      const rejectedLoan: LoanApplication = {
-        ...existingLoan,
-        status: 'REJECTED',
-        rejectedAt: now,
-        rejectionReason: data.reason || 'Application declined by compliance review.',
-        rejectedBy: data.adminId || 'usr_admin',
+      return {
+        success: false,
+        error: result.error || 'Failed to reject loan application.',
       };
-      await firestoreSync.saveLoanApplication(rejectedLoan);
-      return { success: true, loan: rejectedLoan };
     } catch (err: any) {
-      return { success: false, error: err?.message || 'Failed to reject loan.' };
+      console.error('[adminRejectLoan] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error communicating with loan rejection service.',
+      };
     }
   },
 

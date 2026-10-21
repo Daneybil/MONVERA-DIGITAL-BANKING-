@@ -351,6 +351,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
 
             const fullLegalName =
               applicant.kycFullName ||
+              (applicant.kycFirstName && applicant.kycLastName ? `${applicant.kycFirstName} ${applicant.kycLastName}`.trim() : '') ||
               `${applicant.firstName || ''} ${applicant.lastName || ''}`.trim() ||
               'Not Specified';
 
@@ -385,8 +386,8 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                 <div className="p-5 bg-slate-50/60 flex flex-col md:flex-row md:items-center justify-between gap-4">
                   <div className="flex items-center gap-3.5">
                     <div className="w-12 h-12 rounded-2xl bg-slate-900 text-amber-400 font-black flex items-center justify-center text-base shrink-0 shadow-xs">
-                      {applicant.firstName ? applicant.firstName[0].toUpperCase() : 'U'}
-                      {applicant.lastName ? applicant.lastName[0].toUpperCase() : 'S'}
+                      {applicant.kycFirstName ? applicant.kycFirstName[0].toUpperCase() : applicant.firstName ? applicant.firstName[0].toUpperCase() : 'U'}
+                      {applicant.kycLastName ? applicant.kycLastName[0].toUpperCase() : applicant.lastName ? applicant.lastName[0].toUpperCase() : 'S'}
                     </div>
                     <div>
                       <div className="flex items-center gap-2 flex-wrap">

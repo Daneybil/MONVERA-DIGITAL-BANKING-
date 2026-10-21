@@ -51,6 +51,7 @@ export const CardsView: React.FC = () => {
   const [colorScheme, setColorScheme] = useState<string>('obsidian');
   const [bankingLimit, setBankingLimit] = useState<number>(20000);
   const [newlyCreatedCard, setNewlyCreatedCard] = useState<CardItem | null>(null);
+  const [walletAdded, setWalletAdded] = useState(false);
 
   // Card limits editing state
   const [editingLimitCardId, setEditingLimitCardId] = useState<string | null>(null);
@@ -95,6 +96,7 @@ export const CardsView: React.FC = () => {
     setCreateStep('details');
     setActionError(null);
     setNewlyCreatedCard(null);
+    setWalletAdded(false);
     setIsCreateModalOpen(true);
   };
 
@@ -198,6 +200,7 @@ export const CardsView: React.FC = () => {
       spendingLimitMonthly: bankingLimit,
       spendingLimitDaily: bankingLimit,
       colorScheme,
+      clientRequestId: `req_crd_${currentUser.id}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     };
 
     try {
@@ -209,34 +212,18 @@ export const CardsView: React.FC = () => {
         // Automatically refresh balances and notifications immediately
         await refreshBalance();
         await refreshNotifications();
+        try {
+          const freshCards = await api.getCards(currentUser.id);
+          if (freshCards?.cards && Array.isArray(freshCards.cards)) {
+            setCards(freshCards.cards);
+          }
+        } catch {}
         setCreateStep('success');
       } else {
-        // Direct resilient fallback to guarantee instant debit and 0 permission errors
-        const directRes = await firestoreSync.createCardDirect(cardParams);
-        if (directRes.success && directRes.card) {
-          setCards((prev) => [directRes.card!, ...prev.filter((c) => c.id !== directRes.card!.id)]);
-          setNewlyCreatedCard(directRes.card);
-          await refreshBalance();
-          await refreshNotifications();
-          setCreateStep('success');
-        } else {
-          setActionError(directRes.error || 'Failed to create card. Please check your balance.');
-        }
+        setActionError(res.error || 'Failed to create card. Please check your balance.');
       }
     } catch (err: any) {
-      // Seamlessly execute resilient direct issuance so the user never sees permission errors
-      try {
-        const directRes = await firestoreSync.createCardDirect(cardParams);
-        if (directRes.success && directRes.card) {
-          setCards((prev) => [directRes.card!, ...prev.filter((c) => c.id !== directRes.card!.id)]);
-          setNewlyCreatedCard(directRes.card);
-          await refreshBalance();
-          await refreshNotifications();
-          setCreateStep('success');
-          return;
-        }
-      } catch {}
-      setActionError(err.message || 'An unexpected error occurred while creating your card.');
+      setActionError(err?.message || 'An unexpected error occurred while creating your card.');
     } finally {
       setIsProcessing(false);
     }
@@ -1119,13 +1106,18 @@ export const CardsView: React.FC = () => {
                     </button>
 
                     <button
+                      type="button"
                       onClick={() => {
-                        alert('Card added to Apple Pay & Google Wallet securely.');
+                        setWalletAdded(true);
                       }}
                       className="px-4 py-2 rounded-xl text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white flex items-center space-x-1.5 transition-colors cursor-pointer"
                     >
-                      <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Add to Apple / Google Pay</span>
+                      {walletAdded ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
+                      )}
+                      <span>{walletAdded ? 'Added to Apple / Google Pay' : 'Add to Apple / Google Pay'}</span>
                     </button>
                   </div>
                 </div>

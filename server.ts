@@ -4,7 +4,7 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
-import { UserProfile, InvestmentTermDays, LoanApplication } from './src/types';
+import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, AuthenticatedRequest } from './server/authMiddleware';
 import { adminFirestore, isFirebaseAdminConfigured } from './server/firebaseAdmin';
@@ -18,6 +18,7 @@ import {
   executeServerLoanRepayment,
   executeServerInvestmentCreation,
   executeServerInvestmentMaturity,
+  executeServerCardIssuance,
   executeServerPendingWithdrawalReversals,
   reverseServerFirestoreWithdrawal,
   checkUserHasOutstandingLoan,
@@ -355,8 +356,15 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
         updatedAt: nowIso,
       });
     }
+
+    // Persist new user profile to Firestore users collection
+    await adminFirestore.collection('users').doc(userId).set({
+      ...newUser,
+      usernameLower: newUser.username.toLowerCase(),
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
   } catch (fsErr) {
-    console.warn('[Register] Firestore initial accounts initialization note:', fsErr);
+    console.warn('[Register] Firestore initial accounts/user initialization note:', fsErr);
   }
 
   // Welcome notification
@@ -594,22 +602,27 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
   }
 
   const cleanDocNum = documentNumber.trim();
-  const cleanFullName = (fullName?.trim() || `${firstName || ''} ${lastName || ''}`.trim() || 'Monvera Client');
-  const nameParts = cleanFullName.split(' ');
-  const derivedFirstName = firstName?.trim() || nameParts[0] || 'Valued';
-  const derivedLastName = lastName?.trim() || nameParts.slice(1).join(' ') || 'Client';
-
-  const userCountry = country?.trim() || 'United States';
-  const isUS = userCountry.toLowerCase().includes('united states') ||
-               userCountry.toUpperCase() === 'US' ||
-               userCountry.toUpperCase() === 'USA';
-
   const now = new Date().toISOString();
 
   try {
     const userRef = adminFirestore.collection('users').doc(targetUserId);
     const existingSnap = await userRef.get();
     const existingData = existingSnap.exists ? existingSnap.data()! : {};
+    const existingUser = db.users.get(targetUserId);
+    const existingFirst = existingData.kycFirstName || existingData.firstName || existingUser?.firstName;
+    const existingLast = existingData.kycLastName || existingData.lastName || existingUser?.lastName;
+    const existingFull = existingData.kycFullName || existingData.fullName || existingUser?.fullName || (existingFirst && existingLast ? `${existingFirst} ${existingLast}` : undefined);
+
+    const cleanFullName = (fullName?.trim() || (firstName && lastName ? `${firstName} ${lastName}`.trim() : '') || existingFull || 'Monvera Client');
+    const nameParts = cleanFullName.split(' ').filter(Boolean);
+    const derivedFirstName = firstName?.trim() || nameParts[0] || existingFirst || 'Valued';
+    const derivedLastName = lastName?.trim() || nameParts.slice(1).join(' ') || existingLast || 'Client';
+
+    const userCountry = country?.trim() || existingData.country || existingUser?.country || 'United States';
+    const isUS = userCountry.toLowerCase().includes('united states') ||
+                 userCountry.toUpperCase() === 'US' ||
+                 userCountry.toUpperCase() === 'USA';
+
     const currentReviews = existingData.kycItemReviews || {};
 
     // 1. Durably store sensitive document images in dedicated kyc_documents subcollection
@@ -660,6 +673,7 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
     }
 
     // 3. Build authoritative user profile update
+    const resolvedStreet = streetAddress?.trim() || existingData.kycStreetAddress || existingData.streetAddress || existingData.address || '';
     const profileUpdate: Record<string, any> = {
       id: targetUserId,
       uid: targetUserId,
@@ -676,9 +690,11 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
       country: userCountry,
       kycDocumentType: documentType,
       kycDocumentNumber: cleanDocNum,
-      kycStreetAddress: streetAddress?.trim() || existingData.kycStreetAddress || existingData.address || '',
+      kycStreetAddress: resolvedStreet,
+      streetAddress: resolvedStreet,
+      address: resolvedStreet,
       kycProofOfAddressType: proofOfAddressType || 'Bank statement',
-      kycProofOfAddress: `${proofOfAddressType || 'Bank statement'} (${streetAddress?.trim() || ''})`,
+      kycProofOfAddress: `${proofOfAddressType || 'Bank statement'} (${resolvedStreet})`,
       kycItemReviews: newItemReviews,
       kycReviewDurationMinutes: reviewDurationMinutes || 10,
       updatedAt: now,
@@ -688,12 +704,20 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
       profileUpdate.phone = phone.trim();
       profileUpdate.kycPhone = phone.trim();
     }
-    if (email) profileUpdate.kycEmail = email.trim();
+    if (email) {
+      profileUpdate.email = email.trim();
+      profileUpdate.kycEmail = email.trim();
+    }
     if (dateOfBirth) {
       profileUpdate.dateOfBirth = dateOfBirth.trim();
       profileUpdate.kycDateOfBirth = dateOfBirth.trim();
     }
     if (ssn) profileUpdate.kycSsn = ssn.trim();
+    const effectiveUsername = existingData.username || existingUser?.username;
+    if (effectiveUsername) {
+      profileUpdate.username = effectiveUsername;
+      profileUpdate.usernameLower = effectiveUsername.toLowerCase();
+    }
 
     // Store document image references/URIs in top-level document
     if (documentImage) profileUpdate.kycDocumentImage = documentImage;
@@ -708,6 +732,11 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
     // 5. Also log a permanent submission audit record in kyc_submissions collection
     await adminFirestore.collection('kyc_submissions').doc(targetUserId).set({
       userId: targetUserId,
+      fullName: cleanFullName,
+      firstName: derivedFirstName,
+      lastName: derivedLastName,
+      streetAddress: resolvedStreet,
+      dateOfBirth: dateOfBirth?.trim() || existingData.kycDateOfBirth || '',
       submittedAt: now,
       documentType,
       documentNumber: cleanDocNum,
@@ -801,7 +830,11 @@ async function executeAuthoritativeKycApproval(userId: string, adminId: string, 
     ...(isUS || userData.kycSsn ? { ssn: { status: 'approved', reviewedAt: now, reviewedBy: adminId } } : {}),
   };
 
-  const verifiedLegalName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || 'Verified Client';
+  const verifiedLegalName =
+    userData.kycFullName ||
+    (userData.kycFirstName && userData.kycLastName ? `${userData.kycFirstName} ${userData.kycLastName}`.trim() : '') ||
+    `${userData.firstName || ''} ${userData.lastName || ''}`.trim() ||
+    'Verified Client';
 
   const approvalUpdate: Record<string, any> = {
     kycStatus: 'verified',
@@ -810,6 +843,11 @@ async function executeAuthoritativeKycApproval(userId: string, adminId: string, 
     dailyTransactionLimit: 1000000,
     kycItemReviews: approvedReviews,
     verifiedLegalName,
+    fullName: verifiedLegalName,
+    kycFullName: verifiedLegalName,
+    ...(userData.kycFirstName ? { firstName: userData.kycFirstName, kycFirstName: userData.kycFirstName } : {}),
+    ...(userData.kycLastName ? { lastName: userData.kycLastName, kycLastName: userData.kycLastName } : {}),
+    ...(userData.kycStreetAddress ? { streetAddress: userData.kycStreetAddress, address: userData.kycStreetAddress } : {}),
     updatedAt: now,
   };
 
@@ -947,9 +985,10 @@ app.get('/api/accounts/balance', async (req: Request, res: Response) => {
 });
 
 // Lookup recipient by Account Number OR Username before transfer confirmation
-app.get('/api/accounts/lookup', async (req: Request, res: Response) => {
-  const { accountNumber, username, query: rawQuery, currentUserId } = req.query;
+app.get('/api/accounts/lookup', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { accountNumber, username, query: rawQuery, currentUserId: queryUserId } = req.query;
   const rawInput = (rawQuery || accountNumber || username || '') as string;
+  const currentUserId = req.auth?.uid || (queryUserId as string);
   
   if (!rawInput.trim()) {
     return res.status(400).json({ valid: false, error: 'Account number or username is required' });
@@ -983,8 +1022,8 @@ app.get('/api/accounts/lookup', async (req: Request, res: Response) => {
     }
 
     const accNum = recipientData.permanentAccountNumber || recipientData.accountNumber || '1000000000';
-    return res.json({
-      valid: true,
+    const recipientDetails = {
+      id: recipientUid,
       recipientId: recipientUid,
       firstName: recipientData.firstName || 'Monvera',
       lastName: recipientData.lastName || 'Customer',
@@ -994,6 +1033,11 @@ app.get('/api/accounts/lookup', async (req: Request, res: Response) => {
       maskedAccountNumber: `•••• ${accNum.slice(-4)}`,
       membershipTier: recipientData.membershipTier || 'Premier',
       verified: true,
+    };
+    return res.json({
+      valid: true,
+      ...recipientDetails,
+      recipient: recipientDetails,
     });
   } catch (err: any) {
     return res.status(500).json({ valid: false, error: err?.message || 'Server error looking up recipient.' });
@@ -1018,11 +1062,28 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
     idempotencyKey,
   } = req.body;
 
-  // Identity consistency check: verified Firebase Authentication UID is the ONLY authoritative sender identity
-  if (senderUserId && senderUserId !== authUid) {
-    return res.status(403).json({
-      error: 'Session identity mismatch: Authenticated user does not match requested sender.',
-    });
+  // Identity consistency check: verified Firebase Authentication UID is the authoritative sender identity
+  if (
+    senderUserId &&
+    senderUserId !== authUid &&
+    senderUserId !== 'usr_customer' &&
+    !senderUserId.startsWith('acc_') &&
+    senderUserId !== req.auth?.email
+  ) {
+    let isMatchingAcc = false;
+    try {
+      if (isFirebaseAdminConfigured()) {
+        const uSnap = await adminFirestore.collection('users').doc(authUid).get();
+        if (uSnap.exists && uSnap.data()?.permanentAccountNumber === senderUserId) {
+          isMatchingAcc = true;
+        }
+      }
+    } catch {}
+    if (!isMatchingAcc) {
+      return res.status(403).json({
+        error: 'Session identity mismatch: Authenticated user does not match requested sender.',
+      });
+    }
   }
 
   const rawTarget = (recipientIdentifier || recipientAccountNumber || recipientUsername || recipientUserId || '') as string;
@@ -1897,17 +1958,57 @@ app.post('/api/investments/:id/mature', optionalFirebaseAuth, async (req: Authen
 });
 
 // --- CARDS ---
-app.get('/api/cards', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
-  if (!userId) return res.status(400).json({ error: 'userId is required' });
+app.get('/api/cards', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false;
+  const requestedUserId = req.query.userId as string | undefined;
 
-  const userCards = Array.from(db.cards.values()).filter((c) => c.userId === userId);
-  res.json({ cards: userCards });
+  const targetUserId = isCallerAdmin && requestedUserId ? requestedUserId : (callerUid || requestedUserId);
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  // If ordinary customer, deny access to other customers' cards
+  if (callerUid && !isCallerAdmin && requestedUserId && requestedUserId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You are not authorized to view another customer\'s cards.' });
+  }
+
+  try {
+    const cardMap = new Map<string, any>();
+
+    // 1. Authoritative cards in Firestore
+    const fsSnap = await adminFirestore.collection('cards').where('userId', '==', targetUserId).get();
+    fsSnap.forEach((doc) => {
+      const c = doc.data();
+      if (c && c.id) cardMap.set(c.id, c);
+    });
+
+    // 2. In-memory cards
+    Array.from(db.cards.values()).forEach((c) => {
+      if (c.userId === targetUserId && !cardMap.has(c.id)) {
+        cardMap.set(c.id, c);
+      }
+    });
+
+    const userCards = Array.from(cardMap.values()).sort(
+      (a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
+    return res.json({ cards: userCards });
+  } catch (err: any) {
+    console.error('[/api/cards error]', err);
+    const userCards = Array.from(db.cards.values()).filter((c) => c.userId === targetUserId);
+    return res.json({ cards: userCards });
+  }
 });
 
-app.post('/api/cards/create', (req: Request, res: Response) => {
+app.post('/api/cards/create', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth!.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+
+  // Determine target customer UID strictly from verified token (unless admin creating on behalf of a customer)
+  const targetUserId = (isCallerAdmin && req.body.userId) ? req.body.userId : callerUid;
+
   const {
-    userId,
     cardHolderName,
     phone,
     cardType,
@@ -1917,76 +2018,144 @@ app.post('/api/cards/create', (req: Request, res: Response) => {
     spendingLimitDaily,
     colorScheme,
     userAccountNumber,
+    clientRequestId,
     fallbackBalances,
     fallbackUser,
   } = req.body;
-  if (!userId) return res.status(400).json({ error: 'userId is required' });
 
-  const result = db.createCard({
-    userId,
-    cardHolderName,
-    phone,
-    cardType,
-    cardTier,
-    brand,
-    spendingLimitMonthly: spendingLimitMonthly ? Number(spendingLimitMonthly) : 20000,
-    spendingLimitDaily: spendingLimitDaily ? Number(spendingLimitDaily) : 20000,
-    colorScheme,
-    userAccountNumber,
-    fallbackBalances,
-    fallbackUser,
-  });
+  try {
+    const result = await executeServerCardIssuance({
+      userId: targetUserId,
+      cardHolderName,
+      phone,
+      cardType,
+      cardTier,
+      brand,
+      spendingLimitMonthly: spendingLimitMonthly ? Number(spendingLimitMonthly) : 20000,
+      spendingLimitDaily: spendingLimitDaily ? Number(spendingLimitDaily) : 20000,
+      colorScheme,
+      userAccountNumber,
+      clientRequestId,
+      fallbackBalances,
+      fallbackUser,
+    });
 
-  if (!result.success) {
-    return res.status(400).json({ error: result.error });
+    if (!result.success) {
+      const statusCode = result.error?.includes('not found') ? 404 : 400;
+      return res.status(statusCode).json({ error: result.error });
+    }
+
+    // Mirror to in-memory db
+    try {
+      if (result.card) {
+        db.cards.set(result.card.id, result.card);
+      }
+      if (result.transaction) {
+        db.transactions.unshift(result.transaction);
+      }
+      if (result.balanceMetrics?.accounts) {
+        result.balanceMetrics.accounts.forEach((acc) => db.accounts.set(acc.id, acc));
+      }
+    } catch {}
+
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[/api/cards/create Error]:', err);
+    return res.status(500).json({ error: err?.message || 'Server error creating card.' });
   }
-
-  const targetUserId = result.card?.userId || userId;
-  const balanceMetrics = db.getUserBalanceMetrics(targetUserId);
-  res.json({
-    success: true,
-    card: result.card,
-    transaction: result.transaction,
-    balanceMetrics,
-  });
 });
 
-app.post('/api/cards/:id/toggle-freeze', (req: Request, res: Response) => {
+app.post('/api/cards/:id/toggle-freeze', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const card = db.cards.get(id);
+  const callerUid = req.auth?.uid;
+  let card: any = null;
 
-  if (!card) return res.status(404).json({ error: 'Card not found' });
+  try {
+    const cardDocRef = adminFirestore.collection('cards').doc(id);
+    const cardSnap = await cardDocRef.get();
+    if (cardSnap.exists) {
+      card = cardSnap.data();
+      if (callerUid) {
+        const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+        if (!isCallerAdmin && card.userId !== callerUid) {
+          return res.status(403).json({ error: 'FORBIDDEN: You do not own this card.' });
+        }
+      }
+      card.status = card.status === 'ACTIVE' ? 'FROZEN' : 'ACTIVE';
+      card.updatedAt = new Date().toISOString();
+      await cardDocRef.set({ status: card.status, updatedAt: card.updatedAt }, { merge: true });
+      db.cards.set(id, card);
+    }
+  } catch (fsErr) {
+    console.warn('[/api/cards/:id/toggle-freeze] Firestore error:', fsErr);
+  }
 
-  card.status = card.status === 'ACTIVE' ? 'FROZEN' : 'ACTIVE';
+  if (!card) {
+    card = db.cards.get(id);
+    if (!card) return res.status(404).json({ error: 'Card not found' });
+    card.status = card.status === 'ACTIVE' ? 'FROZEN' : 'ACTIVE';
+  }
 
-  db.notifications.unshift({
-    id: `notif_card_${Date.now()}`,
-    userId: card.userId,
-    title: `Card ${card.status === 'FROZEN' ? 'Frozen' : 'Reactivated'}`,
-    message: `Your ${card.cardTier} (•••• ${card.maskedNumber.slice(-4)}) has been ${
-      card.status === 'FROZEN' ? 'locked' : 'unlocked'
-    }.`,
-    type: 'SECURITY',
-    severity: card.status === 'FROZEN' ? 'warning' : 'success',
-    read: false,
-    createdAt: new Date().toISOString(),
-  });
+  // Notification
+  try {
+    const notifItem = {
+      id: `notif_card_${Date.now()}`,
+      userId: card.userId,
+      title: `Card ${card.status === 'FROZEN' ? 'Frozen' : 'Reactivated'}`,
+      message: `Your ${card.cardTier} (•••• ${(card.maskedNumber || card.cardNumber || '0000').slice(-4)}) has been ${
+        card.status === 'FROZEN' ? 'locked' : 'unlocked'
+      }.`,
+      type: 'SECURITY',
+      severity: card.status === 'FROZEN' ? 'warning' : 'success',
+      read: false,
+      createdAt: new Date().toISOString(),
+    };
+    db.notifications.unshift(notifItem as any);
+    await adminFirestore.collection('notifications').doc(notifItem.id).set(notifItem, { merge: true });
+  } catch {}
 
   res.json({ success: true, card });
 });
 
-app.post('/api/cards/:id/update-limits', (req: Request, res: Response) => {
+app.post('/api/cards/:id/update-limits', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
+  const callerUid = req.auth?.uid;
   const { dailyLimit, monthlyLimit, international, online, atm } = req.body;
-  const card = db.cards.get(id);
+  let card: any = null;
 
-  if (!card) return res.status(404).json({ error: 'Card not found' });
+  try {
+    const cardDocRef = adminFirestore.collection('cards').doc(id);
+    const cardSnap = await cardDocRef.get();
+    if (cardSnap.exists) {
+      card = cardSnap.data();
+      if (callerUid) {
+        const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+        if (!isCallerAdmin && card.userId !== callerUid) {
+          return res.status(403).json({ error: 'FORBIDDEN: You do not own this card.' });
+        }
+      }
+      if (dailyLimit !== undefined) card.spendingLimitDaily = Number(dailyLimit);
+      if (monthlyLimit !== undefined) card.spendingLimitMonthly = Number(monthlyLimit);
+      if (international !== undefined) card.internationalEnabled = Boolean(international);
+      if (online !== undefined) card.onlineEnabled = Boolean(online);
+      if (atm !== undefined) card.atmEnabled = Boolean(atm);
+      card.updatedAt = new Date().toISOString();
+      await cardDocRef.set(card, { merge: true });
+      db.cards.set(id, card);
+    }
+  } catch (fsErr) {
+    console.warn('[/api/cards/:id/update-limits] Firestore error:', fsErr);
+  }
 
-  if (dailyLimit !== undefined) card.spendingLimitDaily = Number(dailyLimit);
-  if (monthlyLimit !== undefined) card.spendingLimitMonthly = Number(monthlyLimit);
-  if (international !== undefined) card.internationalEnabled = Boolean(international);
-  if (online !== undefined) card.onlineEnabled = Boolean(online);
-  if (atm !== undefined) card.atmEnabled = Boolean(atm);
+  if (!card) {
+    card = db.cards.get(id);
+    if (!card) return res.status(404).json({ error: 'Card not found' });
+    if (dailyLimit !== undefined) card.spendingLimitDaily = Number(dailyLimit);
+    if (monthlyLimit !== undefined) card.spendingLimitMonthly = Number(monthlyLimit);
+    if (international !== undefined) card.internationalEnabled = Boolean(international);
+    if (online !== undefined) card.onlineEnabled = Boolean(online);
+    if (atm !== undefined) card.atmEnabled = Boolean(atm);
+  }
 
   res.json({ success: true, card });
 });
@@ -2694,7 +2863,26 @@ app.post('/api/admin/kyc/review-item', requireAdminAuth, async (req: Authenticat
     };
 
     if (newKycStatus === 'verified') {
-      itemUpdate.verifiedLegalName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || 'Verified Client';
+      const verifiedLegalName =
+        userData.kycFullName ||
+        (userData.kycFirstName && userData.kycLastName ? `${userData.kycFirstName} ${userData.kycLastName}`.trim() : '') ||
+        `${userData.firstName || ''} ${userData.lastName || ''}`.trim() ||
+        'Verified Client';
+      itemUpdate.verifiedLegalName = verifiedLegalName;
+      itemUpdate.fullName = verifiedLegalName;
+      itemUpdate.kycFullName = verifiedLegalName;
+      if (userData.kycFirstName) {
+        itemUpdate.firstName = userData.kycFirstName;
+        itemUpdate.kycFirstName = userData.kycFirstName;
+      }
+      if (userData.kycLastName) {
+        itemUpdate.lastName = userData.kycLastName;
+        itemUpdate.kycLastName = userData.kycLastName;
+      }
+      if (userData.kycStreetAddress) {
+        itemUpdate.streetAddress = userData.kycStreetAddress;
+        itemUpdate.address = userData.kycStreetAddress;
+      }
     }
 
     await userRef.set(itemUpdate, { merge: true });
@@ -2900,7 +3088,7 @@ app.get('/api/admin/audit-logs', requireAdminAuth, (req: AuthenticatedRequest, r
 // --- LOANS & CREDIT FACILITY API ---
 app.get('/api/loans', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth!.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email);
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
 
   const requestedUserId = req.query.userId as string | undefined;
 
@@ -3050,7 +3238,8 @@ app.post('/api/admin/loans/approve', requireAdminAuth, async (req: Authenticated
     });
 
     if (!result.success) {
-      return res.status(400).json({ error: result.error });
+      const statusCode = result.error?.includes('NOT_FOUND') ? 404 : 400;
+      return res.status(statusCode).json({ error: result.error });
     }
 
     // Mirror to in-memory db for local synchronization
@@ -3071,7 +3260,7 @@ app.post('/api/admin/loans/reject', requireAdminAuth, async (req: AuthenticatedR
 
   const effectiveAdminId = req.auth!.uid;
   const nowIso = new Date().toISOString();
-  const rejectionReason = reason || 'Application declined by compliance';
+  const rejectionReason = reason || 'Application declined by compliance review.';
 
   // 1. Authoritatively update Firestore loan document
   let loanData: LoanApplication | null = null;
@@ -3080,53 +3269,78 @@ app.post('/api/admin/loans/reject', requireAdminAuth, async (req: AuthenticatedR
     const loanSnap = await loanDocRef.get();
     if (loanSnap.exists) {
       loanData = loanSnap.data() as LoanApplication;
-      await loanDocRef.set(
+    } else if (db.loans.has(loanId)) {
+      loanData = { ...db.loans.get(loanId)! };
+    }
+
+    if (!loanData) {
+      return res.status(404).json({ error: 'LOAN_NOT_FOUND: Loan record not found.' });
+    }
+
+    // Validate that the loan application is in an eligible status for rejection
+    if (loanData.status === 'ACTIVE' || loanData.status === 'APPROVED') {
+      return res.status(400).json({
+        error: 'INVALID_STATUS: Cannot reject a loan that has already been approved and disbursed.',
+      });
+    }
+
+    if (loanData.status === 'CANCELLED' || loanData.status === 'PAID') {
+      return res.status(400).json({
+        error: `INVALID_STATUS: Loan application is currently ${loanData.status.toLowerCase()} and cannot be rejected.`,
+      });
+    }
+
+    if (loanData.status === 'REJECTED') {
+      // Idempotent: loan was already rejected
+      return res.json({ success: true, loan: loanData, isDuplicate: true });
+    }
+
+    if (loanData.status !== 'PENDING') {
+      return res.status(400).json({
+        error: `INVALID_STATUS: Only pending loan applications can be rejected (current status: ${loanData.status}).`,
+      });
+    }
+
+    loanData = {
+      ...loanData,
+      status: 'REJECTED',
+      rejectedAt: nowIso,
+      rejectionReason,
+      rejectedBy: effectiveAdminId,
+      updatedAt: nowIso,
+    };
+
+    await loanDocRef.set(loanData, { merge: true });
+
+    // Dispatch security notification to borrower
+    if (loanData.userId) {
+      const notifId = `notif_${Date.now()}_loan_rej`;
+      await adminFirestore.collection('notifications').doc(notifId).set(
         {
-          status: 'REJECTED',
-          rejectedAt: nowIso,
-          rejectionReason,
-          rejectedBy: effectiveAdminId,
-          updatedAt: nowIso,
+          id: notifId,
+          userId: loanData.userId,
+          title: 'Loan Application Update',
+          message: `Your credit facility application (#${loanId.slice(-6).toUpperCase()}) was declined. Reason: "${rejectionReason}".`,
+          type: 'SYSTEM',
+          severity: 'error',
+          read: false,
+          createdAt: nowIso,
+          referenceId: loanId,
         },
         { merge: true }
       );
-      loanData.status = 'REJECTED';
-      loanData.rejectedAt = nowIso;
-      loanData.rejectionReason = rejectionReason;
-      loanData.rejectedBy = effectiveAdminId;
-      loanData.updatedAt = nowIso;
-
-      // Dispatch security notification to borrower
-      if (loanData.userId) {
-        const notifId = `notif_${Date.now()}_loan_rej`;
-        await adminFirestore.collection('notifications').doc(notifId).set(
-          {
-            id: notifId,
-            userId: loanData.userId,
-            title: 'Loan Application Update',
-            message: `Your credit facility application (#${loanId.slice(-6).toUpperCase()}) was declined. Reason: "${rejectionReason}".`,
-            type: 'SYSTEM',
-            severity: 'error',
-            read: false,
-            createdAt: nowIso,
-            referenceId: loanId,
-          },
-          { merge: true }
-        );
-      }
     }
-  } catch (fsErr) {
+  } catch (fsErr: any) {
     console.error('[/api/admin/loans/reject] Firestore error:', fsErr);
-    return res.status(500).json({ error: 'Failed to persist loan rejection to authoritative database.' });
+    return res.status(500).json({ error: fsErr?.message || 'Failed to persist loan rejection to authoritative database.' });
   }
 
   // 2. Sync to in-memory db
-  const result = db.adminRejectLoan({ loanId, reason: rejectionReason, adminId: effectiveAdminId });
-  if (!result.success && !loanData) {
-    return res.status(400).json({ error: result.error });
-  }
+  try {
+    db.adminRejectLoan({ loanId, reason: rejectionReason, adminId: effectiveAdminId });
+  } catch {}
 
-  res.json({ success: true, loan: loanData || result.loan });
+  res.json({ success: true, loan: loanData });
 });
 
 app.post('/api/loans/repay', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {

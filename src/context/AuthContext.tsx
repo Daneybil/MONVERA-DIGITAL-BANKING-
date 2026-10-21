@@ -116,7 +116,7 @@ interface AuthContextType {
   markAllNotificationsAsRead: () => Promise<void>;
   markNotificationAsRead: (notificationId: string) => Promise<void>;
   replyToSupport: (notificationId: string, message: string) => Promise<{ success: boolean; error?: string }>;
-  updateUser: (user: UserProfile) => void;
+  updateUser: (user: UserProfile, options?: { skipFirestoreSync?: boolean }) => void;
   resendVerificationEmail: () => Promise<{ success: boolean; message?: string; error?: string }>;
   checkEmailVerification: () => Promise<boolean>;
   sendPasswordReset: (emailOrIdentifier: string) => Promise<{ success: boolean; message?: string; error?: string }>;
@@ -1593,7 +1593,7 @@ const unenrollTotpMfa = async (): Promise<{
 
   const unreadNotifsCount = notifications.filter((n) => !n.read).length;
 
-  const updateUser = (user: UserProfile) => {
+  const updateUser = (user: UserProfile, options?: { skipFirestoreSync?: boolean }) => {
     if (user.avatarUrl) {
       try {
         localStorage.setItem(`monvera_user_avatar_${user.id}`, user.avatarUrl);
@@ -1604,28 +1604,33 @@ const unenrollTotpMfa = async (): Promise<{
     // Invariant: Do not silently overwrite frozen status with active during ordinary profile/avatar updates
     const effectiveStatus = currentUser?.status === 'frozen' && user.status === 'active' ? 'frozen' : (user.status || currentUser?.status || 'active');
 
-    // Legal Name Synchronization: when unverified, synchronize all legal name representations
-    const isUnverified = (currentUser?.kycStatus || user.kycStatus) !== 'verified';
-    const cleanFirst = user.firstName || currentUser?.firstName || '';
-    const cleanLast = user.lastName || currentUser?.lastName || '';
-    const cleanFull = `${cleanFirst} ${cleanLast}`.trim();
+    // Legal Name Synchronization: respect intentional KYC legal name corrections over stale registration names
+    const effectiveKycFull = user.kycFullName?.trim() || currentUser?.kycFullName?.trim() || undefined;
+    const effectiveKycFirst = user.kycFirstName?.trim() || currentUser?.kycFirstName?.trim() || undefined;
+    const effectiveKycLast = user.kycLastName?.trim() || currentUser?.kycLastName?.trim() || undefined;
+    const effectiveStreet = user.kycStreetAddress?.trim() || user.streetAddress?.trim() || (user as any)?.address?.trim() || currentUser?.kycStreetAddress?.trim() || currentUser?.streetAddress?.trim();
+
+    const cleanFirst = user.firstName?.trim() || effectiveKycFirst || currentUser?.firstName || '';
+    const cleanLast = user.lastName?.trim() || effectiveKycLast || currentUser?.lastName || '';
+    const cleanFull = effectiveKycFull || (cleanFirst && cleanLast ? `${cleanFirst} ${cleanLast}`.trim() : (user.fullName || currentUser?.fullName || ''));
 
     const safeUser: UserProfile = {
+      ...(currentUser || {}),
       ...user,
       status: effectiveStatus,
-      ...(isUnverified && cleanFull ? {
-        fullName: cleanFull,
-        kycFullName: cleanFull,
-        kycFirstName: cleanFirst,
-        kycLastName: cleanLast,
-      } : {}),
+      ...(effectiveKycFull ? { kycFullName: effectiveKycFull } : {}),
+      ...(effectiveKycFirst ? { kycFirstName: effectiveKycFirst } : {}),
+      ...(effectiveKycLast ? { kycLastName: effectiveKycLast } : {}),
+      ...(cleanFull ? { fullName: cleanFull } : {}),
+      ...(effectiveStreet ? { streetAddress: effectiveStreet, address: effectiveStreet, kycStreetAddress: effectiveStreet } : {}),
     };
     setCurrentUser(safeUser);
     cacheUserInDirectory(safeUser);
     setAvailableUsers((prev) => prev.map((u) => (u.id === user.id ? safeUser : u)));
 
-    // Safely sync non-sensitive fields to Firestore
-    if (user.id) {
+    // Safely sync non-sensitive fields to Firestore for normal profile edits (e.g. from ProfileView)
+    // When skipFirestoreSync is true (such as after authoritative /api/kyc/submit), do not execute a secondary write
+    if (user.id && !options?.skipFirestoreSync) {
       const fsPayload: Record<string, any> = {
         firstName: safeUser.firstName,
         lastName: safeUser.lastName,
@@ -1638,10 +1643,22 @@ const unenrollTotpMfa = async (): Promise<{
         maritalStatus: safeUser.maritalStatus,
         businessName: safeUser.businessName,
       };
-      if (isUnverified) {
+      if (safeUser.kycFullName) {
         fsPayload.kycFullName = safeUser.kycFullName;
         fsPayload.kycFirstName = safeUser.kycFirstName;
         fsPayload.kycLastName = safeUser.kycLastName;
+      }
+      if (safeUser.streetAddress) {
+        fsPayload.kycStreetAddress = safeUser.streetAddress;
+      }
+      if (safeUser.country) {
+        fsPayload.kycCountry = safeUser.country;
+      }
+      if (safeUser.phone) {
+        fsPayload.kycPhone = safeUser.phone;
+      }
+      if (safeUser.dateOfBirth) {
+        fsPayload.kycDateOfBirth = safeUser.dateOfBirth;
       }
       firestoreSync.saveUserProfile(user.id, fsPayload).catch((err) => {
         console.warn('[Firestore] Background update notice:', err);

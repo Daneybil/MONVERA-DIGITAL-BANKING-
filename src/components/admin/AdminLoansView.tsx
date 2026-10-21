@@ -86,7 +86,14 @@ export const AdminLoansView: React.FC = () => {
     const unsubscribe = firestoreSync.subscribeToLoans((all) => {
       setLoans(all);
     });
-    return () => unsubscribe();
+    const handleLoanEvent = () => {
+      fetchLoans();
+    };
+    window.addEventListener('monvera_loan_updated', handleLoanEvent);
+    return () => {
+      unsubscribe();
+      window.removeEventListener('monvera_loan_updated', handleLoanEvent);
+    };
   }, []);
 
   const handleToggleInspection = async (loan: LoanApplication) => {

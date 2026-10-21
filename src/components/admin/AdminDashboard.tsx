@@ -220,12 +220,25 @@ export const AdminDashboard: React.FC = () => {
               ...topAcc,
               kycStatus: resolvedKyc,
               kycVerifiedAt: resolvedKyc === 'verified' ? (ex.kycVerifiedAt || u.kycVerifiedAt) : undefined,
+              kycSubmittedAt: topAcc.kycSubmittedAt || baseAcc.kycSubmittedAt,
               kycFullName: topAcc.kycFullName || baseAcc.kycFullName,
               kycFirstName: topAcc.kycFirstName || baseAcc.kycFirstName,
               kycLastName: topAcc.kycLastName || baseAcc.kycLastName,
               firstName: topAcc.firstName || baseAcc.firstName,
               lastName: topAcc.lastName || baseAcc.lastName,
               fullName: topAcc.fullName || baseAcc.fullName,
+              kycStreetAddress: topAcc.kycStreetAddress || baseAcc.kycStreetAddress || topAcc.streetAddress || baseAcc.streetAddress,
+              streetAddress: topAcc.streetAddress || topAcc.kycStreetAddress || baseAcc.streetAddress || baseAcc.kycStreetAddress,
+              address: topAcc.streetAddress || topAcc.kycStreetAddress || baseAcc.streetAddress || baseAcc.kycStreetAddress,
+              kycDateOfBirth: topAcc.kycDateOfBirth || baseAcc.kycDateOfBirth,
+              dateOfBirth: topAcc.dateOfBirth || baseAcc.dateOfBirth || topAcc.kycDateOfBirth || baseAcc.kycDateOfBirth,
+              kycCountry: topAcc.kycCountry || baseAcc.kycCountry,
+              country: topAcc.country || baseAcc.country || topAcc.kycCountry || baseAcc.kycCountry,
+              kycPhone: topAcc.kycPhone || baseAcc.kycPhone,
+              phone: topAcc.phone || baseAcc.phone || topAcc.kycPhone || baseAcc.kycPhone,
+              kycDocumentType: topAcc.kycDocumentType || baseAcc.kycDocumentType,
+              kycDocumentNumber: topAcc.kycDocumentNumber || baseAcc.kycDocumentNumber,
+              kycProofOfAddressType: topAcc.kycProofOfAddressType || baseAcc.kycProofOfAddressType,
               kycDocumentImage: u.kycDocumentImage || ex.kycDocumentImage,
               kycDocumentBackImage: u.kycDocumentBackImage || ex.kycDocumentBackImage,
               kycProofOfAddressImage: u.kycProofOfAddressImage || ex.kycProofOfAddressImage,
@@ -290,16 +303,17 @@ export const AdminDashboard: React.FC = () => {
     setIsLoading(true);
     try {
       const [overviewRes, custRes, txRes, logsRes, firestoreUsers, tickets, loansRes] = await Promise.all([
-        api.getAdminOverview(),
-        api.getAdminCustomers(),
-        api.getTransactions(),
-        api.getAdminAuditLogs(),
-        firestoreSync.getAllUsersWithBalances(),
-        firestoreSync.getAllSupportTickets(),
+        api.getAdminOverview().catch(() => null),
+        api.getAdminCustomers().catch(() => ({ customers: [] })),
+        api.getTransactions().catch(() => ({ transactions: [] })),
+        api.getAdminAuditLogs().catch(() => ({ auditLogs: [] })),
+        firestoreSync.getAllUsersWithBalances().catch(() => []),
+        firestoreSync.getAllSupportTickets().catch(() => []),
         api.getLoans().catch(() => ({ loans: [] })),
       ]);
 
-      const merged = mergeCustomers(firestoreUsers || [], custRes.customers || [], currentUser);
+      const serverCustomers = custRes?.customers || [];
+      const merged = mergeCustomers(firestoreUsers || [], serverCustomers, currentUser);
       setCustomers(merged);
       setSupportTickets(tickets || []);
       if (loansRes?.loans) setAdminLoans(loansRes.loans);
@@ -309,14 +323,14 @@ export const AdminDashboard: React.FC = () => {
       if (overviewRes) {
         setMetrics({
           ...overviewRes,
-          totalCustomers: merged.length,
-          activeAccounts: merged.length * 3,
+          totalCustomers: merged.length > 0 ? merged.length : overviewRes.totalCustomers,
+          activeAccounts: merged.length > 0 ? merged.length * 2 : overviewRes.activeAccounts,
           totalPlatformDeposits: totalUserDeposits > 0 ? totalUserDeposits : overviewRes.totalPlatformDeposits,
         });
       } else {
         setMetrics({
           totalCustomers: merged.length,
-          activeAccounts: merged.length * 3,
+          activeAccounts: merged.length * 2,
           totalPlatformDeposits: totalUserDeposits,
           totalPlatformWithdrawals: 0,
           totalPlatformTransfers: 0,
@@ -329,8 +343,8 @@ export const AdminDashboard: React.FC = () => {
         });
       }
 
-      if (txRes.transactions) setTransactions(txRes.transactions);
-      if (logsRes.auditLogs) setAuditLogs(logsRes.auditLogs);
+      if (txRes?.transactions) setTransactions(txRes.transactions);
+      if (logsRes?.auditLogs) setAuditLogs(logsRes.auditLogs);
       setLastRefreshed(new Date());
     } catch (err) {
       console.error('Failed to load admin data:', err);
@@ -345,15 +359,15 @@ export const AdminDashboard: React.FC = () => {
 
     // Subscribe to Firestore users with balances collection so new signups appear automatically
     const unsubscribeUsers = firestoreSync.subscribeToUsersWithBalances((firestoreUsers) => {
-      if (firestoreUsers) {
-        setCustomers(() => {
-          const merged = mergeCustomers(firestoreUsers, [], currentUser);
+      if (firestoreUsers && firestoreUsers.length > 0) {
+        setCustomers((prevCustomers) => {
+          const merged = mergeCustomers(firestoreUsers, prevCustomers, currentUser);
           setMetrics((prevMetrics) =>
             prevMetrics
               ? {
                   ...prevMetrics,
                   totalCustomers: merged.length,
-                  activeAccounts: merged.length * 3,
+                  activeAccounts: merged.length * 2,
                 }
               : null
           );

@@ -1200,7 +1200,9 @@ export const firestoreSync = {
           kycDocumentImage: data.kycDocumentImage,
           kycDocumentBackImage: data.kycDocumentBackImage,
           kycLiveSelfieImage: data.kycLiveSelfieImage,
-          kycStreetAddress: data.kycStreetAddress,
+          kycStreetAddress: data.kycStreetAddress || data.streetAddress || data.address || '',
+          streetAddress: data.streetAddress || data.kycStreetAddress || data.address || '',
+          address: data.streetAddress || data.kycStreetAddress || data.address || '',
           kycProofOfAddressType: data.kycProofOfAddressType,
           kycProofOfAddressImage: data.kycProofOfAddressImage,
           kycSsn: data.kycSsn,
@@ -1595,7 +1597,9 @@ export const firestoreSync = {
               kycDocumentImage: data.kycDocumentImage,
               kycDocumentBackImage: data.kycDocumentBackImage,
               kycLiveSelfieImage: data.kycLiveSelfieImage,
-              kycStreetAddress: data.kycStreetAddress,
+              kycStreetAddress: data.kycStreetAddress || data.streetAddress || data.address || '',
+              streetAddress: data.streetAddress || data.kycStreetAddress || data.address || '',
+              address: data.streetAddress || data.kycStreetAddress || data.address || '',
               kycProofOfAddressType: data.kycProofOfAddressType,
               kycProofOfAddressImage: data.kycProofOfAddressImage,
               kycSsn: data.kycSsn,
@@ -2443,29 +2447,41 @@ export const firestoreSync = {
         return unsubscribe;
       }
 
-      // 2. Full collection subscription is strictly restricted to verified administrators
-      const currentUid = auth.currentUser?.uid;
-      const isCallerAdmin = currentUid === 'usr_admin' || currentUid === 'admin' || (auth.currentUser as any)?.role === 'admin' || (auth.currentUser as any)?.role === 'super_admin';
+      // 2. Administrative view: event-driven + real-time collection snapshot
+      const handleLoanEvent = () => {
+        this.getAllLoans().then((all) => {
+          if (all && all.length > 0) onUpdate(all);
+        }).catch(() => {});
+      };
 
-      if (!isCallerAdmin) {
-        // A missing UID must never trigger a full-collection query or listener for non-admin
-        onUpdate([]);
-        return () => {};
+      if (typeof window !== 'undefined') {
+        window.addEventListener('monvera_loan_updated', handleLoanEvent);
       }
 
-      const unsubscribe = onSnapshot(
-        colRef,
-        (snap) => {
-          const list: LoanApplication[] = [];
-          snap.forEach((d) => list.push(d.data() as LoanApplication));
-          list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-          onUpdate(list);
-        },
-        (error) => {
-          console.warn('[Firestore loans subscription notice]:', error);
+      let unsubSnapshot = () => {};
+      try {
+        unsubSnapshot = onSnapshot(
+          colRef,
+          (snap) => {
+            const list: LoanApplication[] = [];
+            snap.forEach((d) => list.push(d.data() as LoanApplication));
+            list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            onUpdate(list);
+          },
+          (error) => {
+            console.warn('[Firestore loans subscription notice]:', error);
+          }
+        );
+      } catch (err) {
+        console.warn('[Firestore] Error attaching loans listener:', err);
+      }
+
+      return () => {
+        unsubSnapshot();
+        if (typeof window !== 'undefined') {
+          window.removeEventListener('monvera_loan_updated', handleLoanEvent);
         }
-      );
-      return unsubscribe;
+      };
     } catch (err) {
       console.warn('[Firestore] Error subscribing to loans:', err);
       return () => {};

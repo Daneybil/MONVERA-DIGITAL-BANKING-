@@ -32,6 +32,7 @@ export interface UserProfile {
   dateOfBirth?: string;
   country: string;
   streetAddress?: string;
+  address?: string;
   avatarUrl?: string;
   status: UserStatus;
   role: UserRole;
@@ -110,6 +111,7 @@ export interface Transaction {
   status: TransactionStatus;
   userId?: string;
   senderUserId?: string;
+  senderAccountId?: string;
   senderName?: string;
   senderAccountNumber?: string;
   recipientUserId?: string;
@@ -231,6 +233,8 @@ export interface CardItem {
   atmEnabled: boolean;
   contactlessEnabled: boolean;
   colorScheme: 'obsidian' | 'titanium' | 'emerald' | 'sapphire' | 'gold' | string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface NotificationReply {

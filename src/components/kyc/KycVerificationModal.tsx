@@ -4,6 +4,7 @@ import { api } from '../../services/api';
 import { firestoreSync } from '../../services/firestoreSync';
 import { CountrySelector } from '../common/CountrySelector';
 import { BlueVerifiedBadge } from '../dashboard/ProfileView';
+import { UserProfile } from '../../types';
 import {
   ShieldCheck,
   ShieldAlert,
@@ -38,50 +39,62 @@ interface KycVerificationModalProps {
   onClose: () => void;
 }
 
+// Helper to extract initial values with KYC information taking absolute precedence over registration names
+const getInitialKycValues = (user: any) => {
+  const rawFullName =
+    user?.kycFullName ||
+    (user?.kycFirstName && user?.kycLastName ? `${user.kycFirstName} ${user.kycLastName}`.trim() : '') ||
+    user?.fullName ||
+    (user?.firstName && user?.lastName ? `${user.firstName} ${user.lastName}`.trim() : (user?.firstName || ''));
+  return {
+    fullName: rawFullName,
+    country: user?.kycCountry || user?.country || 'United States',
+    phone: user?.kycPhone || user?.phone || '',
+    email: user?.kycEmail || user?.email || '',
+    dateOfBirth: user?.kycDateOfBirth || user?.dateOfBirth || '1990-01-01',
+    documentType: user?.kycDocumentType || "Driver's License",
+    documentNumber: user?.kycDocumentNumber || '',
+    streetAddress: user?.kycStreetAddress || user?.streetAddress || user?.address || '',
+    proofOfAddressType: user?.kycProofOfAddressType || 'Bank statement',
+    ssnNumber: user?.kycSsn || '',
+    documentImage: user?.kycDocumentImage || '',
+    documentBackImage: user?.kycDocumentBackImage || '',
+    proofOfAddressImage: user?.kycProofOfAddressImage || '',
+    ssnImage: user?.kycSsnImage || '',
+    liveSelfieImage: user?.kycLiveSelfieImage || '',
+  };
+};
+
 export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOpen, onClose }) => {
   const { currentUser, updateUser, refreshNotifications } = useAuth();
 
+  const initialVals = getInitialKycValues(currentUser);
+
   // Full Legal Name: prioritized from newest valid legal name
-  const [fullName, setFullName] = useState(
-    currentUser?.firstName && currentUser?.lastName
-      ? `${currentUser.firstName} ${currentUser.lastName}`.trim()
-      : (currentUser?.kycFullName || currentUser?.fullName || '')
-  );
-  const [country, setCountry] = useState(currentUser?.kycCountry || currentUser?.country || 'United States');
-  const [phone, setPhone] = useState(currentUser?.kycPhone || currentUser?.phone || '');
-  const [email, setEmail] = useState(currentUser?.kycEmail || currentUser?.email || '');
-  const [dateOfBirth, setDateOfBirth] = useState(
-    currentUser?.kycDateOfBirth || currentUser?.dateOfBirth || '1990-01-01'
-  );
+  const [fullName, setFullName] = useState(initialVals.fullName);
+  const [country, setCountry] = useState(initialVals.country);
+  const [phone, setPhone] = useState(initialVals.phone);
+  const [email, setEmail] = useState(initialVals.email);
+  const [dateOfBirth, setDateOfBirth] = useState(initialVals.dateOfBirth);
 
   // Government ID Details
-  const [documentType, setDocumentType] = useState<string>(
-    currentUser?.kycDocumentType || "Driver's License"
-  );
-  const [documentNumber, setDocumentNumber] = useState(currentUser?.kycDocumentNumber || '');
+  const [documentType, setDocumentType] = useState<string>(initialVals.documentType);
+  const [documentNumber, setDocumentNumber] = useState(initialVals.documentNumber);
 
   // Proof of Address Details
-  const [streetAddress, setStreetAddress] = useState(currentUser?.kycStreetAddress || '');
-  const [proofOfAddressType, setProofOfAddressType] = useState(
-    currentUser?.kycProofOfAddressType || 'Bank statement'
-  );
+  const [streetAddress, setStreetAddress] = useState(initialVals.streetAddress);
+  const [proofOfAddressType, setProofOfAddressType] = useState(initialVals.proofOfAddressType);
 
   // US Tax Identifier
-  const [ssnNumber, setSsnNumber] = useState(currentUser?.kycSsn || '');
+  const [ssnNumber, setSsnNumber] = useState(initialVals.ssnNumber);
   const [showSsn, setShowSsn] = useState(false);
 
   // Image Uploads (Base64 data URIs)
-  const [documentImage, setDocumentImage] = useState<string>(currentUser?.kycDocumentImage || '');
-  const [documentBackImage, setDocumentBackImage] = useState<string>(
-    currentUser?.kycDocumentBackImage || ''
-  );
-  const [proofOfAddressImage, setProofOfAddressImage] = useState<string>(
-    currentUser?.kycProofOfAddressImage || ''
-  );
-  const [ssnImage, setSsnImage] = useState<string>(currentUser?.kycSsnImage || '');
-  const [liveSelfieImage, setLiveSelfieImage] = useState<string>(
-    currentUser?.kycLiveSelfieImage || ''
-  );
+  const [documentImage, setDocumentImage] = useState<string>(initialVals.documentImage);
+  const [documentBackImage, setDocumentBackImage] = useState<string>(initialVals.documentBackImage);
+  const [proofOfAddressImage, setProofOfAddressImage] = useState<string>(initialVals.proofOfAddressImage);
+  const [ssnImage, setSsnImage] = useState<string>(initialVals.ssnImage);
+  const [liveSelfieImage, setLiveSelfieImage] = useState<string>(initialVals.liveSelfieImage);
 
   // File Input References
   const docFrontFileRef = useRef<HTMLInputElement>(null);
@@ -94,33 +107,55 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [submittedSuccess, setSubmittedSuccess] = useState(false);
+  const [isEditingPending, setIsEditingPending] = useState(false);
+  const [isEditingIdentity, setIsEditingIdentity] = useState(false);
+  const [isEditingProof, setIsEditingProof] = useState(false);
 
-  // Synchronize state when user changes
+  // Refs to protect active user typing from background polls
+  const initializedUserIdRef = useRef<string | null>(null);
+  const hasUserEditedRef = useRef(false);
+
+  const markEdited = () => {
+    hasUserEditedRef.current = true;
+  };
+
+  // Synchronize state ONLY when modal opens or when switching users.
+  // CRITICAL: Background updates to currentUser (e.g. balance refreshes, notifications)
+  // while the modal is open NEVER overwrite active customer edits.
   useEffect(() => {
-    if (currentUser) {
-      const derivedName =
-        currentUser.firstName && currentUser.lastName
-          ? `${currentUser.firstName} ${currentUser.lastName}`.trim()
-          : (currentUser.kycFullName || currentUser.fullName || '');
-      setFullName(derivedName);
-      setCountry(currentUser.kycCountry || currentUser.country || 'United States');
-      setPhone(currentUser.kycPhone || currentUser.phone || '');
-      setEmail(currentUser.kycEmail || currentUser.email || '');
-      if (currentUser.kycDateOfBirth || currentUser.dateOfBirth) {
-        setDateOfBirth(currentUser.kycDateOfBirth || currentUser.dateOfBirth || '');
+    if (isOpen && currentUser) {
+      if (initializedUserIdRef.current !== currentUser.id) {
+        const initial = getInitialKycValues(currentUser);
+        setFullName(initial.fullName);
+        setCountry(initial.country);
+        setPhone(initial.phone);
+        setEmail(initial.email);
+        setDateOfBirth(initial.dateOfBirth);
+        setDocumentType(initial.documentType);
+        setDocumentNumber(initial.documentNumber);
+        setStreetAddress(initial.streetAddress);
+        setProofOfAddressType(initial.proofOfAddressType);
+        setSsnNumber(initial.ssnNumber);
+        setDocumentImage(initial.documentImage);
+        setDocumentBackImage(initial.documentBackImage);
+        setProofOfAddressImage(initial.proofOfAddressImage);
+        setSsnImage(initial.ssnImage);
+        setLiveSelfieImage(initial.liveSelfieImage);
+        initializedUserIdRef.current = currentUser.id;
+        hasUserEditedRef.current = false;
+        setIsEditingIdentity(false);
+        setIsEditingProof(false);
       }
-      if (currentUser.kycDocumentType) setDocumentType(currentUser.kycDocumentType);
-      if (currentUser.kycDocumentNumber) setDocumentNumber(currentUser.kycDocumentNumber);
-      if (currentUser.kycStreetAddress) setStreetAddress(currentUser.kycStreetAddress);
-      if (currentUser.kycProofOfAddressType) setProofOfAddressType(currentUser.kycProofOfAddressType);
-      if (currentUser.kycDocumentImage) setDocumentImage(currentUser.kycDocumentImage);
-      if (currentUser.kycDocumentBackImage) setDocumentBackImage(currentUser.kycDocumentBackImage);
-      if (currentUser.kycProofOfAddressImage) setProofOfAddressImage(currentUser.kycProofOfAddressImage);
-      if (currentUser.kycSsnImage) setSsnImage(currentUser.kycSsnImage);
-      if (currentUser.kycLiveSelfieImage) setLiveSelfieImage(currentUser.kycLiveSelfieImage);
-      if (currentUser.kycSsn) setSsnNumber(currentUser.kycSsn);
+    } else if (!isOpen) {
+      initializedUserIdRef.current = null;
+      setIsEditingPending(false);
+      setSubmittedSuccess(false);
+      setErrorMsg(null);
+      hasUserEditedRef.current = false;
+      setIsEditingIdentity(false);
+      setIsEditingProof(false);
     }
-  }, [currentUser]);
+  }, [isOpen, currentUser?.id]);
 
   if (!isOpen || !currentUser) return null;
 
@@ -138,20 +173,20 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
 
   const isPassport = documentType.toLowerCase().includes('passport');
 
-  // Review states per item
-  const identityApproved = itemReviews.identity?.status === 'approved';
+  // Review states per item: unlocked if editing pending or specifically toggled for correction
+  const identityApproved = !isEditingPending && !isEditingIdentity && itemReviews.identity?.status === 'approved';
   const identityRejected = itemReviews.identity?.status === 'rejected';
   const identityRejectReason = itemReviews.identity?.rejectionReason;
 
-  const proofApproved = itemReviews.proofOfAddress?.status === 'approved';
+  const proofApproved = !isEditingPending && !isEditingProof && itemReviews.proofOfAddress?.status === 'approved';
   const proofRejected = itemReviews.proofOfAddress?.status === 'rejected';
   const proofRejectReason = itemReviews.proofOfAddress?.rejectionReason;
 
-  const selfieApproved = itemReviews.liveness?.status === 'approved';
+  const selfieApproved = !isEditingPending && itemReviews.liveness?.status === 'approved';
   const selfieRejected = itemReviews.liveness?.status === 'rejected';
   const selfieRejectReason = itemReviews.liveness?.rejectionReason;
 
-  const ssnApproved = itemReviews.ssn?.status === 'approved';
+  const ssnApproved = !isEditingPending && itemReviews.ssn?.status === 'approved';
   const ssnRejected = itemReviews.ssn?.status === 'rejected';
   const ssnRejectReason = itemReviews.ssn?.rejectionReason;
 
@@ -204,23 +239,28 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
               ctx.drawImage(img, 0, 0, width, height);
               const compressedBase64 = canvas.toDataURL('image/jpeg', 0.82);
               setter(compressedBase64);
+              markEdited();
               setErrorMsg(null);
             } else {
               setter(rawBase64);
+              markEdited();
               setErrorMsg(null);
             }
           } catch {
             setter(rawBase64);
+            markEdited();
             setErrorMsg(null);
           }
         };
         img.onerror = () => {
           setter(rawBase64);
+          markEdited();
           setErrorMsg(null);
         };
         img.src = rawBase64;
       } catch {
         setter(rawBase64);
+        markEdited();
         setErrorMsg(null);
       }
     };
@@ -237,6 +277,7 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
       formatted = `${raw.slice(0, 3)}-${raw.slice(3)}`;
     }
     setSsnNumber(formatted);
+    markEdited();
   };
 
   // Submit KYC handler
@@ -313,63 +354,88 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
     setIsSubmitting(true);
 
     try {
-      const nameParts = cleanFullName.split(' ');
-      const derivedFirstName = nameParts[0];
-      const derivedLastName = nameParts.slice(1).join(' ');
+      const cleanFullName = fullName.trim();
+      const nameParts = cleanFullName.split(' ').filter(Boolean);
+      const derivedFirstName = nameParts[0] || 'Valued';
+      const derivedLastName = nameParts.slice(1).join(' ') || 'Client';
 
       const submitPayload = {
         userId: currentUser.id,
         fullName: cleanFullName,
+        legalName: cleanFullName,
+        kycFullName: cleanFullName,
         firstName: derivedFirstName,
         lastName: derivedLastName,
+        kycFirstName: derivedFirstName,
+        kycLastName: derivedLastName,
         country: country.trim(),
+        kycCountry: country.trim(),
         phone: phone.trim(),
+        kycPhone: phone.trim(),
         email: email.trim(),
+        kycEmail: email.trim(),
         dateOfBirth: dateOfBirth || undefined,
+        kycDateOfBirth: dateOfBirth || undefined,
         documentType,
         documentNumber: documentNumber.trim(),
         documentImage: documentImage || undefined,
         documentBackImage: !isPassport ? documentBackImage : undefined,
         liveSelfieImage: liveSelfieImage || undefined,
         streetAddress: streetAddress.trim(),
+        kycStreetAddress: streetAddress.trim(),
         proofOfAddressType,
         proofOfAddress: `${proofOfAddressType} (${streetAddress.trim()})`,
         proofOfAddressImage: proofOfAddressImage || undefined,
         ssn: isUnitedStates ? ssnNumber.trim() : undefined,
         ssnImage: isUnitedStates && ssnImage ? ssnImage : undefined,
-        isResubmission: isResubmissionMode,
+        isResubmission: isResubmissionMode || isEditingPending,
         autoApprove: false,
       };
 
       const res = await api.submitKyc(submitPayload);
 
       if (res.success && res.user) {
-        const updatedUser = {
+        const nowIso = new Date().toISOString();
+        const updatedUser: UserProfile = {
           ...currentUser,
           ...res.user,
           kycStatus: 'pending' as const,
           kycFullName: cleanFullName,
+          kycFirstName: derivedFirstName,
+          kycLastName: derivedLastName,
+          firstName: derivedFirstName,
+          lastName: derivedLastName,
+          name: cleanFullName,
+          fullName: cleanFullName,
           kycCountry: country.trim(),
+          country: country.trim(),
           kycPhone: phone.trim(),
+          phone: phone.trim(),
           kycEmail: email.trim(),
+          email: email.trim(),
           kycDateOfBirth: dateOfBirth,
+          dateOfBirth: dateOfBirth,
           kycDocumentType: documentType,
           kycDocumentNumber: documentNumber.trim(),
           kycDocumentImage: documentImage,
           kycDocumentBackImage: !isPassport ? documentBackImage : undefined,
           kycLiveSelfieImage: liveSelfieImage,
           kycStreetAddress: streetAddress.trim(),
+          streetAddress: streetAddress.trim(),
+          address: streetAddress.trim(),
           kycProofOfAddressType: proofOfAddressType,
           kycProofOfAddressImage: proofOfAddressImage,
           kycSsn: isUnitedStates ? ssnNumber.trim() : undefined,
           kycSsnImage: isUnitedStates && ssnImage ? ssnImage : undefined,
-          kycSubmittedAt: new Date().toISOString(),
+          kycSubmittedAt: nowIso,
           kycRejectionReason: undefined,
         };
 
-        updateUser(updatedUser);
+        updateUser(updatedUser, { skipFirestoreSync: true });
         refreshNotifications();
 
+        hasUserEditedRef.current = false;
+        setIsEditingPending(false);
         setSubmittedSuccess(true);
       } else {
         setErrorMsg(res.error || 'KYC submission could not be processed. Please verify your details.');
@@ -401,6 +467,8 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
               <h3 className="text-xl sm:text-2xl font-black text-slate-950 tracking-tight mt-1">
                 {isVerified
                   ? 'Identity Clearance Active'
+                  : isEditingPending
+                  ? 'Edit Pending KYC Application'
                   : isPending
                   ? 'KYC Verification Under Review'
                   : isResubmissionMode
@@ -446,7 +514,7 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
           )}
 
           {/* STATE 2: PENDING REVIEW CONFIRMATION */}
-          {!isVerified && isPending && (
+          {!isVerified && isPending && !isEditingPending && (
             <div className="p-8 rounded-3xl bg-amber-50/80 border-2 border-amber-300 text-center space-y-5 shadow-sm">
               <div className="w-16 h-16 rounded-full bg-amber-100 border-2 border-amber-400 text-amber-700 flex items-center justify-center mx-auto animate-pulse">
                 <Clock className="w-8 h-8 stroke-[2.5]" />
@@ -491,10 +559,18 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                 Our compliance officers manually inspect each security watermark and document signature. You will receive an in-app notice and email once verification is complete.
               </p>
 
-              <div className="pt-3">
+              <div className="pt-3 flex flex-col sm:flex-row items-center justify-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsEditingPending(true)}
+                  className="px-6 py-3 rounded-2xl bg-amber-600 hover:bg-amber-500 text-white font-black text-sm shadow-md transition-colors cursor-pointer flex items-center gap-2"
+                >
+                  <FileText className="w-4 h-4" />
+                  <span>Edit / Correct Application Details</span>
+                </button>
                 <button
                   onClick={onClose}
-                  className="px-7 py-3 rounded-2xl bg-slate-950 hover:bg-slate-800 text-white font-black text-sm shadow-md transition-colors cursor-pointer"
+                  className="px-6 py-3 rounded-2xl bg-slate-950 hover:bg-slate-800 text-white font-black text-sm shadow-md transition-colors cursor-pointer"
                 >
                   Close & Return to Dashboard
                 </button>
@@ -503,11 +579,35 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
           )}
 
           {/* STATE 3: INTERACTIVE KYC SUBMISSION & RESUBMISSION FORM */}
-          {!isVerified && !isPending && (
+          {!isVerified && (!isPending || isEditingPending) && (
             <form onSubmit={handleSubmit} className="space-y-6">
               
+              {/* Editing Pending Submission Alert Banner */}
+              {isEditingPending && (
+                <div className="p-5 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-950 flex items-start gap-4 shadow-sm">
+                  <AlertCircle className="w-6 h-6 text-amber-600 shrink-0 mt-0.5 stroke-[2.5]" />
+                  <div className="space-y-1.5 text-sm flex-1">
+                    <div className="flex items-center justify-between">
+                      <h4 className="font-black text-amber-950 text-base">
+                        Editing Pending KYC Submission
+                      </h4>
+                      <button
+                        type="button"
+                        onClick={() => setIsEditingPending(false)}
+                        className="text-xs font-bold text-amber-800 underline hover:text-amber-950 cursor-pointer"
+                      >
+                        Cancel Edit
+                      </button>
+                    </div>
+                    <p className="text-amber-900 leading-relaxed font-bold">
+                      You are editing an application currently under review. Correct any mistaken fields below and submit. Your updated submission will replace the pending review draft with the latest version for compliance adjudication.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {/* Granular Resubmission Alert Banner */}
-              {isResubmissionMode && (
+              {isResubmissionMode && !isEditingPending && (
                 <div className="p-5 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 flex items-start gap-4 shadow-sm">
                   <AlertCircle className="w-6 h-6 text-rose-600 shrink-0 mt-0.5 stroke-[2.5]" />
                   <div className="space-y-1.5 text-sm">
@@ -553,7 +653,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                     <input
                       type="text"
                       value={fullName}
-                      onChange={(e) => setFullName(e.target.value)}
+                      onChange={(e) => {
+                        setFullName(e.target.value);
+                        markEdited();
+                      }}
                       placeholder="e.g. Johnathan Alexander Doe"
                       className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 placeholder:text-slate-400 font-bold"
                       required
@@ -571,7 +674,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                     </label>
                     <CountrySelector
                       value={country}
-                      onChange={(opt) => setCountry(opt.name)}
+                      onChange={(opt) => {
+                        setCountry(opt.name);
+                        markEdited();
+                      }}
                       className="w-full"
                     />
                   </div>
@@ -586,7 +692,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       <input
                         type="tel"
                         value={phone}
-                        onChange={(e) => setPhone(e.target.value)}
+                        onChange={(e) => {
+                          setPhone(e.target.value);
+                          markEdited();
+                        }}
                         placeholder="+1 (555) 000-0000"
                         className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 placeholder:text-slate-400 font-bold"
                         required
@@ -601,7 +710,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       <input
                         type="email"
                         value={email}
-                        onChange={(e) => setEmail(e.target.value)}
+                        onChange={(e) => {
+                          setEmail(e.target.value);
+                          markEdited();
+                        }}
                         placeholder="john.doe@example.com"
                         className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 placeholder:text-slate-400 font-bold"
                         required
@@ -618,7 +730,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                     <input
                       type="date"
                       value={dateOfBirth}
-                      onChange={(e) => setDateOfBirth(e.target.value)}
+                      onChange={(e) => {
+                        setDateOfBirth(e.target.value);
+                        markEdited();
+                      }}
                       className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 focus:ring-2 focus:ring-slate-900/10 text-slate-950 font-bold"
                       required
                     />
@@ -664,8 +779,18 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                 )}
 
                 {identityApproved ? (
-                  <div className="text-xs text-emerald-950 font-bold py-2">
-                    ✓ Your {documentType} ({documentNumber}) has been approved by compliance. No changes required.
+                  <div className="flex items-center justify-between text-xs text-emerald-950 font-bold py-2.5 px-4 bg-emerald-100/60 rounded-2xl border border-emerald-300">
+                    <span>✓ Your {documentType} ({documentNumber}) has been approved by compliance.</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditingIdentity(true);
+                        markEdited();
+                      }}
+                      className="text-xs text-emerald-800 underline font-black hover:text-emerald-950 cursor-pointer ml-3 shrink-0"
+                    >
+                      Update ID Document
+                    </button>
                   </div>
                 ) : (
                   <div className="space-y-4 text-sm">
@@ -676,7 +801,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       </label>
                       <select
                         value={documentType}
-                        onChange={(e) => setDocumentType(e.target.value)}
+                        onChange={(e) => {
+                          setDocumentType(e.target.value);
+                          markEdited();
+                        }}
                         className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 text-slate-950 font-bold cursor-pointer"
                       >
                         <option value="Driver's License">Driver's License</option>
@@ -694,7 +822,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       <input
                         type="text"
                         value={documentNumber}
-                        onChange={(e) => setDocumentNumber(e.target.value)}
+                        onChange={(e) => {
+                          setDocumentNumber(e.target.value);
+                          markEdited();
+                        }}
                         placeholder="e.g. DL-98402194 or P982014920"
                         className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 font-mono text-slate-950 placeholder:text-slate-400 font-black"
                         required
@@ -837,8 +968,18 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                 )}
 
                 {proofApproved ? (
-                  <div className="text-xs text-emerald-950 font-bold py-2">
-                    ✓ Your proof of address ({streetAddress}) has been approved by compliance.
+                  <div className="flex items-center justify-between text-xs text-emerald-950 font-bold py-2.5 px-4 bg-emerald-100/60 rounded-2xl border border-emerald-300">
+                    <span>✓ Your proof of address ({streetAddress}) has been approved by compliance.</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditingProof(true);
+                        markEdited();
+                      }}
+                      className="text-xs text-emerald-800 underline font-black hover:text-emerald-950 cursor-pointer ml-3 shrink-0"
+                    >
+                      Update Address
+                    </button>
                   </div>
                 ) : (
                   <div className="space-y-4 text-sm">
@@ -850,7 +991,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       <input
                         type="text"
                         value={streetAddress}
-                        onChange={(e) => setStreetAddress(e.target.value)}
+                        onChange={(e) => {
+                          setStreetAddress(e.target.value);
+                          markEdited();
+                        }}
                         placeholder="e.g. 450 Lexington Avenue, Suite 2400, New York, NY 10017"
                         className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 text-slate-950 placeholder:text-slate-400 font-bold"
                         required
@@ -864,7 +1008,10 @@ export const KycVerificationModal: React.FC<KycVerificationModalProps> = ({ isOp
                       </label>
                       <select
                         value={proofOfAddressType}
-                        onChange={(e) => setProofOfAddressType(e.target.value)}
+                        onChange={(e) => {
+                          setProofOfAddressType(e.target.value);
+                          markEdited();
+                        }}
                         className="w-full px-4 py-3 rounded-xl bg-white border-2 border-slate-300 focus:border-slate-900 text-slate-950 font-bold cursor-pointer"
                       >
                         <option value="Bank statement">Bank statement</option>
