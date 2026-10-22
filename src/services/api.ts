@@ -20,6 +20,13 @@ import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firesto
 import { firestoreSync } from './firestoreSync';
 import { notificationDispatcher } from './notificationDispatcher';
 
+const API_BASE_URL = ((import.meta as any).env?.VITE_API_URL || '').replace(/\/+$/, '');
+
+export function getApiEndpoint(endpoint: string): string {
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  return API_BASE_URL ? `${API_BASE_URL}${cleanEndpoint}` : cleanEndpoint;
+}
+
 /**
  * Retrieves Firebase Auth Bearer token headers for authenticated backend calls
  */
@@ -1434,6 +1441,34 @@ export const api = {
   },
 
   // Admin Endpoints
+  async adminLogin(email: string, password: string): Promise<{
+    success: boolean;
+    isAdminAttempt?: boolean;
+    customToken?: string;
+    error?: string;
+  }> {
+    try {
+      const res = await fetch(getApiEndpoint('/api/admin/login'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await parseJsonResponse<any>(res, { success: false });
+      return {
+        success: !!data.success,
+        isAdminAttempt: data.isAdminAttempt !== undefined ? !!data.isAdminAttempt : !!data.success,
+        customToken: data.customToken,
+        error: data.error,
+      };
+    } catch (err: any) {
+      console.warn('[api.adminLogin] Network or server error:', err);
+      return { success: false, error: 'Failed to communicate with authentication service.' };
+    }
+  },
+
   async verifyAdminSession(): Promise<{ isAdmin: boolean; error?: string }> {
     try {
       const headers = await getAuthHeaders();

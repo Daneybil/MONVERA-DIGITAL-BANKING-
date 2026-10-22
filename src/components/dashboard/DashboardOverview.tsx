@@ -262,10 +262,29 @@ export const DashboardOverview: React.FC = () => {
           <div className="text-4xl sm:text-6xl lg:text-7xl font-black font-mono tracking-tight text-white select-none drop-shadow-md">
             {hideBalances ? (
               '••••••••••••'
+            ) : !liveBalanceMetrics ? (
+              <div className="flex items-center gap-3 py-1">
+                <div className="w-8 h-8 sm:w-10 sm:h-10 border-3 border-emerald-400 border-t-transparent animate-spin rounded-full" />
+                <span className="text-xl sm:text-3xl font-bold font-sans text-slate-300">
+                  Synchronizing ledger...
+                </span>
+              </div>
             ) : (
               `$${balanceMetrics.totalBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
             )}
           </div>
+
+          {!liveBalanceMetrics && (
+            <div className="mt-3 p-3 rounded-xl bg-amber-400/10 border border-amber-400/30 flex items-center justify-between text-xs text-amber-300">
+              <span className="font-semibold">Retrieving authoritative ledger balances from Monvera Banking Core...</span>
+              <button
+                onClick={() => refreshBalance()}
+                className="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 font-black hover:bg-amber-300 transition-colors cursor-pointer"
+              >
+                Retry Sync
+              </button>
+            </div>
+          )}
 
           {/* Balance Breakdown Grid (3 Spacious Columns) */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 pt-6 border-t-2 border-slate-700/90">
@@ -274,7 +293,7 @@ export const DashboardOverview: React.FC = () => {
                 Liquid Operating Balance
               </span>
               <span className="text-2xl sm:text-3xl font-black font-mono text-white block">
-                {hideBalances ? '••••••' : `$${balanceMetrics.availableBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                {hideBalances ? '••••••' : !liveBalanceMetrics ? '••••' : `$${balanceMetrics.availableBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </span>
               <span className="text-xs sm:text-sm text-slate-300 block font-bold">Checking + Savings Accounts</span>
             </div>
@@ -284,7 +303,7 @@ export const DashboardOverview: React.FC = () => {
                 Invested Capital (Locked)
               </span>
               <span className="text-2xl sm:text-3xl font-black font-mono text-emerald-300 block">
-                {hideBalances ? '••••••' : `$${balanceMetrics.investedBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                {hideBalances ? '••••••' : !liveBalanceMetrics ? '••••' : `$${balanceMetrics.investedBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </span>
               <span className="text-xs sm:text-sm text-emerald-200 block font-bold">60-360D Term Sovereign Plans</span>
             </div>
@@ -294,7 +313,7 @@ export const DashboardOverview: React.FC = () => {
                 Total Accrued Interest & Profits
               </span>
               <span className="text-2xl sm:text-3xl font-black font-mono text-amber-300 block">
-                {hideBalances ? '••••••' : `+$${balanceMetrics.accruedEarnings.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                {hideBalances ? '••••••' : !liveBalanceMetrics ? '••••' : `+$${balanceMetrics.accruedEarnings.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </span>
               <span className="text-xs sm:text-sm text-amber-200 block font-bold">Earned from 4.50% Daily Yield & Savings</span>
             </div>

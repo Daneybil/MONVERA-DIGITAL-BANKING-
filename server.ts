@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express, { Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -6,8 +7,8 @@ import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
-import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, AuthenticatedRequest } from './server/authMiddleware';
-import { adminFirestore, isFirebaseAdminConfigured } from './server/firebaseAdmin';
+import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest } from './server/authMiddleware';
+import { adminAuth, adminFirestore, isFirebaseAdminConfigured } from './server/firebaseAdmin';
 import {
   executeServerTransfer,
   executeServerWithdrawal,
@@ -2290,6 +2291,124 @@ app.get('/api/admin/verify-session', requireAdminAuth, (req: AuthenticatedReques
     uid: req.auth!.uid,
     email: req.auth!.email,
   });
+});
+
+app.post('/api/admin/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || typeof email !== 'string' || !password || typeof password !== 'string') {
+      return res.status(400).json({ success: false, error: 'Email and password are required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const configuredEmails = getConfiguredAdminEmails();
+    const configuredPassword = (process.env.ADMIN_PASSWORD || '').replace(/^["']|["']$/g, '').trim();
+
+    // Check if this email matches the configured administrator email list
+    const isAdminEmail = configuredEmails.length > 0 && configuredEmails.includes(cleanEmail);
+
+    if (!isAdminEmail) {
+      // Not an administrator email - tell client it's not an admin attempt so it falls back to standard customer login
+      return res.json({ success: false, isAdminAttempt: false });
+    }
+
+    // It IS an administrator email. Verify password against ADMIN_PASSWORD from Railway environment variables.
+    if (!configuredPassword) {
+      console.warn('[POST /api/admin/login] ADMIN_PASSWORD is not configured in server environment variables.');
+      return res.status(401).json({
+        success: false,
+        isAdminAttempt: true,
+        error: 'ADMIN_NOT_CONFIGURED: Administrator password is not configured on the server.',
+      });
+    }
+
+    // Secure timing-safe password comparison
+    const incomingBuffer = Buffer.from(password);
+    const configuredBuffer = Buffer.from(configuredPassword);
+    const passwordMatches =
+      incomingBuffer.length === configuredBuffer.length &&
+      crypto.timingSafeEqual(incomingBuffer, configuredBuffer);
+
+    if (!passwordMatches) {
+      console.warn(`[POST /api/admin/login] Failed login attempt for administrator email: ${cleanEmail}`);
+      return res.status(401).json({
+        success: false,
+        isAdminAttempt: true,
+        error: 'INVALID_CREDENTIALS: Invalid administrator email or password.',
+      });
+    }
+
+    // Administrator credentials verified successfully!
+    if (!isFirebaseAdminConfigured()) {
+      return res.status(503).json({
+        success: false,
+        isAdminAttempt: true,
+        error: 'SERVICE_UNAVAILABLE: Firebase Admin is not configured on the server.',
+      });
+    }
+
+    let userRecord;
+    try {
+      userRecord = await adminAuth.getUserByEmail(cleanEmail);
+    } catch (userErr: any) {
+      if (userErr?.code === 'auth/user-not-found') {
+        console.log(`[Admin Login] Creating Firebase Auth record for administrator: ${cleanEmail}`);
+        userRecord = await adminAuth.createUser({
+          email: cleanEmail,
+          emailVerified: true,
+          displayName: 'Monvera Administrator',
+          password: configuredPassword,
+        });
+      } else {
+        throw userErr;
+      }
+    }
+
+    // Keep Firebase Auth record updated with emailVerified, password, and custom claims
+    try {
+      await adminAuth.updateUser(userRecord.uid, {
+        emailVerified: true,
+        password: configuredPassword,
+      });
+    } catch (syncErr) {
+      console.warn('[Admin Login] Notice: Could not sync password to Firebase user record:', syncErr);
+    }
+
+    try {
+      await adminAuth.setCustomUserClaims(userRecord.uid, {
+        admin: true,
+        role: 'admin',
+        roleLevel: 4,
+      });
+    } catch (claimsErr) {
+      console.warn('[Admin Login] Notice: Could not set custom claims:', claimsErr);
+    }
+
+    // Mint Firebase Custom Token with admin claims
+    const customToken = await adminAuth.createCustomToken(userRecord.uid, {
+      admin: true,
+      role: 'admin',
+      roleLevel: 4,
+    });
+
+    console.log(`[Admin Login] Successfully authenticated administrator: ${cleanEmail}`);
+    return res.json({
+      success: true,
+      isAdminAttempt: true,
+      customToken,
+      user: {
+        uid: userRecord.uid,
+        email: cleanEmail,
+        role: 'admin',
+      },
+    });
+  } catch (err: any) {
+    console.error('[POST /api/admin/login] Unexpected error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'SERVER_ERROR: An unexpected error occurred during administrator authentication.',
+    });
+  }
 });
 
 const FAKE_ACCOUNT_IDS = new Set([

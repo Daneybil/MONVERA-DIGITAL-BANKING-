@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback } fr
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
+  signInWithCustomToken,
   signOut,
   sendEmailVerification,
   sendPasswordResetEmail,
@@ -1042,6 +1043,30 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             error: 'No Monvera account found with that Account Number or Username.',
           };
         }
+      }
+
+      // 0. Verify administrator credentials with backend environment variables (ADMIN_EMAIL, ADMIN_PASSWORD)
+      try {
+        const adminAuthRes = await api.adminLogin(emailToAuth, cleanPassword);
+        if (adminAuthRes.isAdminAttempt) {
+          if (!adminAuthRes.success || !adminAuthRes.customToken) {
+            return {
+              success: false,
+              error: adminAuthRes.error || 'Invalid administrator email or password. Access denied.',
+            };
+          }
+
+          // Sign in using the cryptographically minted Firebase Custom Token
+          console.log(`[Auth] Authenticating administrator ${emailToAuth} via verified backend session...`);
+          const userCredential = await signInWithCustomToken(auth, adminAuthRes.customToken);
+          await hydrateUserSession(userCredential.user, cleanPassword, emailToAuth);
+          if (checkIsAdminPath()) {
+            setCurrentViewState('admin');
+          }
+          return { success: true };
+        }
+      } catch (adminErr) {
+        console.warn('[Auth] Administrator authentication check notice:', adminErr);
       }
 
       // 1. Authenticate with Firebase Authentication

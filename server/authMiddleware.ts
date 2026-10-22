@@ -91,9 +91,9 @@ export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Resp
  * Fails closed if not explicitly configured in server environment.
  */
 export function getConfiguredAdminEmails(): string[] {
-  const envEmails = process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '';
+  const envEmails = [process.env.ADMIN_EMAILS, process.env.ADMIN_EMAIL].filter(Boolean).join(',');
   return envEmails
-    .split(',')
+    .split(/[,;\s]+/)
     .map((e) => e.replace(/^["']|["']$/g, '').trim().toLowerCase())
     .filter(Boolean);
 }
@@ -103,9 +103,9 @@ export function getConfiguredAdminEmails(): string[] {
  * Fails closed if not explicitly configured in server environment.
  */
 export function getConfiguredAdminUids(): string[] {
-  const envUids = process.env.ADMIN_UIDS || process.env.ADMIN_UID || '';
+  const envUids = [process.env.ADMIN_UIDS, process.env.ADMIN_UID].filter(Boolean).join(',');
   return envUids
-    .split(',')
+    .split(/[,;\s]+/)
     .map((u) => u.replace(/^["']|["']$/g, '').trim())
     .filter(Boolean);
 }

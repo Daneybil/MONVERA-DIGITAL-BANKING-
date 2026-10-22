@@ -88,6 +88,9 @@ export const AdminDashboard: React.FC = () => {
       const check = await api.verifyAdminSession();
       if (isMounted) {
         setIsServerAdminVerified(check.isAdmin);
+        if (check.isAdmin && currentUser) {
+          updateUser({ ...currentUser, role: 'admin' });
+        }
       }
     }
     verifyAdminSession();

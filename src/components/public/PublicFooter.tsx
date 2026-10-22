@@ -224,12 +224,6 @@ export const PublicFooter: React.FC = () => {
               >
                 Security Protocols
               </button>
-              <button
-                onClick={() => setCurrentView('admin')}
-                className="text-emerald-400 hover:text-emerald-300 font-mono font-bold"
-              >
-                Admin Console
-              </button>
             </div>
           </div>
         </div>

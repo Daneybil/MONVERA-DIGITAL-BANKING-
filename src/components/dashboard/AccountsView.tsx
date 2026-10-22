@@ -26,7 +26,29 @@ export const AccountsView: React.FC = () => {
   const [isTransferring, setIsTransferring] = useState<boolean>(false);
   const [transferMsg, setTransferMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  if (!currentUser || !balanceMetrics) return null;
+  if (!currentUser) return null;
+
+  if (!balanceMetrics) {
+    return (
+      <div className="p-8 sm:p-12 text-center bg-white rounded-3xl border border-slate-200 shadow-sm space-y-4">
+        <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 border border-emerald-200 flex items-center justify-center mx-auto shadow-inner">
+          <div className="w-6 h-6 border-3 border-emerald-600 border-t-transparent animate-spin rounded-full" />
+        </div>
+        <div>
+          <h3 className="text-lg font-black text-slate-900">Synchronizing Account Ledger</h3>
+          <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto font-medium">
+            Retrieving authoritative checking, savings, and treasury balances from the Monvera Banking Core.
+          </p>
+        </div>
+        <button
+          onClick={() => refreshBalance()}
+          className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-black transition-colors cursor-pointer shadow-xs"
+        >
+          Refresh Balances
+        </button>
+      </div>
+    );
+  }
 
   const copyToClipboard = (val: string, id: string) => {
     navigator.clipboard.writeText(val);
