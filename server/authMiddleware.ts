@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import { adminAuth, isFirebaseAdminConfigured } from './firebaseAdmin';
 
@@ -7,8 +8,121 @@ export interface AuthenticatedRequest extends Request {
     uid: string;
     email?: string;
     email_verified?: boolean;
+    adminSessionToken?: string;
     [key: string]: any;
   };
+}
+
+/**
+ * Derives a secure HMAC key for admin sessions from the server's ADMIN_PASSWORD and process salt.
+ * If ADMIN_PASSWORD is not configured, returns an empty string (causing all signatures to fail closed).
+ */
+function getAdminSessionSecret(): string {
+  const password = (process.env.ADMIN_PASSWORD || '').replace(/^["']|["']$/g, '').trim();
+  if (!password) return '';
+  const salt = process.env.ADMIN_SESSION_SALT || 'monvera-admin-auth-secure-hmac-salt-v1';
+  return crypto.createHmac('sha256', salt).update(password).digest('hex');
+}
+
+export interface AdminSessionPayload {
+  uid: string;
+  email: string;
+  iat: number;
+  exp: number;
+}
+
+/**
+ * Creates a cryptographically signed administrator session token after ADMIN_PASSWORD verification.
+ * Only called when the administrator's password successfully matches ADMIN_PASSWORD.
+ */
+export function createAdminSessionToken(uid: string, email: string): string | null {
+  const secret = getAdminSessionSecret();
+  if (!secret) return null;
+
+  const now = Date.now();
+  const exp = now + 8 * 60 * 60 * 1000; // 8 hours validity
+  const payload: AdminSessionPayload = {
+    uid,
+    email: email.toLowerCase().trim(),
+    iat: now,
+    exp,
+  };
+
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', secret).update(payloadB64).digest('base64url');
+  return `${payloadB64}.${signature}`;
+}
+
+/**
+ * Validates an administrator session token.
+ * Verifies HMAC signature, expiration time, and matching email/uid against server configuration.
+ */
+export function verifyAdminSessionToken(
+  tokenString?: string,
+  expectedUid?: string,
+  expectedEmail?: string
+): { valid: boolean; payload?: AdminSessionPayload; reason?: string } {
+  if (!tokenString || typeof tokenString !== 'string') {
+    return { valid: false, reason: 'Session token missing' };
+  }
+
+  const secret = getAdminSessionSecret();
+  if (!secret) {
+    return { valid: false, reason: 'Server ADMIN_PASSWORD not configured' };
+  }
+
+  const parts = tokenString.split('.');
+  if (parts.length !== 2) {
+    return { valid: false, reason: 'Malformed session token' };
+  }
+
+  const [payloadB64, signature] = parts;
+  const expectedSig = crypto.createHmac('sha256', secret).update(payloadB64).digest('base64url');
+
+  const sigBuf = Buffer.from(signature);
+  const expSigBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expSigBuf.length || !crypto.timingSafeEqual(sigBuf, expSigBuf)) {
+    return { valid: false, reason: 'Invalid signature on admin session token' };
+  }
+
+  let payload: AdminSessionPayload;
+  try {
+    payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  } catch {
+    return { valid: false, reason: 'Invalid token payload format' };
+  }
+
+  if (!payload || !payload.exp || typeof payload.exp !== 'number') {
+    return { valid: false, reason: 'Missing expiration in token' };
+  }
+
+  if (Date.now() > payload.exp) {
+    return { valid: false, reason: 'Admin session expired' };
+  }
+
+  const configuredEmails = getConfiguredAdminEmails();
+  const configuredUids = getConfiguredAdminUids();
+
+  const tokenEmail = (payload.email || '').toLowerCase().trim();
+  const isEmailAllowed = configuredEmails.length > 0 && configuredEmails.includes(tokenEmail);
+  const isUidAllowed = configuredUids.length > 0 && configuredUids.includes(payload.uid);
+
+  if (!isEmailAllowed && !isUidAllowed) {
+    return { valid: false, reason: 'Token identity does not match configured admin accounts' };
+  }
+
+  if (expectedUid && payload.uid !== expectedUid) {
+    return { valid: false, reason: 'UID mismatch between session and token' };
+  }
+
+  if (expectedEmail) {
+    const cleanExpected = expectedEmail.toLowerCase().trim();
+    if (tokenEmail !== cleanExpected) {
+      return { valid: false, reason: 'Email mismatch between session and token' };
+    }
+  }
+
+  return { valid: true, payload };
 }
 
 /**
@@ -41,10 +155,12 @@ export async function requireFirebaseAuth(req: AuthenticatedRequest, res: Respon
 
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);
+    const sessionToken = (req.headers['x-admin-session'] as string) || (decodedToken.adminSessionToken as string);
     req.auth = {
       uid: decodedToken.uid,
       email: decodedToken.email,
       email_verified: decodedToken.email_verified,
+      adminSessionToken: sessionToken,
       ...decodedToken,
     };
     next();
@@ -71,10 +187,12 @@ export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Resp
     if (token) {
       try {
         const decodedToken = await adminAuth.verifyIdToken(token);
+        const sessionToken = (req.headers['x-admin-session'] as string) || (decodedToken.adminSessionToken as string);
         req.auth = {
           uid: decodedToken.uid,
           email: decodedToken.email,
           email_verified: decodedToken.email_verified,
+          adminSessionToken: sessionToken,
           ...decodedToken,
         };
       } catch (err) {
@@ -112,13 +230,16 @@ export function getConfiguredAdminUids(): string[] {
 
 /**
  * Verifies if a verified Firebase Auth caller has administrator privileges.
- * Derived strictly from verified token UID/email against server configuration or cryptographic custom claims.
- * Does NOT trust unverified client parameters or mutable Firestore user documents.
+ * Requires:
+ * 1. Caller identity (email or UID) must match server-side configuration (ADMIN_EMAIL / ADMIN_EMAILS / ADMIN_UIDS).
+ * 2. Caller MUST present a valid, unexpired, HMAC-signed administrator session token proving successful passage of the ADMIN_PASSWORD challenge.
+ * A matching email, Firestore role, localStorage value, or ordinary Firebase ID token alone will NEVER bypass this check.
  */
 export async function isCallerAdministrator(
   uid?: string,
   email?: string,
-  decodedClaims?: Record<string, any>
+  decodedClaims?: Record<string, any>,
+  sessionToken?: string
 ): Promise<boolean> {
   if (!uid && !email) return false;
 
@@ -126,36 +247,40 @@ export async function isCallerAdministrator(
   const configuredEmails = getConfiguredAdminEmails();
   const configuredUids = getConfiguredAdminUids();
 
-  // Fail closed if server has no administrator configuration set and no cryptographic custom claims
+  // Fail closed if server has no administrator configuration set
   const hasEnvConfig = configuredEmails.length > 0 || configuredUids.length > 0;
-  if (!hasEnvConfig && !decodedClaims?.admin && !decodedClaims?.role) {
+  if (!hasEnvConfig) {
     console.warn('[isCallerAdministrator] Missing configuration: ADMIN_EMAILS and ADMIN_UIDS are empty. Administrator access is failing closed.');
     return false;
   }
 
-  // 1. Explicit server-side configured administrator emails
-  if (normalizedEmail && configuredEmails.includes(normalizedEmail)) {
-    return true;
+  // 1. Identity check: Email or UID must be in configured administrator list
+  const isConfiguredEmail = normalizedEmail && configuredEmails.includes(normalizedEmail);
+  const isConfiguredUid = uid && configuredUids.includes(uid);
+  if (!isConfiguredEmail && !isConfiguredUid) {
+    return false;
   }
 
-  // 2. Explicit server-side configured administrator UIDs
-  if (uid && configuredUids.includes(uid)) {
-    return true;
+  // 2. Cryptographic session verification: Caller MUST provide a valid adminSessionToken (via claims or header)
+  // proving successful verification of ADMIN_PASSWORD. Plain Firebase ID tokens without this valid session are REJECTED.
+  const tokenToVerify = sessionToken || (decodedClaims?.adminSessionToken as string) || (decodedClaims?.adminSessionSignature as string);
+  if (!tokenToVerify) {
+    console.warn(`[isCallerAdministrator] Access denied for ${normalizedEmail || uid}: No valid admin session token provided.`);
+    return false;
   }
 
-  // 3. Cryptographically verified Firebase Custom Claims on the token (minted only by backend Admin SDK)
-  if (decodedClaims) {
-    if (decodedClaims.admin === true || decodedClaims.role === 'admin' || decodedClaims.role === 'super_admin') {
-      return true;
-    }
+  const verification = verifyAdminSessionToken(tokenToVerify, uid, normalizedEmail);
+  if (!verification.valid) {
+    console.warn(`[isCallerAdministrator] Access denied for ${normalizedEmail || uid}: ${verification.reason}`);
+    return false;
   }
 
-  return false;
+  return true;
 }
 
 /**
  * Express middleware to authenticate and authorize administrator requests.
- * Requires a valid Firebase Bearer token and verifies admin privileges.
+ * Requires a valid Firebase Bearer token and verifies active administrator session.
  */
 export async function requireAdminAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   if (!isFirebaseAdminConfigured()) {
@@ -180,29 +305,26 @@ export async function requireAdminAuth(req: AuthenticatedRequest, res: Response,
 
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);
+    const sessionToken = (req.headers['x-admin-session'] as string) || (decodedToken.adminSessionToken as string);
+
     req.auth = {
       uid: decodedToken.uid,
       email: decodedToken.email,
       email_verified: decodedToken.email_verified,
+      adminSessionToken: sessionToken,
       ...decodedToken,
     };
 
     const email = (decodedToken.email || '').toLowerCase().trim();
     const uid = decodedToken.uid;
 
-    // Production security enforcement: testing bypass disabled
-    const isTestingAdminAuthBypass = false;
-    if (isTestingAdminAuthBypass) {
-      return next();
-    }
-
-    const hasAdminAccess = await isCallerAdministrator(uid, email, decodedToken);
+    const hasAdminAccess = await isCallerAdministrator(uid, email, req.auth, sessionToken);
     if (hasAdminAccess) {
       return next();
     }
 
     return res.status(403).json({
-      error: 'FORBIDDEN: Administrative privileges required to perform this action.',
+      error: 'FORBIDDEN: Administrative privileges required to perform this action. Active administrator session is missing or invalid.',
     });
   } catch (err: any) {
     console.warn('[requireAdminAuth] Token verification failed:', err?.message || err);

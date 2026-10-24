@@ -60,6 +60,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     if (!identifier.trim()) {
       setErrorMessage('Please enter your account number, username, or email.');
       return;
@@ -67,21 +68,24 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     setErrorMessage(null);
     setIsSubmitting(true);
 
-    const res = await login(identifier.trim(), password);
-    setIsSubmitting(false);
+    try {
+      const res = await login(identifier.trim(), password);
 
-    if (res.mfaRequired && res.resolver) {
-      setMfaResolver(res.resolver);
-      setMfaHint(res.hint || (res.resolver.hints[0] as MultiFactorInfo));
-      setTotpCode('');
-      setTotpError(null);
-      return;
-    }
+      if (res.mfaRequired && res.resolver) {
+        setMfaResolver(res.resolver);
+        setMfaHint(res.hint || (res.resolver.hints[0] as MultiFactorInfo));
+        setTotpCode('');
+        setTotpError(null);
+        return;
+      }
 
-    if (!res.success) {
-      setErrorMessage(res.error || 'Invalid credentials. Please verify your details.');
-    } else {
-      if (onClose) onClose();
+      if (!res.success) {
+        setErrorMessage(res.error || 'Invalid credentials. Please verify your details.');
+      } else {
+        if (onClose) onClose();
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 

@@ -45,10 +45,21 @@ export const DashboardOverview: React.FC = () => {
   const effectiveUid = auth.currentUser?.uid || currentUser?.id;
 
   // Authoritative balance metrics: live authoritative balanceMetrics from Firestore.
-  // Direct reading of accounts/{auth.currentUser.uid} without localStorage fallback.
+  // When live metrics are in-flight or temporarily reconnecting, fallback to verified last-known cache
   const balanceMetrics: BalanceMetrics = useMemo(() => {
     if (liveBalanceMetrics) {
       return liveBalanceMetrics;
+    }
+    if (effectiveUid && typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem(`monvera_balances_${effectiveUid}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed.totalBalance === 'number' && parsed.accounts) {
+            return parsed;
+          }
+        }
+      } catch {}
     }
     return {
       checkingBalance: 0,
@@ -262,6 +273,8 @@ export const DashboardOverview: React.FC = () => {
           <div className="text-4xl sm:text-6xl lg:text-7xl font-black font-mono tracking-tight text-white select-none drop-shadow-md">
             {hideBalances ? (
               '••••••••••••'
+            ) : balanceMetrics.totalBalance > 0 ? (
+              `$${balanceMetrics.totalBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
             ) : !liveBalanceMetrics ? (
               <div className="flex items-center gap-3 py-1">
                 <div className="w-8 h-8 sm:w-10 sm:h-10 border-3 border-emerald-400 border-t-transparent animate-spin rounded-full" />
@@ -276,7 +289,11 @@ export const DashboardOverview: React.FC = () => {
 
           {!liveBalanceMetrics && (
             <div className="mt-3 p-3 rounded-xl bg-amber-400/10 border border-amber-400/30 flex items-center justify-between text-xs text-amber-300">
-              <span className="font-semibold">Retrieving authoritative ledger balances from Monvera Banking Core...</span>
+              <span className="font-semibold">
+                {balanceMetrics.totalBalance > 0
+                  ? 'Displaying verified last-known balances while synchronizing with the authoritative Monvera Core Ledger...'
+                  : 'Retrieving authoritative ledger balances from Monvera Banking Core...'}
+              </span>
               <button
                 onClick={() => refreshBalance()}
                 className="px-2.5 py-1 rounded-lg bg-amber-400 text-slate-950 font-black hover:bg-amber-300 transition-colors cursor-pointer"

@@ -1,6 +1,6 @@
 import React from 'react';
 import { MonveraLogo } from '../common/MonveraLogo';
-import { ShieldCheck, HeartHandshake, Lock, ArrowUpRight, CheckCircle2, Building2, Headphones } from 'lucide-react';
+import { ShieldCheck, HeartHandshake, Lock, ArrowUpRight, CheckCircle2, Building2, Headphones, Mail } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
 export const PublicFooter: React.FC = () => {
@@ -175,6 +175,43 @@ export const PublicFooter: React.FC = () => {
                   <div className="text-slate-400">Complete transparency on all accounts and yields</div>
                 </div>
               </div>
+            </div>
+
+            {/* Contact Us by Email */}
+            <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-2.5 text-xs">
+              <div className="font-black text-white uppercase tracking-wider text-[11px] flex items-center gap-2">
+                <Mail className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Contact Us by Email</span>
+              </div>
+              <ul className="space-y-1.5 font-medium">
+                <li>
+                  <a
+                    href="mailto:Support@monveradigitalbanking.space"
+                    className="flex items-center justify-between text-slate-300 hover:text-emerald-400 transition-colors group py-0.5"
+                  >
+                    <span className="truncate">Support@monveradigitalbanking.space</span>
+                    <ArrowUpRight className="w-3.5 h-3.5 text-slate-500 group-hover:text-emerald-400 shrink-0 ml-1 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+                  </a>
+                </li>
+                <li>
+                  <a
+                    href="mailto:Enquiry@monveradigitalbanking.space"
+                    className="flex items-center justify-between text-slate-300 hover:text-emerald-400 transition-colors group py-0.5"
+                  >
+                    <span className="truncate">Enquiry@monveradigitalbanking.space</span>
+                    <ArrowUpRight className="w-3.5 h-3.5 text-slate-500 group-hover:text-emerald-400 shrink-0 ml-1 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+                  </a>
+                </li>
+                <li>
+                  <a
+                    href="mailto:Info@monveradigitalbanking.space"
+                    className="flex items-center justify-between text-slate-300 hover:text-emerald-400 transition-colors group py-0.5"
+                  >
+                    <span className="truncate">Info@monveradigitalbanking.space</span>
+                    <ArrowUpRight className="w-3.5 h-3.5 text-slate-500 group-hover:text-emerald-400 shrink-0 ml-1 transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+                  </a>
+                </li>
+              </ul>
             </div>
           </div>
 

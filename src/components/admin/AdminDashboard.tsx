@@ -81,14 +81,11 @@ export const AdminDashboard: React.FC = () => {
         if (isMounted) setIsServerAdminVerified(false);
         return;
       }
-      if (currentUser?.role === 'super_admin' || currentUser?.role === 'admin') {
-        if (isMounted) setIsServerAdminVerified(true);
-        return;
-      }
+      // Never bypass server verification with client-side role claims
       const check = await api.verifyAdminSession();
       if (isMounted) {
         setIsServerAdminVerified(check.isAdmin);
-        if (check.isAdmin && currentUser) {
+        if (check.isAdmin && currentUser && currentUser.role !== 'admin') {
           updateUser({ ...currentUser, role: 'admin' });
         }
       }
@@ -97,7 +94,7 @@ export const AdminDashboard: React.FC = () => {
     return () => {
       isMounted = false;
     };
-  }, [auth?.currentUser, currentUser?.role]);
+  }, [auth?.currentUser]);
 
   // Helper to merge Firestore users and server customers seamlessly without duplicate accounts
   const mergeCustomers = (
@@ -753,16 +750,28 @@ export const AdminDashboard: React.FC = () => {
     { id: 'audit', label: 'Audit Trail', icon: FileText },
   ];
 
-  // Strict Administrator Authentication Gate: Requires verified Firebase session with authorized credentials
+  // Strict Administrator Authentication Gate: Requires verified backend administrator session
   const isTestingAuthBypass = false;
 
   const isAdmin = isTestingAuthBypass || Boolean(
     currentUser &&
     auth?.currentUser &&
-    (currentUser.role === 'super_admin' ||
-     currentUser.role === 'admin' ||
-     isServerAdminVerified === true)
+    isServerAdminVerified === true
   );
+
+  if (isServerAdminVerified === null && auth?.currentUser) {
+    return (
+      <div id="monvera-admin-command-center" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-amber-400/10 border border-amber-400/30 text-amber-400 flex items-center justify-center mx-auto animate-pulse">
+            <Shield className="w-6 h-6" />
+          </div>
+          <h2 className="text-lg font-bold text-white">Verifying Administrator Session...</h2>
+          <p className="text-xs text-slate-400">Authenticating cryptographic credentials with server.</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!isAdmin) {
     return (

@@ -29,6 +29,8 @@ import {
   Battery,
   ArrowDown,
   Sparkles,
+  Mail,
+  ArrowUpRight,
 } from 'lucide-react';
 
 const QUICK_PROMPTS = [
@@ -826,6 +828,37 @@ export const WhatsAppSupportChat: React.FC = () => {
                     </span>
                   </div>
 
+                  {/* Contact Us by Email */}
+                  <div className="mx-auto max-w-[95%] p-2.5 rounded-xl bg-white/95 text-slate-800 border border-slate-200/80 shadow-2xs space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[10px] font-black text-slate-700 uppercase tracking-wider">
+                      <Mail className="w-3 h-3 text-emerald-600" />
+                      <span>Contact Us by Email</span>
+                    </div>
+                    <div className="grid grid-cols-1 gap-1">
+                      <a
+                        href="mailto:Support@monveradigitalbanking.space"
+                        className="flex items-center justify-between px-2 py-1 rounded-lg bg-slate-50 hover:bg-emerald-50 text-[10.5px] font-semibold text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 transition-colors group"
+                      >
+                        <span className="truncate">Support@monveradigitalbanking.space</span>
+                        <ArrowUpRight className="w-3 h-3 text-slate-400 group-hover:text-emerald-600 shrink-0 ml-1" />
+                      </a>
+                      <a
+                        href="mailto:Enquiry@monveradigitalbanking.space"
+                        className="flex items-center justify-between px-2 py-1 rounded-lg bg-slate-50 hover:bg-emerald-50 text-[10.5px] font-semibold text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 transition-colors group"
+                      >
+                        <span className="truncate">Enquiry@monveradigitalbanking.space</span>
+                        <ArrowUpRight className="w-3 h-3 text-slate-400 group-hover:text-emerald-600 shrink-0 ml-1" />
+                      </a>
+                      <a
+                        href="mailto:Info@monveradigitalbanking.space"
+                        className="flex items-center justify-between px-2 py-1 rounded-lg bg-slate-50 hover:bg-emerald-50 text-[10.5px] font-semibold text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 transition-colors group"
+                      >
+                        <span className="truncate">Info@monveradigitalbanking.space</span>
+                        <ArrowUpRight className="w-3 h-3 text-slate-400 group-hover:text-emerald-600 shrink-0 ml-1" />
+                      </a>
+                    </div>
+                  </div>
+
                   {/* Quick Topics */}
                   <div className="space-y-1 pt-1">
                     <div className="text-[10px] font-black text-slate-700 uppercase tracking-wider px-1">
@@ -1137,6 +1170,37 @@ export const WhatsAppSupportChat: React.FC = () => {
                   <span>
                     <strong>End-to-End Bank Encryption:</strong> Messages, identity credentials, and proof documents are secured with 256-bit compliance clearance.
                   </span>
+                </div>
+
+                {/* Contact Us by Email */}
+                <div className="mx-auto max-w-[90%] p-3 rounded-xl bg-white/95 text-slate-800 border border-slate-200/80 shadow-xs space-y-2">
+                  <div className="flex items-center gap-1.5 text-xs font-black text-slate-700 uppercase tracking-wider">
+                    <Mail className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Contact Us by Email</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <a
+                      href="mailto:Support@monveradigitalbanking.space"
+                      className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-emerald-50 text-xs font-semibold text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 transition-colors group"
+                    >
+                      <span className="truncate">Support@monveradigitalbanking.space</span>
+                      <ArrowUpRight className="w-3.5 h-3.5 text-slate-400 group-hover:text-emerald-600 shrink-0 ml-1" />
+                    </a>
+                    <a
+                      href="mailto:Enquiry@monveradigitalbanking.space"
+                      className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-emerald-50 text-xs font-semibold text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 transition-colors group"
+                    >
+                      <span className="truncate">Enquiry@monveradigitalbanking.space</span>
+                      <ArrowUpRight className="w-3.5 h-3.5 text-slate-400 group-hover:text-emerald-600 shrink-0 ml-1" />
+                    </a>
+                    <a
+                      href="mailto:Info@monveradigitalbanking.space"
+                      className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-emerald-50 text-xs font-semibold text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 transition-colors group"
+                    >
+                      <span className="truncate">Info@monveradigitalbanking.space</span>
+                      <ArrowUpRight className="w-3.5 h-3.5 text-slate-400 group-hover:text-emerald-600 shrink-0 ml-1" />
+                    </a>
+                  </div>
                 </div>
 
                 {/* Quick Topics */}

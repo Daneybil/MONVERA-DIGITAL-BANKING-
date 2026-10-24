@@ -27,8 +27,50 @@ export function getApiEndpoint(endpoint: string): string {
   return API_BASE_URL ? `${API_BASE_URL}${cleanEndpoint}` : cleanEndpoint;
 }
 
+const ADMIN_SESSION_STORAGE_KEY = 'monvera_admin_session_token';
+
+export function getAdminSessionToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return sessionStorage.getItem(ADMIN_SESSION_STORAGE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+export function setAdminSessionToken(token: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.setItem(ADMIN_SESSION_STORAGE_KEY, token);
+  } catch {}
+}
+
+export function clearAdminSessionToken(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.removeItem(ADMIN_SESSION_STORAGE_KEY);
+  } catch {}
+}
+
 /**
- * Retrieves Firebase Auth Bearer token headers for authenticated backend calls
+ * Returns a complete URL for displaying or downloading KYC documents,
+ * appending the verified admin session token when accessing server-streamed documents.
+ */
+export function getKycDocumentUrl(url?: string | null): string {
+  if (!url) return '';
+  if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+  if (url.startsWith('/api/kyc/documents/')) {
+    const adminToken = getAdminSessionToken();
+    if (adminToken && !url.includes('adminSession=')) {
+      return `${url}${url.includes('?') ? '&' : '?'}adminSession=${encodeURIComponent(adminToken)}`;
+    }
+  }
+  return url;
+}
+
+/**
+ * Retrieves Firebase Auth Bearer token headers for authenticated backend calls.
+ * If an active verified administrator session token is present, attaches X-Admin-Session.
  */
 async function getAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
@@ -43,6 +85,10 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
     }
   } catch (err) {
     console.warn('[getAuthHeaders] Could not retrieve Firebase ID token:', err);
+  }
+  const adminToken = getAdminSessionToken();
+  if (adminToken) {
+    headers['X-Admin-Session'] = adminToken;
   }
   return headers;
 }
@@ -1445,6 +1491,7 @@ export const api = {
     success: boolean;
     isAdminAttempt?: boolean;
     customToken?: string;
+    adminSessionToken?: string;
     error?: string;
   }> {
     try {
@@ -1457,10 +1504,14 @@ export const api = {
         body: JSON.stringify({ email, password }),
       });
       const data = await parseJsonResponse<any>(res, { success: false });
+      if (data.success && data.adminSessionToken) {
+        setAdminSessionToken(data.adminSessionToken);
+      }
       return {
         success: !!data.success,
-        isAdminAttempt: data.isAdminAttempt !== undefined ? !!data.isAdminAttempt : !!data.success,
+        isAdminAttempt: data.isAdminAttempt !== undefined ? !!data.isAdminAttempt : (res.status === 401 || !!data.success),
         customToken: data.customToken,
+        adminSessionToken: data.adminSessionToken,
         error: data.error,
       };
     } catch (err: any) {
@@ -1475,7 +1526,7 @@ export const api = {
       if (!headers['Authorization']) {
         return { isAdmin: false, error: 'No authentication token available' };
       }
-      const res = await fetch('/api/admin/verify-session', { headers });
+      const res = await fetch(getApiEndpoint('/api/admin/verify-session'), { headers });
       if (res.ok) {
         const data = await parseJsonResponse<{ success: boolean; isAdmin?: boolean }>(res, { success: false, isAdmin: false });
         return { isAdmin: !!data.isAdmin };

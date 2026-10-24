@@ -7,7 +7,7 @@ import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
-import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest } from './server/authMiddleware';
+import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest, createAdminSessionToken, verifyAdminSessionToken } from './server/authMiddleware';
 import { adminAuth, adminFirestore, isFirebaseAdminConfigured } from './server/firebaseAdmin';
 import {
   executeServerTransfer,
@@ -34,7 +34,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || '*';
   res.header('Access-Control-Allow-Origin', origin);
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Admin-Session');
   res.header('Access-Control-Allow-Credentials', 'true');
 
   if (req.method === 'OPTIONS') {
@@ -521,12 +521,47 @@ app.post('/api/user/profile', optionalFirebaseAuth, async (req: AuthenticatedReq
 app.get('/api/kyc/documents/:userId/:docType', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { userId, docType } = req.params;
   const callerUid = req.auth?.uid;
-  const isOwner = callerUid && callerUid === userId;
-  const isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  let isOwner = callerUid && callerUid === userId;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+
+  // Support authenticated admin session from query param or header for <img> tag rendering
+  const queryAdminSession = (req.query.adminSession as string) || (req.headers['x-admin-session'] as string);
+  if (!isAdmin && queryAdminSession) {
+    const verified = verifyAdminSessionToken(queryAdminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  // Support authenticated customer token from query param if <img> tag cannot send Authorization header
+  const queryToken = req.query.token as string;
+  if (!isOwner && queryToken && isFirebaseAdminConfigured()) {
+    try {
+      const decoded = await adminAuth.verifyIdToken(queryToken);
+      if (decoded && decoded.uid === userId) isOwner = true;
+      if (decoded && await isCallerAdministrator(decoded.uid, decoded.email, decoded)) isAdmin = true;
+    } catch {}
+  }
 
   if (!isOwner && !isAdmin) {
     return res.status(403).json({ error: 'FORBIDDEN: You do not have permission to view this customer document.' });
   }
+
+  const serveImageResponse = (base64Str: string, uploadedAt?: string) => {
+    const wantsRaw = req.query.raw === 'true' || req.headers.accept?.startsWith('image/');
+    if (wantsRaw) {
+      try {
+        const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+        const contentType = matches ? matches[1] : 'image/jpeg';
+        const rawData = matches ? matches[2] : base64Str;
+        const buffer = Buffer.from(rawData, 'base64');
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+        return res.send(buffer);
+      } catch (e) {
+        console.warn('[serveImageResponse] Buffer conversion failed:', e);
+      }
+    }
+    return res.json({ success: true, docType, imageBase64: base64Str, uploadedAt });
+  };
 
   try {
     const docSnap = await adminFirestore
@@ -538,7 +573,7 @@ app.get('/api/kyc/documents/:userId/:docType', optionalFirebaseAuth, async (req:
 
     if (docSnap.exists) {
       const docData = docSnap.data()!;
-      return res.json({ success: true, docType, imageBase64: docData.imageBase64, uploadedAt: docData.uploadedAt });
+      return serveImageResponse(docData.imageBase64, docData.uploadedAt);
     }
 
     // Fallback: check top-level profile document for legacy submissions
@@ -553,7 +588,7 @@ app.get('/api/kyc/documents/:userId/:docType', optionalFirebaseAuth, async (req:
       else if (docType === 'ssn') legacyImg = ud.kycSsnImage;
 
       if (legacyImg) {
-        return res.json({ success: true, docType, imageBase64: legacyImg, legacy: true });
+        return serveImageResponse(legacyImg, ud.kycSubmittedAt);
       }
     }
 
@@ -720,12 +755,13 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
       profileUpdate.usernameLower = effectiveUsername.toLowerCase();
     }
 
-    // Store document image references/URIs in top-level document
-    if (documentImage) profileUpdate.kycDocumentImage = documentImage;
-    if (documentBackImage) profileUpdate.kycDocumentBackImage = documentBackImage;
-    if (proofOfAddressImage) profileUpdate.kycProofOfAddressImage = proofOfAddressImage;
-    if (liveSelfieImage) profileUpdate.kycLiveSelfieImage = liveSelfieImage;
-    if (ssnImage) profileUpdate.kycSsnImage = ssnImage;
+    // Store lightweight document image references in top-level users/{userId} document
+    // (Full images are preserved durably in the kyc_documents subcollection without overflowing the 1 MiB Firestore document limit)
+    if (documentImage) profileUpdate.kycDocumentImage = `/api/kyc/documents/${targetUserId}/front?raw=true`;
+    if (documentBackImage) profileUpdate.kycDocumentBackImage = `/api/kyc/documents/${targetUserId}/back?raw=true`;
+    if (proofOfAddressImage) profileUpdate.kycProofOfAddressImage = `/api/kyc/documents/${targetUserId}/address?raw=true`;
+    if (liveSelfieImage) profileUpdate.kycLiveSelfieImage = `/api/kyc/documents/${targetUserId}/selfie?raw=true`;
+    if (ssnImage) profileUpdate.kycSsnImage = `/api/kyc/documents/${targetUserId}/ssn?raw=true`;
 
     // 4. Persist authoritatively to Firestore users/{targetUserId} via Firebase Admin SDK
     await userRef.set(profileUpdate, { merge: true });
@@ -2374,28 +2410,39 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
       console.warn('[Admin Login] Notice: Could not sync password to Firebase user record:', syncErr);
     }
 
-    try {
-      await adminAuth.setCustomUserClaims(userRecord.uid, {
-        admin: true,
-        role: 'admin',
-        roleLevel: 4,
+    // Create cryptographically signed administrator session token
+    const adminSessionToken = createAdminSessionToken(userRecord.uid, cleanEmail);
+    if (!adminSessionToken) {
+      console.error('[Admin Login] Failed to create admin session token');
+      return res.status(500).json({
+        success: false,
+        isAdminAttempt: true,
+        error: 'SERVER_ERROR: Failed to issue administrator session credentials.',
       });
+    }
+
+    const adminClaims = {
+      admin: true,
+      role: 'admin',
+      roleLevel: 4,
+      adminSessionToken,
+    };
+
+    try {
+      await adminAuth.setCustomUserClaims(userRecord.uid, adminClaims);
     } catch (claimsErr) {
       console.warn('[Admin Login] Notice: Could not set custom claims:', claimsErr);
     }
 
-    // Mint Firebase Custom Token with admin claims
-    const customToken = await adminAuth.createCustomToken(userRecord.uid, {
-      admin: true,
-      role: 'admin',
-      roleLevel: 4,
-    });
+    // Mint Firebase Custom Token with admin claims and verified session token
+    const customToken = await adminAuth.createCustomToken(userRecord.uid, adminClaims);
 
     console.log(`[Admin Login] Successfully authenticated administrator: ${cleanEmail}`);
     return res.json({
       success: true,
       isAdminAttempt: true,
       customToken,
+      adminSessionToken,
       user: {
         uid: userRecord.uid,
         email: cleanEmail,

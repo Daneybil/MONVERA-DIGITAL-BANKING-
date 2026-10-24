@@ -24,6 +24,7 @@ import {
   Download,
 } from 'lucide-react';
 import { AdminConfirmationModal } from './AdminConfirmationModal';
+import { getKycDocumentUrl } from '../../services/api';
 
 interface AdminKycViewProps {
   customers: (UserProfile & { balanceMetrics?: any })[];
@@ -84,16 +85,17 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
   const downloadDocument = (url: string, filename: string) => {
     if (!url) return;
     try {
-      if (url.startsWith('data:')) {
+      const targetUrl = getKycDocumentUrl(url);
+      if (targetUrl.startsWith('data:')) {
         const link = document.createElement('a');
-        link.href = url;
+        link.href = targetUrl;
         link.download = filename;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
         return;
       }
-      fetch(url)
+      fetch(targetUrl)
         .then((res) => res.blob())
         .then((blob) => {
           const objectUrl = window.URL.createObjectURL(blob);
@@ -107,7 +109,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
         })
         .catch(() => {
           const link = document.createElement('a');
-          link.href = url;
+          link.href = targetUrl;
           link.target = '_blank';
           link.download = filename;
           document.body.appendChild(link);
@@ -116,7 +118,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
         });
     } catch (err) {
       console.error('Error downloading document:', err);
-      window.open(url, '_blank');
+      window.open(getKycDocumentUrl(url), '_blank');
     }
   };
 
