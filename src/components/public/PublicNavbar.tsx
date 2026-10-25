@@ -3,6 +3,7 @@ import { MonveraLogo } from '../common/MonveraLogo';
 import { useAuth } from '../../context/AuthContext';
 import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, Lock, LayoutDashboard } from 'lucide-react';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
+import { LanguageSelector } from '../common/LanguageSelector';
 
 export const PublicNavbar: React.FC = () => {
   const { currentUser, setCurrentView, openModal } = useAuth();
@@ -49,16 +50,21 @@ export const PublicNavbar: React.FC = () => {
 
   return (
     <header id="monvera-public-navbar" className="sticky top-0 z-50 bg-[#FAF7F2]/95 backdrop-blur-md border-b border-amber-900/10 shadow-2xs">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between">
+      <div className="max-w-7xl mx-auto px-2.5 sm:px-6 lg:px-8 h-16 sm:h-20 flex items-center justify-between gap-1.5 sm:gap-3">
         {/* Monvera Brand */}
         <div
-          className="cursor-pointer flex items-center"
+          className="cursor-pointer flex items-center shrink-0 min-w-0"
           onClick={() => {
             setCurrentView('home');
             window.scrollTo({ top: 0, behavior: 'smooth' });
           }}
         >
-          <MonveraLogo variant="full" size="md" />
+          <div className="hidden sm:block">
+            <MonveraLogo variant="full" size="md" />
+          </div>
+          <div className="sm:hidden">
+            <MonveraLogo variant="full" size="sm" />
+          </div>
         </div>
 
         {/* Desktop Navigation Links */}
@@ -76,7 +82,15 @@ export const PublicNavbar: React.FC = () => {
         </nav>
 
         {/* Right CTA Actions & Menu Trigger (Both Mobile and Desktop) */}
-        <div className="flex items-center gap-2 sm:gap-3.5">
+        <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
+          {/* Automatic Multilingual Language Selector */}
+          <div className="hidden sm:block">
+            <LanguageSelector variant="header" showLabel={true} />
+          </div>
+          <div className="sm:hidden">
+            <LanguageSelector variant="header" showLabel={false} />
+          </div>
+
           {currentUser ? (
             <button
               id="navbar-dashboard-btn"
@@ -87,16 +101,16 @@ export const PublicNavbar: React.FC = () => {
                   setCurrentView('dashboard');
                 }
               }}
-              className="inline-flex items-center gap-2 px-3.5 sm:px-5 py-2.5 text-xs sm:text-sm font-extrabold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-xl shadow-xs border border-amber-500/30 transition-all cursor-pointer"
+              className="inline-flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-5 py-2 sm:py-2.5 text-xs sm:text-sm font-extrabold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-xl shadow-xs border border-amber-500/30 transition-all cursor-pointer"
             >
-              <LayoutDashboard className="w-4 h-4 text-slate-950" />
-              <span>Dashboard</span>
+              <LayoutDashboard className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-950" />
+              <span className="hidden xs:inline">Dashboard</span>
             </button>
           ) : (
             <button
               id="navbar-signin-btn"
               onClick={() => openModal('auth_login')}
-              className="hidden sm:inline-flex items-center gap-1.5 px-4 py-2.5 text-xs sm:text-sm font-bold text-slate-800 hover:text-slate-950 hover:bg-slate-200/60 rounded-xl transition-all cursor-pointer"
+              className="hidden md:inline-flex items-center gap-1.5 px-4 py-2.5 text-xs sm:text-sm font-bold text-slate-800 hover:text-slate-950 hover:bg-slate-200/60 rounded-xl transition-all cursor-pointer"
             >
               <Lock className="w-4 h-4 text-slate-600" />
               <span>Sign In</span>
@@ -113,10 +127,11 @@ export const PublicNavbar: React.FC = () => {
                 openModal('auth_prompt');
               }
             }}
-            className="inline-flex items-center gap-2 px-4 sm:px-6 py-2.5 text-xs sm:text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98] cursor-pointer"
+            className="inline-flex items-center gap-1 sm:gap-2 px-2.5 sm:px-6 py-2 sm:py-2.5 text-xs sm:text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98] cursor-pointer"
           >
-            <span>{currentUser ? 'My Account' : 'Get Started'}</span>
-            <ArrowRight className="w-4 h-4 text-emerald-400" />
+            <span className="hidden xs:inline">{currentUser ? 'My Account' : 'Get Started'}</span>
+            <span className="xs:hidden">{currentUser ? 'Account' : 'Start'}</span>
+            <ArrowRight className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-400" />
           </button>
 
           {/* 3 Horizontal Lines Menu Trigger (Visible on BOTH Mobile & Desktop) */}
@@ -124,13 +139,13 @@ export const PublicNavbar: React.FC = () => {
             id="menu-toggle-btn"
             aria-label="Toggle navigation menu"
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-            className="p-2.5 text-slate-800 bg-slate-100/90 hover:bg-slate-200/90 rounded-xl border border-slate-300/70 shadow-2xs transition-all flex items-center justify-center cursor-pointer active:scale-95"
+            className="p-2 sm:p-2.5 text-slate-800 bg-slate-100/90 hover:bg-slate-200/90 rounded-xl border border-slate-300/70 shadow-2xs transition-all flex items-center justify-center cursor-pointer active:scale-95"
             title="Menu"
           >
             {mobileMenuOpen ? (
-              <X className="w-5 h-5 text-slate-900" />
+              <X className="w-4 h-4 sm:w-5 sm:h-5 text-slate-900" />
             ) : (
-              <Menu className="w-5 h-5 text-slate-900" />
+              <Menu className="w-4 h-4 sm:w-5 sm:h-5 text-slate-900" />
             )}
           </button>
         </div>

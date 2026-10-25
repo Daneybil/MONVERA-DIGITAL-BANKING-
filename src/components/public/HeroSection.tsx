@@ -45,9 +45,14 @@ export const HeroSection: React.FC = () => {
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 relative text-center space-y-10">
         
         {/* Brand Logo & Trusted Digital Bank Worldwide Identifier */}
-        <div className="flex flex-col items-center gap-4 pb-2">
-          <MonveraLogo variant="full" size="lg" />
-          <span className="text-[12px] sm:text-[13px] font-black tracking-wider text-slate-900 uppercase font-mono">
+        <div className="flex flex-col items-center gap-3 sm:gap-4 pb-2 max-w-full px-2">
+          <div className="hidden sm:block">
+            <MonveraLogo variant="full" size="lg" />
+          </div>
+          <div className="sm:hidden">
+            <MonveraLogo variant="full" size="md" />
+          </div>
+          <span className="text-[11px] sm:text-[13px] font-black tracking-normal sm:tracking-wider text-slate-900 uppercase font-mono text-center max-w-full break-words leading-relaxed">
             MONVERA • THE TRUSTED DIGITAL BANK FOR THE PEOPLE WORLDWIDE
           </span>
         </div>
@@ -210,9 +215,9 @@ export const HeroSection: React.FC = () => {
               </div>
 
               {/* Extremely Visible & Bright Depositors Badge */}
-              <div className="text-sm sm:text-base font-black text-slate-950 bg-white px-5 py-2 rounded-full border-2 border-emerald-500 shadow-md flex items-center gap-2">
+              <div className="text-xs sm:text-base font-black text-slate-950 bg-white px-3.5 sm:px-5 py-2 rounded-full border-2 border-emerald-500 shadow-md flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 text-center max-w-full">
                 <span>Trusted by</span>
-                <span className="text-emerald-700 font-black text-base sm:text-lg">2,400,000+</span>
+                <span className="text-emerald-700 font-black text-sm sm:text-lg">2,400,000+</span>
                 <span>depositors globally</span>
               </div>
 

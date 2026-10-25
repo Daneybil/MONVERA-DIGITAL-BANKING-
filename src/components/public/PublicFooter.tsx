@@ -2,6 +2,7 @@ import React from 'react';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { ShieldCheck, HeartHandshake, Lock, ArrowUpRight, CheckCircle2, Building2, Headphones, Mail } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { LanguageSelector } from '../common/LanguageSelector';
 
 export const PublicFooter: React.FC = () => {
   const { setCurrentView, openModal, currentUser } = useAuth();
@@ -233,7 +234,8 @@ export const PublicFooter: React.FC = () => {
             <div className="font-medium text-slate-400">
               © {new Date().getFullYear()} Monvera & Nuvera Financial Technologies. All rights reserved. Building a better tomorrow.
             </div>
-            <div className="flex items-center gap-6 font-bold">
+            <div className="flex flex-wrap items-center gap-4 sm:gap-6 font-bold">
+              <LanguageSelector variant="dark" />
               <button
                 onClick={() => {
                   setCurrentView('privacy');

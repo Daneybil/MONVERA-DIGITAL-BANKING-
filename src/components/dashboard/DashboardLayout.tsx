@@ -3,6 +3,7 @@ import { useAuth, AppView } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { NotificationsDrawer } from './NotificationsDrawer';
 import { KycStatusAlertModal } from '../kyc/KycStatusAlertModal';
+import { LanguageSelector } from '../common/LanguageSelector';
 import {
   LayoutDashboard,
   Wallet,
@@ -135,9 +136,9 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
         <div className="p-4 mx-4 mt-4 rounded-2xl bg-slate-850 border border-slate-800 space-y-1.5 shadow-sm">
           <div className="flex items-center justify-between text-[11px] text-slate-400">
             <span>Checking Balance</span>
-            <span className="text-emerald-400 font-mono font-bold">MVB •••• {currentUser.permanentAccountNumber.slice(-4)}</span>
+            <span className="text-emerald-400 font-mono font-bold notranslate" translate="no">MVB •••• {currentUser.permanentAccountNumber.slice(-4)}</span>
           </div>
-          <div className="text-2xl font-extrabold font-mono text-white tracking-tight">
+          <div className="text-2xl font-extrabold font-mono text-white tracking-tight notranslate" translate="no">
             ${balanceMetrics?.checkingBalance.toLocaleString('en-US', { minimumFractionDigits: 2 }) || '0.00'}
           </div>
           <div className="pt-2 flex items-center gap-2">
@@ -306,21 +307,21 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
       <div className="flex-1 flex flex-col min-w-0">
         
         {/* Top Header Bar */}
-        <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/90 h-16 sm:h-20 px-4 sm:px-8 flex items-center justify-between shadow-2xs">
+        <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/90 h-16 sm:h-20 px-2.5 sm:px-8 flex items-center justify-between gap-1.5 sm:gap-3 shadow-2xs w-full max-w-full">
           
           {/* Left Title / Greeting & Menu Toggle */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5 sm:gap-3 min-w-0">
             
             {/* The 3 Horizontal Lines Menu Toggle Button (Sleek Rectangular Smart Trigger) */}
             <button
               id="dashboard-header-menu-btn"
               onClick={() => setMobileMenuOpen(true)}
-              className="px-3.5 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white shadow-sm border border-slate-800 transition-all active:scale-95 flex items-center gap-2 cursor-pointer group"
+              className="px-2.5 sm:px-3.5 py-2 sm:py-2.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white shadow-sm border border-slate-800 transition-all active:scale-95 flex items-center gap-1.5 sm:gap-2 cursor-pointer group shrink-0"
               title="Open Navigation Menu"
               aria-label="Open Monvera Navigation Menu"
             >
               <Menu className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
-              <span className="text-xs font-black tracking-wide text-slate-100">
+              <span className="text-xs font-black tracking-wide text-slate-100 hidden sm:inline">
                 Menu Hub
               </span>
             </button>
@@ -332,12 +333,12 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
                 setCurrentView('home');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
               }}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 hover:text-slate-950 text-xs font-extrabold border border-slate-300 transition-colors cursor-pointer"
+              className="inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 hover:text-slate-950 text-xs font-extrabold border border-slate-300 transition-colors cursor-pointer shrink-0"
               title="Return to Monvera Home"
             >
-              <ArrowLeft className="w-4 h-4 text-emerald-600" />
-              <span className="hidden xs:inline">Back to Home</span>
-              <span className="xs:hidden">Home</span>
+              <ArrowLeft className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600" />
+              <span className="hidden sm:inline">Back to Home</span>
+              <span className="sm:hidden">Home</span>
             </button>
 
             <div className="hidden md:block pl-2 border-l border-slate-200">
@@ -345,14 +346,22 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
                 {currentView === 'dashboard' ? 'Banking Dashboard' : currentView.replace('-', ' ')}
               </h1>
               <div className="text-[11px] text-slate-500 font-mono">
-                Permanent Account: <strong className="text-slate-800">{currentUser.permanentAccountNumber}</strong>
+                Permanent Account: <strong className="text-slate-800 notranslate" translate="no">{currentUser.permanentAccountNumber}</strong>
               </div>
             </div>
           </div>
 
           {/* Right Header Controls */}
-          <div className="flex items-center gap-2.5 sm:gap-3.5">
+          <div className="flex items-center gap-1.5 sm:gap-3.5 shrink-0">
             
+            {/* Automatic Multilingual Language Selector */}
+            <div className="hidden sm:block">
+              <LanguageSelector variant="header" showLabel={true} />
+            </div>
+            <div className="sm:hidden">
+              <LanguageSelector variant="header" showLabel={false} />
+            </div>
+
             {/* Return to Public Website Switcher */}
             <button
               id="header-view-website-btn"
@@ -369,16 +378,16 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
               <button
                 id="header-user-profile-btn"
                 onClick={() => setPersonaMenuOpen(!personaMenuOpen)}
-                className="flex items-center gap-2 px-3.5 py-2.5 text-xs font-bold text-slate-900 bg-slate-100 hover:bg-slate-200/80 rounded-xl border border-slate-300/80 shadow-2xs transition-colors cursor-pointer"
+                className="flex items-center gap-1 sm:gap-2 px-2 sm:px-3.5 py-2 sm:py-2.5 text-xs font-bold text-slate-900 bg-slate-100 hover:bg-slate-200/80 rounded-xl border border-slate-300/80 shadow-2xs transition-colors cursor-pointer"
                 title="Account Menu & Profile"
               >
                 <div className="w-6 h-6 rounded-lg bg-slate-900 text-emerald-400 flex items-center justify-center font-black text-[11px]">
                   {currentUser.firstName?.[0] || 'U'}
                 </div>
-                <span className="hidden sm:inline">
+                <span className="hidden md:inline">
                   Active: <strong className="font-extrabold">{currentUser.firstName} {currentUser.lastName}</strong>
                 </span>
-                <span className="sm:hidden font-bold">{currentUser.firstName}</span>
+                <span className="hidden sm:inline md:hidden font-bold">{currentUser.firstName}</span>
                 <ChevronDown className={`w-3.5 h-3.5 text-slate-500 transition-transform ${personaMenuOpen ? 'rotate-180' : ''}`} />
               </button>
 
@@ -555,7 +564,7 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
                   <div className="flex items-center justify-between sm:justify-end gap-3">
                     <div className="text-right">
                       <div className="text-[10px] uppercase font-mono text-slate-400 font-bold">Checking</div>
-                      <div className="text-base sm:text-lg font-black font-mono text-emerald-400">
+                      <div className="text-base sm:text-lg font-black font-mono text-emerald-400 notranslate" translate="no">
                         ${balanceMetrics?.checkingBalance.toLocaleString('en-US', { minimumFractionDigits: 2 }) || '0.00'}
                       </div>
                     </div>

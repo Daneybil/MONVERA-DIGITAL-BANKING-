@@ -312,7 +312,7 @@ const AppContent: React.FC = () => {
   // Dedicated Monvera Bank Admin Control Center
   if (currentView === 'admin') {
     return (
-      <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-emerald-500 selection:text-white">
+      <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-emerald-500 selection:text-white w-full max-w-full overflow-x-clip">
         <AdminDashboard />
         {/* Global Modals */}
         <AuthModals />
@@ -328,7 +328,7 @@ const AppContent: React.FC = () => {
   // If user is on the public landing page ('home')
   if (currentView === 'home') {
     return (
-      <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans selection:bg-emerald-500 selection:text-white">
+      <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans selection:bg-emerald-500 selection:text-white w-full max-w-full overflow-x-clip">
         <PublicNavbar />
         <main className="flex-1">
           <HeroSection />

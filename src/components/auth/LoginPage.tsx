@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
+import { LanguageSelector } from '../common/LanguageSelector';
 import {
   Lock,
   User,
@@ -546,40 +547,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Language Selector Dropdown */}
-          <div className="relative">
-            <button
-              type="button"
-              id="login-lang-selector"
-              onClick={() => setIsLangOpen(!isLangOpen)}
-              className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-900/80 hover:bg-slate-850 text-slate-200 border border-slate-700/80 text-xs font-semibold backdrop-blur-md shadow-sm transition-colors cursor-pointer"
-            >
-              <Globe className="w-4 h-4 text-slate-400" />
-              <span>{selectedLang}</span>
-              <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
-            </button>
-
-            {isLangOpen && (
-              <div className="absolute right-0 mt-2 w-36 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl py-1.5 z-30 text-xs animate-in fade-in zoom-in-95 duration-150">
-                {languages.map((lang) => (
-                  <button
-                    key={lang}
-                    type="button"
-                    onClick={() => {
-                      setSelectedLang(lang);
-                      setIsLangOpen(false);
-                    }}
-                    className={`w-full text-left px-3.5 py-2 hover:bg-slate-800 text-slate-200 transition-colors flex items-center justify-between ${
-                      selectedLang === lang ? 'text-amber-400 font-bold bg-slate-800/60' : ''
-                    }`}
-                  >
-                    <span>{lang}</span>
-                    {selectedLang === lang && <span className="text-amber-400 text-xs">✓</span>}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+          {/* Automatic Multilingual Language Selector */}
+          <LanguageSelector variant="dark" />
 
           {/* Close button if shown as modal */}
           {isModal && onClose && (

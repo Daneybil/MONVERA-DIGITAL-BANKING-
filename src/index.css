@@ -9,11 +9,16 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    max-width: 100%;
+    overflow-x: clip;
   }
 
   body {
     font-weight: 600;
     color: #020617;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: clip;
   }
 
   p, span, label, input, button, select, textarea, div {
@@ -54,3 +59,47 @@
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
+
+/* --- MONVERA TRANSLATION & RTL STYLES --- */
+.goog-te-banner-frame.skiptranslate,
+.goog-te-banner-frame,
+#goog-gt-tt,
+.goog-te-balloon-frame {
+  display: none !important;
+  visibility: hidden !important;
+}
+
+body {
+  top: 0px !important;
+  position: static !important;
+}
+
+.goog-text-highlight {
+  background: none !important;
+  box-shadow: none !important;
+}
+
+#google_translate_element {
+  display: none !important;
+}
+
+/* RTL layout helpers */
+html[dir="rtl"] {
+  direction: rtl;
+  text-align: right;
+}
+
+html[dir="rtl"] .text-left {
+  text-align: right;
+}
+
+html[dir="rtl"] .text-right {
+  text-align: left;
+}
+
+/* Protect financial amounts, account numbers, and codes from machine translation */
+.notranslate,
+[translate="no"] {
+  -webkit-touch-callout: none;
+}
+

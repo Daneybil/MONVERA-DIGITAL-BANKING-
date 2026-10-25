@@ -807,23 +807,26 @@ export const AdminDashboard: React.FC = () => {
     <div id="monvera-admin-command-center" className="min-h-screen bg-slate-100/60 pb-16">
       
       {/* Top Professional Master Navigation Bar */}
-      <header className="sticky top-0 z-30 bg-slate-900 border-b border-slate-800 text-white shadow-lg">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-20 gap-4">
+      <header className="sticky top-0 z-30 bg-slate-900 border-b border-slate-800 text-white shadow-lg w-full max-w-full">
+        <div className="max-w-7xl mx-auto px-2.5 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between min-h-16 sm:h-20 py-2 sm:py-0 gap-2 sm:gap-4">
             
             {/* Brand / Admin Identity */}
-            <div className="flex items-center gap-3.5">
-              <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center text-slate-950 font-black shadow-md">
-                <Shield className="w-6 h-6" />
+            <div className="flex items-center gap-2 sm:gap-3.5 min-w-0">
+              <div className="w-8 h-8 sm:w-11 sm:h-11 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center text-slate-950 font-black shadow-md shrink-0">
+                <Shield className="w-4 h-4 sm:w-6 sm:h-6" />
               </div>
-              <div>
-                <div className="flex items-center gap-2.5">
-                  <h1 className="text-xl font-black text-white tracking-tight">MONVERA</h1>
-                  <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-amber-400/25 border border-amber-400/50 text-amber-300">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 sm:gap-2.5">
+                  <h1 className="text-base sm:text-xl font-black text-white tracking-tight">MONVERA</h1>
+                  <span className="hidden sm:inline-block px-2.5 py-0.5 rounded-full text-xs font-black bg-amber-400/25 border border-amber-400/50 text-amber-300">
                     BANKING CONTROL CENTER
                   </span>
+                  <span className="sm:hidden px-1.5 py-0.5 rounded-full text-[10px] font-black bg-amber-400/25 border border-amber-400/50 text-amber-300">
+                    ADMIN
+                  </span>
                 </div>
-                <div className="text-xs font-semibold text-slate-300 flex items-center gap-2 mt-0.5">
+                <div className="hidden md:flex text-xs font-semibold text-slate-300 items-center gap-2 mt-0.5">
                   <span className="w-2 h-2 rounded-full bg-emerald-400" />
                   <span>Administrative Clearance Level 4</span>
                 </div>
@@ -831,16 +834,16 @@ export const AdminDashboard: React.FC = () => {
             </div>
 
             {/* Quick System Tools */}
-            <div className="flex items-center gap-2.5 sm:gap-3.5">
+            <div className="flex items-center gap-1.5 sm:gap-3.5 shrink-0">
               {/* Send Money Button (Prominent, matching reference) */}
               <button
                 id="admin-header-send-money-btn"
                 onClick={() => openModal('send')}
-                className="inline-flex items-center gap-2 px-3.5 sm:px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-md hover:shadow-lg transition-all cursor-pointer border border-emerald-500/60 active:scale-95"
+                className="inline-flex items-center gap-1.5 px-2.5 sm:px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-md hover:shadow-lg transition-all cursor-pointer border border-emerald-500/60 active:scale-95"
                 title="Send Money to Customer Account"
               >
-                <Send className="w-4 h-4 text-white stroke-[2.5]" />
-                <span>Send Money</span>
+                <Send className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-white stroke-[2.5]" />
+                <span className="hidden xs:inline">Send Money</span>
               </button>
 
               {/* Back to Member Portal / Public Website Button */}
@@ -850,11 +853,12 @@ export const AdminDashboard: React.FC = () => {
                   setCurrentView(currentUser ? 'dashboard' : 'home');
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                 }}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 hover:text-amber-300 text-xs font-black border border-slate-700 transition-all cursor-pointer shadow-xs active:scale-95"
+                className="inline-flex items-center gap-1.5 px-2.5 sm:px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 hover:text-amber-300 text-xs font-black border border-slate-700 transition-all cursor-pointer shadow-xs active:scale-95"
                 title="Return to Member Dashboard"
               >
-                <ArrowLeft className="w-4 h-4 text-amber-400 stroke-[3]" />
-                <span className="font-extrabold">{currentUser ? 'Back to Dashboard' : 'Back to Home'}</span>
+                <ArrowLeft className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400 stroke-[3]" />
+                <span className="hidden sm:inline font-extrabold">{currentUser ? 'Back to Dashboard' : 'Back to Home'}</span>
+                <span className="sm:hidden font-extrabold">{currentUser ? 'Portal' : 'Home'}</span>
               </button>
 
               <div className="hidden md:flex items-center gap-2 text-xs text-slate-300 font-mono font-semibold">
@@ -865,14 +869,15 @@ export const AdminDashboard: React.FC = () => {
               <button
                 onClick={loadAllAdminData}
                 disabled={isLoading}
-                className="p-2 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer shadow-xs disabled:opacity-50"
+                className="p-2 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50"
+                title="Refresh Data"
               >
-                <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-amber-400' : ''}`} />
-                <span className="hidden sm:inline">Refresh</span>
+                <RefreshCw className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${isLoading ? 'animate-spin text-amber-400' : ''}`} />
+                <span className="hidden md:inline">Refresh</span>
               </button>
 
-              <div className="flex items-center gap-2.5 pl-2 sm:pl-3 border-l border-slate-800">
-                <div className="w-9 h-9 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-black text-amber-400">
+              <div className="flex items-center gap-2 pl-1.5 sm:pl-3 border-l border-slate-800">
+                <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-black text-amber-400">
                   {currentUser?.firstName?.[0] || 'B'}
                 </div>
                 <div className="hidden lg:block text-left">
@@ -884,7 +889,7 @@ export const AdminDashboard: React.FC = () => {
           </div>
 
           {/* Sub-Navigation Bar Tabs */}
-          <nav className="flex items-center gap-1.5 overflow-x-auto py-2.5 border-t border-slate-800/80 no-scrollbar">
+          <nav className="flex items-center gap-1.5 overflow-x-auto py-2.5 border-t border-slate-800/80 no-scrollbar touch-pan-x max-w-full">
             {navTabs.map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -946,30 +951,31 @@ export const AdminDashboard: React.FC = () => {
       </header>
 
       {/* Main Content Area */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 pb-12">
+      <main className="max-w-7xl mx-auto px-2.5 sm:px-6 lg:px-8 pt-4 sm:pt-6 pb-12 w-full max-w-full">
         {/* Navigation Breadcrumb Bar with Quick Back Action */}
-        <div className="mb-6 flex items-center justify-between pb-3 border-b border-slate-200">
-          <div className="flex items-center gap-2.5">
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-2.5 pb-3 border-b border-slate-200">
+          <div className="flex items-center gap-1.5 sm:gap-2.5 min-w-0 flex-wrap">
             <button
               onClick={() => {
                 setCurrentView(currentUser ? 'dashboard' : 'home');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
               }}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 text-xs font-black transition-colors cursor-pointer shadow-2xs"
+              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 text-xs font-black transition-colors cursor-pointer shadow-2xs shrink-0"
             >
               <ArrowLeft className="w-3.5 h-3.5 text-slate-600 stroke-[2.5]" />
-              <span>Back to User Banking Portal</span>
+              <span className="hidden sm:inline">Back to User Banking Portal</span>
+              <span className="sm:hidden">Back</span>
             </button>
             <span className="text-slate-300">/</span>
-            <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+            <span className="text-xs font-bold text-slate-500 uppercase tracking-wider truncate max-w-[140px] sm:max-w-none">
               {navTabs.find((t) => t.id === activeTab)?.label || 'Control Center'}
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={() => openModal('send')}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow-xs transition-colors cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow-xs transition-colors cursor-pointer"
             >
               <Send className="w-3.5 h-3.5" />
               <span>Send Money</span>

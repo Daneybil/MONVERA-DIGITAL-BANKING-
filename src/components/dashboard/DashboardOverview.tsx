@@ -202,7 +202,7 @@ export const DashboardOverview: React.FC = () => {
         <div className="flex items-center gap-3 bg-white px-5 py-3 rounded-2xl border-2 border-slate-300 shadow-md">
           <div className="text-left">
             <span className="text-xs text-slate-900 font-mono block uppercase font-black tracking-wider">Permanent Account</span>
-            <span className="text-base font-mono font-black text-slate-950">{currentUser.permanentAccountNumber}</span>
+            <span className="text-base font-mono font-black text-slate-950 notranslate" translate="no">{currentUser.permanentAccountNumber}</span>
           </div>
           <button
             onClick={handleCopyAccount}
@@ -270,7 +270,7 @@ export const DashboardOverview: React.FC = () => {
           </div>
 
           {/* Primary Large Balance Display */}
-          <div className="text-4xl sm:text-6xl lg:text-7xl font-black font-mono tracking-tight text-white select-none drop-shadow-md">
+          <div className="text-4xl sm:text-6xl lg:text-7xl font-black font-mono tracking-tight text-white select-none drop-shadow-md notranslate" translate="no">
             {hideBalances ? (
               '••••••••••••'
             ) : balanceMetrics.totalBalance > 0 ? (
@@ -551,7 +551,7 @@ export const DashboardOverview: React.FC = () => {
               </div>
               <div>
                 <h4 className="font-black text-slate-950 text-lg">Premier Checking Account</h4>
-                <div className="text-xs font-mono font-bold text-slate-700 mt-0.5">
+                <div className="text-xs font-mono font-bold text-slate-700 mt-0.5 notranslate" translate="no">
                   MVB •••• {currentUser.permanentAccountNumber.slice(-4)}
                 </div>
                 <p className="text-xs text-slate-800 font-medium mt-1">
@@ -562,7 +562,7 @@ export const DashboardOverview: React.FC = () => {
 
             <div className="pt-3 border-t-2 border-slate-200 space-y-1">
               <div className="text-xs text-slate-700 font-black uppercase tracking-wider font-mono">Available Checking Balance</div>
-              <div className="text-2xl sm:text-3xl font-black font-mono text-slate-950">
+              <div className="text-2xl sm:text-3xl font-black font-mono text-slate-950 notranslate" translate="no">
                 {hideBalances ? '••••••' : `$${balanceMetrics.checkingBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </div>
             </div>

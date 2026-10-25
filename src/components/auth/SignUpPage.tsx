@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { CountrySelector } from '../common/CountrySelector';
 import { CountryOption, findCountry } from '../../data/countries';
+import { LanguageSelector } from '../common/LanguageSelector';
 import {
   User,
   Mail,
@@ -430,8 +431,9 @@ export const SignUpPage: React.FC<SignUpPageProps> = ({
           <MonveraLogo variant="full" size="md" isLight={false} />
         </div>
 
-        {/* Close modal button if active */}
+        {/* Language Selector & Close modal button */}
         <div className="flex items-center gap-3">
+          <LanguageSelector variant="light" />
           {isModal && onClose && (
             <button
               onClick={onClose}
