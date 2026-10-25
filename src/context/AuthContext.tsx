@@ -62,9 +62,15 @@ interface AuthContextType {
   login: (identifier: string, password?: string) => Promise<{
     success: boolean;
     error?: string;
+    errorCode?: string;
     mfaRequired?: boolean;
     resolver?: MultiFactorResolver;
     hint?: MultiFactorInfo;
+  }>;
+  adminLogin: (email: string, password: string) => Promise<{
+    success: boolean;
+    errorCode?: string;
+    error?: string;
   }>;
   resolveTotpLogin: (
     resolver: MultiFactorResolver,
@@ -964,6 +970,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   ): Promise<{
     success: boolean;
     error?: string;
+    errorCode?: string;
     mfaRequired?: boolean;
     resolver?: MultiFactorResolver;
     hint?: MultiFactorInfo;
@@ -1060,6 +1067,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (!adminAuthRes.success || !adminAuthRes.customToken) {
             return {
               success: false,
+              errorCode: adminAuthRes.errorCode || 'INVALID_CREDENTIALS',
               error: adminAuthRes.error || 'Invalid administrator email or password. Access denied.',
             };
           }
@@ -1072,12 +1080,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setCurrentViewState('admin');
           }
           return { success: true };
+        } else if (checkIsAdminPath()) {
+          // If on admin path and backend reported email is not an admin
+          return {
+            success: false,
+            errorCode: adminAuthRes.errorCode || 'EMAIL_NOT_ADMIN',
+            error: adminAuthRes.error || 'This email address is not recognized as an authorized administrator.',
+          };
         }
       } catch (adminErr: any) {
         console.warn('[Auth] Administrator authentication check notice:', adminErr);
         if (checkIsAdminPath()) {
           return {
             success: false,
+            errorCode: 'AUTH_FAILED',
             error: adminErr?.message || 'Administrator authentication failed. Access denied.',
           };
         }
@@ -1087,6 +1103,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // If an administrator login was attempted, NEVER fall through to standard customer login
         return {
           success: false,
+          errorCode: 'ADMIN_AUTH_FAILED',
           error: 'Administrator authentication failed. Access denied.',
         };
       }
@@ -1095,6 +1112,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (checkIsAdminPath()) {
         return {
           success: false,
+          errorCode: 'EMAIL_NOT_ADMIN',
           error: 'This portal requires authorized administrator credentials. Access denied.',
         };
       }
@@ -1118,6 +1136,86 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       const friendlyMsg = getFirebaseErrorMessage(err);
       return { success: false, error: friendlyMsg };
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  /**
+   * Dedicated Administrator Login via Railway Backend and Firebase Custom Token exchange
+   */
+  const adminLogin = async (
+    email: string,
+    password: string
+  ): Promise<{ success: boolean; errorCode?: string; error?: string }> => {
+    setIsLoading(true);
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      const cleanPassword = password || '';
+
+      if (!cleanEmail) {
+        return {
+          success: false,
+          errorCode: 'INVALID_INPUT',
+          error: 'Please enter your administrator email address.',
+        };
+      }
+      if (!cleanEmail.includes('@')) {
+        return {
+          success: false,
+          errorCode: 'INVALID_INPUT',
+          error: 'Please enter a valid email address (e.g. admin@monvera.com).',
+        };
+      }
+      if (!cleanPassword) {
+        return {
+          success: false,
+          errorCode: 'INVALID_INPUT',
+          error: 'Please enter your administrator password.',
+        };
+      }
+
+      // 1. Verify credentials against Railway environment variables on Node.js backend
+      console.log(`[Auth] Verifying administrator credentials for ${cleanEmail} with backend...`);
+      const res = await api.adminLogin(cleanEmail, cleanPassword);
+
+      if (!res.success || !res.customToken) {
+        const defaultMsg = res.isAdminAttempt
+          ? 'Invalid administrator email or password.'
+          : 'Email address is not recognized as an authorized administrator in server configuration.';
+        return {
+          success: false,
+          errorCode: res.errorCode || (res.isAdminAttempt ? 'INVALID_CREDENTIALS' : 'EMAIL_NOT_ADMIN'),
+          error: res.error || defaultMsg,
+        };
+      }
+
+      // 2. Exchange cryptographically minted Firebase Custom Token
+      console.log(`[Auth] Exchanging Firebase Custom Token for administrator session...`);
+      let userCredential;
+      try {
+        userCredential = await signInWithCustomToken(auth, res.customToken);
+      } catch (fbErr: any) {
+        console.error('[Admin Auth] Firebase Custom Token exchange error:', fbErr);
+        return {
+          success: false,
+          errorCode: 'TOKEN_AUTH_FAILED',
+          error: 'Cryptographic session exchange failed: Firebase was unable to accept the administrator session token.',
+        };
+      }
+
+      // 3. Hydrate administrator session and transition view
+      await hydrateUserSession(userCredential.user, cleanPassword, cleanEmail);
+      setCurrentViewState('admin');
+      setActiveModal(null);
+      return { success: true };
+    } catch (err: any) {
+      console.error('[Admin Auth] Unexpected administrator login error:', err);
+      return {
+        success: false,
+        errorCode: 'UNEXPECTED',
+        error: err?.message || 'An unexpected error occurred during administrator authentication.',
+      };
     } finally {
       setIsLoading(false);
     }
@@ -1745,6 +1843,7 @@ const unenrollTotpMfa = async (): Promise<{
         notifications,
         unreadNotifsCount,
         login,
+        adminLogin,
         resolveTotpLogin,
         reauthenticateUser,
         getEnrolledTotpFactor,

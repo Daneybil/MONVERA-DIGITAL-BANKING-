@@ -2344,16 +2344,23 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
     const isAdminEmail = configuredEmails.length > 0 && configuredEmails.includes(cleanEmail);
 
     if (!isAdminEmail) {
-      // Not an administrator email - tell client it's not an admin attempt so it falls back to standard customer login
-      return res.json({ success: false, isAdminAttempt: false });
+      // Not an administrator email - notify client with distinct error code
+      console.warn(`[POST /api/admin/login] Authentication attempt with unconfigured email: ${cleanEmail}`);
+      return res.status(403).json({
+        success: false,
+        isAdminAttempt: false,
+        errorCode: 'EMAIL_NOT_ADMIN',
+        error: 'Email address is not recognized as an authorized administrator in server configuration.',
+      });
     }
 
     // It IS an administrator email. Verify password against ADMIN_PASSWORD from Railway environment variables.
     if (!configuredPassword) {
       console.warn('[POST /api/admin/login] ADMIN_PASSWORD is not configured in server environment variables.');
-      return res.status(401).json({
+      return res.status(503).json({
         success: false,
         isAdminAttempt: true,
+        errorCode: 'CONFIG_UNAVAILABLE',
         error: 'ADMIN_NOT_CONFIGURED: Administrator password is not configured on the server.',
       });
     }
@@ -2370,16 +2377,19 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
       return res.status(401).json({
         success: false,
         isAdminAttempt: true,
+        errorCode: 'INVALID_CREDENTIALS',
         error: 'INVALID_CREDENTIALS: Invalid administrator email or password.',
       });
     }
 
     // Administrator credentials verified successfully!
     if (!isFirebaseAdminConfigured()) {
+      console.warn('[POST /api/admin/login] Firebase Admin SDK is not configured in this environment.');
       return res.status(503).json({
         success: false,
         isAdminAttempt: true,
-        error: 'SERVICE_UNAVAILABLE: Firebase Admin is not configured on the server.',
+        errorCode: 'CONFIG_UNAVAILABLE',
+        error: 'SERVICE_UNAVAILABLE: Firebase Admin service account is not configured on the server.',
       });
     }
 
@@ -2417,6 +2427,7 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
       return res.status(500).json({
         success: false,
         isAdminAttempt: true,
+        errorCode: 'SERVER_ERROR',
         error: 'SERVER_ERROR: Failed to issue administrator session credentials.',
       });
     }
@@ -2450,9 +2461,11 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
       },
     });
   } catch (err: any) {
-    console.error('[POST /api/admin/login] Unexpected error:', err);
+    console.error('[POST /api/admin/login] Unexpected error:', err?.message || err);
     return res.status(500).json({
       success: false,
+      isAdminAttempt: true,
+      errorCode: 'SERVER_ERROR',
       error: 'SERVER_ERROR: An unexpected error occurred during administrator authentication.',
     });
   }

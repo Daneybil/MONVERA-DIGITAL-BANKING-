@@ -1492,6 +1492,7 @@ export const api = {
     isAdminAttempt?: boolean;
     customToken?: string;
     adminSessionToken?: string;
+    errorCode?: string;
     error?: string;
   }> {
     try {
@@ -1512,11 +1513,17 @@ export const api = {
         isAdminAttempt: data.isAdminAttempt !== undefined ? !!data.isAdminAttempt : (res.status === 401 || !!data.success),
         customToken: data.customToken,
         adminSessionToken: data.adminSessionToken,
+        errorCode: data.errorCode || (res.status === 401 ? 'INVALID_CREDENTIALS' : res.status === 403 ? 'EMAIL_NOT_ADMIN' : res.status === 503 ? 'CONFIG_UNAVAILABLE' : res.status >= 500 ? 'SERVER_ERROR' : undefined),
         error: data.error,
       };
     } catch (err: any) {
       console.warn('[api.adminLogin] Network or server error:', err);
-      return { success: false, error: 'Failed to communicate with authentication service.' };
+      return {
+        success: false,
+        isAdminAttempt: true,
+        errorCode: 'NETWORK_FAILURE',
+        error: 'Failed to communicate with authentication service. Please verify server connectivity.',
+      };
     }
   },
 

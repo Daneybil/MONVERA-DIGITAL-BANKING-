@@ -57,6 +57,7 @@ import { AdminAuditLogView } from './AdminAuditLogView';
 import { AdminLoansView } from './AdminLoansView';
 import { AdminWebhooksView } from './AdminWebhooksView';
 import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
+import { AdminLoginForm } from './AdminLoginForm';
 
 export const AdminDashboard: React.FC = () => {
   const { currentUser, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal, updateUser } = useAuth();
@@ -775,31 +776,10 @@ export const AdminDashboard: React.FC = () => {
 
   if (!isAdmin) {
     return (
-      <div id="monvera-admin-command-center" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
-        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-6">
-          <div className="w-16 h-16 rounded-2xl bg-amber-400/10 border border-amber-400/30 text-amber-400 flex items-center justify-center mx-auto">
-            <Shield className="w-8 h-8" />
-          </div>
-          <div>
-            <h2 className="text-xl font-black text-white">Administrator Access Required</h2>
-            <p className="text-xs text-slate-400 mt-2">
-              The Monvera Core Banking Console (/MonveraMV) requires an authenticated Firebase administrator session. Please sign in with your authorized administrator credentials.
-            </p>
-          </div>
-          <button
-            onClick={() => openModal('auth_login')}
-            className="w-full py-3 px-4 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-sm transition-all shadow-lg cursor-pointer"
-          >
-            Authenticate Administrator
-          </button>
-          <button
-            onClick={() => setCurrentView('home')}
-            className="text-xs text-slate-500 hover:text-slate-400 transition-colors cursor-pointer"
-          >
-            Return to Public Home
-          </button>
-        </div>
-      </div>
+      <AdminLoginForm
+        onCancel={() => setCurrentView('home')}
+        onSuccess={() => loadAllAdminData()}
+      />
     );
   }
 
