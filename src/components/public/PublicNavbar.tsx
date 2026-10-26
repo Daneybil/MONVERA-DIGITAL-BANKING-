@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { useAuth } from '../../context/AuthContext';
-import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, Lock, LayoutDashboard } from 'lucide-react';
+import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, Lock, LayoutDashboard, Globe } from 'lucide-react';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { LanguageSelector } from '../common/LanguageSelector';
 
@@ -50,6 +50,30 @@ export const PublicNavbar: React.FC = () => {
 
   return (
     <header id="monvera-public-navbar" className="sticky top-0 z-50 bg-[#FAF7F2]/95 backdrop-blur-md border-b border-amber-900/10 shadow-2xs">
+      {/* 1. Language Selector & Google Translation Bar - At the VERY TOP */}
+      <div
+        id="monvera-translator-bar"
+        className="bg-[#FAF7F2] border-b border-amber-900/10 py-1.5 px-2.5 sm:px-6 lg:px-8 w-full notranslate relative z-30 shadow-2xs"
+        translate="no"
+      >
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2 text-slate-700 min-w-0">
+            <div className="w-5 h-5 rounded-md bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-800 shrink-0">
+              <Globe className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+            </div>
+            <span className="text-[11px] sm:text-xs font-mono font-bold uppercase tracking-wider text-slate-700 truncate">
+              <span className="hidden sm:inline">Website Language / Dil Seçimi:</span>
+              <span className="sm:hidden">Language:</span>
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            <LanguageSelector variant="header" showLabel={true} />
+          </div>
+        </div>
+      </div>
+
+      {/* 2. Main Navigation Bar - Pushed Down Below the Language Selector */}
       <div className="max-w-7xl mx-auto px-2.5 sm:px-6 lg:px-8 h-16 sm:h-20 flex items-center justify-between gap-1.5 sm:gap-3">
         {/* Monvera Brand */}
         <div
@@ -83,14 +107,6 @@ export const PublicNavbar: React.FC = () => {
 
         {/* Right CTA Actions & Menu Trigger (Both Mobile and Desktop) */}
         <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
-          {/* Automatic Multilingual Language Selector */}
-          <div className="hidden sm:block">
-            <LanguageSelector variant="header" showLabel={true} />
-          </div>
-          <div className="sm:hidden">
-            <LanguageSelector variant="header" showLabel={false} />
-          </div>
-
           {currentUser ? (
             <button
               id="navbar-dashboard-btn"

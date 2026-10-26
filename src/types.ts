@@ -96,6 +96,7 @@ export type TransactionType =
   | 'INVESTMENT_MATURITY'
   | 'CARD_PURCHASE'
   | 'ADMIN_DEVELOPMENT_FUNDING'
+  | 'WELCOME_REWARD'
   | 'REVERSAL'
   | 'FEE';
 
@@ -119,11 +120,32 @@ export interface Transaction {
   recipientAccountNumber?: string;
   fee: number;
   description: string;
-  category: 'Transfers' | 'Deposits' | 'Withdrawals' | 'Investments' | 'Shopping' | 'Earnings' | 'System' | 'Bills';
+  category: 'Transfers' | 'Deposits' | 'Withdrawals' | 'Investments' | 'Shopping' | 'Earnings' | 'System' | 'Bills' | 'Rewards';
   paymentProviderRef?: string;
   createdAt: string;
   completedAt?: string;
   metadata?: Record<string, any>;
+}
+
+export type WelcomeRewardStatus = 'IN_PROGRESS' | 'QUALIFIED' | 'PAID';
+
+export interface WelcomeRewardInfo {
+  userId: string;
+  rewardAmount: number; // $1,000.00
+  targetAmount: number; // $10,000.00
+  qualifyingDeposits: number;
+  progressPercentage: number;
+  remainingAmount: number;
+  status: WelcomeRewardStatus;
+  qualifyingDepositCount: number;
+  paidAt?: string;
+  transactionReference?: string;
+  transactionId?: string;
+  customerName?: string;
+  permanentAccountNumber?: string;
+  registrationDate?: string;
+  updatedAt?: string;
+  failureReason?: string;
 }
 
 export interface LedgerEntry {

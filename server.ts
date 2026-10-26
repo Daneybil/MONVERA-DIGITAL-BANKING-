@@ -25,6 +25,7 @@ import {
   checkUserHasOutstandingLoan,
   resolveRecipientUser,
 } from './server/firestoreTransactions';
+import { evaluateAndProcessWelcomeReward, getAllWelcomeRewardsAdmin } from './server/welcomeRewardService';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -1593,6 +1594,42 @@ const handleStripeSessionConfirmation = async (req: AuthenticatedRequest, res: R
 
 app.get('/api/stripe/confirm-session', optionalFirebaseAuth, handleStripeSessionConfirmation);
 app.post('/api/stripe/confirm-session', optionalFirebaseAuth, handleStripeSessionConfirmation);
+
+// --- $1,000 NEW USER WELCOME REWARD ENDPOINTS ---
+// Customer endpoint: retrieves customer's authoritative reward status and cumulative verified deposits
+app.get('/api/rewards/welcome/:userId', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { userId } = req.params;
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID is required.' });
+  }
+
+  // Authorization check: only account owner or verified admin can query user's reward details
+  if (callerUid && callerUid !== userId && !isCallerAdmin) {
+    return res.status(403).json({ error: 'FORBIDDEN: You can only view reward status for your own account.' });
+  }
+
+  try {
+    const rewardInfo = await evaluateAndProcessWelcomeReward(userId);
+    return res.json({ success: true, reward: rewardInfo });
+  } catch (err: any) {
+    console.error(`[GET /api/rewards/welcome/${userId}] Error:`, err);
+    return res.status(500).json({ error: err?.message || 'Failed to evaluate Welcome Reward.' });
+  }
+});
+
+// Administrator endpoint: retrieves all customer welcome reward records and aggregate stats
+app.get('/api/admin/rewards/welcome', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const data = await getAllWelcomeRewardsAdmin();
+    return res.json({ success: true, rewards: data.rewards, stats: data.stats });
+  } catch (err: any) {
+    console.error('[GET /api/admin/rewards/welcome] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to retrieve administrative reward records.' });
+  }
+});
 
 // --- WITHDRAWALS ---
 app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {

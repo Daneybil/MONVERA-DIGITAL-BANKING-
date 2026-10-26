@@ -30,6 +30,7 @@ import {
   Lock,
   CheckCircle2,
   Banknote,
+  Globe,
 } from 'lucide-react';
 
 interface DashboardLayoutProps {
@@ -307,71 +308,83 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
       <div className="flex-1 flex flex-col min-w-0">
         
         {/* Top Header Bar */}
-        <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/90 h-16 sm:h-20 px-2.5 sm:px-8 flex items-center justify-between gap-1.5 sm:gap-3 shadow-2xs w-full max-w-full">
-          
-          {/* Left Title / Greeting & Menu Toggle */}
-          <div className="flex items-center gap-1.5 sm:gap-3 min-w-0">
-            
-            {/* The 3 Horizontal Lines Menu Toggle Button (Sleek Rectangular Smart Trigger) */}
-            <button
-              id="dashboard-header-menu-btn"
-              onClick={() => setMobileMenuOpen(true)}
-              className="px-2.5 sm:px-3.5 py-2 sm:py-2.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white shadow-sm border border-slate-800 transition-all active:scale-95 flex items-center gap-1.5 sm:gap-2 cursor-pointer group shrink-0"
-              title="Open Navigation Menu"
-              aria-label="Open Monvera Navigation Menu"
-            >
-              <Menu className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
-              <span className="text-xs font-black tracking-wide text-slate-100 hidden sm:inline">
-                Menu Hub
-              </span>
-            </button>
-
-            {/* Prominent Back Button on Dashboard */}
-            <button
-              id="dashboard-back-to-home-btn"
-              onClick={() => {
-                setCurrentView('home');
-                window.scrollTo({ top: 0, behavior: 'smooth' });
-              }}
-              className="inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 hover:text-slate-950 text-xs font-extrabold border border-slate-300 transition-colors cursor-pointer shrink-0"
-              title="Return to Monvera Home"
-            >
-              <ArrowLeft className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600" />
-              <span className="hidden sm:inline">Back to Home</span>
-              <span className="sm:hidden">Home</span>
-            </button>
-
-            <div className="hidden md:block pl-2 border-l border-slate-200">
-              <h1 className="text-base font-bold text-slate-900 capitalize leading-tight">
-                {currentView === 'dashboard' ? 'Banking Dashboard' : currentView.replace('-', ' ')}
-              </h1>
-              <div className="text-[11px] text-slate-500 font-mono">
-                Permanent Account: <strong className="text-slate-800 notranslate" translate="no">{currentUser.permanentAccountNumber}</strong>
+        <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/90 shadow-2xs w-full max-w-full">
+          {/* 1. Language Selector & Google Translation Bar - At the VERY TOP */}
+          <div
+            id="dashboard-translator-bar"
+            className="bg-slate-50 border-b border-slate-200 py-1.5 px-2.5 sm:px-8 w-full notranslate relative z-30 shadow-2xs"
+            translate="no"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 sm:gap-2 text-slate-700 min-w-0">
+                <Globe className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                <span className="text-[11px] sm:text-xs font-mono font-bold uppercase tracking-wider text-slate-700 truncate">
+                  <span className="hidden sm:inline">Website Language / Dil Seçimi:</span>
+                  <span className="sm:hidden">Language:</span>
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <LanguageSelector variant="header" showLabel={true} />
               </div>
             </div>
           </div>
 
-          {/* Right Header Controls */}
-          <div className="flex items-center gap-1.5 sm:gap-3.5 shrink-0">
-            
-            {/* Automatic Multilingual Language Selector */}
-            <div className="hidden sm:block">
-              <LanguageSelector variant="header" showLabel={true} />
-            </div>
-            <div className="sm:hidden">
-              <LanguageSelector variant="header" showLabel={false} />
+          {/* 2. Main Dashboard Navigation Row - Pushed Down Below Language Bar */}
+          <div className="h-16 sm:h-20 px-2.5 sm:px-8 flex items-center justify-between gap-1.5 sm:gap-3 w-full">
+            {/* Left Title / Greeting & Menu Toggle */}
+            <div className="flex items-center gap-1.5 sm:gap-3 min-w-0">
+              
+              {/* The 3 Horizontal Lines Menu Toggle Button (Sleek Rectangular Smart Trigger) */}
+              <button
+                id="dashboard-header-menu-btn"
+                onClick={() => setMobileMenuOpen(true)}
+                className="px-2.5 sm:px-3.5 py-2 sm:py-2.5 rounded-xl bg-slate-950 hover:bg-slate-900 text-white shadow-sm border border-slate-800 transition-all active:scale-95 flex items-center gap-1.5 sm:gap-2 cursor-pointer group shrink-0"
+                title="Open Navigation Menu"
+                aria-label="Open Monvera Navigation Menu"
+              >
+                <Menu className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
+                <span className="text-xs font-black tracking-wide text-slate-100 hidden sm:inline">
+                  Menu Hub
+                </span>
+              </button>
+
+              {/* Prominent Back Button on Dashboard */}
+              <button
+                id="dashboard-back-to-home-btn"
+                onClick={() => {
+                  setCurrentView('home');
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+                className="inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 hover:text-slate-950 text-xs font-extrabold border border-slate-300 transition-colors cursor-pointer shrink-0"
+                title="Return to Monvera Home"
+              >
+                <ArrowLeft className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600" />
+                <span className="hidden sm:inline">Back to Home</span>
+                <span className="sm:hidden">Home</span>
+              </button>
+
+              <div className="hidden md:block pl-2 border-l border-slate-200">
+                <h1 className="text-base font-bold text-slate-900 capitalize leading-tight">
+                  {currentView === 'dashboard' ? 'Banking Dashboard' : currentView.replace('-', ' ')}
+                </h1>
+                <div className="text-[11px] text-slate-500 font-mono">
+                  Permanent Account: <strong className="text-slate-800 notranslate" translate="no">{currentUser.permanentAccountNumber}</strong>
+                </div>
+              </div>
             </div>
 
-            {/* Return to Public Website Switcher */}
-            <button
-              id="header-view-website-btn"
-              onClick={() => setCurrentView('home')}
-              className="hidden md:inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-bold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200/80 rounded-xl border border-slate-250 transition-colors cursor-pointer"
-              title="View Public Homepage"
-            >
-              <Home className="w-4 h-4 text-slate-500" />
-              <span>Public Website</span>
-            </button>
+            {/* Right Header Controls */}
+            <div className="flex items-center gap-1.5 sm:gap-3.5 shrink-0">
+              {/* Return to Public Website Switcher */}
+              <button
+                id="header-view-website-btn"
+                onClick={() => setCurrentView('home')}
+                className="hidden md:inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-bold text-slate-700 hover:text-slate-950 bg-slate-100 hover:bg-slate-200/80 rounded-xl border border-slate-250 transition-colors cursor-pointer"
+                title="View Public Homepage"
+              >
+                <Home className="w-4 h-4 text-slate-500" />
+                <span>Public Website</span>
+              </button>
 
             {/* User Profile & Account Menu Popover */}
             <div className="relative">
@@ -494,7 +507,8 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
               <span>Send Money</span>
             </button>
           </div>
-        </header>
+        </div>
+      </header>
 
         {/* --- PROFESSIONAL, PORTABLE RECTANGULAR NAVIGATION MENU (FLOATING SMART MODAL, DOES NOT COVER FULL SCREEN) --- */}
         {mobileMenuOpen && (

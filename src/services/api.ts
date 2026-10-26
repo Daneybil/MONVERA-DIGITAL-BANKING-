@@ -14,6 +14,7 @@ import {
   AdminSystemOverview,
   InvestmentTermDays,
   KycStatus,
+  WelcomeRewardInfo,
 } from '../types';
 import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
@@ -2538,6 +2539,61 @@ export const api = {
       return {
         success: false,
         error: err?.message || 'Network error communicating with repayment service.',
+      };
+    }
+  },
+
+  /**
+   * Retrieves the customer's authoritative Welcome Reward status and cumulative progress
+   */
+  async getWelcomeReward(userId: string): Promise<{
+    success: boolean;
+    reward?: WelcomeRewardInfo;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/rewards/welcome/${encodeURIComponent(userId)}`), {
+        headers,
+      });
+      const data = await parseJsonResponse<{ success: boolean; reward?: WelcomeRewardInfo; error?: string }>(res, {
+        success: false,
+        error: 'Failed to retrieve welcome reward',
+      });
+      return data;
+    } catch (err: any) {
+      console.error('[getWelcomeReward] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error retrieving welcome reward status.',
+      };
+    }
+  },
+
+  /**
+   * Retrieves all customer Welcome Reward records for the administrator dashboard
+   */
+  async getAdminWelcomeRewards(): Promise<{
+    success: boolean;
+    rewards?: WelcomeRewardInfo[];
+    stats?: any;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint('/api/admin/rewards/welcome'), {
+        headers,
+      });
+      const data = await parseJsonResponse<{ success: boolean; rewards?: WelcomeRewardInfo[]; stats?: any; error?: string }>(res, {
+        success: false,
+        error: 'Failed to retrieve administrative welcome rewards',
+      });
+      return data;
+    } catch (err: any) {
+      console.error('[getAdminWelcomeRewards] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error retrieving admin welcome rewards.',
       };
     }
   },

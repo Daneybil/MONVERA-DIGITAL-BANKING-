@@ -33,6 +33,7 @@ import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { firestoreSync } from '../../services/firestoreSync';
+import { WelcomeRewardCard } from './WelcomeRewardCard';
 
 export const DashboardOverview: React.FC = () => {
   const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance, lastUpdateTimestamp } = useAuth();
@@ -337,6 +338,9 @@ export const DashboardOverview: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* --- $1,000 NEW USER WELCOME REWARD TRACKER --- */}
+      <WelcomeRewardCard onOpenDeposit={() => handleProtectedAction(() => openModal('deposit'))} />
 
       {/* --- MAIN DASHBOARD ACTIONS (LARGE, SMART & PROFESSIONAL BUTTONS) --- */}
       <div className="space-y-4">

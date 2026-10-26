@@ -42,6 +42,7 @@ import {
   Send,
   Banknote,
   Webhook,
+  Gift,
 } from 'lucide-react';
 import { AdminOverviewView } from './AdminOverviewView';
 import { AdminCustomersView } from './AdminCustomersView';
@@ -49,6 +50,7 @@ import { AdminKycView } from './AdminKycView';
 import { AdminSupportView } from './AdminSupportView';
 import { AdminTransactionsView } from './AdminTransactionsView';
 import { AdminDepositsView } from './AdminDepositsView';
+import { AdminRewardsView } from './AdminRewardsView';
 import { AdminWithdrawalsView } from './AdminWithdrawalsView';
 import { AdminTransfersView } from './AdminTransfersView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
@@ -735,6 +737,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'support', label: 'Support & Live Chat', icon: MessageSquare, alertBadge: pendingLiveChatsCount > 0 ? pendingLiveChatsCount : (openTicketsCount > 0 ? openTicketsCount : undefined) },
     { id: 'transactions', label: 'Transactions', icon: RefreshCw, alertBadge: pendingTxCount },
     { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
+    { id: 'rewards', label: 'Welcome Rewards', icon: Gift },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
@@ -1016,6 +1019,10 @@ export const AdminDashboard: React.FC = () => {
             transactions={transactions}
             onRefreshData={loadAllAdminData}
           />
+        )}
+
+        {activeTab === 'rewards' && (
+          <AdminRewardsView />
         )}
 
         {activeTab === 'withdrawals' && (

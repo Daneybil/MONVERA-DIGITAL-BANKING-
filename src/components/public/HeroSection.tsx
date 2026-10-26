@@ -3,7 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import officeHeroImage from '../../assets/images/monvera_office_hero_1787152640128.jpg';
 import dualCardsLamborghiniImage from '../../assets/images/monvera_cards_lambo_wide_1787576194809.jpg';
-import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, CheckCircle2, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star, Lock } from 'lucide-react';
+import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, ShieldCheck, CheckCircle2, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star, Lock, Gift } from 'lucide-react';
 
 export const HeroSection: React.FC = () => {
   const { currentUser, setCurrentView, openModal } = useAuth();
@@ -66,6 +66,45 @@ export const HeroSection: React.FC = () => {
         <p className="text-lg sm:text-xl md:text-2xl text-slate-950 font-semibold max-w-3xl mx-auto leading-relaxed">
           Send money instantly, earn guaranteed returns on your savings, and spend anywhere with premium cards and zero hidden fees. Everything you need for personal and business finances in one easy dashboard.
         </p>
+
+        {/* Promotional Banner: Monvera $1,000 New User Welcome Reward */}
+        <div
+          id="monvera-welcome-reward-promo"
+          className="max-w-4xl mx-auto rounded-3xl p-5 sm:p-7 bg-gradient-to-r from-slate-950 via-slate-900 to-slate-950 text-white border-2 border-amber-400/50 shadow-2xl relative overflow-hidden text-center transition-all hover:border-amber-400"
+        >
+          {/* Subtle Ambient Radial Glow */}
+          <div className="absolute -top-12 -right-12 w-48 h-48 bg-amber-400/15 rounded-full blur-2xl pointer-events-none" />
+          <div className="absolute -bottom-12 -left-12 w-48 h-48 bg-emerald-500/15 rounded-full blur-2xl pointer-events-none" />
+
+          <div className="relative z-10 flex flex-col items-center gap-3">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-400/20 border border-amber-400/40 text-amber-300 font-mono text-xs font-black uppercase tracking-wider shadow-inner">
+              <Gift className="w-4 h-4 text-amber-300 animate-bounce" />
+              <span>YOUR MONVERA WELCOME REWARD</span>
+            </div>
+
+            <h2 className="text-xl sm:text-2xl md:text-3xl font-black text-white tracking-tight leading-snug">
+              Complete <span className="text-amber-300 underline decoration-amber-400/60">$10,000</span> in qualifying deposits and receive a <span className="text-emerald-400">FREE $1,000</span> reward!
+            </h2>
+
+            <p className="text-xs sm:text-sm text-slate-300 font-medium max-w-2xl leading-relaxed">
+              This one-time welcome reward is available for eligible new users. When your verified cumulative deposits reach $10,000, your $1,000 bonus is automatically credited directly to your Monvera account.
+            </p>
+
+            <div className="pt-1 flex flex-wrap items-center justify-center gap-3 sm:gap-4 text-xs font-mono text-slate-300">
+              <span className="flex items-center gap-1.5 text-emerald-400 font-bold">
+                <CheckCircle2 className="w-3.5 h-3.5" /> Automatic Ledger Credit
+              </span>
+              <span className="text-slate-600">•</span>
+              <span className="flex items-center gap-1.5 text-amber-300 font-bold">
+                <Sparkles className="w-3.5 h-3.5" /> 100% Free & Authoritative
+              </span>
+              <span className="text-slate-600">•</span>
+              <span className="flex items-center gap-1.5 text-cyan-300 font-bold">
+                <ShieldCheck className="w-3.5 h-3.5" /> FDIC Insured Partner Security
+              </span>
+            </div>
+          </div>
+        </div>
 
         {/* Stretched Bold Rectangular Monvera Executive Office Image */}
         <div className="w-full max-w-5xl mx-auto rounded-2xl sm:rounded-3xl overflow-hidden shadow-2xl border-2 border-slate-800/40 bg-slate-950 relative group transition-all duration-300 hover:shadow-slate-950/30">

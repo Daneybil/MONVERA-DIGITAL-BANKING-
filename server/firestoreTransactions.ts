@@ -11,6 +11,7 @@ import {
   CardItem,
   UserProfile,
 } from '../src/types';
+import { evaluateAndProcessWelcomeReward } from './welcomeRewardService';
 
 export interface TransferParams {
   senderUid: string;
@@ -1544,6 +1545,13 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
         createdAt: new Date().toISOString(),
         referenceId: finalTx.referenceNumber,
       }).catch((e) => console.warn('[executeServerDeposit] Notification write note:', e?.message || e));
+
+      // Authoritatively evaluate Welcome Reward threshold ($10,000 deposits -> $1,000 reward)
+      if (!isDuplicate) {
+        evaluateAndProcessWelcomeReward(userId).catch((e) =>
+          console.warn('[executeServerDeposit] Welcome reward evaluation note:', e?.message || e)
+        );
+      }
 
       return {
         success: true,
