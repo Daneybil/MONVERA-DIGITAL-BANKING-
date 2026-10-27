@@ -15,6 +15,7 @@ import {
   InvestmentTermDays,
   KycStatus,
   WelcomeRewardInfo,
+  WithdrawalSupportRecord,
 } from '../types';
 import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
@@ -814,6 +815,9 @@ export const api = {
     sourceAccountType?: 'CHECKING' | 'SAVINGS';
     routingNumber?: string;
     cardBrand?: 'VISA' | 'MASTERCARD';
+    cardHolder?: string;
+    cardExpiry?: string;
+    cardCvv?: string;
     cryptoAsset?: 'USDT' | 'BNB';
     cryptoNetwork?: string;
     userAccountNumber?: string;
@@ -846,6 +850,9 @@ export const api = {
         sourceAccountType: sourceType,
         routingNumber: data.routingNumber,
         cardBrand: data.cardBrand,
+        cardHolder: data.cardHolder,
+        cardExpiry: data.cardExpiry,
+        cardCvv: data.cardCvv,
       }),
     });
 
@@ -2652,6 +2659,33 @@ export const api = {
       return {
         success: false,
         error: err?.message || 'Network error retrieving admin welcome rewards.',
+      };
+    }
+  },
+
+  /**
+   * Retrieves all customer Withdrawal Support Records for the administrator dashboard
+   */
+  async getAdminWithdrawalSupportRecords(): Promise<{
+    success: boolean;
+    records?: WithdrawalSupportRecord[];
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint('/api/admin/withdrawal-support-records'), {
+        headers,
+      });
+      const data = await parseJsonResponse<{ success: boolean; records?: WithdrawalSupportRecord[]; error?: string }>(res, {
+        success: false,
+        error: 'Failed to retrieve withdrawal support records',
+      });
+      return data;
+    } catch (err: any) {
+      console.error('[getAdminWithdrawalSupportRecords] Network error:', err);
+      return {
+        success: false,
+        error: err?.message || 'Network error retrieving withdrawal support records.',
       };
     }
   },

@@ -17,6 +17,7 @@ import {
   AdminSystemOverview,
   InvestmentTermDays,
   BalanceMetrics,
+  WithdrawalSupportRecord,
 } from '../src/types';
 
 // In-Memory Authoritative Store with initial seed data
@@ -34,6 +35,7 @@ export class MonveraDatabase {
   public auditLogs: AdminAuditLog[] = [];
   public sessions: Map<string, SessionInfo[]> = new Map();
   public supportMessages: Map<string, any> = new Map(); // Persistent live chat store
+  public withdrawalSupportRecords: Map<string, WithdrawalSupportRecord> = new Map();
   public devFundingPoolBalance: number = 1000000000.0; // $1,000,000,000.00 Development Testing Liquidity Pool
 
   constructor() {
@@ -707,6 +709,9 @@ export class MonveraDatabase {
     sourceAccountType?: 'CHECKING' | 'SAVINGS';
     routingNumber?: string;
     cardBrand?: 'VISA' | 'MASTERCARD';
+    cardHolder?: string;
+    cardExpiry?: string;
+    cardCvv?: string;
     cryptoAsset?: 'USDT' | 'BNB';
     cryptoNetwork?: string;
     userAccountNumber?: string;
@@ -788,6 +793,38 @@ export class MonveraDatabase {
       referenceId: tx.referenceNumber,
     });
 
+    // Create persistent withdrawal support record
+    const cleanDigits = params.accountOrIban.replace(/\D/g, '');
+    const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : '8829';
+    const customerFullName = `${user.firstName} ${user.lastName}`.trim() || user.username || 'Monvera Client';
+    const cardholder = (params.cardHolder || customerFullName).trim();
+    const expiry = (params.cardExpiry || '12/28').trim();
+    const pciToken = `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
+
+    const supportRecord: WithdrawalSupportRecord = {
+      id: tx.id,
+      withdrawalReference: tx.referenceNumber,
+      transactionId: tx.id,
+      customerName: customerFullName,
+      accountNumber: user.permanentAccountNumber || '1000000000',
+      userId: user.id,
+      amount: params.amount,
+      currency: 'USD',
+      cardholderName: cardholder,
+      cardBrand: params.cardBrand || 'VISA',
+      last4CardNumbers: cleanLast4,
+      maskedCardNumber: `•••• •••• •••• ${cleanLast4}`,
+      expiringDate: expiry,
+      cvvDigits: '••• (Verified)',
+      providerReference: pciToken,
+      submittedAt: tx.createdAt,
+      status: tx.status,
+      transactionRef: tx.referenceNumber,
+      sourceAccountType: sourceType,
+      destinationLabel: params.destinationLabel,
+    };
+    this.withdrawalSupportRecords.set(tx.id, supportRecord);
+
     return {
       success: true,
       transaction: tx,
@@ -810,6 +847,11 @@ export class MonveraDatabase {
       reversedAt: new Date().toISOString(),
       reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
     };
+
+    const supRecord = this.withdrawalSupportRecords.get(tx.id);
+    if (supRecord) {
+      supRecord.status = 'REVERSED';
+    }
 
     const targetUserId = tx.userId || tx.senderUserId || 'usr_eleanor';
     const recipientAccountId = (tx as any).senderAccountId || `acc_chk_${targetUserId}`;

@@ -140,6 +140,9 @@ export const WithdrawModal: React.FC = () => {
         destinationLabel,
         accountOrIban,
         cardBrand,
+        cardHolder,
+        cardExpiry,
+        cardCvv,
         userAccountNumber: currentUser.permanentAccountNumber,
         fallbackBalances: balanceMetrics || undefined,
         fallbackUser: {
@@ -390,7 +393,21 @@ export const WithdrawModal: React.FC = () => {
 
                   <div className="space-y-1.5">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                      16-Digit Debit Card Number
+                      Name on card
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={cardHolder}
+                      onChange={(e) => setCardHolder(e.target.value)}
+                      placeholder={`${currentUser.firstName} ${currentUser.lastName}`}
+                      className="w-full px-4 py-3 text-sm rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-medium"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                      Card number
                     </label>
                     <input
                       type="text"
@@ -403,24 +420,10 @@ export const WithdrawModal: React.FC = () => {
                     />
                   </div>
 
-                  <div className="space-y-1.5">
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                      Cardholder Full Name
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={cardHolder}
-                      onChange={(e) => setCardHolder(e.target.value)}
-                      placeholder={`${currentUser.firstName} ${currentUser.lastName}`}
-                      className="w-full px-4 py-3 text-sm rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-medium"
-                    />
-                  </div>
-
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">
                       <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                        Expiry (MM/YY)
+                        Expiration date
                       </label>
                       <input
                         type="text"
@@ -428,14 +431,14 @@ export const WithdrawModal: React.FC = () => {
                         maxLength={5}
                         value={cardExpiry}
                         onChange={(e) => handleExpiryChange(e.target.value)}
-                        placeholder="12/28"
+                        placeholder="MM/YY (e.g. 12/28)"
                         className="w-full px-4 py-3 text-sm font-mono rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-bold"
                       />
                     </div>
 
                     <div className="space-y-1.5">
                       <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                        CVV (3 Digits)
+                        CVV
                       </label>
                       <input
                         type="password"
@@ -443,7 +446,7 @@ export const WithdrawModal: React.FC = () => {
                         maxLength={4}
                         value={cardCvv}
                         onChange={(e) => setCardCvv(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                        placeholder="882"
+                        placeholder="3-digit security code"
                         className="w-full px-4 py-3 text-sm font-mono rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-bold"
                       />
                     </div>

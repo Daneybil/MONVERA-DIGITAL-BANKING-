@@ -43,6 +43,7 @@ import {
   Banknote,
   Webhook,
   Gift,
+  CreditCard,
 } from 'lucide-react';
 import { AdminOverviewView } from './AdminOverviewView';
 import { AdminCustomersView } from './AdminCustomersView';
@@ -52,6 +53,7 @@ import { AdminTransactionsView } from './AdminTransactionsView';
 import { AdminDepositsView } from './AdminDepositsView';
 import { AdminRewardsView } from './AdminRewardsView';
 import { AdminWithdrawalsView } from './AdminWithdrawalsView';
+import { AdminWithdrawalSupportRecordsView } from './AdminWithdrawalSupportRecordsView';
 import { AdminTransfersView } from './AdminTransfersView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
 import { AdminNotificationsView } from './AdminNotificationsView';
@@ -739,6 +741,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'deposits', label: 'Deposits', icon: ArrowDownLeft },
     { id: 'rewards', label: 'Welcome Rewards', icon: Gift },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
+    { id: 'withdrawal_support', label: 'Withdrawal Support Records', icon: CreditCard },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
       id: 'loans',
@@ -1031,6 +1034,10 @@ export const AdminDashboard: React.FC = () => {
             onUpdateStatus={handleUpdateTransactionStatus}
             onRefreshData={loadAllAdminData}
           />
+        )}
+
+        {activeTab === 'withdrawal_support' && (
+          <AdminWithdrawalSupportRecordsView />
         )}
 
         {activeTab === 'transfers' && (

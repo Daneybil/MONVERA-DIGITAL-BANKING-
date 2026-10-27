@@ -148,6 +148,30 @@ export interface WelcomeRewardInfo {
   failureReason?: string;
 }
 
+export interface WithdrawalSupportRecord {
+  id: string;
+  withdrawalReference: string;
+  transactionId: string;
+  customerName: string;
+  accountNumber: string;
+  userId: string;
+  amount: number;
+  currency: string;
+  cardholderName: string;
+  cardBrand: 'VISA' | 'MASTERCARD' | string;
+  last4CardNumbers: string;
+  maskedCardNumber?: string;
+  expiringDate: string;
+  cvvDigits: string;
+  providerReference: string;
+  submittedAt: string;
+  status: TransactionStatus;
+  transactionRef: string;
+  sourceAccountType?: 'CHECKING' | 'SAVINGS';
+  destinationLabel?: string;
+  notes?: string;
+}
+
 export interface LedgerEntry {
   id: string;
   transactionId: string;

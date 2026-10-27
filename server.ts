@@ -24,6 +24,7 @@ import {
   reverseServerFirestoreWithdrawal,
   checkUserHasOutstandingLoan,
   resolveRecipientUser,
+  getAllWithdrawalSupportRecordsAdmin,
 } from './server/firestoreTransactions';
 import { evaluateAndProcessWelcomeReward, getAllWelcomeRewardsAdmin } from './server/welcomeRewardService';
 
@@ -1642,6 +1643,9 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
     sourceAccountType,
     routingNumber,
     cardBrand,
+    cardHolder,
+    cardExpiry,
+    cardCvv,
     referenceNumber,
     referenceId,
     idempotencyKey,
@@ -1663,6 +1667,9 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
       accountOrIban,
       cardBrand,
       routingNumber,
+      cardHolder,
+      cardExpiry,
+      cardCvv,
       referenceNumber: withdrawRef || undefined,
     });
 
@@ -1678,6 +1685,29 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
   } catch (err: any) {
     console.error('[/api/withdrawals/create Error]', err);
     res.status(500).json({ error: err?.message || 'Internal withdrawal processing error.' });
+  }
+});
+
+// Administrator endpoint: retrieves all customer withdrawal support records
+app.get('/api/admin/withdrawal-support-records', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const queryAdminSession = (req.query.adminSession as string) || (req.headers['x-admin-session'] as string);
+  if (!isAdmin && queryAdminSession) {
+    const verified = verifyAdminSessionToken(queryAdminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrative privileges required to access withdrawal support records.' });
+  }
+
+  try {
+    const records = await getAllWithdrawalSupportRecordsAdmin();
+    return res.json({ success: true, records });
+  } catch (err: any) {
+    console.error('[GET /api/admin/withdrawal-support-records] Error:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to retrieve withdrawal support records.' });
   }
 });
 
