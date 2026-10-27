@@ -54,18 +54,10 @@ export function clearAdminSessionToken(): void {
 }
 
 /**
- * Returns a complete URL for displaying or downloading KYC documents,
- * appending the verified admin session token when accessing server-streamed documents.
+ * Returns a clean URL for KYC documents without appending credentials to query strings.
  */
 export function getKycDocumentUrl(url?: string | null): string {
   if (!url) return '';
-  if (url.startsWith('data:') || url.startsWith('blob:')) return url;
-  if (url.startsWith('/api/kyc/documents/')) {
-    const adminToken = getAdminSessionToken();
-    if (adminToken && !url.includes('adminSession=')) {
-      return `${url}${url.includes('?') ? '&' : '?'}adminSession=${encodeURIComponent(adminToken)}`;
-    }
-  }
   return url;
 }
 
@@ -73,7 +65,7 @@ export function getKycDocumentUrl(url?: string | null): string {
  * Retrieves Firebase Auth Bearer token headers for authenticated backend calls.
  * If an active verified administrator session token is present, attaches X-Admin-Session.
  */
-async function getAuthHeaders(): Promise<Record<string, string>> {
+export async function getAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
@@ -92,6 +84,72 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
     headers['X-Admin-Session'] = adminToken;
   }
   return headers;
+}
+
+/**
+ * Securely fetches a protected KYC document blob using Firebase Auth Bearer token and X-Admin-Session header.
+ * Converts server image responses (binary buffers or JSON containing imageBase64) into a browser Blob.
+ */
+export async function fetchAuthenticatedKycBlob(url: string): Promise<Blob> {
+  if (!url) throw new Error('No document URL provided');
+
+  // Handle data URIs or already-resolved blob URIs directly
+  if (url.startsWith('data:') || url.startsWith('blob:')) {
+    const res = await fetch(url);
+    return await res.blob();
+  }
+
+  const endpoint = getApiEndpoint(url);
+  const authHeaders = await getAuthHeaders();
+  const headers: Record<string, string> = {
+    ...authHeaders,
+    Accept: 'image/*, application/json;q=0.9, */*;q=0.8',
+  };
+  delete headers['Content-Type'];
+
+  const res = await fetch(endpoint, { headers });
+  if (!res.ok) {
+    throw new Error(`Failed to load KYC document (${res.status} ${res.statusText})`);
+  }
+
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const json = await res.json();
+    if (json.imageBase64) {
+      const dataUrl = json.imageBase64.startsWith('data:')
+        ? json.imageBase64
+        : `data:image/jpeg;base64,${json.imageBase64}`;
+      const bRes = await fetch(dataUrl);
+      return await bRes.blob();
+    }
+    throw new Error('No image payload in response');
+  }
+
+  return await res.blob();
+}
+
+/**
+ * Securely downloads a protected KYC document using authenticated blob fetching.
+ */
+export async function downloadKycDocument(url: string, filename: string): Promise<void> {
+  if (!url) return;
+  try {
+    const blob = await fetchAuthenticatedKycBlob(url);
+    const objectUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => {
+      try {
+        window.URL.revokeObjectURL(objectUrl);
+      } catch {}
+    }, 1000);
+  } catch (err) {
+    console.error('Failed to download authenticated document:', err);
+  }
 }
 
 /**

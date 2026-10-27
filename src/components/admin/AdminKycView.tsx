@@ -24,7 +24,8 @@ import {
   Download,
 } from 'lucide-react';
 import { AdminConfirmationModal } from './AdminConfirmationModal';
-import { getKycDocumentUrl } from '../../services/api';
+import { getKycDocumentUrl, downloadKycDocument } from '../../services/api';
+import { AuthenticatedKycImage } from './AuthenticatedKycImage';
 
 interface AdminKycViewProps {
   customers: (UserProfile & { balanceMetrics?: any })[];
@@ -84,42 +85,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
 
   const downloadDocument = (url: string, filename: string) => {
     if (!url) return;
-    try {
-      const targetUrl = getKycDocumentUrl(url);
-      if (targetUrl.startsWith('data:')) {
-        const link = document.createElement('a');
-        link.href = targetUrl;
-        link.download = filename;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        return;
-      }
-      fetch(targetUrl)
-        .then((res) => res.blob())
-        .then((blob) => {
-          const objectUrl = window.URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = objectUrl;
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          window.URL.revokeObjectURL(objectUrl);
-        })
-        .catch(() => {
-          const link = document.createElement('a');
-          link.href = targetUrl;
-          link.target = '_blank';
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-        });
-    } catch (err) {
-      console.error('Error downloading document:', err);
-      window.open(getKycDocumentUrl(url), '_blank');
-    }
+    downloadKycDocument(url, filename);
   };
 
   const handleDownloadAllDocuments = (applicant: UserProfile) => {
@@ -615,7 +581,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                             >
                               {applicant.kycDocumentImage ? (
                                 <>
-                                  <img
+                                  <AuthenticatedKycImage
                                     src={applicant.kycDocumentImage}
                                     alt="ID Front"
                                     className="w-full h-full object-cover group-hover:scale-105 transition-transform"
@@ -666,7 +632,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                             >
                               {applicant.kycDocumentBackImage ? (
                                 <>
-                                  <img
+                                  <AuthenticatedKycImage
                                     src={applicant.kycDocumentBackImage}
                                     alt="ID Back"
                                     className="w-full h-full object-cover group-hover:scale-105 transition-transform"
@@ -772,7 +738,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                           >
                             {applicant.kycLiveSelfieImage || applicant.avatarUrl ? (
                               <>
-                                <img
+                                <AuthenticatedKycImage
                                   src={applicant.kycLiveSelfieImage || applicant.avatarUrl}
                                   alt="Live Selfie"
                                   className="w-full h-full object-cover group-hover:scale-105 transition-transform"
@@ -877,7 +843,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                           >
                             {applicant.kycProofOfAddressImage ? (
                               <>
-                                <img
+                                <AuthenticatedKycImage
                                   src={applicant.kycProofOfAddressImage}
                                   alt="Proof of Address"
                                   className="w-full h-full object-cover group-hover:scale-105 transition-transform"
@@ -982,7 +948,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
                             >
                               {applicant.kycSsnImage ? (
                                 <>
-                                  <img
+                                  <AuthenticatedKycImage
                                     src={applicant.kycSsnImage}
                                     alt="SSN Document"
                                     className="w-full h-full object-cover group-hover:scale-105 transition-transform"
@@ -1161,7 +1127,7 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
               </div>
             </div>
             <div className="max-h-[75vh] overflow-hidden rounded-2xl bg-slate-950 flex items-center justify-center p-2">
-              <img
+              <AuthenticatedKycImage
                 src={zoomedImage.src}
                 alt={zoomedImage.title}
                 className="w-full h-auto max-h-[70vh] object-contain rounded-xl"

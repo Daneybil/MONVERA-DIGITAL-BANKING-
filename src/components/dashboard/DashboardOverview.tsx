@@ -28,6 +28,7 @@ import {
   FileText,
   Banknote,
   ShieldAlert,
+  Gift,
 } from 'lucide-react';
 import { TransactionReceiptModal } from './TransactionReceiptModal';
 import { KycBanner } from '../kyc/KycBanner';
@@ -42,6 +43,7 @@ export const DashboardOverview: React.FC = () => {
   const [hideBalances, setHideBalances] = useState<boolean>(false);
   const [copiedAcc, setCopiedAcc] = useState<boolean>(false);
   const [isKycModalOpen, setIsKycModalOpen] = useState<boolean>(false);
+  const [isRewardModalOpen, setIsRewardModalOpen] = useState<boolean>(false);
 
   const effectiveUid = auth.currentUser?.uid || currentUser?.id;
 
@@ -339,9 +341,6 @@ export const DashboardOverview: React.FC = () => {
         </div>
       </div>
 
-      {/* --- $1,000 NEW USER WELCOME REWARD TRACKER --- */}
-      <WelcomeRewardCard onOpenDeposit={() => handleProtectedAction(() => openModal('deposit'))} />
-
       {/* --- MAIN DASHBOARD ACTIONS (LARGE, SMART & PROFESSIONAL BUTTONS) --- */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
@@ -356,7 +355,7 @@ export const DashboardOverview: React.FC = () => {
             </button>
           )}
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 xl:grid-cols-8 gap-3 sm:gap-4">
           
           <button
             id="action-btn-deposit"
@@ -519,8 +518,30 @@ export const DashboardOverview: React.FC = () => {
             </div>
           </button>
 
+          {/* Action Button 8: $1,000 Welcome Reward Button */}
+          <button
+            id="action-btn-welcome-reward"
+            onClick={() => setIsRewardModalOpen(true)}
+            className="p-5 sm:p-6 rounded-3xl bg-white border-2 border-amber-300 hover:border-amber-500 hover:bg-amber-50/40 shadow-md hover:shadow-xl active:translate-y-1 transition-all text-center flex flex-col items-center justify-center gap-3 group cursor-pointer relative"
+          >
+            <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center group-hover:scale-110 group-hover:bg-amber-400 group-hover:text-slate-950 transition-all shadow-sm">
+              <Gift className="w-7 h-7 stroke-[2.5]" />
+            </div>
+            <div>
+              <span className="text-base font-black text-slate-950 block">Welcome Reward</span>
+              <span className="text-xs text-amber-700 font-bold block">$1,000 Bonus</span>
+            </div>
+          </button>
+
         </div>
       </div>
+
+      {/* --- $1,000 NEW USER WELCOME REWARD MODAL (OPENS ON BUTTON CLICK) --- */}
+      <WelcomeRewardCard
+        isOpen={isRewardModalOpen}
+        onClose={() => setIsRewardModalOpen(false)}
+        onOpenDeposit={() => handleProtectedAction(() => openModal('deposit'))}
+      />
 
       {/* --- ACCOUNT SUMMARY (ACCOUNTS & BALANCES SECTION) --- */}
       <div className="space-y-5">

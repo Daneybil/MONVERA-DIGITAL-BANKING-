@@ -36,7 +36,8 @@ import {
   Download,
 } from 'lucide-react';
 import { AdminConfirmationModal } from './AdminConfirmationModal';
-import { getKycDocumentUrl } from '../../services/api';
+import { getKycDocumentUrl, downloadKycDocument } from '../../services/api';
+import { AuthenticatedKycImage } from './AuthenticatedKycImage';
 
 interface AdminCustomerDetailsModalProps {
   customer: (UserProfile & { balanceMetrics?: any }) | null;
@@ -99,42 +100,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
 
   const downloadDocument = (url: string, filename: string) => {
     if (!url) return;
-    try {
-      const targetUrl = getKycDocumentUrl(url);
-      if (targetUrl.startsWith('data:')) {
-        const link = document.createElement('a');
-        link.href = targetUrl;
-        link.download = filename;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        return;
-      }
-      fetch(targetUrl)
-        .then((res) => res.blob())
-        .then((blob) => {
-          const objectUrl = window.URL.createObjectURL(blob);
-          const link = document.createElement('a');
-          link.href = objectUrl;
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          window.URL.revokeObjectURL(objectUrl);
-        })
-        .catch(() => {
-          const link = document.createElement('a');
-          link.href = targetUrl;
-          link.target = '_blank';
-          link.download = filename;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-        });
-    } catch (err) {
-      console.error('Error downloading document:', err);
-      window.open(getKycDocumentUrl(url), '_blank');
-    }
+    downloadKycDocument(url, filename);
   };
 
   const handleDownloadAllCustomerDocuments = (cust: UserProfile) => {
@@ -190,7 +156,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
           <div className="flex items-center gap-4">
             <div className="relative">
               {customer.avatarUrl ? (
-                <img
+                <AuthenticatedKycImage
                   src={customer.avatarUrl}
                   alt={customer.firstName}
                   className="w-16 h-16 rounded-2xl object-cover ring-2 ring-white/20"
@@ -679,7 +645,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                           <span className="text-xs font-bold text-slate-700 block mb-1.5">Front Page Photo</span>
                           {customer.kycDocumentImage ? (
                             <div className="relative group rounded-xl overflow-hidden border border-slate-200 bg-white">
-                              <img
+                              <AuthenticatedKycImage
                                 src={customer.kycDocumentImage}
                                 alt="ID Front"
                                 className="w-full h-36 object-cover"
@@ -713,7 +679,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                           <span className="text-xs font-bold text-slate-700 block mb-1.5">Back Page Photo</span>
                           {customer.kycDocumentBackImage ? (
                             <div className="relative group rounded-xl overflow-hidden border border-slate-200 bg-white">
-                              <img
+                              <AuthenticatedKycImage
                                 src={customer.kycDocumentBackImage}
                                 alt="ID Back"
                                 className="w-full h-36 object-cover"
@@ -825,7 +791,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                         <span className="text-xs font-bold text-slate-700 block mb-1.5">Submitted Proof Document</span>
                         {customer.kycProofOfAddressImage ? (
                           <div className="relative group rounded-xl overflow-hidden border border-slate-200 bg-white max-w-md">
-                            <img
+                            <AuthenticatedKycImage
                               src={customer.kycProofOfAddressImage}
                               alt="Proof of Address"
                               className="w-full h-40 object-cover"
@@ -929,7 +895,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                         {customer.kycLiveSelfieImage || customer.avatarUrl ? (
                           <div className="flex flex-col items-center">
                             <div className="relative group rounded-full overflow-hidden border-2 border-slate-300 bg-white w-28 h-28 shrink-0">
-                              <img
+                              <AuthenticatedKycImage
                                 src={customer.kycLiveSelfieImage || customer.avatarUrl}
                                 alt="Biometric Selfie"
                                 className="w-full h-full object-cover"
@@ -1062,7 +1028,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                         <div>
                           <span className="text-xs font-bold text-slate-700 block mb-1.5">Attached SSN Card Document</span>
                           <div className="relative group rounded-xl overflow-hidden border border-slate-200 bg-white max-w-sm">
-                            <img
+                            <AuthenticatedKycImage
                               src={customer.kycSsnImage}
                               alt="SSN Card"
                               className="w-full h-32 object-cover"
@@ -1288,7 +1254,7 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
               </div>
             </div>
             <div className="p-4 sm:p-6 overflow-auto flex items-center justify-center bg-slate-950 flex-1 min-h-[300px]">
-              <img
+              <AuthenticatedKycImage
                 src={zoomedImage.src}
                 alt={zoomedImage.title}
                 className="max-h-[70vh] max-w-full object-contain rounded-xl shadow-lg border border-slate-800"
