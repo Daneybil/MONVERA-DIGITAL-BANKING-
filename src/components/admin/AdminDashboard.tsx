@@ -307,18 +307,17 @@ export const AdminDashboard: React.FC = () => {
   const loadAllAdminData = async () => {
     setIsLoading(true);
     try {
-      const [overviewRes, custRes, txRes, logsRes, firestoreUsers, tickets, loansRes] = await Promise.all([
+      const [overviewRes, custRes, txRes, logsRes, tickets, loansRes] = await Promise.all([
         api.getAdminOverview().catch(() => null),
         api.getAdminCustomers().catch(() => ({ customers: [] })),
         api.getTransactions().catch(() => ({ transactions: [] })),
         api.getAdminAuditLogs().catch(() => ({ auditLogs: [] })),
-        firestoreSync.getAllUsersWithBalances().catch(() => []),
         firestoreSync.getAllSupportTickets().catch(() => []),
         api.getLoans().catch(() => ({ loans: [] })),
       ]);
 
       const serverCustomers = custRes?.customers || [];
-      const merged = mergeCustomers(firestoreUsers || [], serverCustomers, currentUser);
+      const merged = mergeCustomers([], serverCustomers, currentUser);
       setCustomers(merged);
       setSupportTickets(tickets || []);
       if (loansRes?.loans) setAdminLoans(loansRes.loans);

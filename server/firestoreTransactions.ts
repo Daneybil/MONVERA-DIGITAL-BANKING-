@@ -997,6 +997,12 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
       const reversalMinutes = 30;
       const reversalScheduledAt = new Date(Date.now() + reversalMinutes * 60 * 1000).toISOString();
 
+      const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.username || userData.kycFullName || '';
+      const cleanDigits = accountOrIban ? accountOrIban.replace(/\D/g, '') : '';
+      const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
+      const safeCardholder = params.cardHolder ? params.cardHolder.trim() : (customerFullName || undefined);
+      const safeExpiry = params.cardExpiry ? params.cardExpiry.trim() : undefined;
+
       finalTx = {
         id: txId,
         referenceNumber: finalRef,
@@ -1008,7 +1014,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         senderUserId: userId,
         senderAccountNumber: userAcc,
         fee: 0.0,
-        description: `Instant Card Push to ${destinationLabel} (${accountOrIban.slice(-4)})`,
+        description: `Instant Card Push to ${destinationLabel} (${cleanLast4 !== 'Unavailable' ? cleanLast4 : 'CARD'})`,
         category: 'Withdrawals',
         createdAt: nowIso,
         metadata: {
@@ -1016,6 +1022,8 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
           destinationLabel,
           accountOrIban,
           cardBrand,
+          ...(safeCardholder ? { cardHolder: safeCardholder } : {}),
+          ...(safeExpiry ? { cardExpiry: safeExpiry } : {}),
           routingNumber,
           sourceAccountType,
           autoReverse: true,
@@ -1040,28 +1048,23 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
       // Atomic commit: create persistent withdrawal support record in Firebase
       const supportRef = adminFirestore.collection('withdrawal_support_records').doc(txId);
-      const cleanDigits = accountOrIban ? accountOrIban.replace(/\D/g, '') : '';
-      const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : '8829';
-      const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.username || 'Monvera Client';
-      const cardholder = (params.cardHolder || customerFullName).trim();
-      const expiry = (params.cardExpiry || '12/28').trim();
       const pciToken = `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
       const supportRecord: WithdrawalSupportRecord = {
         id: txId,
         withdrawalReference: finalRef,
         transactionId: txId,
-        customerName: customerFullName,
-        accountNumber: userAcc,
+        customerName: customerFullName || 'Unavailable',
+        accountNumber: userAcc || 'Unavailable',
         userId: userId,
         amount: withdrawAmount,
         currency: 'USD',
-        cardholderName: cardholder,
+        cardholderName: safeCardholder || 'Unavailable',
         cardBrand: (cardBrand as any) || 'VISA',
         last4CardNumbers: cleanLast4,
-        maskedCardNumber: `•••• •••• •••• ${cleanLast4}`,
-        expiringDate: expiry,
-        cvvDigits: '••• (Verified)',
+        maskedCardNumber: cleanLast4 !== 'Unavailable' ? `•••• •••• •••• ${cleanLast4}` : 'Unavailable',
+        expiringDate: safeExpiry || 'Unavailable',
+        cvvDigits: params.cardCvv ? '••• (Verified)' : 'Unavailable',
         providerReference: pciToken,
         submittedAt: nowIso,
         status: 'PENDING',
@@ -1075,27 +1078,27 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
     if (finalTx) {
       const cleanDigits = accountOrIban ? accountOrIban.replace(/\D/g, '') : '';
-      const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : '8829';
-      const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.username || 'Monvera Client';
-      const cardholder = (params.cardHolder || customerFullName).trim();
-      const expiry = (params.cardExpiry || '12/28').trim();
+      const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
+      const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.username || userData.kycFullName || '';
+      const safeCardholder = params.cardHolder ? params.cardHolder.trim() : (customerFullName || undefined);
+      const safeExpiry = params.cardExpiry ? params.cardExpiry.trim() : undefined;
       const pciToken = `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
       db.withdrawalSupportRecords.set(finalTx.id, {
         id: finalTx.id,
         withdrawalReference: finalRef,
         transactionId: finalTx.id,
-        customerName: customerFullName,
-        accountNumber: userAcc,
+        customerName: customerFullName || 'Unavailable',
+        accountNumber: userAcc || 'Unavailable',
         userId: userId,
         amount: withdrawAmount,
         currency: 'USD',
-        cardholderName: cardholder,
+        cardholderName: safeCardholder || 'Unavailable',
         cardBrand: (cardBrand as any) || 'VISA',
         last4CardNumbers: cleanLast4,
-        maskedCardNumber: `•••• •••• •••• ${cleanLast4}`,
-        expiringDate: expiry,
-        cvvDigits: '••• (Verified)',
+        maskedCardNumber: cleanLast4 !== 'Unavailable' ? `•••• •••• •••• ${cleanLast4}` : 'Unavailable',
+        expiringDate: safeExpiry || 'Unavailable',
+        cvvDigits: params.cardCvv ? '••• (Verified)' : 'Unavailable',
         providerReference: pciToken,
         submittedAt: finalTx.createdAt,
         status: 'PENDING',
@@ -1329,7 +1332,7 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
     }
   }
 
-  // 3. Backfill from withdrawal transactions to ensure 100% comprehensive records
+  // 3. Backfill and sanitize from withdrawal transactions to ensure 100% comprehensive, accurate records
   try {
     const txList: Transaction[] = [];
     if (isFirebaseAdminConfigured()) {
@@ -1349,38 +1352,71 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
       }
     }
 
+    // Customer profile cache to avoid redundant network lookups
+    const userProfilesCache = new Map<string, any>();
+    const getResolvedUserProfile = async (targetUid: string) => {
+      if (!targetUid) return null;
+      if (userProfilesCache.has(targetUid)) return userProfilesCache.get(targetUid);
+      const memUser = db.users.get(targetUid);
+      if (memUser) {
+        userProfilesCache.set(targetUid, memUser);
+        return memUser;
+      }
+      if (isFirebaseAdminConfigured()) {
+        try {
+          const uSnap = await adminFirestore.collection('users').doc(targetUid).get();
+          if (uSnap.exists) {
+            const data = uSnap.data();
+            userProfilesCache.set(targetUid, data);
+            return data;
+          }
+        } catch {}
+      }
+      return null;
+    };
+
     for (const tx of txList) {
       const txId = tx.id;
-      if (!recordsMap.has(txId)) {
-        const meta = tx.metadata || {};
-        const rawAccount = meta.accountOrIban || meta.accountOrIbanMasked || '•••• 8829';
-        const cleanDigits = String(rawAccount).replace(/\D/g, '');
-        const last4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : '8829';
-        const uId = tx.userId || tx.senderUserId || 'usr_eleanor';
-        let uName = tx.senderName;
-        let uAcc = tx.senderAccountNumber;
-        if (!uName || !uAcc) {
-          const userObj = db.users.get(uId);
-          if (userObj) {
-            uName = `${userObj.firstName} ${userObj.lastName}`.trim();
-            uAcc = userObj.permanentAccountNumber;
-          }
-        }
+      const meta = tx.metadata || {};
+      const uId = tx.userId || tx.senderUserId || '';
 
+      // Resolve customer profile using memory first, then Firestore
+      let uName = tx.senderName;
+      let uAcc = tx.senderAccountNumber;
+      const userProfile = uId ? await getResolvedUserProfile(uId) : null;
+      if (userProfile) {
+        if (!uName) {
+          const full = `${userProfile.firstName || ''} ${userProfile.lastName || ''}`.trim() || userProfile.kycFullName || userProfile.username;
+          if (full) uName = full;
+        }
+        if (!uAcc) {
+          uAcc = userProfile.permanentAccountNumber || userProfile.accountNumber;
+        }
+      }
+
+      const rawAccount = meta.accountOrIban || meta.accountOrIbanMasked || '';
+      const cleanDigits = String(rawAccount).replace(/\D/g, '');
+      const last4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
+
+      const safeCardholder = meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable';
+      const safeExpiry = meta.cardExpiry ? String(meta.cardExpiry).trim() : 'Unavailable';
+
+      if (!recordsMap.has(txId)) {
+        const resolvedName = (uName && uName !== 'Monvera Client') ? uName : 'Unavailable';
         const newRecord: WithdrawalSupportRecord = {
           id: txId,
           withdrawalReference: tx.referenceNumber,
           transactionId: txId,
-          customerName: uName || 'Monvera Client',
-          accountNumber: uAcc || '1000000000',
-          userId: uId,
+          customerName: resolvedName,
+          accountNumber: uAcc || 'Unavailable',
+          userId: uId || 'Unavailable',
           amount: tx.amount,
           currency: tx.currency || 'USD',
-          cardholderName: meta.cardHolder || uName || 'Monvera Cardholder',
+          cardholderName: safeCardholder,
           cardBrand: meta.cardBrand || 'VISA',
           last4CardNumbers: last4,
-          maskedCardNumber: `•••• •••• •••• ${last4}`,
-          expiringDate: meta.cardExpiry || '12/28',
+          maskedCardNumber: last4 !== 'Unavailable' ? `•••• •••• •••• ${last4}` : 'Unavailable',
+          expiringDate: safeExpiry,
           cvvDigits: '••• (Verified)',
           providerReference: `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`,
           submittedAt: tx.createdAt,
@@ -1401,16 +1437,61 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
             .catch(() => {});
         }
       } else {
-        // Sync status if transaction changed (e.g. COMPLETED or REVERSED)
+        // Sync status if transaction changed (e.g. COMPLETED or REVERSED),
+        // and sanitize any previously fabricated placeholder data ("Monvera Client", "Monvera Cardholder", "12/28")
         const existing = recordsMap.get(txId)!;
-        if (existing.status !== tx.status) {
-          existing.status = tx.status;
-          recordsMap.set(txId, existing);
+        let needsUpdate = false;
+        const updated = { ...existing };
+
+        if (updated.status !== tx.status) {
+          updated.status = tx.status;
+          needsUpdate = true;
+        }
+
+        // Clean up fabricated customerName
+        if (uName && uName !== 'Monvera Client' && updated.customerName !== uName) {
+          updated.customerName = uName;
+          needsUpdate = true;
+        } else if (updated.customerName === 'Monvera Client' || !updated.customerName) {
+          updated.customerName = 'Unavailable';
+          needsUpdate = true;
+        }
+
+        // Clean up fabricated accountNumber
+        if ((!updated.accountNumber || updated.accountNumber === '1000000000') && uAcc) {
+          updated.accountNumber = uAcc;
+          needsUpdate = true;
+        }
+
+        // Clean up fabricated cardholderName if it was 'Monvera Cardholder'
+        if (updated.cardholderName === 'Monvera Cardholder') {
+          updated.cardholderName = meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable';
+          needsUpdate = true;
+        }
+
+        // Clean up fabricated expiringDate if it was '12/28' and not in meta.cardExpiry
+        if (updated.expiringDate === '12/28' && !meta.cardExpiry) {
+          updated.expiringDate = 'Unavailable';
+          needsUpdate = true;
+        }
+
+        // If cardholder or expiry is empty, show Unavailable rather than fabricating
+        if (!updated.cardholderName) {
+          updated.cardholderName = 'Unavailable';
+          needsUpdate = true;
+        }
+        if (!updated.expiringDate) {
+          updated.expiringDate = 'Unavailable';
+          needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+          recordsMap.set(txId, updated);
           if (isFirebaseAdminConfigured()) {
             adminFirestore
               .collection('withdrawal_support_records')
               .doc(txId)
-              .update({ status: tx.status })
+              .set(updated, { merge: true })
               .catch(() => {});
           }
         }

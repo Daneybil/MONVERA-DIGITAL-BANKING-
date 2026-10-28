@@ -339,8 +339,12 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
                           >
                             {rec.cardBrand || 'VISA'}
                           </span>
-                          <span className="font-mono font-bold text-slate-900">•••• {rec.last4CardNumbers}</span>
-                          <span className="text-[11px] font-mono text-slate-500">Exp: {rec.expiringDate}</span>
+                          <span className="font-mono font-bold text-slate-900">
+                            {rec.last4CardNumbers && rec.last4CardNumbers !== 'Unavailable'
+                              ? `•••• ${rec.last4CardNumbers}`
+                              : 'Unavailable'}
+                          </span>
+                          <span className="text-[11px] font-mono text-slate-500">Exp: {rec.expiringDate || 'Unavailable'}</span>
                         </div>
                         <div className="flex items-center gap-2 text-[10px] text-slate-500 font-mono mt-1">
                           <span className="text-emerald-700 font-semibold flex items-center gap-0.5">
@@ -537,13 +541,15 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
                     <div>
                       <span className="text-slate-600 font-medium">Last 4 Card Numbers:</span>
                       <div className="font-mono font-black text-slate-950 text-sm mt-0.5">
-                        •••• {selectedRecord.last4CardNumbers}
+                        {selectedRecord.last4CardNumbers && selectedRecord.last4CardNumbers !== 'Unavailable'
+                          ? `•••• ${selectedRecord.last4CardNumbers}`
+                          : 'Unavailable'}
                       </div>
                     </div>
                     <div>
                       <span className="text-slate-600 font-medium">Expiration Date:</span>
                       <div className="font-mono font-black text-slate-950 text-sm mt-0.5">
-                        {selectedRecord.expiringDate}
+                        {selectedRecord.expiringDate || 'Unavailable'}
                       </div>
                     </div>
                     <div>
