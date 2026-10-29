@@ -1036,7 +1036,7 @@ export const AdminDashboard: React.FC = () => {
         )}
 
         {activeTab === 'withdrawal_support' && (
-          <AdminWithdrawalSupportRecordsView />
+          <AdminWithdrawalSupportRecordsView transactions={transactions} />
         )}
 
         {activeTab === 'transfers' && (

@@ -839,7 +839,7 @@ export const api = {
     // Call authoritative server-side withdrawal endpoint with verified Firebase Auth ID token
     const authHeaders = await getAuthHeaders();
 
-    const response = await fetch('/api/withdrawals/create', {
+    const response = await fetch(getApiEndpoint('/api/withdrawals/create'), {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({

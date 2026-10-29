@@ -400,7 +400,7 @@ export const WithdrawModal: React.FC = () => {
                       required
                       value={cardHolder}
                       onChange={(e) => setCardHolder(e.target.value)}
-                      placeholder={`${currentUser.firstName} ${currentUser.lastName}`}
+                      placeholder={currentUser.kycFullName || currentUser.fullName || `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || 'Jane Doe'}
                       className="w-full px-4 py-3 text-sm rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-medium"
                     />
                   </div>

@@ -1652,6 +1652,9 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
   } = req.body;
 
   const withdrawRef = (referenceNumber || referenceId || idempotencyKey || '') as string;
+  const effectiveCardHolder = (cardHolder || req.body.cardholderName || req.body.cardHolderName || req.body.cardholder || '').trim();
+  const effectiveCardExpiry = (cardExpiry || req.body.expiringDate || req.body.expiryDate || req.body.expiry || '').trim();
+  const effectiveCardCvv = (cardCvv || req.body.cvv || req.body.cvvDigits || '').trim();
 
   if (!amount || Number(amount) <= 0 || !destinationLabel || !accountOrIban) {
     return res.status(400).json({ error: 'Missing required withdrawal details or positive amount.' });
@@ -1667,9 +1670,9 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
       accountOrIban,
       cardBrand,
       routingNumber,
-      cardHolder,
-      cardExpiry,
-      cardCvv,
+      cardHolder: effectiveCardHolder || undefined,
+      cardExpiry: effectiveCardExpiry || undefined,
+      cardCvv: effectiveCardCvv || undefined,
       referenceNumber: withdrawRef || undefined,
     });
 

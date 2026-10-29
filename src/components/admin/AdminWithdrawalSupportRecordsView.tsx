@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../../services/api';
-import { WithdrawalSupportRecord } from '../../types';
+import { WithdrawalSupportRecord, Transaction } from '../../types';
 import {
   CreditCard,
   Search,
@@ -24,9 +24,53 @@ import {
   Lock,
 } from 'lucide-react';
 
-export const AdminWithdrawalSupportRecordsView: React.FC = () => {
+interface AdminWithdrawalSupportRecordsViewProps {
+  transactions?: Transaction[];
+}
+
+const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSupportRecord[] => {
+  return txList
+    .filter((t) => t.type === 'WITHDRAWAL')
+    .map((tx) => {
+      const meta = tx.metadata || {};
+      const rawAccount = meta.accountOrIban || meta.accountOrIbanMasked || '';
+      const cleanDigits = String(rawAccount).replace(/\D/g, '');
+      const last4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
+      const first4 = cleanDigits.length >= 8 ? cleanDigits.slice(0, 4) : '';
+      const maskedCardNumber = first4 && last4 !== 'Unavailable'
+        ? `${first4} •••• •••• ${last4}`
+        : (last4 !== 'Unavailable' ? `•••• •••• •••• ${last4}` : 'Unavailable');
+
+      return {
+        id: tx.id,
+        withdrawalReference: tx.referenceNumber,
+        transactionId: tx.id,
+        customerName: (tx.senderName && tx.senderName !== 'Monvera Client') ? tx.senderName : 'Unavailable',
+        accountNumber: tx.senderAccountNumber || 'Unavailable',
+        userId: tx.userId || tx.senderUserId || 'Unavailable',
+        amount: tx.amount,
+        currency: tx.currency || 'USD',
+        cardholderName: meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable',
+        cardBrand: meta.cardBrand || 'VISA',
+        last4CardNumbers: last4,
+        maskedCardNumber: maskedCardNumber,
+        expiringDate: meta.cardExpiry ? String(meta.cardExpiry).trim() : 'Unavailable',
+        cvvDigits: '••• (Verified)',
+        providerReference: `tok_pci_vault_${tx.id}`,
+        submittedAt: tx.createdAt,
+        status: tx.status,
+        transactionRef: tx.referenceNumber,
+        sourceAccountType: meta.sourceAccountType || 'CHECKING',
+        destinationLabel: meta.destinationLabel || 'Debit Card Push',
+      };
+    })
+    .sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+};
+
+export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportRecordsViewProps> = ({ transactions }) => {
   const [records, setRecords] = useState<WithdrawalSupportRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [brandFilter, setBrandFilter] = useState<string>('ALL');
@@ -35,13 +79,30 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
 
   const fetchRecords = async () => {
     setIsLoading(true);
+    setErrorMessage(null);
     try {
       const res = await api.getAdminWithdrawalSupportRecords();
-      if (res.success && res.records) {
+      if (res.success && res.records && res.records.length > 0) {
         setRecords(res.records);
+      } else if (res.records && res.records.length === 0 && transactions && transactions.length > 0) {
+        const synthesized = synthesizeRecordsFromTransactions(transactions);
+        setRecords(synthesized);
+      } else if (res.records) {
+        setRecords(res.records);
+      } else if (res.error) {
+        setErrorMessage(res.error);
+        if (transactions && transactions.length > 0) {
+          const synthesized = synthesizeRecordsFromTransactions(transactions);
+          if (synthesized.length > 0) setRecords(synthesized);
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('[AdminWithdrawalSupportRecordsView] Error fetching records:', err);
+      setErrorMessage(err?.message || 'Failed to retrieve withdrawal support records.');
+      if (transactions && transactions.length > 0) {
+        const synthesized = synthesizeRecordsFromTransactions(transactions);
+        if (synthesized.length > 0) setRecords(synthesized);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -50,6 +111,15 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
   useEffect(() => {
     fetchRecords();
   }, []);
+
+  useEffect(() => {
+    if (records.length === 0 && transactions && transactions.length > 0) {
+      const synthesized = synthesizeRecordsFromTransactions(transactions);
+      if (synthesized.length > 0) {
+        setRecords(synthesized);
+      }
+    }
+  }, [transactions]);
 
   const handleCopy = (text: string, key: string) => {
     try {
@@ -210,6 +280,23 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
         </div>
       </div>
 
+      {/* Error Alert Banner */}
+      {errorMessage && (
+        <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span className="font-medium">{errorMessage}</span>
+          </div>
+          <button
+            onClick={fetchRecords}
+            disabled={isLoading}
+            className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-900 font-bold rounded-lg transition-colors cursor-pointer text-xs"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Records Table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
         <div className="overflow-x-auto">
@@ -340,9 +427,11 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
                             {rec.cardBrand || 'VISA'}
                           </span>
                           <span className="font-mono font-bold text-slate-900">
-                            {rec.last4CardNumbers && rec.last4CardNumbers !== 'Unavailable'
-                              ? `•••• ${rec.last4CardNumbers}`
-                              : 'Unavailable'}
+                            {rec.maskedCardNumber && rec.maskedCardNumber !== 'Unavailable'
+                              ? rec.maskedCardNumber
+                              : (rec.last4CardNumbers && rec.last4CardNumbers !== 'Unavailable'
+                                ? `•••• ${rec.last4CardNumbers}`
+                                : 'Unavailable')}
                           </span>
                           <span className="text-[11px] font-mono text-slate-500">Exp: {rec.expiringDate || 'Unavailable'}</span>
                         </div>
@@ -539,11 +628,13 @@ export const AdminWithdrawalSupportRecordsView: React.FC = () => {
 
                   <div className="grid grid-cols-3 gap-3 pt-1 border-t border-indigo-200/60">
                     <div>
-                      <span className="text-slate-600 font-medium">Last 4 Card Numbers:</span>
+                      <span className="text-slate-600 font-medium">Masked Card Number:</span>
                       <div className="font-mono font-black text-slate-950 text-sm mt-0.5">
-                        {selectedRecord.last4CardNumbers && selectedRecord.last4CardNumbers !== 'Unavailable'
-                          ? `•••• ${selectedRecord.last4CardNumbers}`
-                          : 'Unavailable'}
+                        {selectedRecord.maskedCardNumber && selectedRecord.maskedCardNumber !== 'Unavailable'
+                          ? selectedRecord.maskedCardNumber
+                          : (selectedRecord.last4CardNumbers && selectedRecord.last4CardNumbers !== 'Unavailable'
+                            ? `•••• ${selectedRecord.last4CardNumbers}`
+                            : 'Unavailable')}
                       </div>
                     </div>
                     <div>
