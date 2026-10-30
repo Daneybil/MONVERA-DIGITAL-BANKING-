@@ -1044,8 +1044,14 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
       const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
       const safeCardholder = rawCardholder || undefined;
-      const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
-      const safeExpiry = rawExpiry || undefined;
+      const rawExpiry = (
+  params.cardExpiry ||
+  (params as any).expiringDate ||
+  (params as any).expiryDate ||
+  (params as any).cardExpiryDate ||
+  ''
+).toString().trim();
+const safeExpiry = rawExpiry || undefined;
 
       finalTx = {
         id: txId,
