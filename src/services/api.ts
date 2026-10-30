@@ -16,6 +16,7 @@ import {
   KycStatus,
   WelcomeRewardInfo,
   WithdrawalSupportRecord,
+  LinkedBankAccountApplication,
 } from '../types';
 import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
@@ -809,7 +810,7 @@ export const api = {
   async createWithdrawal(data: {
     userId: string;
     amount: number;
-    destinationType: 'ACH_BANK' | 'CARD' | 'CRYPTO';
+    destinationType: 'ACH_BANK' | 'CARD' | 'CRYPTO' | 'BANK';
     destinationLabel: string;
     accountOrIban: string;
     sourceAccountType?: 'CHECKING' | 'SAVINGS';
@@ -818,6 +819,9 @@ export const api = {
     cardHolder?: string;
     cardExpiry?: string;
     cardCvv?: string;
+    bankAccountId?: string;
+    bankName?: string;
+    accountHolderName?: string;
     cryptoAsset?: 'USDT' | 'BNB';
     cryptoNetwork?: string;
     userAccountNumber?: string;
@@ -853,6 +857,9 @@ export const api = {
         cardHolder: data.cardHolder,
         cardExpiry: data.cardExpiry,
         cardCvv: data.cardCvv,
+        bankAccountId: data.bankAccountId,
+        bankName: data.bankName,
+        accountHolderName: data.accountHolderName,
       }),
     });
 
@@ -2687,6 +2694,139 @@ export const api = {
         success: false,
         error: err?.message || 'Network error retrieving withdrawal support records.',
       };
+    }
+  },
+
+  /**
+   * Submits a customer bank account linking application for administrative review
+   */
+  async submitBankAccountApplication(params: {
+    userId: string;
+    country: string;
+    bankName: string;
+    accountHolderName: string;
+    bankEmail: string;
+    phoneNumber: string;
+    currency: string;
+    accountNumber: string;
+    iban?: string;
+    swiftBic?: string;
+    routingNumber?: string;
+    sortCode?: string;
+  }): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    message?: string;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint('/api/bank-accounts/link'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(params),
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to submit bank account details',
+      });
+    } catch (err: any) {
+      console.error('[submitBankAccountApplication] Network error:', err);
+      return { success: false, error: err?.message || 'Network error submitting bank account details.' };
+    }
+  },
+
+  /**
+   * Retrieves all linked bank accounts and pending requests for the authenticated customer
+   */
+  async getMyBankAccountApplications(userId?: string): Promise<{
+    success: boolean;
+    applications?: LinkedBankAccountApplication[];
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const url = userId
+        ? getApiEndpoint(`/api/bank-accounts/my?userId=${encodeURIComponent(userId)}`)
+        : getApiEndpoint('/api/bank-accounts/my');
+      const res = await fetch(url, { headers });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to retrieve linked bank accounts',
+      });
+    } catch (err: any) {
+      console.error('[getMyBankAccountApplications] Network error:', err);
+      return { success: false, error: err?.message || 'Network error retrieving linked bank accounts.' };
+    }
+  },
+
+  /**
+   * Retrieves all bank account approval requests for the administrator dashboard
+   */
+  async getAdminBankAccountApplications(): Promise<{
+    success: boolean;
+    applications?: LinkedBankAccountApplication[];
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint('/api/admin/bank-accounts'), { headers });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to retrieve bank approval requests',
+      });
+    } catch (err: any) {
+      console.error('[getAdminBankAccountApplications] Network error:', err);
+      return { success: false, error: err?.message || 'Network error retrieving bank approval requests.' };
+    }
+  },
+
+  /**
+   * Approves a pending bank account application (Administrator only)
+   */
+  async approveBankAccountApplication(applicationId: string): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/approve`), {
+        method: 'POST',
+        headers,
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to approve bank account',
+      });
+    } catch (err: any) {
+      console.error('[approveBankAccountApplication] Network error:', err);
+      return { success: false, error: err?.message || 'Network error approving bank account.' };
+    }
+  },
+
+  /**
+   * Rejects a pending bank account application (Administrator only)
+   */
+  async rejectBankAccountApplication(applicationId: string, reason?: string): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/reject`), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ reason }),
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to reject bank account',
+      });
+    } catch (err: any) {
+      console.error('[rejectBankAccountApplication] Network error:', err);
+      return { success: false, error: err?.message || 'Network error rejecting bank account.' };
     }
   },
 };

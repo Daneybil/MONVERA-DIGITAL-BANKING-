@@ -25,6 +25,11 @@ import {
   checkUserHasOutstandingLoan,
   resolveRecipientUser,
   getAllWithdrawalSupportRecordsAdmin,
+  submitBankAccountApplication,
+  getCustomerBankAccountApplications,
+  getAllBankAccountApplicationsAdmin,
+  approveBankAccountApplication,
+  rejectBankAccountApplication,
 } from './server/firestoreTransactions';
 import { evaluateAndProcessWelcomeReward, getAllWelcomeRewardsAdmin } from './server/welcomeRewardService';
 
@@ -1674,6 +1679,9 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
       cardExpiry: effectiveCardExpiry || undefined,
       cardCvv: effectiveCardCvv || undefined,
       referenceNumber: withdrawRef || undefined,
+      bankAccountId: req.body.bankAccountId,
+      bankName: req.body.bankName,
+      accountHolderName: req.body.accountHolderName || effectiveCardHolder || undefined,
     });
 
     if (!result.success) {
@@ -1712,6 +1720,155 @@ app.get('/api/admin/withdrawal-support-records', optionalFirebaseAuth, async (re
     console.error('[GET /api/admin/withdrawal-support-records] Error:', err);
     return res.status(500).json({ error: err?.message || 'Failed to retrieve withdrawal support records.' });
   }
+});
+
+// --- MANUAL BANK ACCOUNT LINKING & ADMINISTRATIVE APPROVAL ---
+
+// Customer endpoint: submit new bank account linking application
+app.post('/api/bank-accounts/link', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (req.body.userId || callerUid);
+
+  if (!targetUserId) {
+    return res.status(401).json({ error: 'Authentication required to link a bank account.' });
+  }
+
+  const {
+    country,
+    bankName,
+    accountHolderName,
+    bankEmail,
+    phoneNumber,
+    currency,
+    accountNumber,
+    iban,
+    swiftBic,
+    routingNumber,
+    sortCode,
+  } = req.body;
+
+  if (!country || !bankName || !accountHolderName || !bankEmail || !phoneNumber || !currency || !accountNumber) {
+    return res.status(400).json({ error: 'Please provide all required bank account fields.' });
+  }
+
+  const result = await submitBankAccountApplication({
+    userId: targetUserId,
+    country,
+    bankName,
+    accountHolderName,
+    bankEmail,
+    phoneNumber,
+    currency,
+    accountNumber,
+    iban,
+    swiftBic,
+    routingNumber,
+    sortCode,
+  });
+
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({
+    success: true,
+    application: result.application,
+    message: 'Bank Account Submitted Successfully',
+  });
+});
+
+// Customer endpoint: retrieve all bank accounts for authenticated customer
+app.get('/api/bank-accounts/my', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (req.query.userId as string || callerUid);
+
+  if (!targetUserId) {
+    return res.status(401).json({ error: 'Authentication required.' });
+  }
+
+  try {
+    const applications = await getCustomerBankAccountApplications(targetUserId);
+    return res.json({ success: true, applications });
+  } catch (err: any) {
+    console.error('[GET /api/bank-accounts/my Error]:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to retrieve linked bank accounts.' });
+  }
+});
+
+// Administrator endpoint: retrieve all bank account approval requests
+app.get('/api/admin/bank-accounts', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const queryAdminSession = (req.query.adminSession as string) || (req.headers['x-admin-session'] as string);
+  if (!isAdmin && queryAdminSession) {
+    const verified = verifyAdminSessionToken(queryAdminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrative privileges required to access bank approval requests.' });
+  }
+
+  try {
+    const applications = await getAllBankAccountApplicationsAdmin();
+    return res.json({ success: true, applications });
+  } catch (err: any) {
+    console.error('[GET /api/admin/bank-accounts Error]:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to retrieve bank approval requests.' });
+  }
+});
+
+// Administrator endpoint: approve bank account
+app.post('/api/admin/bank-accounts/:id/approve', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const adminSession = (req.headers['x-admin-session'] as string) || (req.body?.adminSession as string);
+  if (!isAdmin && adminSession) {
+    const verified = verifyAdminSessionToken(adminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrator privileges required to approve bank accounts.' });
+  }
+
+  const { id } = req.params;
+  const adminId = callerUid || 'usr_admin';
+
+  const result = await approveBankAccountApplication(adminId, id);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, application: result.application });
+});
+
+// Administrator endpoint: reject bank account
+app.post('/api/admin/bank-accounts/:id/reject', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const adminSession = (req.headers['x-admin-session'] as string) || (req.body?.adminSession as string);
+  if (!isAdmin && adminSession) {
+    const verified = verifyAdminSessionToken(adminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrator privileges required to reject bank accounts.' });
+  }
+
+  const { id } = req.params;
+  const { reason } = req.body;
+  const adminId = callerUid || 'usr_admin';
+
+  const result = await rejectBankAccountApplication(adminId, id, reason);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, application: result.application });
 });
 
 // Reverse pending withdrawal

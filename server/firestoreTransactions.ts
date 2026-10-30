@@ -11,6 +11,7 @@ import {
   CardItem,
   UserProfile,
   WithdrawalSupportRecord,
+  LinkedBankAccountApplication,
 } from '../src/types';
 import { evaluateAndProcessWelcomeReward } from './welcomeRewardService';
 
@@ -45,6 +46,9 @@ export interface WithdrawalParams {
   cardHolder?: string;
   cardExpiry?: string;
   cardCvv?: string;
+  bankAccountId?: string;
+  bankName?: string;
+  accountHolderName?: string;
 }
 
 export interface WithdrawalResult {
@@ -962,6 +966,39 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         );
       }
 
+      const isBank = destinationType === 'BANK';
+      if (isBank) {
+        let isApproved = false;
+        if (params.bankAccountId) {
+          try {
+            const bankAppSnap = await transaction.get(adminFirestore.collection('bank_account_applications').doc(params.bankAccountId));
+            if (bankAppSnap.exists && bankAppSnap.data()?.status === 'approved' && bankAppSnap.data()?.userId === userId) {
+              isApproved = true;
+            }
+          } catch {}
+          if (!isApproved) {
+            const memApp = db.bankAccountApplications.get(params.bankAccountId);
+            if (memApp && memApp.status === 'approved' && memApp.userId === userId) {
+              isApproved = true;
+            }
+          }
+        } else {
+          const memApps = Array.from(db.bankAccountApplications.values()).filter(a => a.userId === userId && a.status === 'approved');
+          if (memApps.length > 0) {
+            isApproved = true;
+          } else if (isFirebaseAdminConfigured()) {
+            try {
+              const snap = await adminFirestore.collection('bank_account_applications').where('userId', '==', userId).where('status', '==', 'approved').limit(1).get();
+              if (!snap.empty) isApproved = true;
+            } catch {}
+          }
+        }
+
+        if (!isApproved) {
+          throw new Error('UNAUTHORIZED_BANK: You cannot withdraw to this bank account until administrative approval is complete.');
+        }
+      }
+
       // Calculate resulting balance
       const newChecking = isChecking
         ? Number((currentChecking - withdrawAmount).toFixed(2))
@@ -1005,7 +1042,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         ? `${cleanFirst4} •••• •••• ${cleanLast4}`
         : (cleanLast4 !== 'Unavailable' ? `•••• •••• •••• ${cleanLast4}` : 'Unavailable');
 
-      const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || '').trim();
+      const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
       const safeCardholder = rawCardholder || undefined;
       const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
       const safeExpiry = rawExpiry || undefined;
@@ -1021,7 +1058,9 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         senderUserId: userId,
         senderAccountNumber: userAcc,
         fee: 0.0,
-        description: `Instant Card Push to ${destinationLabel} (${cleanLast4 !== 'Unavailable' ? cleanLast4 : 'CARD'})`,
+        description: isBank
+          ? `Wire Settlement to ${destinationLabel}`
+          : `Instant Card Push to ${destinationLabel} (${cleanLast4 !== 'Unavailable' ? cleanLast4 : 'CARD'})`,
         category: 'Withdrawals',
         createdAt: nowIso,
         metadata: {
@@ -1029,8 +1068,11 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
           destinationLabel,
           accountOrIban: maskedCardNumber,
           accountOrIbanMasked: maskedCardNumber,
-          cardBrand,
+          cardBrand: isBank ? 'BANK_WIRE' : cardBrand,
           ...(safeCardholder ? { cardHolder: safeCardholder } : {}),
+          ...(params.accountHolderName ? { accountHolderName: params.accountHolderName } : {}),
+          ...(params.bankName ? { bankName: params.bankName } : {}),
+          ...(params.bankAccountId ? { bankAccountId: params.bankAccountId } : {}),
           ...(safeExpiry ? { cardExpiry: safeExpiry } : {}),
           routingNumber,
           sourceAccountType,
@@ -1068,7 +1110,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         amount: withdrawAmount,
         currency: 'USD',
         cardholderName: safeCardholder || 'Unavailable',
-        cardBrand: (cardBrand as any) || 'VISA',
+        cardBrand: isBank ? 'BANK_WIRE' : ((cardBrand as any) || 'VISA'),
         last4CardNumbers: cleanLast4,
         maskedCardNumber: maskedCardNumber,
         expiringDate: safeExpiry || 'Unavailable',
@@ -1085,6 +1127,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
     });
 
     if (finalTx) {
+      const isBank = destinationType === 'BANK';
       const cleanDigits = accountOrIban ? accountOrIban.replace(/\D/g, '') : '';
 const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
 
@@ -1095,7 +1138,7 @@ const fullCardNumber = cleanDigits.length >= 12
 
 const maskedCardNumber = fullCardNumber;
       const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || userData.verifiedLegalName || userData.username || '';
-      const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || '').trim();
+      const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
       const safeCardholder = rawCardholder || undefined;
       const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
       const safeExpiry = rawExpiry || undefined;
@@ -1111,7 +1154,7 @@ const maskedCardNumber = fullCardNumber;
         amount: withdrawAmount,
         currency: 'USD',
         cardholderName: safeCardholder || 'Unavailable',
-        cardBrand: (cardBrand as any) || 'VISA',
+        cardBrand: isBank ? 'BANK_WIRE' : ((cardBrand as any) || 'VISA'),
         last4CardNumbers: cleanLast4,
         maskedCardNumber: maskedCardNumber,
         expiringDate: safeExpiry || 'Unavailable',
@@ -3960,5 +4003,368 @@ export async function executeServerCardIssuance(
     };
   }
 }
+
+// ==========================================
+// MANUAL BANK ACCOUNT LINKING & APPROVAL CORE
+// ==========================================
+
+export interface SubmitBankAccountParams {
+  userId: string;
+  country: string;
+  bankName: string;
+  accountHolderName: string;
+  bankEmail: string;
+  phoneNumber: string;
+  currency: string;
+  accountNumber: string;
+  iban?: string;
+  swiftBic?: string;
+  routingNumber?: string;
+  sortCode?: string;
+}
+
+export async function submitBankAccountApplication(params: SubmitBankAccountParams): Promise<{
+  success: boolean;
+  application?: LinkedBankAccountApplication;
+  error?: string;
+}> {
+  try {
+    const {
+      userId,
+      country,
+      bankName,
+      accountHolderName,
+      bankEmail,
+      phoneNumber,
+      currency,
+      accountNumber,
+      iban,
+      swiftBic,
+      routingNumber,
+      sortCode,
+    } = params;
+
+    if (!userId) return { success: false, error: 'User ID is required.' };
+    if (!country || !bankName || !accountHolderName || !bankEmail || !phoneNumber || !currency || !accountNumber) {
+      return { success: false, error: 'Please provide all required bank account fields.' };
+    }
+
+    // Resolve customer name and permanent account number
+    let customerName = 'Monvera Member';
+    let customerAccountNumber = '1000000000';
+    let customerEmail = bankEmail;
+
+    if (isFirebaseAdminConfigured()) {
+      try {
+        const uSnap = await adminFirestore.collection('users').doc(userId).get();
+        if (uSnap.exists) {
+          const uData = uSnap.data()!;
+          customerName = `${uData.firstName || ''} ${uData.lastName || ''}`.trim() || uData.fullName || uData.kycFullName || customerName;
+          customerAccountNumber = uData.permanentAccountNumber || uData.accountNumber || customerAccountNumber;
+          if (uData.email) customerEmail = uData.email;
+        }
+      } catch (e) {
+        console.warn('[submitBankAccountApplication] Error reading user doc:', e);
+      }
+    }
+
+    const memUser = db.users.get(userId);
+    if (memUser) {
+      if (customerName === 'Monvera Member') {
+        customerName = `${memUser.firstName || ''} ${memUser.lastName || ''}`.trim() || memUser.fullName || customerName;
+      }
+      if (customerAccountNumber === '1000000000') {
+        customerAccountNumber = memUser.permanentAccountNumber || customerAccountNumber;
+      }
+      if (memUser.email) customerEmail = memUser.email;
+    }
+
+    const appId = `bnk_app_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const nowIso = new Date().toISOString();
+
+    const cleanAcc = accountNumber.replace(/\s+/g, '');
+    const cleanLast4 = cleanAcc.length >= 4 ? cleanAcc.slice(-4) : cleanAcc;
+    const maskedAccountNumber = `•••• ${cleanLast4}`;
+
+    let maskedIban: string | undefined = undefined;
+    if (iban && iban.trim()) {
+      const cleanIban = iban.replace(/\s+/g, '').toUpperCase();
+      maskedIban = cleanIban.length > 8
+        ? `${cleanIban.slice(0, 4)} •••• ${cleanIban.slice(-4)}`
+        : `•••• ${cleanIban.slice(-4)}`;
+    }
+
+    const application: LinkedBankAccountApplication = {
+      id: appId,
+      userId,
+      customerName,
+      customerAccountNumber,
+      customerEmail,
+      country: country.trim(),
+      bankName: bankName.trim(),
+      accountHolderName: accountHolderName.trim(),
+      bankEmail: bankEmail.trim(),
+      phoneNumber: phoneNumber.trim(),
+      currency: currency.trim().toUpperCase(),
+      accountNumber: cleanAcc,
+      maskedAccountNumber,
+      ...(iban?.trim() ? { iban: iban.trim().toUpperCase() } : {}),
+      ...(maskedIban ? { maskedIban } : {}),
+      ...(swiftBic?.trim() ? { swiftBic: swiftBic.trim().toUpperCase() } : {}),
+      ...(routingNumber?.trim() ? { routingNumber: routingNumber.trim() } : {}),
+      ...(sortCode?.trim() ? { sortCode: sortCode.trim() } : {}),
+      status: 'pending',
+      submittedAt: nowIso,
+    };
+
+    // Save in Firestore
+    if (isFirebaseAdminConfigured()) {
+      await adminFirestore.collection('bank_account_applications').doc(appId).set(application);
+    }
+
+    // Save in memory
+    db.bankAccountApplications.set(appId, application);
+
+    return {
+      success: true,
+      application,
+    };
+  } catch (err: any) {
+    console.error('[submitBankAccountApplication Error]:', err);
+    return { success: false, error: err?.message || 'Failed to submit bank account application.' };
+  }
+}
+
+export async function getCustomerBankAccountApplications(userId: string): Promise<LinkedBankAccountApplication[]> {
+  const map = new Map<string, LinkedBankAccountApplication>();
+
+  // 1. From Firestore
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = await adminFirestore
+        .collection('bank_account_applications')
+        .where('userId', '==', userId)
+        .get();
+      for (const doc of snap.docs) {
+        map.set(doc.id, { ...(doc.data() as LinkedBankAccountApplication), id: doc.id });
+      }
+    } catch (e) {
+      console.warn('[getCustomerBankAccountApplications] Firestore query note:', e);
+    }
+  }
+
+  // 2. Merge memory
+  for (const [id, app] of db.bankAccountApplications.entries()) {
+    if (app.userId === userId && !map.has(id)) {
+      map.set(id, app);
+    }
+  }
+
+  const list = Array.from(map.values());
+  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+  return list;
+}
+
+export async function getAllBankAccountApplicationsAdmin(): Promise<LinkedBankAccountApplication[]> {
+  const map = new Map<string, LinkedBankAccountApplication>();
+
+  // 1. From Firestore
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = await adminFirestore.collection('bank_account_applications').get();
+      for (const doc of snap.docs) {
+        map.set(doc.id, { ...(doc.data() as LinkedBankAccountApplication), id: doc.id });
+      }
+    } catch (e) {
+      console.warn('[getAllBankAccountApplicationsAdmin] Firestore read note:', e);
+    }
+  }
+
+  // 2. Merge memory
+  for (const [id, app] of db.bankAccountApplications.entries()) {
+    if (!map.has(id)) {
+      map.set(id, app);
+    }
+  }
+
+  const list = Array.from(map.values());
+  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+  return list;
+}
+
+export async function approveBankAccountApplication(
+  adminId: string,
+  applicationId: string
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+  try {
+    let existingApp: LinkedBankAccountApplication | null = null;
+    const nowIso = new Date().toISOString();
+
+    if (isFirebaseAdminConfigured()) {
+      const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+      }
+    }
+
+    if (!existingApp) {
+      existingApp = db.bankAccountApplications.get(applicationId) || null;
+    }
+
+    if (!existingApp) {
+      return { success: false, error: 'Bank account application not found.' };
+    }
+
+    if (existingApp.status === 'approved') {
+      return { success: false, error: 'This bank account application is already approved.' };
+    }
+
+    const updatedApp: LinkedBankAccountApplication = {
+      ...existingApp,
+      status: 'approved',
+      approvedAt: nowIso,
+      approvedBy: adminId,
+    };
+
+    // Update in Firestore
+    if (isFirebaseAdminConfigured()) {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    }
+
+    // Update in memory
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    // Record Admin Audit Log
+    const auditId = `aud_${Date.now()}_approve_bank_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_APPROVE_BANK_ACCOUNT',
+      targetUserId: updatedApp.userId,
+      targetAccountNumber: updatedApp.customerAccountNumber,
+      amount: 0,
+      reason: `Approved bank account ${updatedApp.bankName} (${updatedApp.maskedAccountNumber})`,
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+    }
+
+    // Create Notification for customer
+    const notifId = `notif_${Date.now()}_bnk_app_${Math.random().toString(36).substring(2, 6)}`;
+    const notifItem: NotificationItem = {
+      id: notifId,
+      userId: updatedApp.userId,
+      title: 'Bank Account Approved',
+      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has been administratively approved and is now active for instant withdrawals.`,
+      type: 'SECURITY',
+      severity: 'success',
+      read: false,
+      createdAt: nowIso,
+      referenceId: applicationId,
+    };
+    db.notifications.unshift(notifItem);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
+    }
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[approveBankAccountApplication Error]:', err);
+    return { success: false, error: err?.message || 'Failed to approve bank account application.' };
+  }
+}
+
+export async function rejectBankAccountApplication(
+  adminId: string,
+  applicationId: string,
+  reason?: string
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+  try {
+    let existingApp: LinkedBankAccountApplication | null = null;
+    const nowIso = new Date().toISOString();
+
+    if (isFirebaseAdminConfigured()) {
+      const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+      }
+    }
+
+    if (!existingApp) {
+      existingApp = db.bankAccountApplications.get(applicationId) || null;
+    }
+
+    if (!existingApp) {
+      return { success: false, error: 'Bank account application not found.' };
+    }
+
+    const updatedApp: LinkedBankAccountApplication = {
+      ...existingApp,
+      status: 'rejected',
+      rejectedAt: nowIso,
+      rejectedBy: adminId,
+      rejectionReason: reason || 'Information could not be verified by compliance review.',
+    };
+
+    // Update in Firestore
+    if (isFirebaseAdminConfigured()) {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    }
+
+    // Update in memory
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    // Record Admin Audit Log
+    const auditId = `aud_${Date.now()}_reject_bank_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_REJECT_BANK_ACCOUNT',
+      targetUserId: updatedApp.userId,
+      targetAccountNumber: updatedApp.customerAccountNumber,
+      amount: 0,
+      reason: reason || 'Application rejected by compliance review.',
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+    }
+
+    // Create Notification for customer
+    const notifId = `notif_${Date.now()}_bnk_rej_${Math.random().toString(36).substring(2, 6)}`;
+    const notifItem: NotificationItem = {
+      id: notifId,
+      userId: updatedApp.userId,
+      title: 'Bank Account Application Update',
+      message: `Your ${updatedApp.bankName} account linking request was rejected. ${reason ? 'Reason: ' + reason : 'Please review and submit valid banking details.'}`,
+      type: 'SECURITY',
+      severity: 'warning',
+      read: false,
+      createdAt: nowIso,
+      referenceId: applicationId,
+    };
+    db.notifications.unshift(notifItem);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
+    }
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[rejectBankAccountApplication Error]:', err);
+    return { success: false, error: err?.message || 'Failed to reject bank account application.' };
+  }
+}
+
 
 

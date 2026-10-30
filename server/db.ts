@@ -18,6 +18,7 @@ import {
   InvestmentTermDays,
   BalanceMetrics,
   WithdrawalSupportRecord,
+  LinkedBankAccountApplication,
 } from '../src/types';
 
 // In-Memory Authoritative Store with initial seed data
@@ -36,6 +37,7 @@ export class MonveraDatabase {
   public sessions: Map<string, SessionInfo[]> = new Map();
   public supportMessages: Map<string, any> = new Map(); // Persistent live chat store
   public withdrawalSupportRecords: Map<string, WithdrawalSupportRecord> = new Map();
+  public bankAccountApplications: Map<string, LinkedBankAccountApplication> = new Map();
   public devFundingPoolBalance: number = 1000000000.0; // $1,000,000,000.00 Development Testing Liquidity Pool
 
   constructor() {

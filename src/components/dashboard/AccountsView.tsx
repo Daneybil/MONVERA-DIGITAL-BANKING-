@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { LinkedBankAccountApplication } from '../../types';
 import {
   Wallet,
   Landmark,
@@ -14,11 +15,39 @@ import {
   Download,
   AlertCircle,
   CheckCircle2,
+  Clock,
+  XCircle,
+  Building2,
 } from 'lucide-react';
 
 export const AccountsView: React.FC = () => {
   const { currentUser, balanceMetrics, openModal, refreshBalance, refreshNotifications } = useAuth();
   const [copiedAcc, setCopiedAcc] = useState<string | null>(null);
+
+  // Bank Account Applications State
+  const [bankAccounts, setBankAccounts] = useState<LinkedBankAccountApplication[]>([]);
+  const [isLoadingBanks, setIsLoadingBanks] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (currentUser?.id) {
+      loadBanks();
+    }
+  }, [currentUser?.id]);
+
+  const loadBanks = async () => {
+    if (!currentUser?.id) return;
+    setIsLoadingBanks(true);
+    try {
+      const res = await api.getMyBankAccountApplications(currentUser.id);
+      if (res.success && res.applications) {
+        setBankAccounts(res.applications);
+      }
+    } catch (err) {
+      console.warn('Could not load bank accounts:', err);
+    } finally {
+      setIsLoadingBanks(false);
+    }
+  };
 
   // Internal Transfer Form State (Between Checking and Savings)
   const [fromType, setFromType] = useState<'CHECKING' | 'SAVINGS'>('CHECKING');
@@ -358,13 +387,112 @@ export const AccountsView: React.FC = () => {
             <button
               type="submit"
               disabled={isTransferring}
-              className="py-3 px-6 rounded-xl font-bold text-xs text-white bg-slate-900 hover:bg-slate-800 transition-colors shadow-sm flex items-center gap-2"
+              className="py-3 px-6 rounded-xl font-bold text-xs text-white bg-slate-900 hover:bg-slate-800 transition-colors shadow-sm flex items-center gap-2 cursor-pointer"
             >
               <span>{isTransferring ? 'Transferring...' : 'Execute Internal Transfer'}</span>
               <ArrowRight className="w-3.5 h-3.5 text-emerald-400" />
             </button>
           </div>
         </form>
+      </div>
+
+      {/* Linked External Bank Accounts Area */}
+      <div className="p-6 sm:p-8 bg-white rounded-3xl border border-slate-200 shadow-sm space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-slate-950 text-emerald-400 flex items-center justify-center font-bold shadow-xs">
+              <Landmark className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-black text-slate-950">Linked Bank Accounts</h3>
+              <p className="text-xs text-slate-500 font-medium">
+                External bank accounts linked for verified wire and ACH payout settlement
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => openModal('withdraw')}
+            className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black transition-colors flex items-center gap-1.5 self-start sm:self-center shadow-xs cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Link Bank Account</span>
+          </button>
+        </div>
+
+        {isLoadingBanks ? (
+          <div className="py-8 text-center text-xs font-bold text-slate-400">Loading linked bank accounts...</div>
+        ) : bankAccounts.length === 0 ? (
+          <div className="py-8 text-center space-y-2 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+            <Building2 className="w-8 h-8 text-slate-400 mx-auto" />
+            <div className="font-bold text-xs text-slate-700">No External Bank Accounts Linked</div>
+            <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
+              Link your domestic or international checking or savings bank account to enable direct wire and ACH withdrawals.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+            {bankAccounts.map((app) => (
+              <div
+                key={app.id}
+                className="p-4 rounded-2xl border-2 border-slate-200 bg-slate-50/70 space-y-2.5 transition-all hover:bg-white hover:border-slate-300"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-slate-800">
+                      <Landmark className="w-4 h-4 text-emerald-600" />
+                    </div>
+                    <div>
+                      <h4 className="font-black text-xs text-slate-950">{app.bankName}</h4>
+                      <p className="text-[10px] text-slate-500 font-medium">{app.country} • {app.currency}</p>
+                    </div>
+                  </div>
+
+                  {app.status === 'approved' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300">
+                      <Check className="w-3 h-3 text-emerald-600" />
+                      Approved
+                    </span>
+                  )}
+                  {app.status === 'pending' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300">
+                      <Clock className="w-3 h-3 text-amber-600" />
+                      Pending Review
+                    </span>
+                  )}
+                  {app.status === 'rejected' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-300">
+                      <XCircle className="w-3 h-3 text-rose-600" />
+                      Rejected
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-200/80">
+                  <div>
+                    <span className="text-[10px] text-slate-400 block font-semibold">Account Number</span>
+                    <strong className="font-mono text-slate-900 text-xs">{app.maskedAccountNumber}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-400 block font-semibold">Beneficiary Name</span>
+                    <strong className="text-slate-900 text-xs truncate block">{app.accountHolderName}</strong>
+                  </div>
+                </div>
+
+                {app.status === 'pending' && (
+                  <div className="p-2.5 rounded-xl bg-amber-100/60 border border-amber-200 text-[11px] text-amber-900 font-medium">
+                    Pending Approval — Your bank account is being reviewed.
+                  </div>
+                )}
+                {app.status === 'rejected' && app.rejectionReason && (
+                  <div className="p-2.5 rounded-xl bg-rose-100/60 border border-rose-200 text-[11px] text-rose-900 font-medium">
+                    Reason: {app.rejectionReason}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
     </div>

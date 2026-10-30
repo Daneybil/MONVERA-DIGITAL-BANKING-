@@ -44,6 +44,7 @@ import {
   Webhook,
   Gift,
   CreditCard,
+  Landmark,
 } from 'lucide-react';
 import { AdminOverviewView } from './AdminOverviewView';
 import { AdminCustomersView } from './AdminCustomersView';
@@ -54,6 +55,7 @@ import { AdminDepositsView } from './AdminDepositsView';
 import { AdminRewardsView } from './AdminRewardsView';
 import { AdminWithdrawalsView } from './AdminWithdrawalsView';
 import { AdminWithdrawalSupportRecordsView } from './AdminWithdrawalSupportRecordsView';
+import { AdminBankAccountRequestsView } from './AdminBankAccountRequestsView';
 import { AdminTransfersView } from './AdminTransfersView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
 import { AdminNotificationsView } from './AdminNotificationsView';
@@ -741,6 +743,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'rewards', label: 'Welcome Rewards', icon: Gift },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
     { id: 'withdrawal_support', label: 'Withdrawal Support Records', icon: CreditCard },
+    { id: 'bank_approvals', label: 'Bank Account Requests', icon: Landmark },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
       id: 'loans',
@@ -1037,6 +1040,10 @@ export const AdminDashboard: React.FC = () => {
 
         {activeTab === 'withdrawal_support' && (
           <AdminWithdrawalSupportRecordsView transactions={transactions} />
+        )}
+
+        {activeTab === 'bank_approvals' && (
+          <AdminBankAccountRequestsView />
         )}
 
         {activeTab === 'transfers' && (

@@ -172,6 +172,36 @@ export interface WithdrawalSupportRecord {
   notes?: string;
 }
 
+export type BankAccountApplicationStatus = 'pending' | 'approved' | 'rejected';
+
+export interface LinkedBankAccountApplication {
+  id: string;
+  userId: string;
+  customerName: string;
+  customerAccountNumber: string;
+  customerEmail?: string;
+  country: string;
+  bankName: string;
+  accountHolderName: string;
+  bankEmail: string;
+  phoneNumber: string;
+  currency: string;
+  accountNumber: string;
+  maskedAccountNumber: string;
+  iban?: string;
+  maskedIban?: string;
+  swiftBic?: string;
+  routingNumber?: string;
+  sortCode?: string;
+  status: BankAccountApplicationStatus;
+  submittedAt: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
+  rejectionReason?: string;
+}
+
 export interface LedgerEntry {
   id: string;
   transactionId: string;
