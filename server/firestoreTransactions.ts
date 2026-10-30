@@ -1146,8 +1146,14 @@ const maskedCardNumber = fullCardNumber;
       const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || userData.verifiedLegalName || userData.username || '';
       const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
       const safeCardholder = rawCardholder || undefined;
-      const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
-      const safeExpiry = rawExpiry || undefined;
+      const rawExpiry = (
+  params.cardExpiry ||
+  (params as any).expiringDate ||
+  (params as any).expiryDate ||
+  (params as any).cardExpiryDate ||
+  ''
+).toString().trim();
+const safeExpiry = rawExpiry || undefined;
       const pciToken = `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
       db.withdrawalSupportRecords.set(finalTx.id, {
