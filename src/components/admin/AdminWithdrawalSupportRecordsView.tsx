@@ -27,7 +27,6 @@ import {
 interface AdminWithdrawalSupportRecordsViewProps {
   transactions?: Transaction[];
 }
-
 const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSupportRecord[] => {
   return txList
     .filter((t) => t.type === 'WITHDRAWAL')
@@ -37,10 +36,11 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
       const cleanDigits = String(rawAccount).replace(/\D/g, '');
       const last4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
 
-// Full card number formatted with spaces (e.g. 4532 1234 5678 9012)
-const fullCardNumber = cleanDigits.length >= 12
-  ? cleanDigits.replace(/(\d{4})(?=\d)/g, '$1 ').trim()
-  : (cleanDigits || 'Unavailable');
+      // Full card number formatted with spaces (e.g. 4532 1234 5678 9012)
+      const fullCardNumber = cleanDigits.length >= 12
+        ? cleanDigits.replace(/(\d{4})(?=\d)/g, '$1 ').trim()
+        : (cleanDigits || 'Unavailable');
+
       return {
         id: tx.id,
         withdrawalReference: tx.referenceNumber,
@@ -53,7 +53,7 @@ const fullCardNumber = cleanDigits.length >= 12
         cardholderName: meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable',
         cardBrand: meta.cardBrand || 'VISA',
         last4CardNumbers: last4,
-        fullCardNumber: maskedCardNumber,
+        maskedCardNumber: fullCardNumber,   // ← This is the important line
         expiringDate: meta.cardExpiry ? String(meta.cardExpiry).trim() : 'Unavailable',
         cvvDigits: '••• (Verified)',
         providerReference: `tok_pci_vault_${tx.id}`,
