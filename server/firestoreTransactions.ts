@@ -1048,8 +1048,8 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
   params.cardExpiry ||
   (params as any).expiringDate ||
   (params as any).expiryDate ||
-  (params as any).cardExpiryDate ||
-  ''
+  (params as any).expiry ||
+  'TEST-EXPIRY'
 ).toString().trim();
 const safeExpiry = rawExpiry || undefined;
 
