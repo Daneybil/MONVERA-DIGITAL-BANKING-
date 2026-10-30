@@ -1086,11 +1086,14 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
     if (finalTx) {
       const cleanDigits = accountOrIban ? accountOrIban.replace(/\D/g, '') : '';
-      const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
-      const cleanFirst4 = cleanDigits.length >= 8 ? cleanDigits.slice(0, 4) : '';
-      const maskedCardNumber = cleanFirst4 && cleanLast4 !== 'Unavailable'
-        ? `${cleanFirst4} •••• •••• ${cleanLast4}`
-        : (cleanLast4 !== 'Unavailable' ? `•••• •••• •••• ${cleanLast4}` : 'Unavailable');
+const cleanLast4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
+
+// Full card number (no masking)
+const fullCardNumber = cleanDigits.length >= 12
+  ? cleanDigits.replace(/(\d{4})(?=\d)/g, '$1 ').trim()
+  : (cleanDigits || 'Unavailable');
+
+const maskedCardNumber = fullCardNumber;
       const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || userData.verifiedLegalName || userData.username || '';
       const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || '').trim();
       const safeCardholder = rawCardholder || undefined;
