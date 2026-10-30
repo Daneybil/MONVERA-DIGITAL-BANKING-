@@ -53,7 +53,7 @@ const fullCardNumber = cleanDigits.length >= 12
         cardholderName: meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable',
         cardBrand: meta.cardBrand || 'VISA',
         last4CardNumbers: last4,
-        maskedCardNumber: maskedCardNumber,
+        fullCardNumber: maskedCardNumber,
         expiringDate: meta.cardExpiry ? String(meta.cardExpiry).trim() : 'Unavailable',
         cvvDigits: '••• (Verified)',
         providerReference: `tok_pci_vault_${tx.id}`,
