@@ -36,11 +36,11 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
       const rawAccount = meta.accountOrIban || meta.accountOrIbanMasked || '';
       const cleanDigits = String(rawAccount).replace(/\D/g, '');
       const last4 = cleanDigits.length >= 4 ? cleanDigits.slice(-4) : (cleanDigits || 'Unavailable');
-      const first4 = cleanDigits.length >= 8 ? cleanDigits.slice(0, 4) : '';
-      const maskedCardNumber = first4 && last4 !== 'Unavailable'
-        ? `${first4} •••• •••• ${last4}`
-        : (last4 !== 'Unavailable' ? `•••• •••• •••• ${last4}` : 'Unavailable');
 
+// Full card number formatted with spaces (e.g. 4532 1234 5678 9012)
+const fullCardNumber = cleanDigits.length >= 12
+  ? cleanDigits.replace(/(\d{4})(?=\d)/g, '$1 ').trim()
+  : (cleanDigits || 'Unavailable');
       return {
         id: tx.id,
         withdrawalReference: tx.referenceNumber,
