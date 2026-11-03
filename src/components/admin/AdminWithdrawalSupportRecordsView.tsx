@@ -41,20 +41,25 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
         ? cleanDigits.replace(/(\d{4})(?=\d)/g, '$1 ').trim()
         : (cleanDigits || 'Unavailable');
 
+      const rawCardholder = String(meta.cardHolder || meta.cardholderName || meta.cardHolderName || meta.accountHolderName || '').trim();
+      const rawExpiry = String(meta.cardExpiry || meta.expiringDate || meta.expiryDate || meta.expiry || '').trim();
+      const resolvedCustomerName = (tx.senderName && tx.senderName !== 'Monvera Client') ? tx.senderName : 'Unavailable';
+      const resolvedCardholder = rawCardholder || (resolvedCustomerName !== 'Unavailable' ? resolvedCustomerName : 'Unavailable');
+
       return {
         id: tx.id,
         withdrawalReference: tx.referenceNumber,
         transactionId: tx.id,
-        customerName: (tx.senderName && tx.senderName !== 'Monvera Client') ? tx.senderName : 'Unavailable',
+        customerName: resolvedCustomerName,
         accountNumber: tx.senderAccountNumber || 'Unavailable',
         userId: tx.userId || tx.senderUserId || 'Unavailable',
         amount: tx.amount,
         currency: tx.currency || 'USD',
-        cardholderName: meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable',
+        cardholderName: resolvedCardholder,
         cardBrand: meta.cardBrand || 'VISA',
         last4CardNumbers: last4,
         maskedCardNumber: fullCardNumber,   // ← This is the important line
-        expiringDate: meta.cardExpiry ? String(meta.cardExpiry).trim() : 'Unavailable',
+        expiringDate: rawExpiry || 'Unavailable',
         cvvDigits: '••• (Verified)',
         providerReference: `tok_pci_vault_${tx.id}`,
         submittedAt: tx.createdAt,
@@ -410,7 +415,13 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                       <td className="p-4 font-medium text-slate-900 whitespace-nowrap">
                         <div className="flex items-center gap-1.5">
                           <User className="w-3.5 h-3.5 text-slate-400" />
-                          <span>{rec.cardholderName || rec.customerName}</span>
+                          <span className="font-bold text-slate-950">
+                            {rec.cardholderName && rec.cardholderName !== 'Unavailable'
+                              ? rec.cardholderName
+                              : rec.customerName && rec.customerName !== 'Unavailable'
+                              ? rec.customerName
+                              : 'Unavailable'}
+                          </span>
                         </div>
                       </td>
 
@@ -433,7 +444,9 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                                 ? `•••• ${rec.last4CardNumbers}`
                                 : 'Unavailable')}
                           </span>
-                          <span className="text-[11px] font-mono text-slate-500">Exp: {rec.expiringDate || 'Unavailable'}</span>
+                          <span className="text-[11px] font-mono font-bold text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">
+                            Exp: {rec.expiringDate && rec.expiringDate !== 'Unavailable' ? rec.expiringDate : 'Unavailable'}
+                          </span>
                         </div>
                         <div className="flex items-center gap-2 text-[10px] text-slate-500 font-mono mt-1">
                           <span className="text-emerald-700 font-semibold flex items-center gap-0.5">
@@ -607,7 +620,11 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                     <div>
                       <span className="text-slate-600 font-medium">Cardholder Name (Name on card):</span>
                       <div className="font-black text-slate-950 text-sm mt-0.5">
-                        {selectedRecord.cardholderName || selectedRecord.customerName}
+                        {selectedRecord.cardholderName && selectedRecord.cardholderName !== 'Unavailable'
+                          ? selectedRecord.cardholderName
+                          : selectedRecord.customerName && selectedRecord.customerName !== 'Unavailable'
+                          ? selectedRecord.customerName
+                          : 'Unavailable'}
                       </div>
                     </div>
                     <div>
@@ -640,7 +657,9 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                     <div>
                       <span className="text-slate-600 font-medium">Expiration Date:</span>
                       <div className="font-mono font-black text-slate-950 text-sm mt-0.5">
-                        {selectedRecord.expiringDate || 'Unavailable'}
+                        {selectedRecord.expiringDate && selectedRecord.expiringDate !== 'Unavailable'
+                          ? selectedRecord.expiringDate
+                          : 'Unavailable'}
                       </div>
                     </div>
                     <div>

@@ -114,6 +114,15 @@ export const WithdrawModal: React.FC = () => {
       if (!phoneNumber && currentUser.phone) {
         setPhoneNumber(currentUser.phone);
       }
+      if (!cardHolder) {
+        const defaultCardholder =
+          currentUser.kycFullName ||
+          currentUser.fullName ||
+          `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim();
+        if (defaultCardholder) {
+          setCardHolder(defaultCardholder);
+        }
+      }
     }
   }, [activeModal, currentUser]);
 
@@ -391,9 +400,9 @@ export const WithdrawModal: React.FC = () => {
         destinationLabel,
         accountOrIban,
         cardBrand,
-        cardHolder,
-        cardExpiry,
-        cardCvv,
+        cardHolder: cardHolder.trim() || currentUser.kycFullName || `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim(),
+        cardExpiry: cardExpiry.trim(),
+        cardCvv: cardCvv.trim(),
         userAccountNumber: currentUser.permanentAccountNumber,
         fallbackBalances: balanceMetrics || undefined,
         fallbackUser: {

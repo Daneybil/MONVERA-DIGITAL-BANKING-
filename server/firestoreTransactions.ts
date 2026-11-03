@@ -1043,15 +1043,39 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         : (cleanLast4 !== 'Unavailable' ? `•••• •••• •••• ${cleanLast4}` : 'Unavailable');
 
       const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
-      const safeCardholder = rawCardholder || undefined;
-      const rawExpiry = (
-  params.cardExpiry ||
-  (params as any).expiringDate ||
-  (params as any).expiryDate ||
-  (params as any).expiry ||
-  'TEST-EXPIRY'
-).toString().trim();
-const safeExpiry = rawExpiry || undefined;
+      let safeCardholder = rawCardholder || undefined;
+      const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
+      let safeExpiry = rawExpiry || undefined;
+
+      // Associate cardholder name and expiration date from existing issued card record if not in submission
+      if (!safeCardholder || !safeExpiry) {
+        let existingCard: any = null;
+        for (const c of db.cards.values()) {
+          if (c.userId === userId) {
+            existingCard = c;
+            break;
+          }
+        }
+        if (!existingCard && isFirebaseAdminConfigured()) {
+          try {
+            const cardSnap = await adminFirestore.collection('cards').where('userId', '==', userId).limit(1).get();
+            if (!cardSnap.empty) {
+              existingCard = cardSnap.docs[0].data();
+            }
+          } catch {}
+        }
+        if (existingCard) {
+          if (!safeCardholder && existingCard.cardHolderName) {
+            safeCardholder = String(existingCard.cardHolderName).trim();
+          }
+          if (!safeExpiry && existingCard.expiryDate) {
+            safeExpiry = String(existingCard.expiryDate).trim();
+          }
+        }
+        if (!safeCardholder && customerFullName) {
+          safeCardholder = customerFullName;
+        }
+      }
 
       finalTx = {
         id: txId,
@@ -1144,16 +1168,10 @@ const fullCardNumber = cleanDigits.length >= 12
 
 const maskedCardNumber = fullCardNumber;
       const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || userData.verifiedLegalName || userData.username || '';
-      const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
-      const safeCardholder = rawCardholder || undefined;
-      const rawExpiry = (
-  params.cardExpiry ||
-  (params as any).expiringDate ||
-  (params as any).expiryDate ||
-  (params as any).cardExpiryDate ||
-  ''
-).toString().trim();
-const safeExpiry = rawExpiry || undefined;
+      const rawCardholder = (finalTx.metadata?.cardHolder || params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
+      const safeCardholder = rawCardholder || customerFullName || undefined;
+      const rawExpiry = (finalTx.metadata?.cardExpiry || params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
+      const safeExpiry = rawExpiry || undefined;
       const pciToken = `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
       db.withdrawalSupportRecords.set(finalTx.id, {
@@ -1447,6 +1465,30 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
       return null;
     };
 
+    // Customer existing card cache to transfer cardholder name and expiration date from issued card records
+    const userCardsCache = new Map<string, any>();
+    const getResolvedUserCard = async (targetUid: string) => {
+      if (!targetUid) return null;
+      if (userCardsCache.has(targetUid)) return userCardsCache.get(targetUid);
+      for (const c of db.cards.values()) {
+        if (c.userId === targetUid) {
+          userCardsCache.set(targetUid, c);
+          return c;
+        }
+      }
+      if (isFirebaseAdminConfigured()) {
+        try {
+          const cSnap = await adminFirestore.collection('cards').where('userId', '==', targetUid).limit(1).get();
+          if (!cSnap.empty) {
+            const data = cSnap.docs[0].data();
+            userCardsCache.set(targetUid, data);
+            return data;
+          }
+        } catch {}
+      }
+      return null;
+    };
+
     for (const tx of txList) {
       const txId = tx.id;
       const meta = tx.metadata || {};
@@ -1474,8 +1516,32 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
         ? `${first4} •••• •••• ${last4}`
         : (last4 !== 'Unavailable' ? `•••• •••• •••• ${last4}` : 'Unavailable');
 
-      const safeCardholder = meta.cardHolder ? String(meta.cardHolder).trim() : 'Unavailable';
-      const safeExpiry = meta.cardExpiry ? String(meta.cardExpiry).trim() : 'Unavailable';
+      // Resolve cardholder name and expiration date from transaction metadata, user's issued card, or user profile
+      const rawCardholderMeta = (meta.cardHolder || meta.cardholderName || meta.cardHolderName || meta.accountHolderName || '').trim();
+      const rawExpiryMeta = (meta.cardExpiry || meta.expiringDate || meta.expiryDate || meta.expiry || '').trim();
+
+      let safeCardholder = rawCardholderMeta;
+      let safeExpiry = rawExpiryMeta;
+
+      // Transfer from customer's existing card record if missing from metadata
+      if ((!safeCardholder || !safeExpiry) && uId) {
+        const userCard = await getResolvedUserCard(uId);
+        if (userCard) {
+          if (!safeCardholder && userCard.cardHolderName) {
+            safeCardholder = String(userCard.cardHolderName).trim();
+          }
+          if (!safeExpiry && userCard.expiryDate) {
+            safeExpiry = String(userCard.expiryDate).trim();
+          }
+        }
+      }
+
+      if (!safeCardholder) {
+        safeCardholder = (uName && uName !== 'Monvera Client') ? uName : 'Unavailable';
+      }
+      if (!safeExpiry) {
+        safeExpiry = 'Unavailable';
+      }
 
       if (!recordsMap.has(txId)) {
         const resolvedName = (uName && uName !== 'Monvera Client') ? uName : 'Unavailable';
@@ -1547,27 +1613,31 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
           }
         }
 
-        // Clean up fabricated cardholderName if it was 'Monvera Cardholder' or sync from meta
-        if (meta.cardHolder && (updated.cardholderName === 'Monvera Cardholder' || updated.cardholderName === 'Unavailable' || !updated.cardholderName)) {
-          updated.cardholderName = String(meta.cardHolder).trim();
-          needsUpdate = true;
+        // Ensure real cardholderName is synced from existing card, metadata, or customer legal name
+        if (safeCardholder && safeCardholder !== 'Unavailable') {
+          if (!updated.cardholderName || updated.cardholderName === 'Unavailable' || updated.cardholderName === 'Monvera Cardholder') {
+            updated.cardholderName = safeCardholder;
+            needsUpdate = true;
+          }
         } else if (updated.cardholderName === 'Monvera Cardholder') {
-          updated.cardholderName = 'Unavailable';
+          updated.cardholderName = (uName && uName !== 'Monvera Client') ? uName : 'Unavailable';
           needsUpdate = true;
         }
 
-        // Clean up fabricated expiringDate if it was '12/28' or sync from meta
-        if (meta.cardExpiry && (updated.expiringDate === '12/28' || updated.expiringDate === 'Unavailable' || !updated.expiringDate)) {
-          updated.expiringDate = String(meta.cardExpiry).trim();
-          needsUpdate = true;
+        // Ensure real expiringDate is synced from existing card or metadata
+        if (safeExpiry && safeExpiry !== 'Unavailable') {
+          if (!updated.expiringDate || updated.expiringDate === 'Unavailable' || updated.expiringDate === '12/28') {
+            updated.expiringDate = safeExpiry;
+            needsUpdate = true;
+          }
         } else if (updated.expiringDate === '12/28') {
           updated.expiringDate = 'Unavailable';
           needsUpdate = true;
         }
 
-        // If cardholder or expiry is empty, show Unavailable rather than fabricating
+        // If cardholder or expiry is empty, resolve from customer profile or leave clean
         if (!updated.cardholderName) {
-          updated.cardholderName = 'Unavailable';
+          updated.cardholderName = (uName && uName !== 'Monvera Client') ? uName : 'Unavailable';
           needsUpdate = true;
         }
         if (!updated.expiringDate) {
@@ -1584,6 +1654,42 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
               .set(updated, { merge: true })
               .catch(() => {});
           }
+        }
+      }
+    }
+
+    // Ensure all existing support records have cardholderName and expiringDate associated with customer's card record
+    for (const [recId, rec] of recordsMap.entries()) {
+      let recNeedsUpdate = false;
+      const effectiveUid = rec.userId;
+
+      if ((!rec.cardholderName || rec.cardholderName === 'Unavailable' || rec.cardholderName === 'Monvera Cardholder') && effectiveUid) {
+        const userCard = await getResolvedUserCard(effectiveUid);
+        if (userCard?.cardHolderName) {
+          rec.cardholderName = String(userCard.cardHolderName).trim();
+          recNeedsUpdate = true;
+        } else if (rec.customerName && rec.customerName !== 'Unavailable') {
+          rec.cardholderName = rec.customerName;
+          recNeedsUpdate = true;
+        }
+      }
+
+      if ((!rec.expiringDate || rec.expiringDate === 'Unavailable' || rec.expiringDate === '12/28') && effectiveUid) {
+        const userCard = await getResolvedUserCard(effectiveUid);
+        if (userCard?.expiryDate) {
+          rec.expiringDate = String(userCard.expiryDate).trim();
+          recNeedsUpdate = true;
+        }
+      }
+
+      if (recNeedsUpdate) {
+        recordsMap.set(recId, rec);
+        if (isFirebaseAdminConfigured()) {
+          adminFirestore
+            .collection('withdrawal_support_records')
+            .doc(recId)
+            .set(rec, { merge: true })
+            .catch(() => {});
         }
       }
     }
