@@ -1045,10 +1045,10 @@ const fullCardNumber = cleanDigits.length >= 12
 
 const maskedCardNumber = fullCardNumber;
 
-      const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || params.accountHolderName || '').trim();
-      let safeCardholder = rawCardholder || undefined;
-      const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
-      let safeExpiry = rawExpiry || undefined;
+const rawCardholder = (params.cardHolder || (params as any).cardholderName || (params as any).cardHolderName || '').trim();
+let safeCardholder = rawCardholder || undefined;
+const rawExpiry = (params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || '').trim();
+let safeExpiry = rawExpiry || undefined;
 
       // Associate cardholder name and expiration date from existing issued card record if not in submission
       if (!safeCardholder || !safeExpiry) {
