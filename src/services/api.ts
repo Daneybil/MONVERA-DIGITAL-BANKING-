@@ -2713,6 +2713,9 @@ export const api = {
     swiftBic?: string;
     routingNumber?: string;
     sortCode?: string;
+    bsb?: string;
+    authMethod?: string;
+    authVerificationStatus?: string;
   }): Promise<{
     success: boolean;
     application?: LinkedBankAccountApplication;

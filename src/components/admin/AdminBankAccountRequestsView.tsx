@@ -300,6 +300,17 @@ export const AdminBankAccountRequestsView: React.FC = () => {
                       <td className="px-5 py-4">
                         <div className="font-bold text-slate-900">{app.accountHolderName}</div>
                         <div className="text-[10px] text-slate-500">Legal Beneficiary</div>
+                        {app.accountHolderName.trim().toLowerCase() !== app.customerName.trim().toLowerCase() ? (
+                          <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300">
+                            <AlertTriangle className="w-2.5 h-2.5 text-amber-600 flex-shrink-0" />
+                            <span>Name Mismatch</span>
+                          </div>
+                        ) : (
+                          <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold tracking-wider bg-emerald-50 text-emerald-800 border border-emerald-200">
+                            <Check className="w-2.5 h-2.5 text-emerald-600 flex-shrink-0" />
+                            <span>Matched</span>
+                          </div>
+                        )}
                       </td>
 
                       {/* Account / IBAN */}
@@ -318,6 +329,16 @@ export const AdminBankAccountRequestsView: React.FC = () => {
                         {app.sortCode && (
                           <div className="font-mono text-[10px] text-slate-400">
                             Sort Code: {app.sortCode}
+                          </div>
+                        )}
+                        {app.bsb && (
+                          <div className="font-mono text-[10px] text-slate-400">
+                            BSB: {app.bsb}
+                          </div>
+                        )}
+                        {app.swiftBic && (
+                          <div className="font-mono text-[10px] text-slate-400">
+                            SWIFT: {app.swiftBic}
                           </div>
                         )}
                       </td>
@@ -441,6 +462,24 @@ export const AdminBankAccountRequestsView: React.FC = () => {
             </div>
 
             <div className="mt-5 space-y-4 text-xs">
+              {/* Beneficiary Name Audit Banner */}
+              {selectedApp.accountHolderName.trim().toLowerCase() !== selectedApp.customerName.trim().toLowerCase() ? (
+                <div className="p-3.5 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-950 space-y-1">
+                  <div className="flex items-center gap-1.5 font-black text-amber-900 text-xs">
+                    <AlertTriangle className="w-4 h-4 text-amber-600" />
+                    <span>⚠️ Warning: Account Holder & Monvera Profile Name Mismatch</span>
+                  </div>
+                  <p className="text-[11px] text-amber-800 leading-relaxed font-medium">
+                    Submitted bank holder name (<strong>{selectedApp.accountHolderName}</strong>) differs from Monvera profile name (<strong>{selectedApp.customerName}</strong>). Please manually review KYC documentation and verify whether third-party wire authorization applies before approval. Do not reject solely due to a name difference without verifying relationship.
+                  </p>
+                </div>
+              ) : (
+                <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-950 flex items-center gap-2 text-[11px] font-medium">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                  <span>Beneficiary name matches customer's registered Monvera legal identity.</span>
+                </div>
+              )}
+
               {/* Customer Profile Section */}
               <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2">
                 <div className="font-bold text-slate-900 uppercase tracking-wider text-[11px] flex items-center gap-1.5">
@@ -510,6 +549,23 @@ export const AdminBankAccountRequestsView: React.FC = () => {
                     <div>
                       <span className="text-slate-400 block text-[10px]">Sort Code</span>
                       <strong className="font-mono text-slate-950">{selectedApp.sortCode}</strong>
+                    </div>
+                  )}
+                  {selectedApp.bsb && (
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">BSB Code</span>
+                      <strong className="font-mono text-slate-950">{selectedApp.bsb}</strong>
+                    </div>
+                  )}
+                  {selectedApp.authVerificationStatus && (
+                    <div className="col-span-2 pt-2 border-t border-slate-200/80">
+                      <span className="text-slate-400 block text-[10px]">Open Banking OAuth Status</span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200 mt-1">
+                        <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                        {selectedApp.authVerificationStatus === 'OAUTH_VERIFIED'
+                          ? 'Open Banking OAuth Verified'
+                          : 'Manual Compliance Document Verification Mode'}
+                      </span>
                     </div>
                   )}
                 </div>

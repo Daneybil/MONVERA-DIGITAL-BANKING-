@@ -4142,6 +4142,9 @@ export interface SubmitBankAccountParams {
   swiftBic?: string;
   routingNumber?: string;
   sortCode?: string;
+  bsb?: string;
+  authMethod?: string;
+  authVerificationStatus?: string;
 }
 
 export async function submitBankAccountApplication(params: SubmitBankAccountParams): Promise<{
@@ -4163,6 +4166,9 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       swiftBic,
       routingNumber,
       sortCode,
+      bsb,
+      authMethod,
+      authVerificationStatus,
     } = params;
 
     if (!userId) return { success: false, error: 'User ID is required.' };
@@ -4234,6 +4240,9 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       ...(swiftBic?.trim() ? { swiftBic: swiftBic.trim().toUpperCase() } : {}),
       ...(routingNumber?.trim() ? { routingNumber: routingNumber.trim() } : {}),
       ...(sortCode?.trim() ? { sortCode: sortCode.trim() } : {}),
+      ...(bsb?.trim() ? { bsb: bsb.trim() } : {}),
+      ...(authMethod ? { authMethod: String(authMethod).trim() } : {}),
+      ...(authVerificationStatus ? { authVerificationStatus: String(authVerificationStatus).trim() } : {}),
       status: 'pending',
       submittedAt: nowIso,
     };

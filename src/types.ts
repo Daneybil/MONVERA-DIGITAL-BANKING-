@@ -193,6 +193,9 @@ export interface LinkedBankAccountApplication {
   swiftBic?: string;
   routingNumber?: string;
   sortCode?: string;
+  bsb?: string;
+  authMethod?: string;
+  authVerificationStatus?: string;
   status: BankAccountApplicationStatus;
   submittedAt: string;
   approvedAt?: string;

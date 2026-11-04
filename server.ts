@@ -1746,6 +1746,9 @@ app.post('/api/bank-accounts/link', optionalFirebaseAuth, async (req: Authentica
     swiftBic,
     routingNumber,
     sortCode,
+    bsb,
+    authMethod,
+    authVerificationStatus,
   } = req.body;
 
   if (!country || !bankName || !accountHolderName || !bankEmail || !phoneNumber || !currency || !accountNumber) {
@@ -1765,6 +1768,9 @@ app.post('/api/bank-accounts/link', optionalFirebaseAuth, async (req: Authentica
     swiftBic,
     routingNumber,
     sortCode,
+    bsb,
+    authMethod,
+    authVerificationStatus,
   });
 
   if (!result.success) {
