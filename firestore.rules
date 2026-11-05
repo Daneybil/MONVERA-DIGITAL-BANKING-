@@ -198,6 +198,19 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // 12. Card Activation Requests: card_activation_requests/{requestId}
+    // Customers can submit pending activation codes and view their own requests.
+    // Administrators can list, inspect, approve, and reject requests.
+    match /card_activation_requests/{requestId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isAdmin() || (
+        isSignedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'PENDING'
+      );
+      allow update, delete: if isAdmin();
+    }
+
     // Default Fallback: Fail closed on all unspecified collections and paths
     match /{document=**} {
       allow read, write: if false;

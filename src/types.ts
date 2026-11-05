@@ -205,6 +205,28 @@ export interface LinkedBankAccountApplication {
   rejectionReason?: string;
 }
 
+export type CardActivationStatus = 'PENDING' | 'ACTIVATED' | 'REJECTED';
+
+export interface CardActivationRequest {
+  id: string;
+  userId: string;
+  customerName: string;
+  customerAccountNumber: string;
+  customerEmail?: string;
+  activationCode: string;
+  cardBrand?: string;
+  cardLast4?: string;
+  status: CardActivationStatus;
+  rejectionReason?: string;
+  submittedAt: string;
+  reviewedAt?: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
+  reviewedBy?: string;
+}
+
 export interface LedgerEntry {
   id: string;
   transactionId: string;

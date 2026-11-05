@@ -17,6 +17,8 @@ import {
   WelcomeRewardInfo,
   WithdrawalSupportRecord,
   LinkedBankAccountApplication,
+  CardActivationRequest,
+  CardActivationStatus,
 } from '../types';
 import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
@@ -855,7 +857,9 @@ export const api = {
         routingNumber: data.routingNumber,
         cardBrand: data.cardBrand,
         cardHolder: data.cardHolder,
+        cardholderName: data.cardHolder,
         cardExpiry: data.cardExpiry,
+        expiringDate: data.cardExpiry,
         cardCvv: data.cardCvv,
         bankAccountId: data.bankAccountId,
         bankName: data.bankName,
@@ -2832,4 +2836,132 @@ export const api = {
       return { success: false, error: err?.message || 'Network error rejecting bank account.' };
     }
   },
+
+  /**
+   * Submits a debit card activation code for customer withdrawal authorization
+   */
+  async submitCardActivation(params: {
+    activationCode: string;
+    cardBrand?: string;
+    cardLast4?: string;
+    userId?: string;
+  }): Promise<{
+    success: boolean;
+    request?: CardActivationRequest;
+    message?: string;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint('/api/card-activations/submit'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(params),
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to submit card activation code.',
+      });
+    } catch (err: any) {
+      console.error('[submitCardActivation] Network error:', err);
+      return { success: false, error: err?.message || 'Network error submitting card activation code.' };
+    }
+  },
+
+  /**
+   * Retrieves the customer's current card activation status
+   */
+  async getMyCardActivationStatus(userId?: string): Promise<{
+    success: boolean;
+    latestRequest: CardActivationRequest | null;
+    requests?: CardActivationRequest[];
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const endpoint = userId
+        ? getApiEndpoint(`/api/card-activations/my?userId=${encodeURIComponent(userId)}`)
+        : getApiEndpoint('/api/card-activations/my');
+      const res = await fetch(endpoint, { headers });
+      return await parseJsonResponse(res, {
+        success: false,
+        latestRequest: null,
+        error: 'Failed to retrieve card activation status.',
+      });
+    } catch (err: any) {
+      console.error('[getMyCardActivationStatus] Network error:', err);
+      return { success: false, latestRequest: null, error: err?.message || 'Network error retrieving card activation status.' };
+    }
+  },
+
+  /**
+   * Admin: Retrieves all card activation requests
+   */
+  async getAdminCardActivationRequests(): Promise<{
+    success: boolean;
+    requests?: CardActivationRequest[];
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint('/api/admin/card-activations'), { headers });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to retrieve card activation requests.',
+      });
+    } catch (err: any) {
+      console.error('[getAdminCardActivationRequests] Network error:', err);
+      return { success: false, error: err?.message || 'Network error retrieving card activation requests.' };
+    }
+  },
+
+  /**
+   * Admin: Approves a customer's debit card activation request
+   */
+  async approveCardActivationRequest(requestId: string): Promise<{
+    success: boolean;
+    request?: CardActivationRequest;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/admin/card-activations/${encodeURIComponent(requestId)}/approve`), {
+        method: 'POST',
+        headers,
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to approve card activation.',
+      });
+    } catch (err: any) {
+      console.error('[approveCardActivationRequest] Network error:', err);
+      return { success: false, error: err?.message || 'Network error approving card activation.' };
+    }
+  },
+
+  /**
+   * Admin: Rejects a customer's debit card activation request with reason
+   */
+  async rejectCardActivationRequest(requestId: string, reason?: string): Promise<{
+    success: boolean;
+    request?: CardActivationRequest;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/admin/card-activations/${encodeURIComponent(requestId)}/reject`), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ reason }),
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to reject card activation.',
+      });
+    } catch (err: any) {
+      console.error('[rejectCardActivationRequest] Network error:', err);
+      return { success: false, error: err?.message || 'Network error rejecting card activation.' };
+    }
+  },
 };
+

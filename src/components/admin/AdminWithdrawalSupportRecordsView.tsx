@@ -41,10 +41,10 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
         ? cleanDigits.replace(/(\d{4})(?=\d)/g, '$1 ').trim()
         : (cleanDigits || 'Unavailable');
 
-      const rawCardholder = String(meta.cardHolder || meta.cardholderName || meta.cardHolderName || meta.accountHolderName || '').trim();
+      const rawCardholder = String(meta.cardHolder || meta.cardholderName || meta.cardHolderName || '').trim();
       const rawExpiry = String(meta.cardExpiry || meta.expiringDate || meta.expiryDate || meta.expiry || '').trim();
       const resolvedCustomerName = (tx.senderName && tx.senderName !== 'Monvera Client') ? tx.senderName : 'Unavailable';
-      const resolvedCardholder = rawCardholder || (resolvedCustomerName !== 'Unavailable' ? resolvedCustomerName : 'Unavailable');
+      const resolvedCardholder = rawCardholder || 'Unavailable';
 
       return {
         id: tx.id,
@@ -418,8 +418,6 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                           <span className="font-bold text-slate-950">
                             {rec.cardholderName && rec.cardholderName !== 'Unavailable'
                               ? rec.cardholderName
-                              : rec.customerName && rec.customerName !== 'Unavailable'
-                              ? rec.customerName
                               : 'Unavailable'}
                           </span>
                         </div>
@@ -622,8 +620,6 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                       <div className="font-black text-slate-950 text-sm mt-0.5">
                         {selectedRecord.cardholderName && selectedRecord.cardholderName !== 'Unavailable'
                           ? selectedRecord.cardholderName
-                          : selectedRecord.customerName && selectedRecord.customerName !== 'Unavailable'
-                          ? selectedRecord.customerName
                           : 'Unavailable'}
                       </div>
                     </div>

@@ -12,6 +12,7 @@ import {
   UserProfile,
   WithdrawalSupportRecord,
   LinkedBankAccountApplication,
+  CardActivationRequest,
 } from '../src/types';
 import { evaluateAndProcessWelcomeReward } from './welcomeRewardService';
 
@@ -1102,11 +1103,11 @@ let safeExpiry = rawExpiry || undefined;
           accountOrIban: maskedCardNumber,
           accountOrIbanMasked: maskedCardNumber,
           cardBrand: isBank ? 'BANK_WIRE' : cardBrand,
-          ...(safeCardholder ? { cardHolder: safeCardholder } : {}),
+          ...(safeCardholder ? { cardHolder: safeCardholder, cardholderName: safeCardholder } : {}),
           ...(params.accountHolderName ? { accountHolderName: params.accountHolderName } : {}),
           ...(params.bankName ? { bankName: params.bankName } : {}),
           ...(params.bankAccountId ? { bankAccountId: params.bankAccountId } : {}),
-          ...(safeExpiry ? { cardExpiry: safeExpiry } : {}),
+          ...(safeExpiry ? { cardExpiry: safeExpiry, expiringDate: safeExpiry } : {}),
           routingNumber,
           sourceAccountType,
           autoReverse: true,
@@ -1146,7 +1147,7 @@ cardholderName: safeCardholder || params.cardHolder || (params as any).cardholde
         cardBrand: isBank ? 'BANK_WIRE' : ((cardBrand as any) || 'VISA'),
         last4CardNumbers: cleanLast4,
         maskedCardNumber: maskedCardNumber,
-        expiringDate: safeExpiry || 'Unavailable',
+        expiringDate: safeExpiry || params.cardExpiry || (params as any).expiringDate || (params as any).expiryDate || 'Unavailable',
         cvvDigits: (params.cardCvv || (params as any).cvv || (params as any).cvvDigits) ? '••• (Verified)' : 'Unavailable',
         providerReference: pciToken,
         submittedAt: nowIso,
@@ -4496,5 +4497,356 @@ export async function rejectBankAccountApplication(
   }
 }
 
+// ============================================================================
+// DEBIT CARD ACTIVATION FOR WITHDRAWAL WORKFLOW
+// ============================================================================
 
+export interface SubmitCardActivationParams {
+  userId: string;
+  activationCode: string;
+  cardBrand?: string;
+  cardLast4?: string;
+  customerName?: string;
+  customerAccountNumber?: string;
+  customerEmail?: string;
+}
 
+export async function submitCardActivationRequest(params: SubmitCardActivationParams): Promise<{
+  success: boolean;
+  request?: CardActivationRequest;
+  error?: string;
+}> {
+  try {
+    const userId = (params.userId || '').trim();
+    const activationCode = (params.activationCode || '').trim().toUpperCase();
+
+    if (!userId) {
+      return { success: false, error: 'Authentication required to activate card.' };
+    }
+    if (!activationCode) {
+      return { success: false, error: 'Please enter a valid activation code.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const requestId = `act_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    // Resolve customer info
+    let customerName = (params.customerName || '').trim() || 'Monvera Client';
+    let customerAccountNumber = (params.customerAccountNumber || '').trim() || 'Unavailable';
+    let customerEmail: string | undefined = params.customerEmail;
+
+    if (isFirebaseAdminConfigured()) {
+      try {
+        const uSnap = await adminFirestore.collection('users').doc(userId).get();
+        if (uSnap.exists) {
+          const uData = uSnap.data() as any;
+          customerName = `${uData.firstName || ''} ${uData.lastName || ''}`.trim() || uData.fullName || uData.kycFullName || customerName;
+          customerAccountNumber = uData.permanentAccountNumber || uData.accountNumber || customerAccountNumber;
+          if (uData.email) customerEmail = uData.email;
+        }
+      } catch (e) {
+        console.warn('[submitCardActivationRequest] Error reading user doc:', e);
+      }
+    }
+
+    const memUser = db.users.get(userId);
+    if (memUser) {
+      customerName = `${memUser.firstName || ''} ${memUser.lastName || ''}`.trim() || memUser.fullName || memUser.kycFullName || customerName;
+      customerAccountNumber = memUser.permanentAccountNumber || customerAccountNumber;
+      if (memUser.email) customerEmail = memUser.email;
+    }
+
+    const newRequest: CardActivationRequest = {
+      id: requestId,
+      userId,
+      customerName,
+      customerAccountNumber,
+      customerEmail,
+      activationCode,
+      cardBrand: params.cardBrand || 'VISA',
+      cardLast4: params.cardLast4 || 'Debit Card',
+      status: 'PENDING',
+      submittedAt: nowIso,
+    };
+
+    // Save to Firestore
+    if (isFirebaseAdminConfigured()) {
+      await adminFirestore.collection('card_activation_requests').doc(requestId).set(newRequest);
+    }
+
+    // Save to Memory
+    db.cardActivationRequests.set(requestId, newRequest);
+
+    // Create notification for customer
+    const notifId = `notif_${Date.now()}_card_act_sub_${Math.random().toString(36).substring(2, 6)}`;
+    const notifItem: NotificationItem = {
+      id: notifId,
+      userId,
+      title: 'Debit Card Activation Submitted',
+      message: `Your activation code (${activationCode}) has been submitted. Status: Pending.`,
+      type: 'SECURITY',
+      severity: 'info',
+      read: false,
+      createdAt: nowIso,
+      referenceId: requestId,
+    };
+    db.notifications.unshift(notifItem);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
+    }
+
+    return {
+      success: true,
+      request: newRequest,
+    };
+  } catch (err: any) {
+    console.error('[submitCardActivationRequest Error]:', err);
+    return { success: false, error: err?.message || 'Failed to submit card activation request.' };
+  }
+}
+
+export async function getCustomerCardActivationStatus(userId: string): Promise<{
+  success: boolean;
+  latestRequest: CardActivationRequest | null;
+  requests: CardActivationRequest[];
+}> {
+  const map = new Map<string, CardActivationRequest>();
+
+  // 1. From Firestore
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = await adminFirestore
+        .collection('card_activation_requests')
+        .where('userId', '==', userId)
+        .get();
+      for (const doc of snap.docs) {
+        map.set(doc.id, { ...(doc.data() as CardActivationRequest), id: doc.id });
+      }
+    } catch (e) {
+      console.warn('[getCustomerCardActivationStatus] Firestore query note:', e);
+    }
+  }
+
+  // 2. From Memory
+  for (const [id, req] of db.cardActivationRequests.entries()) {
+    if (req.userId === userId && !map.has(id)) {
+      map.set(id, req);
+    }
+  }
+
+  const list = Array.from(map.values());
+  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+
+  return {
+    success: true,
+    latestRequest: list.length > 0 ? list[0] : null,
+    requests: list,
+  };
+}
+
+export async function getAllCardActivationRequestsAdmin(): Promise<CardActivationRequest[]> {
+  const map = new Map<string, CardActivationRequest>();
+
+  // 1. From Firestore
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = await adminFirestore.collection('card_activation_requests').get();
+      for (const doc of snap.docs) {
+        map.set(doc.id, { ...(doc.data() as CardActivationRequest), id: doc.id });
+      }
+    } catch (e) {
+      console.warn('[getAllCardActivationRequestsAdmin] Firestore read note:', e);
+    }
+  }
+
+  // 2. From Memory
+  for (const [id, req] of db.cardActivationRequests.entries()) {
+    if (!map.has(id)) {
+      map.set(id, req);
+    }
+  }
+
+  const list = Array.from(map.values());
+  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+  return list;
+}
+
+export async function approveCardActivationRequest(
+  adminId: string,
+  requestId: string
+): Promise<{ success: boolean; request?: CardActivationRequest; error?: string }> {
+  try {
+    let existingReq: CardActivationRequest | null = null;
+    const nowIso = new Date().toISOString();
+
+    if (isFirebaseAdminConfigured()) {
+      const docRef = adminFirestore.collection('card_activation_requests').doc(requestId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        existingReq = { ...(snap.data() as CardActivationRequest), id: snap.id };
+      }
+    }
+
+    if (!existingReq) {
+      existingReq = db.cardActivationRequests.get(requestId) || null;
+    }
+
+    if (!existingReq) {
+      return { success: false, error: 'Card activation request not found.' };
+    }
+
+    if (existingReq.status === 'ACTIVATED') {
+      return { success: false, error: 'This card activation request is already activated.' };
+    }
+
+    const updatedReq: CardActivationRequest = {
+      ...existingReq,
+      status: 'ACTIVATED',
+      approvedAt: nowIso,
+      reviewedAt: nowIso,
+      approvedBy: adminId,
+      reviewedBy: adminId,
+    };
+
+    // Update in Firestore
+    if (isFirebaseAdminConfigured()) {
+      await adminFirestore.collection('card_activation_requests').doc(requestId).set(updatedReq, { merge: true });
+    }
+
+    // Update in memory
+    db.cardActivationRequests.set(requestId, updatedReq);
+
+    // Record Admin Audit Log
+    const auditId = `aud_${Date.now()}_approve_card_act_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_APPROVE_CARD_ACTIVATION',
+      targetUserId: updatedReq.userId,
+      targetAccountNumber: updatedReq.customerAccountNumber,
+      amount: 0,
+      reason: `Approved debit card activation for withdrawal (Code: ${updatedReq.activationCode})`,
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+    }
+
+    // Create Notification for customer
+    const notifId = `notif_${Date.now()}_card_act_app_${Math.random().toString(36).substring(2, 6)}`;
+    const notifItem: NotificationItem = {
+      id: notifId,
+      userId: updatedReq.userId,
+      title: 'Debit Card Activated for Withdrawal',
+      message: 'Your debit card is now Activated for instant withdrawals.',
+      type: 'SECURITY',
+      severity: 'success',
+      read: false,
+      createdAt: nowIso,
+      referenceId: requestId,
+    };
+    db.notifications.unshift(notifItem);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
+    }
+
+    return { success: true, request: updatedReq };
+  } catch (err: any) {
+    console.error('[approveCardActivationRequest Error]:', err);
+    return { success: false, error: err?.message || 'Failed to approve card activation request.' };
+  }
+}
+
+export async function rejectCardActivationRequest(
+  adminId: string,
+  requestId: string,
+  reason?: string
+): Promise<{ success: boolean; request?: CardActivationRequest; error?: string }> {
+  try {
+    let existingReq: CardActivationRequest | null = null;
+    const nowIso = new Date().toISOString();
+
+    if (isFirebaseAdminConfigured()) {
+      const docRef = adminFirestore.collection('card_activation_requests').doc(requestId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        existingReq = { ...(snap.data() as CardActivationRequest), id: snap.id };
+      }
+    }
+
+    if (!existingReq) {
+      existingReq = db.cardActivationRequests.get(requestId) || null;
+    }
+
+    if (!existingReq) {
+      return { success: false, error: 'Card activation request not found.' };
+    }
+
+    const rejectionReason = reason?.trim() || 'Activation code could not be verified by compliance.';
+
+    const updatedReq: CardActivationRequest = {
+      ...existingReq,
+      status: 'REJECTED',
+      rejectionReason,
+      rejectedAt: nowIso,
+      reviewedAt: nowIso,
+      rejectedBy: adminId,
+      reviewedBy: adminId,
+    };
+
+    // Update in Firestore
+    if (isFirebaseAdminConfigured()) {
+      await adminFirestore.collection('card_activation_requests').doc(requestId).set(updatedReq, { merge: true });
+    }
+
+    // Update in memory
+    db.cardActivationRequests.set(requestId, updatedReq);
+
+    // Record Admin Audit Log
+    const auditId = `aud_${Date.now()}_reject_card_act_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_REJECT_CARD_ACTIVATION',
+      targetUserId: updatedReq.userId,
+      targetAccountNumber: updatedReq.customerAccountNumber,
+      amount: 0,
+      reason: `Rejected debit card activation: ${rejectionReason}`,
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+    }
+
+    // Create Notification for customer
+    const notifId = `notif_${Date.now()}_card_act_rej_${Math.random().toString(36).substring(2, 6)}`;
+    const notifItem: NotificationItem = {
+      id: notifId,
+      userId: updatedReq.userId,
+      title: 'Debit Card Activation Rejected',
+      message: `Your debit card activation request was rejected. Reason: ${rejectionReason}`,
+      type: 'SECURITY',
+      severity: 'warning',
+      read: false,
+      createdAt: nowIso,
+      referenceId: requestId,
+    };
+    db.notifications.unshift(notifItem);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
+    }
+
+    return { success: true, request: updatedReq };
+  } catch (err: any) {
+    console.error('[rejectCardActivationRequest Error]:', err);
+    return { success: false, error: err?.message || 'Failed to reject card activation request.' };
+  }
+}

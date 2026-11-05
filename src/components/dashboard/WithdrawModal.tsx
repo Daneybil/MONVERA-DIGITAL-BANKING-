@@ -1,43 +1,30 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
-import { LinkedBankAccountApplication } from '../../types';
+import { CardActivationRequest } from '../../types';
 import {
   X,
   ArrowRight,
-  Landmark,
   CreditCard,
   ShieldCheck,
   CheckCircle2,
   AlertCircle,
   Lock,
   Wallet,
-  Building2,
   Check,
   Coins,
   Zap,
   Info,
   Clock,
   XCircle,
-  Plus,
-  Globe,
-  ChevronDown,
-  Search,
-  ExternalLink,
+  KeyRound,
+  RefreshCw,
 } from 'lucide-react';
-import {
-  WORLD_COUNTRIES,
-  MAJOR_BANKS,
-  WORLD_CURRENCIES,
-  CountryBankingConfig,
-  BankInstitution,
-  CurrencyConfig,
-} from '../../constants/bankingData';
 
 export const WithdrawModal: React.FC = () => {
   const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications } = useAuth();
   const [sourceAccount, setSourceAccount] = useState<'CHECKING' | 'SAVINGS'>('CHECKING');
-  const [destinationType, setDestinationType] = useState<'CARD' | 'BANK' | 'CRYPTO'>('CARD');
+  const [destinationType, setDestinationType] = useState<'CARD' | 'ACTIVATION' | 'CRYPTO'>('CARD');
 
   // Debit Card fields
   const [cardBrand, setCardBrand] = useState<'VISA' | 'MASTERCARD'>('VISA');
@@ -46,45 +33,12 @@ export const WithdrawModal: React.FC = () => {
   const [cardExpiry, setCardExpiry] = useState('');
   const [cardCvv, setCardCvv] = useState('');
 
-  // Bank Account linking & selection states
-  const [bankAccounts, setBankAccounts] = useState<LinkedBankAccountApplication[]>([]);
-  const [isLoadingBankAccounts, setIsLoadingBankAccounts] = useState<boolean>(false);
-  const [selectedBankAccountId, setSelectedBankAccountId] = useState<string | null>(null);
-  const [showLinkBankForm, setShowLinkBankForm] = useState<boolean>(false);
-
-  // Link Bank Account Form fields
-  const [country, setCountry] = useState<string>('United States');
-  const [bankName, setBankName] = useState<string>('JPMorgan Chase Bank');
-  const [customBankName, setCustomBankName] = useState<string>('');
-  const [accountHolderName, setAccountHolderName] = useState<string>('');
-  const [bankEmail, setBankEmail] = useState<string>('');
-  const [phoneNumber, setPhoneNumber] = useState<string>('');
-  const [currency, setCurrency] = useState<string>('USD');
-  const [accountNumber, setAccountNumber] = useState<string>('');
-  const [iban, setIban] = useState<string>('');
-  const [swiftBic, setSwiftBic] = useState<string>('');
-  const [routingNumber, setRoutingNumber] = useState<string>('');
-  const [sortCode, setSortCode] = useState<string>('');
-  const [bsb, setBsb] = useState<string>('');
-
-  // Searchable dropdown popover states
-  const [countrySearch, setCountrySearch] = useState<string>('');
-  const [isCountryOpen, setIsCountryOpen] = useState<boolean>(false);
-
-  const [bankSearch, setBankSearch] = useState<string>('');
-  const [isBankOpen, setIsBankOpen] = useState<boolean>(false);
-
-  const [currencySearch, setCurrencySearch] = useState<string>('');
-  const [isCurrencyOpen, setIsCurrencyOpen] = useState<boolean>(false);
-
-  // Bank Open Banking / Authentication state
-  const [authStatus, setAuthStatus] = useState<'IDLE' | 'CHECKING' | 'AUTHENTICATED' | 'COMPLIANCE_MODE'>('IDLE');
-  const [authMessage, setAuthMessage] = useState<string | null>(null);
-
-  // Bank Form Submission Feedback
-  const [isSubmittingBank, setIsSubmittingBank] = useState<boolean>(false);
-  const [bankSubmitSuccess, setBankSubmitSuccess] = useState<boolean>(false);
-  const [bankSubmitError, setBankSubmitError] = useState<string | null>(null);
+  // Debit Card Activation states
+  const [activationCodeInput, setActivationCodeInput] = useState<string>('');
+  const [activationRequest, setActivationRequest] = useState<CardActivationRequest | null>(null);
+  const [isLoadingActivation, setIsLoadingActivation] = useState<boolean>(false);
+  const [isSubmittingActivation, setIsSubmittingActivation] = useState<boolean>(false);
+  const [activationFeedback, setActivationFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Amount & Status
   const [amount, setAmount] = useState<string>('2500');
@@ -100,24 +54,25 @@ export const WithdrawModal: React.FC = () => {
     method: string;
   } | null>(null);
 
-  // Initialize and load bank accounts
+  // Load customer's card activation status on open
+  const loadCardActivationStatus = async () => {
+    if (!currentUser?.id) return;
+    setIsLoadingActivation(true);
+    try {
+      const res = await api.getMyCardActivationStatus(currentUser.id);
+      if (res.success && res.latestRequest) {
+        setActivationRequest(res.latestRequest);
+      }
+    } catch (err) {
+      console.warn('[WithdrawModal] Failed to load card activation status:', err);
+    } finally {
+      setIsLoadingActivation(false);
+    }
+  };
+
   useEffect(() => {
     if (activeModal === 'withdraw' && currentUser?.id) {
-      loadCustomerBankAccounts();
-      if (!accountHolderName) {
-        setAccountHolderName(
-          currentUser.kycFullName ||
-            currentUser.fullName ||
-            `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() ||
-            'Jane Doe'
-        );
-      }
-      if (!bankEmail && currentUser.email) {
-        setBankEmail(currentUser.email);
-      }
-      if (!phoneNumber && currentUser.phone) {
-        setPhoneNumber(currentUser.phone);
-      }
+      loadCardActivationStatus();
       if (!cardHolder) {
         const defaultCardholder =
           currentUser.kycFullName ||
@@ -130,69 +85,6 @@ export const WithdrawModal: React.FC = () => {
     }
   }, [activeModal, currentUser]);
 
-  const loadCustomerBankAccounts = async () => {
-    if (!currentUser?.id) return;
-    setIsLoadingBankAccounts(true);
-    try {
-      const res = await api.getMyBankAccountApplications(currentUser.id);
-      if (res.success && res.applications) {
-        setBankAccounts(res.applications);
-        const approved = res.applications.filter((a) => a.status === 'approved');
-        if (approved.length > 0 && !selectedBankAccountId) {
-          setSelectedBankAccountId(approved[0].id);
-        }
-      }
-    } catch (err) {
-      console.warn('Could not load bank accounts:', err);
-    } finally {
-      setIsLoadingBankAccounts(false);
-    }
-  };
-
-  const handleCountrySelect = (c: CountryBankingConfig) => {
-    setCountry(c.name);
-    // Suggest default currency without locking customer
-    setCurrency(c.defaultCurrency);
-    if (!phoneNumber || phoneNumber.trim() === '' || phoneNumber.startsWith('+')) {
-      setPhoneNumber(c.dialCode + ' ');
-    }
-    setIsCountryOpen(false);
-    setCountrySearch('');
-  };
-
-  const handleCurrencySelect = (curr: CurrencyConfig) => {
-    setCurrency(curr.code);
-    setIsCurrencyOpen(false);
-    setCurrencySearch('');
-  };
-
-  const handleBankSelect = (selectedName: string) => {
-    setBankName(selectedName);
-    if (selectedName !== 'Other') {
-      setCustomBankName('');
-    }
-    setIsBankOpen(false);
-    setBankSearch('');
-    setAuthStatus('IDLE');
-    setAuthMessage(null);
-  };
-
-  const handleInitiateBankAuth = () => {
-    const effectiveBankName = bankName === 'Other' ? customBankName.trim() : bankName.trim();
-    if (!effectiveBankName) {
-      setBankSubmitError('Please select or enter your bank name first.');
-      return;
-    }
-    setAuthStatus('CHECKING');
-    setAuthMessage(null);
-    setTimeout(() => {
-      setAuthStatus('COMPLIANCE_MODE');
-      setAuthMessage(
-        `Open Banking OAuth client for ${effectiveBankName} is operating in Compliance Verification Mode. Monvera never asks for or stores your external banking password, PIN, or CVV. Your account details will be securely verified by a Monvera compliance officer before approval.`
-      );
-    }, 600);
-  };
-
   if (activeModal !== 'withdraw' || !currentUser) return null;
 
   const checkingBal = balanceMetrics?.checkingBalance || 0;
@@ -202,12 +94,6 @@ export const WithdrawModal: React.FC = () => {
   const fee = 0.0; // 100% Free across all settlement rails
   const numAmount = parseFloat(amount) || 0;
   const totalDeducted = numAmount + fee;
-
-  const approvedAccounts = bankAccounts.filter((a) => a.status === 'approved');
-  const pendingAccounts = bankAccounts.filter((a) => a.status === 'pending');
-  const rejectedAccounts = bankAccounts.filter((a) => a.status === 'rejected');
-
-  const selectedBank = approvedAccounts.find((a) => a.id === selectedBankAccountId);
 
   // Format card number with spaces (4 4 4 4)
   const handleCardNumberChange = (val: string) => {
@@ -226,202 +112,43 @@ export const WithdrawModal: React.FC = () => {
     }
   };
 
-  // Submit Bank Account Linking Form
-  const handleLinkBankSubmit = async (e: React.FormEvent) => {
+  // Submit Debit Card Activation Request
+  const handleActivateCard = async (e: React.FormEvent) => {
     e.preventDefault();
-    setBankSubmitError(null);
-    setBankSubmitSuccess(false);
-
-    const effectiveBankName = bankName === 'Other' ? customBankName.trim() : bankName.trim();
-    if (!effectiveBankName) {
-      setBankSubmitError('Please specify your bank name.');
+    const cleanCode = activationCodeInput.trim().toUpperCase();
+    if (!cleanCode) {
+      setActivationFeedback({ type: 'error', text: 'Please enter a valid activation code.' });
       return;
     }
-    if (!accountHolderName.trim()) {
-      setBankSubmitError("Please enter the account holder's full name as registered with the bank.");
-      return;
-    }
-    if (!bankEmail.trim() || !bankEmail.includes('@')) {
-      setBankSubmitError('Please provide a valid email address.');
-      return;
-    }
-    if (!phoneNumber.trim()) {
-      setBankSubmitError('Please provide a contact phone number.');
-      return;
-    }
-    if (!accountNumber.trim()) {
-      setBankSubmitError('Please enter your bank account number.');
-      return;
-    }
-
-    // Country specific requirements
-    const currentCountryConfig = WORLD_COUNTRIES.find((c) => c.name.toLowerCase() === country.toLowerCase()) ||
-      WORLD_COUNTRIES.find((c) => c.code.toLowerCase() === country.toLowerCase());
-
-    if (country === 'United States' && (!routingNumber.trim() || routingNumber.replace(/\D/g, '').length !== 9)) {
-      setBankSubmitError('US Bank Accounts require a valid 9-digit ABA Routing Number.');
-      return;
-    }
-    if (country === 'United Kingdom' && !sortCode.trim()) {
-      setBankSubmitError('UK Bank Accounts require a 6-digit Sort Code.');
-      return;
-    }
-    if (country === 'Australia' && !bsb.trim()) {
-      setBankSubmitError('Australian Bank Accounts require a 6-digit BSB code (e.g. 062-000).');
-      return;
-    }
-    if ((country === 'Turkey' || currentCountryConfig?.ibanRequired) && !iban.trim()) {
-      setBankSubmitError(`${country} bank accounts require an IBAN (e.g. TR... for Turkey).`);
-      return;
-    }
-
-    setIsSubmittingBank(true);
+    setIsSubmittingActivation(true);
+    setActivationFeedback(null);
     try {
-      const res = await api.submitBankAccountApplication({
-        userId: currentUser.id,
-        country,
-        bankName: effectiveBankName,
-        accountHolderName: accountHolderName.trim(),
-        bankEmail: bankEmail.trim(),
-        phoneNumber: phoneNumber.trim(),
-        currency: currency.trim().toUpperCase(),
-        accountNumber: accountNumber.trim(),
-        iban: iban.trim() || undefined,
-        swiftBic: swiftBic.trim() || undefined,
-        routingNumber: routingNumber.trim() || undefined,
-        sortCode: sortCode.trim() || undefined,
-        bsb: bsb.trim() || undefined,
-        authMethod: 'OPEN_BANKING_OAUTH',
-        authVerificationStatus: authStatus === 'AUTHENTICATED' ? 'OAUTH_VERIFIED' : 'PENDING_DOCUMENT_VERIFICATION',
+      const res = await api.submitCardActivation({
+        activationCode: cleanCode,
+        cardBrand,
+        cardLast4: cardNumber ? cardNumber.replace(/\s+/g, '').slice(-4) : undefined,
+        userId: currentUser?.id,
       });
-
-      if (res.success && res.application) {
-        setBankSubmitSuccess(true);
-        await loadCustomerBankAccounts();
+      if (res.success && res.request) {
+        setActivationRequest(res.request);
+        setActivationCodeInput('');
+        setActivationFeedback({
+          type: 'success',
+          text: 'Debit card activation request submitted successfully. It is now Pending administrative review.',
+        });
         await refreshNotifications();
-        // Clear sensitive inputs
-        setAccountNumber('');
-        setIban('');
-        setRoutingNumber('');
-        setSortCode('');
-        setBsb('');
-        setSwiftBic('');
-        setAuthStatus('IDLE');
-        setAuthMessage(null);
       } else {
-        setBankSubmitError(res.error || 'Failed to submit bank account details.');
+        setActivationFeedback({ type: 'error', text: res.error || 'Failed to submit activation code.' });
       }
     } catch (err: any) {
-      setBankSubmitError(err?.message || 'Network error while submitting bank account.');
+      setActivationFeedback({ type: 'error', text: err?.message || 'Server error submitting activation code.' });
     } finally {
-      setIsSubmittingBank(false);
+      setIsSubmittingActivation(false);
     }
   };
 
-  // Submit Withdrawal Request
-  const handleWithdrawSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (currentUser?.status === 'frozen') {
-      setErrorMessage(
-        'Your account is currently restricted/frozen. Outgoing transfers and withdrawals are disabled. Please contact compliance support.'
-      );
-      return;
-    }
-    if (numAmount <= 0) {
-      setErrorMessage('Please enter a valid withdrawal amount greater than $0.00.');
-      return;
-    }
-    if (totalDeducted > availableBal) {
-      setErrorMessage(
-        `Insufficient liquid funds in ${
-          sourceAccount === 'CHECKING' ? 'Checking' : 'Savings'
-        } ($${availableBal.toLocaleString('en-US', {
-          minimumFractionDigits: 2,
-        })}). Requested: $${totalDeducted.toFixed(2)}. Sovereign term deposits are locked until maturity.`
-      );
-      return;
-    }
-
-    if (destinationType === 'CRYPTO') {
-      setErrorMessage('Crypto Payouts are coming soon. Please use Debit Card Push or Bank Account.');
-      return;
-    }
-
-    // BANK ACCOUNT WITHDRAWAL
-    if (destinationType === 'BANK') {
-      if (!selectedBank) {
-        setErrorMessage(
-          'Please select an approved bank account for withdrawal, or link your bank account for administrative review.'
-        );
-        return;
-      }
-      if (selectedBank.status !== 'approved') {
-        setErrorMessage(
-          'You cannot withdraw to this bank account until approval is complete. The account is currently pending administrative review.'
-        );
-        return;
-      }
-
-      setErrorMessage(null);
-      setIsProcessing(true);
-
-      const destinationLabel = `${selectedBank.bankName} (${selectedBank.maskedAccountNumber})`;
-      const accountOrIban = selectedBank.accountNumber;
-      const accountDisplay = selectedBank.maskedAccountNumber;
-
-      try {
-        const res = await api.createWithdrawal({
-          userId: currentUser.id,
-          amount: numAmount,
-          destinationType: 'BANK',
-          sourceAccountType: sourceAccount,
-          destinationLabel,
-          accountOrIban,
-          bankAccountId: selectedBank.id,
-          bankName: selectedBank.bankName,
-          accountHolderName: selectedBank.accountHolderName,
-          routingNumber: selectedBank.routingNumber || selectedBank.sortCode || selectedBank.swiftBic,
-          userAccountNumber: currentUser.permanentAccountNumber,
-          fallbackBalances: balanceMetrics || undefined,
-          fallbackUser: {
-            firstName: currentUser.firstName,
-            lastName: currentUser.lastName,
-            email: currentUser.email,
-            permanentAccountNumber: currentUser.permanentAccountNumber,
-          },
-        });
-
-        if (res.success && res.transaction) {
-          setIsSuccess(true);
-          setTxRef(res.transaction.referenceNumber);
-          setReceiptDetails({
-            amount: numAmount,
-            destinationLabel: `${selectedBank.bankName} Wire Payout`,
-            accountDisplay,
-            sourceAccount: sourceAccount === 'CHECKING' ? 'Premier Checking' : 'Treasury Savings',
-            method: 'Authoritative Bank Transfer Wire',
-          });
-          if (res.balanceMetrics && typeof window !== 'undefined') {
-            window.dispatchEvent(
-              new CustomEvent('monvera_balance_updated', {
-                detail: { userId: currentUser.id, balanceMetrics: res.balanceMetrics },
-              })
-            );
-          }
-          await refreshBalance();
-          await refreshNotifications();
-        } else {
-          setErrorMessage(res.error || "We couldn't complete this withdrawal. Please try again.");
-        }
-      } catch (err: any) {
-        setErrorMessage('Network error while dispatching withdrawal request.');
-      } finally {
-        setIsProcessing(false);
-      }
-      return;
-    }
-
-    // DEBIT CARD WITHDRAWAL (CARD)
+  // Handle Card Withdrawal Submission
+  const handleWithdrawSubmit = async () => {
     const cleanCard = cardNumber.replace(/\s+/g, '');
     if (cleanCard.length !== 16) {
       setErrorMessage('Please enter a valid 16-digit debit card number.');
@@ -500,117 +227,98 @@ export const WithdrawModal: React.FC = () => {
 
   const handleReset = () => {
     setIsSuccess(false);
-    setTxRef(null);
     setAmount('2500');
     setCardNumber('');
-    setCardHolder('');
     setCardExpiry('');
     setCardCvv('');
-    setBankSubmitSuccess(false);
-    setBankSubmitError(null);
     setErrorMessage(null);
+    setReceiptDetails(null);
     closeModal();
   };
 
   return (
-    <div
-      id="withdraw-modal-backdrop"
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-slate-950/80 backdrop-blur-md animate-in fade-in duration-200"
-      onClick={(e) => {
-        if (e.target === e.currentTarget && !isProcessing && !isSubmittingBank) handleReset();
-      }}
-    >
-      <div
-        id="withdraw-modal-container"
-        className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl border-2 border-slate-200 overflow-hidden relative max-h-[94vh] flex flex-col"
-      >
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/70 backdrop-blur-xs overflow-y-auto">
+      <div className="relative w-full max-w-2xl bg-white rounded-3xl shadow-2xl border border-slate-200 overflow-hidden my-4 animate-in zoom-in-95 duration-150">
         {/* Header */}
-        <div className="p-6 sm:p-7 bg-slate-50 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
-          <div className="flex items-center gap-3.5">
-            <div className="w-12 h-12 rounded-2xl bg-slate-950 text-emerald-400 flex items-center justify-center font-black shadow-sm">
-              <Landmark className="w-6 h-6" />
+        <div className="flex items-center justify-between p-5 sm:p-6 border-b border-slate-100 bg-linear-to-r from-slate-950 via-slate-900 to-indigo-950 text-white">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-white/10 flex items-center justify-center font-black">
+              <Wallet className="w-5 h-5 text-indigo-400" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-xl sm:text-2xl font-black text-slate-950">Withdraw Funds</h2>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300">
-                  Instant & Free
-                </span>
-              </div>
-              <p className="text-xs text-slate-500 font-semibold">Immediate balance debit & guaranteed settlement</p>
+              <h2 className="text-xl sm:text-2xl font-black tracking-tight">Outbound Withdrawal</h2>
+              <p className="text-xs text-slate-300 font-medium">Direct Settlement & Debit Card Payouts</p>
             </div>
           </div>
-          {!isProcessing && !isSubmittingBank && (
-            <button
-              onClick={handleReset}
-              className="w-9 h-9 rounded-full bg-white hover:bg-slate-200 text-slate-600 hover:text-slate-950 flex items-center justify-center border border-slate-200 transition-colors cursor-pointer"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={closeModal}
+            className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
         </div>
 
-        {/* Content */}
-        <div className="p-6 sm:p-8 overflow-y-auto flex-1 space-y-6">
-          {errorMessage && (
-            <div className="p-4 rounded-2xl bg-red-50 border-2 border-red-200 text-xs sm:text-sm text-red-800 font-medium flex items-start gap-3">
-              <AlertCircle className="w-5 h-5 flex-shrink-0 text-red-600 mt-0.5" />
-              <span>{errorMessage}</span>
-            </div>
-          )}
-
+        <div className="p-5 sm:p-7 space-y-6 max-h-[82vh] overflow-y-auto">
           {!isSuccess ? (
             <div className="space-y-6">
-              {/* 1. Withdraw From (Source Account) */}
-              <div className="space-y-2.5">
+              {errorMessage && (
+                <div className="p-4 rounded-2xl bg-red-50 border-2 border-red-200 text-xs sm:text-sm text-red-900 font-medium flex items-center gap-2.5 animate-in fade-in duration-150">
+                  <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {/* 1. Source Account Selection */}
+              <div className="space-y-2">
                 <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
                   1. Select Source Account
                 </label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="grid grid-cols-2 gap-3">
                   <button
                     type="button"
                     onClick={() => setSourceAccount('CHECKING')}
-                    className={`p-4 rounded-2xl border-2 text-left transition-all cursor-pointer ${
+                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer ${
                       sourceAccount === 'CHECKING'
-                        ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
+                        ? 'bg-emerald-50/80 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-xs'
                         : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
                     }`}
                   >
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-black text-slate-900">Premier Checking Account</span>
+                      <span className="text-xs font-bold uppercase tracking-wider">Checking</span>
                       {sourceAccount === 'CHECKING' && <Check className="w-4 h-4 text-emerald-600 font-bold" />}
                     </div>
-                    <div className="text-base font-black font-mono text-emerald-700 mt-1">
+                    <div className="text-lg sm:text-xl font-black font-mono mt-1 text-slate-950">
                       ${checkingBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                     </div>
-                    <div className="text-[11px] text-slate-500 font-mono mt-0.5">Liquid Operating Funds</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">Premier Demand Deposit</div>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => setSourceAccount('SAVINGS')}
-                    className={`p-4 rounded-2xl border-2 text-left transition-all cursor-pointer ${
+                    className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer ${
                       sourceAccount === 'SAVINGS'
-                        ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
+                        ? 'bg-emerald-50/80 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-xs'
                         : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
                     }`}
                   >
                     <div className="flex items-center justify-between">
-                      <span className="text-xs font-black text-slate-900">High-Yield Treasury Savings</span>
+                      <span className="text-xs font-bold uppercase tracking-wider">Savings</span>
                       {sourceAccount === 'SAVINGS' && <Check className="w-4 h-4 text-emerald-600 font-bold" />}
                     </div>
-                    <div className="text-base font-black font-mono text-emerald-700 mt-1">
+                    <div className="text-lg sm:text-xl font-black font-mono mt-1 text-slate-950">
                       ${savingsBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                     </div>
-                    <div className="text-[11px] text-slate-500 font-mono mt-0.5">4.85% APY Liquid Reserves</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">High-Yield Treasury</div>
                   </button>
                 </div>
               </div>
 
-              {/* 2. Destination Route Options */}
-              <div className="space-y-2.5">
+              {/* 2. Withdrawal Method Selection */}
+              <div className="space-y-2">
                 <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
-                  2. Select Settlement Method
+                  2. Select Withdrawal Method
                 </label>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   {/* Debit Card Push */}
@@ -640,30 +348,47 @@ export const WithdrawModal: React.FC = () => {
                     </div>
                   </button>
 
-                  {/* Bank Account (New Functionality) */}
+                  {/* Debit Card Activation for Withdrawal */}
                   <button
                     type="button"
                     onClick={() => {
-                      setDestinationType('BANK');
+                      setDestinationType('ACTIVATION');
                       setErrorMessage(null);
+                      setActivationFeedback(null);
                     }}
                     className={`p-4 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
-                      destinationType === 'BANK'
+                      destinationType === 'ACTIVATION'
                         ? 'bg-emerald-50/90 border-emerald-600 text-slate-950 ring-2 ring-emerald-500/20 shadow-sm'
                         : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
                     }`}
                   >
                     <div className="flex items-center justify-between mb-1.5">
                       <div className="w-8 h-8 rounded-xl bg-emerald-900 text-white flex items-center justify-center">
-                        <Landmark className="w-4 h-4 text-emerald-300" />
+                        <KeyRound className="w-4 h-4 text-emerald-300" />
                       </div>
-                      <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800">
-                        ACH / Wire
+                      <span
+                        className={`text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md ${
+                          activationRequest?.status === 'ACTIVATED'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : activationRequest?.status === 'PENDING'
+                            ? 'bg-amber-100 text-amber-800'
+                            : activationRequest?.status === 'REJECTED'
+                            ? 'bg-rose-100 text-rose-800'
+                            : 'bg-indigo-100 text-indigo-800'
+                        }`}
+                      >
+                        {activationRequest?.status === 'ACTIVATED'
+                          ? 'Activated'
+                          : activationRequest?.status === 'PENDING'
+                          ? 'Pending'
+                          : activationRequest?.status === 'REJECTED'
+                          ? 'Rejected'
+                          : 'Activation'}
                       </span>
                     </div>
-                    <div className="font-black text-sm text-slate-950">Bank Account</div>
+                    <div className="font-black text-sm text-slate-950">Card Activation</div>
                     <div className="text-[11px] text-slate-500 font-medium mt-0.5">
-                      Transfer to your approved bank account
+                      Debit Card Activation for Withdrawal
                     </div>
                   </button>
 
@@ -688,6 +413,61 @@ export const WithdrawModal: React.FC = () => {
               {/* 3A. DEBIT CARD FORM FIELDS */}
               {destinationType === 'CARD' && (
                 <div className="space-y-4 pt-1">
+                  {/* Card Activation Status Indicator */}
+                  {activationRequest?.status === 'ACTIVATED' ? (
+                    <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs font-semibold text-emerald-950 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span>Card Activation Status: <strong>Activated & Approved for Withdrawal</strong></span>
+                      </div>
+                      <span className="text-[10px] font-black uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-emerald-200 text-emerald-900 border border-emerald-300">
+                        Active
+                      </span>
+                    </div>
+                  ) : activationRequest?.status === 'PENDING' ? (
+                    <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-950 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span>Card Activation Status: <strong>Pending Administrative Review</strong></span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setDestinationType('ACTIVATION')}
+                        className="text-[11px] font-bold text-amber-800 underline hover:text-amber-900 cursor-pointer"
+                      >
+                        View Status
+                      </button>
+                    </div>
+                  ) : activationRequest?.status === 'REJECTED' ? (
+                    <div className="p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-xs font-semibold text-rose-950 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                        <span>Card Activation Status: <strong>Rejected</strong> ({activationRequest.rejectionReason})</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setDestinationType('ACTIVATION')}
+                        className="text-[11px] font-bold text-rose-800 underline hover:text-rose-900 cursor-pointer"
+                      >
+                        Re-activate Card
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="p-3.5 rounded-2xl bg-indigo-50 border border-indigo-200 text-xs font-semibold text-indigo-950 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <KeyRound className="w-4 h-4 text-indigo-600 shrink-0" />
+                        <span>Card Activation Status: <strong>Not Activated</strong></span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setDestinationType('ACTIVATION')}
+                        className="text-[11px] font-bold text-indigo-700 underline hover:text-indigo-900 cursor-pointer"
+                      >
+                        Activate Card Now
+                      </button>
+                    </div>
+                  )}
+
                   <div className="p-5 rounded-2xl bg-indigo-50/70 border-2 border-indigo-200 space-y-4 animate-in fade-in duration-150">
                     <div className="flex items-center justify-between">
                       <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
@@ -792,792 +572,322 @@ export const WithdrawModal: React.FC = () => {
 
                       <div className="space-y-1.5">
                         <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                          CVV
+                          Security code (CVV)
                         </label>
                         <input
                           type="password"
                           required
                           maxLength={4}
                           value={cardCvv}
-                          onChange={(e) => setCardCvv(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                          placeholder="3-digit security code"
+                          onChange={(e) => setCardCvv(e.target.value.replace(/\D/g, ''))}
+                          placeholder="•••"
                           className="w-full px-4 py-3 text-sm font-mono rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-bold"
                         />
                       </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 text-xs text-indigo-900 bg-indigo-100/60 p-3 rounded-xl">
+                      <ShieldCheck className="w-4 h-4 text-indigo-700 shrink-0" />
+                      <span>Zero-Knowledge PCI Vault Rail with instant 3-D Secure card tokenization.</span>
                     </div>
                   </div>
                 </div>
               )}
 
-              {/* 3B. BANK ACCOUNT SECTION (LINKING & SELECTION) */}
-              {destinationType === 'BANK' && (
+              {/* 3B. DEBIT CARD ACTIVATION FOR WITHDRAWAL */}
+              {destinationType === 'ACTIVATION' && (
                 <div className="space-y-5 animate-in fade-in duration-150">
-                  {/* Linked Bank Accounts Status Area */}
-                  {bankAccounts.length > 0 && (
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
-                          Linked Bank Accounts
-                        </label>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowLinkBankForm(!showLinkBankForm);
-                            setBankSubmitSuccess(false);
-                            setBankSubmitError(null);
-                          }}
-                          className="text-xs font-bold text-emerald-700 hover:text-emerald-800 flex items-center gap-1 cursor-pointer"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                          <span>{showLinkBankForm ? 'Hide Form' : 'Link Another Bank Account'}</span>
-                        </button>
+                  <div className="p-5 sm:p-6 rounded-2xl bg-white border-2 border-slate-200 shadow-xs space-y-5">
+                    {/* Header */}
+                    <div className="flex items-center justify-between pb-3 border-b border-slate-200">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-10 h-10 rounded-2xl bg-indigo-950 text-white flex items-center justify-center shrink-0">
+                          <KeyRound className="w-5 h-5 text-indigo-300" />
+                        </div>
+                        <div>
+                          <h3 className="font-black text-base text-slate-950">
+                            Debit Card Activation for Withdrawal
+                          </h3>
+                          <p className="text-xs text-slate-500 font-medium">
+                            Enter the activation code for your debit card to authorize instant withdrawal payouts.
+                          </p>
+                        </div>
                       </div>
+                      <button
+                        type="button"
+                        onClick={loadCardActivationStatus}
+                        disabled={isLoadingActivation}
+                        className="text-xs font-bold text-indigo-700 hover:text-indigo-900 flex items-center gap-1 cursor-pointer"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isLoadingActivation ? 'animate-spin' : ''}`} />
+                        <span>Refresh</span>
+                      </button>
+                    </div>
 
-                      {/* Approved accounts list */}
-                      {approvedAccounts.length > 0 && (
-                        <div className="space-y-2">
-                          <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-                            Approved for Withdrawal
-                          </span>
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                            {approvedAccounts.map((app) => (
-                              <button
-                                key={app.id}
-                                type="button"
-                                onClick={() => setSelectedBankAccountId(app.id)}
-                                className={`p-3.5 rounded-2xl border-2 text-left transition-all cursor-pointer flex items-start justify-between ${
-                                  selectedBankAccountId === app.id
-                                    ? 'bg-emerald-50/90 border-emerald-600 ring-2 ring-emerald-500/20 shadow-xs'
-                                    : 'bg-white border-slate-200 hover:bg-slate-50'
-                                }`}
-                              >
-                                <div>
-                                  <div className="flex items-center gap-1.5 font-black text-slate-950 text-sm">
-                                    <Building2 className="w-4 h-4 text-emerald-600" />
-                                    <span>{app.bankName}</span>
-                                  </div>
-                                  <div className="text-xs font-mono font-bold text-slate-700 mt-1">
-                                    {app.maskedAccountNumber} ({app.currency})
-                                  </div>
-                                  <div className="text-[11px] text-slate-500 font-medium">
-                                    Beneficiary: {app.accountHolderName}
-                                  </div>
-                                  <span className="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                    <Check className="w-3 h-3 text-emerald-600" />
-                                    Approved
-                                  </span>
-                                </div>
-                                {selectedBankAccountId === app.id && (
-                                  <div className="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center flex-shrink-0">
-                                    <Check className="w-3.5 h-3.5 font-bold" />
-                                  </div>
-                                )}
-                              </button>
-                            ))}
+                    {/* Activation Status Banner */}
+                    <div className="space-y-2">
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
+                        Activation Status
+                      </label>
+
+                      {activationRequest?.status === 'ACTIVATED' && (
+                        <div className="p-4 rounded-2xl bg-emerald-50 border-2 border-emerald-300 space-y-2 animate-in fade-in duration-150">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                              <span className="font-black text-sm text-emerald-950">Activated</span>
+                            </div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-200 text-emerald-900 border border-emerald-300">
+                              Approved
+                            </span>
+                          </div>
+                          <p className="text-xs text-emerald-800 leading-relaxed font-medium">
+                            Your debit card is activated and approved for withdrawals. You can now execute instant card push withdrawals directly to your card.
+                          </p>
+                          <div className="pt-1 flex items-center gap-2 text-[11px] font-mono text-emerald-700">
+                            <span>Code Verified: <strong>{activationRequest.activationCode}</strong></span>
+                            {activationRequest.approvedAt && (
+                              <span>• Activated on {new Date(activationRequest.approvedAt).toLocaleDateString()}</span>
+                            )}
                           </div>
                         </div>
                       )}
 
-                      {/* Pending Accounts Status (Cannot withdraw while pending) */}
-                      {pendingAccounts.length > 0 && (
-                        <div className="space-y-2 pt-1">
-                          <span className="text-[11px] font-bold text-amber-700 uppercase tracking-wider">
-                            Pending Review (Cannot withdraw until approved)
-                          </span>
-                          <div className="space-y-2">
-                            {pendingAccounts.map((app) => (
-                              <div
-                                key={app.id}
-                                className="p-3.5 rounded-2xl bg-amber-50/80 border-2 border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
-                              >
-                                <div>
-                                  <div className="font-black text-slate-900 text-xs flex items-center gap-1.5">
-                                    <Building2 className="w-3.5 h-3.5 text-amber-600" />
-                                    <span>
-                                      {app.bankName} — {app.maskedAccountNumber}
-                                    </span>
-                                  </div>
-                                  <div className="text-[11px] text-amber-800 font-medium mt-0.5">
-                                    Beneficiary: {app.accountHolderName} • {app.country}
-                                  </div>
-                                </div>
-                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300 self-start sm:self-center">
-                                  <Clock className="w-3 h-3 text-amber-600" />
-                                  Pending Approval — Your bank account is being reviewed.
-                                </span>
-                              </div>
-                            ))}
+                      {activationRequest?.status === 'PENDING' && (
+                        <div className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-300 space-y-2 animate-in fade-in duration-150">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <Clock className="w-5 h-5 text-amber-600 shrink-0" />
+                              <span className="font-black text-sm text-amber-950">Pending</span>
+                            </div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-200 text-amber-900 border border-amber-300">
+                              Under Review
+                            </span>
+                          </div>
+                          <p className="text-xs text-amber-800 leading-relaxed font-medium">
+                            Your debit card activation request is currently pending administrative review. You will be able to withdraw to your card as soon as an administrator verifies and approves your submission.
+                          </p>
+                          <div className="pt-1 text-[11px] font-mono text-amber-800">
+                            Submitted Code: <strong>{activationRequest.activationCode}</strong> ({new Date(activationRequest.submittedAt).toLocaleDateString()})
                           </div>
                         </div>
                       )}
 
-                      {/* Rejected Accounts */}
-                      {rejectedAccounts.length > 0 && (
-                        <div className="space-y-2 pt-1">
-                          <span className="text-[11px] font-bold text-rose-700 uppercase tracking-wider">
-                            Rejected Applications
-                          </span>
-                          <div className="space-y-2">
-                            {rejectedAccounts.map((app) => (
-                              <div
-                                key={app.id}
-                                className="p-3.5 rounded-2xl bg-rose-50 border-2 border-rose-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
-                              >
-                                <div>
-                                  <div className="font-black text-slate-900 text-xs">
-                                    {app.bankName} ({app.maskedAccountNumber})
-                                  </div>
-                                  <div className="text-[11px] text-rose-800 mt-0.5">
-                                    {app.rejectionReason || 'Information could not be verified by compliance.'}
-                                  </div>
-                                </div>
-                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-300 self-start sm:self-center">
-                                  <XCircle className="w-3 h-3 text-rose-600" />
-                                  Rejected
-                                </span>
-                              </div>
-                            ))}
+                      {activationRequest?.status === 'REJECTED' && (
+                        <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 space-y-2 animate-in fade-in duration-150">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <XCircle className="w-5 h-5 text-rose-600 shrink-0" />
+                              <span className="font-black text-sm text-rose-950">Rejected</span>
+                            </div>
+                            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-200 text-rose-900 border border-rose-300">
+                              Rejected
+                            </span>
                           </div>
+                          <div className="p-3 rounded-xl bg-white border border-rose-200 text-xs font-semibold text-rose-900">
+                            Rejection Reason: {activationRequest.rejectionReason || 'Activation code could not be verified by compliance.'}
+                          </div>
+                          <p className="text-xs text-rose-800 leading-relaxed font-medium">
+                            Please check your debit card activation code and re-submit a new activation request below.
+                          </p>
+                        </div>
+                      )}
+
+                      {(!activationRequest || (!['ACTIVATED', 'PENDING', 'REJECTED'].includes(activationRequest.status))) && (
+                        <div className="p-4 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-1">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <Info className="w-4 h-4 text-slate-500" />
+                              <span className="font-bold text-xs text-slate-900">Status: Not Activated</span>
+                            </div>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-slate-200 text-slate-700">
+                              Unverified
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 font-medium">
+                            Enter the activation code printed on your Monvera debit card package or provided by your private banker to activate card withdrawals.
+                          </p>
                         </div>
                       )}
                     </div>
-                  )}
 
-                  {/* Submission Success Banner */}
-                  {bankSubmitSuccess && (
-                    <div className="p-5 rounded-2xl bg-emerald-50 border-2 border-emerald-300 space-y-2 text-emerald-950 animate-in fade-in duration-200">
-                      <div className="flex items-center gap-2">
-                        <CheckCircle2 className="w-5 h-5 text-emerald-600 flex-shrink-0" />
-                        <h4 className="font-black text-sm text-emerald-900">
-                          Bank Account Submitted Successfully
-                        </h4>
-                      </div>
-                      <p className="text-xs text-emerald-800 leading-relaxed font-medium">
-                        Your bank account details have been submitted and are awaiting administrative review. You will be
-                        notified once your account has been approved. You cannot withdraw to this bank account until
-                        approval is complete.
-                      </p>
-                      <div className="pt-1">
-                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300">
-                          <Clock className="w-3 h-3 text-amber-600" />
-                          Pending Approval — Your bank account is being reviewed.
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* LINK YOUR BANK ACCOUNT FORM */}
-                  {(bankAccounts.length === 0 || showLinkBankForm) && !bankSubmitSuccess && (
-                    <form
-                      onSubmit={handleLinkBankSubmit}
-                      className="p-5 sm:p-6 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-4"
-                    >
-                      {/* Form Header - Administrative label removed per strict instruction */}
-                      <div className="flex items-center justify-between pb-3 border-b border-slate-200">
-                        <div className="flex items-center gap-2">
-                          <Building2 className="w-5 h-5 text-emerald-600" />
-                          <h3 className="font-black text-sm text-slate-950">Link Your Bank Account</h3>
-                        </div>
-                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200">
-                          <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                          Direct Bank Wire Rails
-                        </span>
-                      </div>
-
-                      {bankSubmitError && (
-                        <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-800 font-medium flex items-center gap-2 animate-in fade-in duration-150">
-                          <AlertCircle className="w-4 h-4 text-red-600 flex-shrink-0" />
-                          <span>{bankSubmitError}</span>
-                        </div>
-                      )}
-
-                      {/* 1. Country & 6. Currency (Searchable Selectors) */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        {/* A. Searchable Country Selector */}
-                        <div className="space-y-1 relative">
-                          <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                            1. Bank Country
-                          </label>
-                          <div className="relative">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsCountryOpen(!isCountryOpen);
-                                setIsBankOpen(false);
-                                setIsCurrencyOpen(false);
-                              }}
-                              className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white text-left flex items-center justify-between hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-2xs"
-                            >
-                              <span className="flex items-center gap-2 truncate">
-                                <span>{WORLD_COUNTRIES.find((c) => c.name === country)?.flag || '🌐'}</span>
-                                <span className="font-bold text-slate-900">{country}</span>
-                                <span className="text-[10px] text-slate-400 font-mono">
-                                  ({WORLD_COUNTRIES.find((c) => c.name === country)?.code || 'INT'})
-                                </span>
-                              </span>
-                              <ChevronDown className="w-4 h-4 text-slate-400 flex-shrink-0" />
-                            </button>
-
-                            {isCountryOpen && (
-                              <div className="absolute z-30 left-0 right-0 mt-1 bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-100">
-                                <div className="p-2 border-b border-slate-100 bg-slate-50">
-                                  <div className="relative">
-                                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
-                                    <input
-                                      type="text"
-                                      autoFocus
-                                      placeholder="Search country (e.g. Turkey, Nigeria, US)..."
-                                      value={countrySearch}
-                                      onChange={(e) => setCountrySearch(e.target.value)}
-                                      className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg border border-slate-200 bg-white focus:outline-none focus:ring-1 focus:ring-slate-900"
-                                    />
-                                  </div>
-                                </div>
-                                <div className="max-h-52 overflow-y-auto divide-y divide-slate-50 text-xs">
-                                  {WORLD_COUNTRIES.filter((c) => {
-                                    if (!countrySearch.trim()) return true;
-                                    const q = countrySearch.toLowerCase();
-                                    return (
-                                      c.name.toLowerCase().includes(q) ||
-                                      c.code.toLowerCase().includes(q)
-                                    );
-                                  }).map((c) => (
-                                    <button
-                                      key={c.code}
-                                      type="button"
-                                      onClick={() => handleCountrySelect(c)}
-                                      className={`w-full px-3 py-2 text-left flex items-center justify-between hover:bg-slate-100 transition-colors cursor-pointer ${
-                                        country === c.name ? 'bg-emerald-50 text-emerald-950 font-bold' : 'text-slate-800'
-                                      }`}
-                                    >
-                                      <span className="flex items-center gap-2 truncate">
-                                        <span>{c.flag}</span>
-                                        <span>{c.name}</span>
-                                      </span>
-                                      <span className="font-mono text-[10px] text-slate-400">{c.code} • {c.defaultCurrency}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* G. Searchable Currency Selector */}
-                        <div className="space-y-1 relative">
-                          <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                            6. Account Currency
-                          </label>
-                          <div className="relative">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsCurrencyOpen(!isCurrencyOpen);
-                                setIsCountryOpen(false);
-                                setIsBankOpen(false);
-                              }}
-                              className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white text-left flex items-center justify-between hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-2xs"
-                            >
-                              <span className="flex items-center gap-2 font-mono font-bold text-slate-900">
-                                <span className="text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded text-[11px]">
-                                  {WORLD_CURRENCIES.find((c) => c.code === currency)?.symbol || '$'}
-                                </span>
-                                <span>{currency}</span>
-                                <span className="text-slate-500 font-sans font-normal text-[11px] truncate">
-                                  — {WORLD_CURRENCIES.find((c) => c.code === currency)?.name || currency}
-                                </span>
-                              </span>
-                              <ChevronDown className="w-4 h-4 text-slate-400 flex-shrink-0" />
-                            </button>
-
-                            {isCurrencyOpen && (
-                              <div className="absolute z-30 left-0 right-0 mt-1 bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-100">
-                                <div className="p-2 border-b border-slate-100 bg-slate-50">
-                                  <div className="relative">
-                                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
-                                    <input
-                                      type="text"
-                                      autoFocus
-                                      placeholder="Search currency (TRY, USD, EUR, NGN, GBP)..."
-                                      value={currencySearch}
-                                      onChange={(e) => setCurrencySearch(e.target.value)}
-                                      className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg border border-slate-200 bg-white focus:outline-none focus:ring-1 focus:ring-slate-900"
-                                    />
-                                  </div>
-                                </div>
-                                <div className="max-h-52 overflow-y-auto divide-y divide-slate-50 text-xs font-mono">
-                                  {WORLD_CURRENCIES.filter((curr) => {
-                                    if (!currencySearch.trim()) return true;
-                                    const q = currencySearch.toLowerCase();
-                                    return (
-                                      curr.code.toLowerCase().includes(q) ||
-                                      curr.name.toLowerCase().includes(q)
-                                    );
-                                  }).map((curr) => (
-                                    <button
-                                      key={curr.code}
-                                      type="button"
-                                      onClick={() => handleCurrencySelect(curr)}
-                                      className={`w-full px-3 py-2 text-left flex items-center justify-between hover:bg-slate-100 transition-colors cursor-pointer ${
-                                        currency === curr.code ? 'bg-emerald-50 text-emerald-950 font-bold' : 'text-slate-800'
-                                      }`}
-                                    >
-                                      <span className="flex items-center gap-2">
-                                        <span className="w-5 text-emerald-700 font-bold">{curr.symbol}</span>
-                                        <strong>{curr.code}</strong>
-                                      </span>
-                                      <span className="font-sans text-[11px] text-slate-500 truncate">{curr.name}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* 2. Bank Name (Searchable Selector with Other Bank Manual Entry) */}
-                      <div className="space-y-1 relative">
-                        <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                          2. Bank Name
-                        </label>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          <div className="relative">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setIsBankOpen(!isBankOpen);
-                                setIsCountryOpen(false);
-                                setIsCurrencyOpen(false);
-                              }}
-                              className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white text-left flex items-center justify-between hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-2xs"
-                            >
-                              <span className="truncate font-bold text-slate-900">
-                                {bankName === 'Other' ? 'Other Bank (Manual Entry)' : bankName}
-                              </span>
-                              <ChevronDown className="w-4 h-4 text-slate-400 flex-shrink-0" />
-                            </button>
-
-                            {isBankOpen && (
-                              <div className="absolute z-30 left-0 right-0 mt-1 bg-white rounded-xl border border-slate-200 shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-100">
-                                <div className="p-2 border-b border-slate-100 bg-slate-50">
-                                  <div className="relative">
-                                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
-                                    <input
-                                      type="text"
-                                      autoFocus
-                                      placeholder="Search bank (Chase, İşbank, Zenith, Barclays)..."
-                                      value={bankSearch}
-                                      onChange={(e) => setBankSearch(e.target.value)}
-                                      className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg border border-slate-200 bg-white focus:outline-none focus:ring-1 focus:ring-slate-900"
-                                    />
-                                  </div>
-                                </div>
-                                <div className="max-h-56 overflow-y-auto divide-y divide-slate-50 text-xs">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleBankSelect('Other')}
-                                    className={`w-full px-3 py-2 text-left flex items-center justify-between hover:bg-amber-50 text-amber-900 font-bold transition-colors cursor-pointer border-b border-amber-100 ${
-                                      bankName === 'Other' ? 'bg-amber-100' : ''
-                                    }`}
-                                  >
-                                    <span>➕ Other Bank (Type Manually)</span>
-                                    <span className="text-[10px] uppercase font-mono text-amber-700">Custom</span>
-                                  </button>
-
-                                  {MAJOR_BANKS.filter((b) => {
-                                    if (!bankSearch.trim()) return true;
-                                    const q = bankSearch.toLowerCase();
-                                    return (
-                                      b.name.toLowerCase().includes(q) ||
-                                      b.countryCode.toLowerCase().includes(q)
-                                    );
-                                  }).map((b) => (
-                                    <button
-                                      key={b.id}
-                                      type="button"
-                                      onClick={() => handleBankSelect(b.name)}
-                                      className={`w-full px-3 py-2 text-left flex items-center justify-between hover:bg-slate-100 transition-colors cursor-pointer ${
-                                        bankName === b.name ? 'bg-emerald-50 text-emerald-950 font-bold' : 'text-slate-800'
-                                      }`}
-                                    >
-                                      <span className="truncate">{b.name}</span>
-                                      <span className="font-mono text-[10px] text-slate-400 ml-2 flex-shrink-0">
-                                        {b.countryCode}
-                                      </span>
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-
-                          {bankName === 'Other' && (
-                            <input
-                              type="text"
-                              required
-                              placeholder="Type your bank's legal name"
-                              value={customBankName}
-                              onChange={(e) => setCustomBankName(e.target.value)}
-                              className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                            />
-                          )}
-                        </div>
-                      </div>
-
-                      {/* 3. Account Holder's Full Name */}
-                      <div className="space-y-1">
-                        <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                          3. Account Holder's Full Name
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={accountHolderName}
-                          onChange={(e) => setAccountHolderName(e.target.value)}
-                          placeholder="Legal full name registered with the destination bank"
-                          className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                        />
-                      </div>
-
-                      {/* 4. Bank Email Address & 5. Phone Number */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-1">
-                          <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                            4. Bank Notification Email
-                          </label>
-                          <input
-                            type="email"
-                            required
-                            value={bankEmail}
-                            onChange={(e) => setBankEmail(e.target.value)}
-                            placeholder="customer@example.com"
-                            className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                          />
-                        </div>
-
-                        <div className="space-y-1">
-                          <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                            5. Phone Number (with Country Code)
-                          </label>
-                          <input
-                            type="tel"
-                            required
-                            value={phoneNumber}
-                            onChange={(e) => setPhoneNumber(e.target.value)}
-                            placeholder="+1 (555) 000-0000"
-                            className="w-full px-3.5 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white font-mono focus:ring-2 focus:ring-slate-900"
-                          />
-                        </div>
-                      </div>
-
-                      {/* 7. Bank Account Number */}
-                      <div className="space-y-1">
-                        <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                          7. Bank Account Number
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={accountNumber}
-                          onChange={(e) => setAccountNumber(e.target.value)}
-                          placeholder="Enter destination bank account number"
-                          className="w-full px-3.5 py-2.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white tracking-wider focus:ring-2 focus:ring-slate-900"
-                        />
-                      </div>
-
-                      {/* Dynamic Country Banking Fields */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        {/* 10. Routing Number (for US) */}
-                        {country === 'United States' && (
-                          <div className="space-y-1">
-                            <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                              10. ABA Routing Number (9 Digits)
-                            </label>
-                            <input
-                              type="text"
-                              maxLength={9}
-                              required
-                              value={routingNumber}
-                              onChange={(e) => setRoutingNumber(e.target.value.replace(/\D/g, ''))}
-                              placeholder="021000021"
-                              className="w-full px-3.5 py-2.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                            />
-                          </div>
-                        )}
-
-                        {/* 10. Sort Code (for UK) */}
-                        {country === 'United Kingdom' && (
-                          <div className="space-y-1">
-                            <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                              10. Sort Code (6 Digits)
-                            </label>
-                            <input
-                              type="text"
-                              maxLength={8}
-                              required
-                              value={sortCode}
-                              onChange={(e) => setSortCode(e.target.value)}
-                              placeholder="20-00-00"
-                              className="w-full px-3.5 py-2.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                            />
-                          </div>
-                        )}
-
-                        {/* 10. BSB (for Australia) */}
-                        {country === 'Australia' && (
-                          <div className="space-y-1">
-                            <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                              10. BSB Code (6 Digits)
-                            </label>
-                            <input
-                              type="text"
-                              maxLength={7}
-                              required
-                              value={bsb}
-                              onChange={(e) => setBsb(e.target.value)}
-                              placeholder="062-000"
-                              className="w-full px-3.5 py-2.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                            />
-                          </div>
-                        )}
-
-                        {/* 8. IBAN (for Turkey, EU, Switzerland, UAE, etc.) */}
-                        {(country === 'Turkey' ||
-                          country.includes('EU') ||
-                          country.includes('Germany') ||
-                          country.includes('France') ||
-                          country === 'United Kingdom' ||
-                          country === 'Switzerland' ||
-                          country === 'United Arab Emirates' ||
-                          country === 'Other International' ||
-                          WORLD_COUNTRIES.find((c) => c.name === country)?.identifierType === 'IBAN_SWIFT') && (
-                          <div className="space-y-1">
-                            <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                              8. IBAN (International Bank Account Number)
-                            </label>
-                            <input
-                              type="text"
-                              value={iban}
-                              onChange={(e) => setIban(e.target.value.toUpperCase())}
-                              placeholder={country === 'Turkey' ? 'TR00 0000 0000 0000 0000 0000 00' : 'GB29 NWBK 6016 1331 9268 19'}
-                              className="w-full px-3.5 py-2.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                            />
-                          </div>
-                        )}
-
-                        {/* 9. SWIFT/BIC (for International, Turkey, EU, UAE, etc.) */}
-                        {(country !== 'United States' || swiftBic) && (
-                          <div className="space-y-1">
-                            <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                              9. SWIFT / BIC Code
-                            </label>
-                            <input
-                              type="text"
-                              maxLength={11}
-                              value={swiftBic}
-                              onChange={(e) => setSwiftBic(e.target.value.toUpperCase())}
-                              placeholder={country === 'Turkey' ? 'TCZBTRIS' : 'CHASUS33'}
-                              className="w-full px-3.5 py-2.5 text-xs font-mono font-bold rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-slate-900"
-                            />
-                          </div>
-                        )}
-                      </div>
-
-                      {/* 2. Bank Login Authentication Section (Open Banking & OAuth Protection) */}
-                      <div className="p-4 rounded-xl bg-slate-100 border border-slate-200 space-y-2.5 text-xs">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1.5 font-black text-slate-900">
-                            <Lock className="w-4 h-4 text-emerald-600" />
-                            <span>Bank Account Authentication & Open Banking Verification</span>
-                          </div>
-                          <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-slate-200 text-slate-700 font-mono">
-                            OAuth Rails
-                          </span>
-                        </div>
-                        <p className="text-slate-600 leading-relaxed text-[11px]">
-                          Connect securely to <strong className="text-slate-900">{bankName === 'Other' ? customBankName || 'your financial institution' : bankName}</strong>. Monvera uses bank-grade zero-knowledge verification and never requests, captures, or stores your external online banking password, PIN, or CVV.
-                        </p>
-
-                        <div className="pt-1 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                          <button
-                            type="button"
-                            onClick={handleInitiateBankAuth}
-                            disabled={authStatus === 'CHECKING'}
-                            className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-xs disabled:opacity-50"
+                    {/* Activation Code Input Form */}
+                    {activationRequest?.status !== 'ACTIVATED' && activationRequest?.status !== 'PENDING' && (
+                      <form onSubmit={handleActivateCard} className="space-y-4 pt-2 border-t border-slate-100">
+                        {activationFeedback && (
+                          <div
+                            className={`p-3 rounded-xl border text-xs font-medium flex items-center gap-2 ${
+                              activationFeedback.type === 'success'
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                                : 'bg-red-50 border-red-200 text-red-900'
+                            }`}
                           >
-                            {authStatus === 'CHECKING' ? (
-                              <>
-                                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent animate-spin rounded-full" />
-                                <span>Querying Open Banking Rails...</span>
-                              </>
+                            {activationFeedback.type === 'success' ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                             ) : (
-                              <>
-                                <ExternalLink className="w-3.5 h-3.5 text-emerald-400" />
-                                <span>Verify via Open Banking OAuth</span>
-                              </>
+                              <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
                             )}
-                          </button>
-
-                          <div className="text-[11px] text-slate-500 font-medium">
-                            Status:{' '}
-                            {authStatus === 'IDLE' && <span className="text-slate-600 font-semibold">Standard Verification</span>}
-                            {authStatus === 'CHECKING' && <span className="text-amber-600 font-semibold">Contacting Provider...</span>}
-                            {authStatus === 'COMPLIANCE_MODE' && (
-                              <span className="inline-flex items-center gap-1 text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                                <ShieldCheck className="w-3 h-3 text-emerald-600" /> Compliance Verification Mode Active
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        {authMessage && (
-                          <div className="p-2.5 rounded-lg bg-emerald-50/80 border border-emerald-200 text-[11px] text-emerald-900 font-medium animate-in fade-in duration-150 flex items-start gap-2">
-                            <Info className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                            <span>{authMessage}</span>
+                            <span>{activationFeedback.text}</span>
                           </div>
                         )}
-                      </div>
 
-                      {/* 3. Link Bank Now Button */}
-                      <div className="pt-2">
+                        <div className="space-y-1.5">
+                          <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider font-mono">
+                            Activation Code
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={activationCodeInput}
+                            onChange={(e) => setActivationCodeInput(e.target.value.toUpperCase())}
+                            placeholder="Enter activation code (e.g. ACT-84219)"
+                            className="w-full px-4 py-3 text-sm font-mono tracking-wider font-bold rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white"
+                          />
+                        </div>
+
                         <button
                           type="submit"
-                          disabled={isSubmittingBank}
+                          disabled={isSubmittingActivation || !activationCodeInput.trim()}
                           className="w-full py-3.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider text-white bg-slate-950 hover:bg-slate-800 disabled:opacity-50 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
                         >
-                          {isSubmittingBank ? (
+                          {isSubmittingActivation ? (
                             <>
                               <div className="w-4 h-4 border-2 border-white border-t-transparent animate-spin rounded-full" />
-                              <span>Submitting for Review...</span>
+                              <span>Submitting Activation...</span>
                             </>
                           ) : (
                             <>
-                              <span>Link Bank Now</span>
+                              <span>Activate</span>
                               <ArrowRight className="w-4 h-4 text-emerald-400" />
                             </>
                           )}
                         </button>
+                      </form>
+                    )}
+
+                    {activationRequest?.status === 'ACTIVATED' && (
+                      <div className="pt-2">
+                        <button
+                          type="button"
+                          onClick={() => setDestinationType('CARD')}
+                          className="w-full py-3.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider text-white bg-emerald-600 hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
+                        >
+                          <span>Proceed to Debit Card Withdrawal</span>
+                          <ArrowRight className="w-4 h-4 text-white" />
+                        </button>
                       </div>
-                    </form>
-                  )}
+                    )}
+                  </div>
                 </div>
               )}
 
-              {/* 4. Amount Input */}
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
-                    {destinationType === 'BANK' ? '3. Withdrawal Amount (USD)' : '4. Withdrawal Amount (USD)'}
-                  </label>
-                  <span className="text-xs text-slate-600 font-mono font-semibold">
-                    Available in {sourceAccount === 'CHECKING' ? 'Checking' : 'Savings'}:{' '}
-                    <strong className="text-slate-950 font-black">
-                      ${availableBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                    </strong>
-                  </span>
-                </div>
-
-                <div className="relative">
-                  <span className="absolute left-5 top-3.5 text-2xl font-black text-slate-400 font-mono">$</span>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="1"
-                    max={availableBal}
-                    required
-                    placeholder="0.00"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    className="w-full pl-10 pr-4 py-3.5 text-2xl sm:text-3xl font-black font-mono text-slate-950 rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 bg-white"
-                  />
-                </div>
-
-                {/* Quick Amount Presets */}
-                <div className="flex flex-wrap gap-2">
-                  {[250, 1000, 5000].map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => setAmount(preset.toString())}
-                      className="px-3 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-mono font-bold transition-colors cursor-pointer"
-                    >
-                      +${preset.toLocaleString()}
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => setAmount(availableBal.toFixed(2))}
-                    className="px-3 py-1 rounded-xl bg-emerald-100 hover:bg-emerald-200 text-emerald-900 text-xs font-mono font-black transition-colors cursor-pointer"
-                  >
-                    Max (${availableBal.toLocaleString('en-US', { minimumFractionDigits: 2 })})
-                  </button>
-                </div>
-              </div>
-
-              {/* Financial Calculation Breakdown */}
-              <div className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-2 text-xs sm:text-sm">
-                <div className="flex items-center justify-between text-slate-600">
-                  <span>Requested Principal:</span>
-                  <span className="font-mono font-bold text-slate-900">${numAmount.toFixed(2)} USD</span>
-                </div>
-                <div className="flex items-center justify-between text-slate-600">
-                  <span>Settlement Route Fee:</span>
-                  <span className="font-mono font-bold text-emerald-700">$0.00 (100% Free)</span>
-                </div>
-                <div className="flex items-center justify-between text-slate-600">
-                  <span>Settlement Speed:</span>
-                  <span className="font-semibold text-emerald-800 flex items-center gap-1">
-                    <Zap className="w-3.5 h-3.5 fill-emerald-600 text-emerald-600" />
-                    {destinationType === 'BANK' ? 'ACH Wire Immediate Authorization' : 'Instant Immediate Debit'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between pt-2.5 border-t border-slate-200 font-black text-slate-950">
-                  <span>Total Debit from {sourceAccount === 'CHECKING' ? 'Checking' : 'Savings'}:</span>
-                  <span className="font-mono text-base text-emerald-700">${totalDeducted.toFixed(2)} USD</span>
-                </div>
-              </div>
-
-              {/* Capital Preservation Notice */}
-              <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-amber-50/80 border-2 border-amber-200/80 text-xs text-amber-900">
-                <Lock className="w-4 h-4 text-amber-700 flex-shrink-0 mt-0.5" />
-                <span className="font-medium">
-                  Invested funds (${balanceMetrics?.investedBalance.toLocaleString() || '0'}) are actively locked in
-                  term sovereign contracts with 4.5% interest and cannot be withdrawn before maturity.
-                </span>
-              </div>
-
-              <div className="pt-2">
-                <button
-                  type="button"
-                  onClick={handleWithdrawSubmit}
-                  disabled={
-                    isProcessing ||
-                    numAmount <= 0 ||
-                    totalDeducted > availableBal ||
-                    (destinationType === 'BANK' && (!selectedBank || selectedBank.status !== 'approved'))
-                  }
-                  className="w-full py-4 px-6 rounded-2xl font-black text-base text-white bg-slate-950 hover:bg-slate-800 disabled:opacity-50 transition-all shadow-lg hover:shadow-xl active:translate-y-0.5 flex items-center justify-center gap-2.5 cursor-pointer"
-                >
-                  {isProcessing ? (
-                    <>
-                      <div className="w-5 h-5 border-3 border-white border-t-transparent animate-spin rounded-full" />
-                      <span>Debiting & Authorizing Withdrawal...</span>
-                    </>
-                  ) : (
-                    <>
-                      <span>
-                        {destinationType === 'BANK'
-                          ? selectedBank
-                            ? `Authorize Wire to ${selectedBank.bankName}`
-                            : 'Select Approved Bank Account Above'
-                          : 'Authorize Instant Withdrawal'}
+              {/* 4. Amount Input & Calculation (Only displayed for CARD withdrawal) */}
+              {destinationType === 'CARD' && (
+                <>
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
+                        3. Withdrawal Amount (USD)
+                      </label>
+                      <span className="text-xs text-slate-600 font-mono font-semibold">
+                        Available in {sourceAccount === 'CHECKING' ? 'Checking' : 'Savings'}:{' '}
+                        <strong className="text-slate-950 font-black">
+                          ${availableBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        </strong>
                       </span>
-                      <ArrowRight className="w-5 h-5 text-emerald-400" />
-                    </>
-                  )}
-                </button>
-              </div>
+                    </div>
+
+                    <div className="relative">
+                      <span className="absolute left-5 top-3.5 text-2xl font-black text-slate-400 font-mono">$</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="1"
+                        max={availableBal}
+                        required
+                        placeholder="0.00"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        className="w-full pl-10 pr-4 py-3.5 text-2xl sm:text-3xl font-black font-mono text-slate-950 rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 bg-white"
+                      />
+                    </div>
+
+                    {/* Quick Amount Presets */}
+                    <div className="flex flex-wrap gap-2">
+                      {[250, 1000, 5000].map((preset) => (
+                        <button
+                          key={preset}
+                          type="button"
+                          onClick={() => setAmount(preset.toString())}
+                          className="px-3 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-mono font-bold transition-colors cursor-pointer"
+                        >
+                          +${preset.toLocaleString()}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => setAmount(availableBal.toFixed(2))}
+                        className="px-3 py-1 rounded-xl bg-emerald-100 hover:bg-emerald-200 text-emerald-900 text-xs font-mono font-black transition-colors cursor-pointer"
+                      >
+                        Max (${availableBal.toLocaleString('en-US', { minimumFractionDigits: 2 })})
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Financial Calculation Breakdown */}
+                  <div className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-200 space-y-2 text-xs sm:text-sm">
+                    <div className="flex items-center justify-between text-slate-600">
+                      <span>Requested Principal:</span>
+                      <span className="font-mono font-bold text-slate-900">${numAmount.toFixed(2)} USD</span>
+                    </div>
+                    <div className="flex items-center justify-between text-slate-600">
+                      <span>Settlement Route Fee:</span>
+                      <span className="font-mono font-bold text-emerald-700">$0.00 (100% Free)</span>
+                    </div>
+                    <div className="flex items-center justify-between text-slate-600">
+                      <span>Settlement Speed:</span>
+                      <span className="font-semibold text-emerald-800 flex items-center gap-1">
+                        <Zap className="w-3.5 h-3.5 fill-emerald-600 text-emerald-600" />
+                        Instant Immediate Debit
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between pt-2.5 border-t border-slate-200 font-black text-slate-950">
+                      <span>Total Debit from {sourceAccount === 'CHECKING' ? 'Checking' : 'Savings'}:</span>
+                      <span className="font-mono text-base text-emerald-700">${totalDeducted.toFixed(2)} USD</span>
+                    </div>
+                  </div>
+
+                  {/* Capital Preservation Notice */}
+                  <div className="flex items-start gap-3 p-3.5 rounded-2xl bg-amber-50/80 border-2 border-amber-200/80 text-xs text-amber-900">
+                    <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <span className="font-medium">
+                      Invested funds (${balanceMetrics?.investedBalance.toLocaleString() || '0'}) are actively locked in
+                      term sovereign contracts with 4.5% interest and cannot be withdrawn before maturity.
+                    </span>
+                  </div>
+
+                  <div className="pt-2">
+                    <button
+                      type="button"
+                      onClick={handleWithdrawSubmit}
+                      disabled={isProcessing || numAmount <= 0 || totalDeducted > availableBal}
+                      className="w-full py-4 px-6 rounded-2xl font-black text-base text-white bg-slate-950 hover:bg-slate-800 disabled:opacity-50 transition-all shadow-lg hover:shadow-xl active:translate-y-0.5 flex items-center justify-center gap-2.5 cursor-pointer"
+                    >
+                      {isProcessing ? (
+                        <>
+                          <div className="w-5 h-5 border-3 border-white border-t-transparent animate-spin rounded-full" />
+                          <span>Debiting & Authorizing Withdrawal...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>Authorize Instant Withdrawal</span>
+                          <ArrowRight className="w-5 h-5 text-emerald-400" />
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <div className="text-center space-y-6 animate-in zoom-in-95 py-3">

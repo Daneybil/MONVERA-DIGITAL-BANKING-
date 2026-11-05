@@ -30,6 +30,11 @@ import {
   getAllBankAccountApplicationsAdmin,
   approveBankAccountApplication,
   rejectBankAccountApplication,
+  submitCardActivationRequest,
+  getCustomerCardActivationStatus,
+  getAllCardActivationRequestsAdmin,
+  approveCardActivationRequest,
+  rejectCardActivationRequest,
 } from './server/firestoreTransactions';
 import { evaluateAndProcessWelcomeReward, getAllWelcomeRewardsAdmin } from './server/welcomeRewardService';
 
@@ -1875,6 +1880,134 @@ app.post('/api/admin/bank-accounts/:id/reject', optionalFirebaseAuth, async (req
   }
 
   return res.json({ success: true, application: result.application });
+});
+
+// --- DEBIT CARD ACTIVATION FOR WITHDRAWAL WORKFLOW ---
+
+// Customer endpoint: submit activation code for debit card withdrawal
+app.post('/api/card-activations/submit', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (req.body.userId || callerUid);
+
+  if (!targetUserId) {
+    return res.status(401).json({ error: 'Authentication required to activate card.' });
+  }
+
+  const { activationCode, cardBrand, cardLast4 } = req.body;
+  if (!activationCode || !String(activationCode).trim()) {
+    return res.status(400).json({ error: 'Please enter a valid activation code.' });
+  }
+
+  const result = await submitCardActivationRequest({
+    userId: targetUserId,
+    activationCode: String(activationCode).trim(),
+    cardBrand,
+    cardLast4,
+  });
+
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({
+    success: true,
+    request: result.request,
+    message: 'Card activation request submitted successfully.',
+  });
+});
+
+// Customer endpoint: get customer's latest card activation status
+app.get('/api/card-activations/my', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (req.query.userId as string || callerUid);
+
+  if (!targetUserId) {
+    return res.status(401).json({ error: 'Authentication required.' });
+  }
+
+  try {
+    const result = await getCustomerCardActivationStatus(targetUserId);
+    return res.json(result);
+  } catch (err: any) {
+    console.error('[GET /api/card-activations/my Error]:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to retrieve card activation status.' });
+  }
+});
+
+// Administrator endpoint: retrieve all card activation requests
+app.get('/api/admin/card-activations', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const queryAdminSession = (req.query.adminSession as string) || (req.headers['x-admin-session'] as string);
+  if (!isAdmin && queryAdminSession) {
+    const verified = verifyAdminSessionToken(queryAdminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrative privileges required to access card activation requests.' });
+  }
+
+  try {
+    const requests = await getAllCardActivationRequestsAdmin();
+    return res.json({ success: true, requests });
+  } catch (err: any) {
+    console.error('[GET /api/admin/card-activations Error]:', err);
+    return res.status(500).json({ error: err?.message || 'Failed to retrieve card activation requests.' });
+  }
+});
+
+// Administrator endpoint: approve card activation request
+app.post('/api/admin/card-activations/:id/approve', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const adminSession = (req.headers['x-admin-session'] as string) || (req.body?.adminSession as string);
+  if (!isAdmin && adminSession) {
+    const verified = verifyAdminSessionToken(adminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrator privileges required to approve card activations.' });
+  }
+
+  const { id } = req.params;
+  const adminId = callerUid || 'usr_admin';
+
+  const result = await approveCardActivationRequest(adminId, id);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, request: result.request });
+});
+
+// Administrator endpoint: reject card activation request with reason
+app.post('/api/admin/card-activations/:id/reject', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  const adminSession = (req.headers['x-admin-session'] as string) || (req.body?.adminSession as string);
+  if (!isAdmin && adminSession) {
+    const verified = verifyAdminSessionToken(adminSession);
+    if (verified.valid) isAdmin = true;
+  }
+
+  if (!isAdmin && isFirebaseAdminConfigured()) {
+    return res.status(403).json({ error: 'FORBIDDEN: Administrator privileges required to reject card activations.' });
+  }
+
+  const { id } = req.params;
+  const { reason } = req.body;
+  const adminId = callerUid || 'usr_admin';
+
+  const result = await rejectCardActivationRequest(adminId, id, reason);
+  if (!result.success) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, request: result.request });
 });
 
 // Reverse pending withdrawal
