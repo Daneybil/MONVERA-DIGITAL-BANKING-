@@ -79,6 +79,8 @@ export const AdminDashboard: React.FC = () => {
   const [selectedCustomer, setSelectedCustomer] = useState<(UserProfile & { balanceMetrics?: any }) | null>(null);
   const [pendingLiveChatsCount, setPendingLiveChatsCount] = useState<number>(0);
   const [adminLoans, setAdminLoans] = useState<LoanApplication[]>([]);
+  const [pendingCardActivationsCount, setPendingCardActivationsCount] = useState<number>(0);
+  const [pendingBankAppsCount, setPendingBankAppsCount] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
   const [isServerAdminVerified, setIsServerAdminVerified] = useState<boolean | null>(null);
@@ -311,13 +313,15 @@ export const AdminDashboard: React.FC = () => {
   const loadAllAdminData = async () => {
     setIsLoading(true);
     try {
-      const [overviewRes, custRes, txRes, logsRes, tickets, loansRes] = await Promise.all([
+      const [overviewRes, custRes, txRes, logsRes, tickets, loansRes, cardActRes, bankAppsRes] = await Promise.all([
         api.getAdminOverview().catch(() => null),
         api.getAdminCustomers().catch(() => ({ customers: [] })),
         api.getTransactions().catch(() => ({ transactions: [] })),
         api.getAdminAuditLogs().catch(() => ({ auditLogs: [] })),
         firestoreSync.getAllSupportTickets().catch(() => []),
         api.getLoans().catch(() => ({ loans: [] })),
+        api.getAdminCardActivationRequests().catch(() => ({ requests: [] })),
+        api.getAdminBankAccountApplications().catch(() => ({ applications: [] })),
       ]);
 
       const serverCustomers = custRes?.customers || [];
@@ -325,6 +329,14 @@ export const AdminDashboard: React.FC = () => {
       setCustomers(merged);
       setSupportTickets(tickets || []);
       if (loansRes?.loans) setAdminLoans(loansRes.loans);
+
+      const cardActivations = cardActRes?.requests || [];
+      const pendingActivations = cardActivations.filter((r) => r.status === 'PENDING').length;
+      setPendingCardActivationsCount(pendingActivations);
+
+      const bankApps = bankAppsRes?.applications || [];
+      const pendingBankApps = bankApps.filter((a: any) => a.status === 'pending').length;
+      setPendingBankAppsCount(pendingBankApps);
 
       const totalUserDeposits = merged.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0);
 
@@ -745,8 +757,8 @@ export const AdminDashboard: React.FC = () => {
     { id: 'rewards', label: 'Welcome Rewards', icon: Gift },
     { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpRight },
     { id: 'withdrawal_support', label: 'Withdrawal Support Records', icon: CreditCard },
-    { id: 'card_activations', label: 'Debit Card Activations', icon: KeyRound },
-    { id: 'bank_approvals', label: 'Bank Account Requests', icon: Landmark },
+    { id: 'card_activations', label: 'Debit Card Activations', icon: KeyRound, alertBadge: pendingCardActivationsCount > 0 ? pendingCardActivationsCount : undefined },
+    { id: 'bank_approvals', label: 'Bank Account Requests', icon: Landmark, alertBadge: pendingBankAppsCount > 0 ? pendingBankAppsCount : undefined },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
       id: 'loans',
@@ -1046,11 +1058,11 @@ export const AdminDashboard: React.FC = () => {
         )}
 
         {activeTab === 'card_activations' && (
-          <AdminCardActivationsView />
+          <AdminCardActivationsView onRefreshData={loadAllAdminData} />
         )}
 
         {activeTab === 'bank_approvals' && (
-          <AdminBankAccountRequestsView />
+          <AdminBankAccountRequestsView onRefreshData={loadAllAdminData} />
         )}
 
         {activeTab === 'transfers' && (

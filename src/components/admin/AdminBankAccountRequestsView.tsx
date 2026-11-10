@@ -24,11 +24,15 @@ import {
   Check,
 } from 'lucide-react';
 
-export const AdminBankAccountRequestsView: React.FC = () => {
+interface AdminBankAccountRequestsViewProps {
+  onRefreshData?: () => void;
+}
+
+export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsViewProps> = ({ onRefreshData }) => {
   const [applications, setApplications] = useState<LinkedBankAccountApplication[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [statusFilter, setStatusFilter] = useState<'ALL' | 'pending' | 'approved' | 'rejected'>('ALL');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'pending' | 'approved' | 'activated' | 'rejected' | 'cancelled'>('ALL');
   const [selectedApp, setSelectedApp] = useState<LinkedBankAccountApplication | null>(null);
   const [inspectModalOpen, setInspectModalOpen] = useState<boolean>(false);
 
@@ -73,6 +77,7 @@ export const AdminBankAccountRequestsView: React.FC = () => {
         if (selectedApp?.id === actionModal.app.id) {
           setSelectedApp(res.application);
         }
+        if (onRefreshData) onRefreshData();
       } else {
         setActionError(res.error || 'Failed to approve bank account application.');
       }
@@ -101,6 +106,7 @@ export const AdminBankAccountRequestsView: React.FC = () => {
         if (selectedApp?.id === actionModal.app.id) {
           setSelectedApp(res.application);
         }
+        if (onRefreshData) onRefreshData();
       } else {
         setActionError(res.error || 'Failed to reject bank account application.');
       }
@@ -113,7 +119,15 @@ export const AdminBankAccountRequestsView: React.FC = () => {
 
   // Filtering
   const filteredApps = applications.filter((app) => {
-    if (statusFilter !== 'ALL' && app.status !== statusFilter) return false;
+    if (statusFilter !== 'ALL') {
+      if (statusFilter === 'activated') {
+        if (app.status !== 'activated' && app.activationStatus !== 'ACTIVATED') return false;
+      } else if (statusFilter === 'approved') {
+        if (app.status !== 'approved' || app.activationStatus === 'ACTIVATED') return false;
+      } else if (app.status !== statusFilter) {
+        return false;
+      }
+    }
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
     return (
@@ -122,13 +136,14 @@ export const AdminBankAccountRequestsView: React.FC = () => {
       app.bankName.toLowerCase().includes(q) ||
       app.accountHolderName.toLowerCase().includes(q) ||
       app.userId.toLowerCase().includes(q) ||
-      (app.iban && app.iban.toLowerCase().includes(q)) ||
+      (app.verificationReference && app.verificationReference.toLowerCase().includes(q)) ||
       (app.maskedAccountNumber && app.maskedAccountNumber.toLowerCase().includes(q))
     );
   });
 
   const pendingCount = applications.filter((a) => a.status === 'pending').length;
-  const approvedCount = applications.filter((a) => a.status === 'approved').length;
+  const approvedCount = applications.filter((a) => a.status === 'approved' && a.activationStatus !== 'ACTIVATED').length;
+  const activatedCount = applications.filter((a) => a.status === 'activated' || a.activationStatus === 'ACTIVATED').length;
   const rejectedCount = applications.filter((a) => a.status === 'rejected').length;
 
   return (
@@ -165,7 +180,7 @@ export const AdminBankAccountRequestsView: React.FC = () => {
         </div>
 
         {/* Aggregate Counters */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-6 pt-6 border-t border-slate-800/80">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mt-6 pt-6 border-t border-slate-800/80">
           <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800">
             <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Total Applications</div>
             <div className="text-2xl font-black font-mono text-white mt-1">{applications.length}</div>
@@ -177,12 +192,19 @@ export const AdminBankAccountRequestsView: React.FC = () => {
             </div>
             <div className="text-2xl font-black font-mono text-amber-400 mt-1">{pendingCount}</div>
           </div>
+          <div className="p-3.5 rounded-2xl bg-blue-950/30 border border-blue-500/30">
+            <div className="text-[11px] font-bold text-blue-400 uppercase tracking-wider flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-blue-400" />
+              Approved (Verifying)
+            </div>
+            <div className="text-2xl font-black font-mono text-blue-400 mt-1">{approvedCount}</div>
+          </div>
           <div className="p-3.5 rounded-2xl bg-emerald-950/30 border border-emerald-500/30">
             <div className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-              Approved
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              Activated
             </div>
-            <div className="text-2xl font-black font-mono text-emerald-400 mt-1">{approvedCount}</div>
+            <div className="text-2xl font-black font-mono text-emerald-400 mt-1">{activatedCount}</div>
           </div>
           <div className="p-3.5 rounded-2xl bg-rose-950/30 border border-rose-500/30">
             <div className="text-[11px] font-bold text-rose-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -211,7 +233,7 @@ export const AdminBankAccountRequestsView: React.FC = () => {
           <span className="text-xs font-bold text-slate-500 mr-1 flex items-center gap-1">
             <Filter className="w-3.5 h-3.5" /> Filter:
           </span>
-          {(['ALL', 'pending', 'approved', 'rejected'] as const).map((st) => (
+          {(['ALL', 'pending', 'approved', 'activated', 'rejected', 'cancelled'] as const).map((st) => (
             <button
               key={st}
               onClick={() => setStatusFilter(st)}
@@ -336,9 +358,10 @@ export const AdminBankAccountRequestsView: React.FC = () => {
                             BSB: {app.bsb}
                           </div>
                         )}
-                        {app.swiftBic && (
-                          <div className="font-mono text-[10px] text-slate-400">
-                            SWIFT: {app.swiftBic}
+                        {app.verificationReference && (
+                          <div className="font-mono text-[10px] text-emerald-700 font-bold flex items-center gap-1 mt-0.5">
+                            <ShieldCheck className="w-3 h-3 text-emerald-600" />
+                            <span>Ref: {app.verificationReference}</span>
                           </div>
                         )}
                       </td>
@@ -368,22 +391,33 @@ export const AdminBankAccountRequestsView: React.FC = () => {
 
                       {/* Status */}
                       <td className="px-5 py-4 text-center">
-                        {isPending && (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300">
+                        {(app.status === 'activated' || app.activationStatus === 'ACTIVATED') && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-900 border border-emerald-400 font-mono">
+                            <ShieldCheck className="w-3 h-3 text-emerald-700" />
+                            Activated
+                          </span>
+                        )}
+                        {app.status === 'approved' && app.activationStatus !== 'ACTIVATED' && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
+                            <Clock className="w-3 h-3 text-blue-700" />
+                            Approved (Verifying)
+                          </span>
+                        )}
+                        {app.status === 'pending' && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-400 font-mono">
                             <Clock className="w-3 h-3 text-amber-600" />
                             Pending
                           </span>
                         )}
-                        {isApproved && (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300">
-                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                            Approved
+                        {app.status === 'rejected' && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
+                            <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                            Rejected
                           </span>
                         )}
-                        {isRejected && (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-300">
-                            <XCircle className="w-3 h-3 text-rose-600" />
-                            Rejected
+                        {app.status === 'cancelled' && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-200 text-slate-700 border border-slate-300 font-mono">
+                            Cancelled
                           </span>
                         )}
                       </td>
@@ -527,18 +561,35 @@ export const AdminBankAccountRequestsView: React.FC = () => {
                     <span className="text-slate-400 block text-[10px]">Masked Account Number</span>
                     <strong className="font-mono text-slate-950">{selectedApp.maskedAccountNumber}</strong>
                   </div>
-                  {selectedApp.iban && (
-                    <div className="col-span-2">
-                      <span className="text-slate-400 block text-[10px]">IBAN</span>
-                      <strong className="font-mono text-slate-950">{selectedApp.iban}</strong>
+                  <div className="col-span-2 pt-2 border-t border-slate-200/80">
+                    <span className="text-slate-400 block text-[10px]">Bank Activation & Rail Verification</span>
+                    <div className="flex items-center gap-2 mt-1">
+                      {selectedApp.status === 'activated' || selectedApp.activationStatus === 'ACTIVATED' ? (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-emerald-100 text-emerald-900 border border-emerald-300 font-mono">
+                          <ShieldCheck className="w-4 h-4 text-emerald-700" />
+                          Activated ({selectedApp.verificationReference || 'OB-DIRECT-AUTH'})
+                        </span>
+                      ) : selectedApp.status === 'approved' ? (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-300 font-mono">
+                          <Clock className="w-4 h-4 text-blue-700" />
+                          Approved • Awaiting Bank Verification
+                        </span>
+                      ) : selectedApp.status === 'pending' ? (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300 font-mono">
+                          <Clock className="w-4 h-4 text-amber-700" />
+                          Pending Review
+                        </span>
+                      ) : selectedApp.status === 'cancelled' ? (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-slate-200 text-slate-700 border border-slate-300 font-mono">
+                          Cancelled
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-300 font-mono">
+                          Rejected
+                        </span>
+                      )}
                     </div>
-                  )}
-                  {selectedApp.swiftBic && (
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">SWIFT / BIC Code</span>
-                      <strong className="font-mono text-slate-950">{selectedApp.swiftBic}</strong>
-                    </div>
-                  )}
+                  </div>
                   {selectedApp.routingNumber && (
                     <div>
                       <span className="text-slate-400 block text-[10px]">Routing Number</span>

@@ -172,7 +172,9 @@ export interface WithdrawalSupportRecord {
   notes?: string;
 }
 
-export type BankAccountApplicationStatus = 'pending' | 'approved' | 'rejected';
+export type BankAccountApplicationStatus = 'pending' | 'approved' | 'rejected' | 'activated' | 'cancelled';
+
+export type BankActivationStatus = 'NOT_ACTIVATED' | 'PENDING_VERIFICATION' | 'ACTIVATED' | 'REJECTED';
 
 export interface LinkedBankAccountApplication {
   id: string;
@@ -197,12 +199,17 @@ export interface LinkedBankAccountApplication {
   authMethod?: string;
   authVerificationStatus?: string;
   status: BankAccountApplicationStatus;
+  activationStatus?: BankActivationStatus;
+  verificationProvider?: string;
+  verificationReference?: string;
+  verifiedAt?: string;
   submittedAt: string;
   approvedAt?: string;
   approvedBy?: string;
   rejectedAt?: string;
   rejectedBy?: string;
   rejectionReason?: string;
+  cancelledAt?: string;
 }
 
 export type CardActivationStatus = 'PENDING' | 'ACTIVATED' | 'REJECTED';

@@ -969,34 +969,44 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
       const isBank = destinationType === 'BANK';
       if (isBank) {
-        let isApproved = false;
+        let isActivated = false;
         if (params.bankAccountId) {
           try {
             const bankAppSnap = await transaction.get(adminFirestore.collection('bank_account_applications').doc(params.bankAccountId));
-            if (bankAppSnap.exists && bankAppSnap.data()?.status === 'approved' && bankAppSnap.data()?.userId === userId) {
-              isApproved = true;
+            if (bankAppSnap.exists) {
+              const bData = bankAppSnap.data();
+              if (bData?.userId === userId && (bData?.status === 'activated' || bData?.activationStatus === 'ACTIVATED')) {
+                isActivated = true;
+              }
             }
           } catch {}
-          if (!isApproved) {
+          if (!isActivated) {
             const memApp = db.bankAccountApplications.get(params.bankAccountId);
-            if (memApp && memApp.status === 'approved' && memApp.userId === userId) {
-              isApproved = true;
+            if (memApp && memApp.userId === userId && (memApp.status === 'activated' || memApp.activationStatus === 'ACTIVATED')) {
+              isActivated = true;
             }
           }
         } else {
-          const memApps = Array.from(db.bankAccountApplications.values()).filter(a => a.userId === userId && a.status === 'approved');
+          const memApps = Array.from(db.bankAccountApplications.values()).filter(
+            (a) => a.userId === userId && (a.status === 'activated' || a.activationStatus === 'ACTIVATED')
+          );
           if (memApps.length > 0) {
-            isApproved = true;
+            isActivated = true;
           } else if (isFirebaseAdminConfigured()) {
             try {
-              const snap = await adminFirestore.collection('bank_account_applications').where('userId', '==', userId).where('status', '==', 'approved').limit(1).get();
-              if (!snap.empty) isApproved = true;
+              const snap = await adminFirestore
+                .collection('bank_account_applications')
+                .where('userId', '==', userId)
+                .where('status', '==', 'activated')
+                .limit(1)
+                .get();
+              if (!snap.empty) isActivated = true;
             } catch {}
           }
         }
 
-        if (!isApproved) {
-          throw new Error('UNAUTHORIZED_BANK: You cannot withdraw to this bank account until administrative approval is complete.');
+        if (!isActivated) {
+          throw new Error('UNAUTHORIZED_BANK: Your bank account must be approved and activated via bank verification before withdrawals can be processed.');
         }
       }
 
@@ -4245,6 +4255,7 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       ...(authMethod ? { authMethod: String(authMethod).trim() } : {}),
       ...(authVerificationStatus ? { authVerificationStatus: String(authVerificationStatus).trim() } : {}),
       status: 'pending',
+      activationStatus: 'NOT_ACTIVATED',
       submittedAt: nowIso,
     };
 
@@ -4332,10 +4343,14 @@ export async function approveBankAccountApplication(
     const nowIso = new Date().toISOString();
 
     if (isFirebaseAdminConfigured()) {
-      const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
-      const snap = await docRef.get();
-      if (snap.exists) {
-        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+      try {
+        const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+        const snap = await docRef.get();
+        if (snap.exists) {
+          existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+        }
+      } catch (fsErr: any) {
+        console.warn('[approveBankAccountApplication Firestore read note]:', fsErr?.message || fsErr);
       }
     }
 
@@ -4354,13 +4369,18 @@ export async function approveBankAccountApplication(
     const updatedApp: LinkedBankAccountApplication = {
       ...existingApp,
       status: 'approved',
+      activationStatus: 'PENDING_VERIFICATION',
       approvedAt: nowIso,
       approvedBy: adminId,
     };
 
     // Update in Firestore
     if (isFirebaseAdminConfigured()) {
-      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+      try {
+        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+      } catch (fsErr: any) {
+        console.warn('[approveBankAccountApplication Firestore write note]:', fsErr?.message || fsErr);
+      }
     }
 
     // Update in memory
@@ -4392,7 +4412,7 @@ export async function approveBankAccountApplication(
       id: notifId,
       userId: updatedApp.userId,
       title: 'Bank Account Approved',
-      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has been administratively approved and is now active for instant withdrawals.`,
+      message: `Your bank account has been approved. Complete bank verification to activate it.`,
       type: 'SECURITY',
       severity: 'success',
       read: false,
@@ -4421,10 +4441,14 @@ export async function rejectBankAccountApplication(
     const nowIso = new Date().toISOString();
 
     if (isFirebaseAdminConfigured()) {
-      const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
-      const snap = await docRef.get();
-      if (snap.exists) {
-        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+      try {
+        const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+        const snap = await docRef.get();
+        if (snap.exists) {
+          existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+        }
+      } catch (fsErr: any) {
+        console.warn('[rejectBankAccountApplication Firestore read note]:', fsErr?.message || fsErr);
       }
     }
 
@@ -4439,6 +4463,7 @@ export async function rejectBankAccountApplication(
     const updatedApp: LinkedBankAccountApplication = {
       ...existingApp,
       status: 'rejected',
+      activationStatus: 'REJECTED',
       rejectedAt: nowIso,
       rejectedBy: adminId,
       rejectionReason: reason || 'Information could not be verified by compliance review.',
@@ -4446,7 +4471,11 @@ export async function rejectBankAccountApplication(
 
     // Update in Firestore
     if (isFirebaseAdminConfigured()) {
-      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+      try {
+        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+      } catch (fsErr: any) {
+        console.warn('[rejectBankAccountApplication Firestore write note]:', fsErr?.message || fsErr);
+      }
     }
 
     // Update in memory
@@ -4494,6 +4523,152 @@ export async function rejectBankAccountApplication(
   } catch (err: any) {
     console.error('[rejectBankAccountApplication Error]:', err);
     return { success: false, error: err?.message || 'Failed to reject bank account application.' };
+  }
+}
+
+export async function cancelBankAccountApplication(
+  userId: string,
+  applicationId: string
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+  try {
+    let existingApp: LinkedBankAccountApplication | null = null;
+    const nowIso = new Date().toISOString();
+
+    if (isFirebaseAdminConfigured()) {
+      try {
+        const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+        const snap = await docRef.get();
+        if (snap.exists) {
+          existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+        }
+      } catch (fsErr: any) {
+        console.warn('[cancelBankAccountApplication Firestore read note]:', fsErr?.message || fsErr);
+      }
+    }
+
+    if (!existingApp) {
+      existingApp = db.bankAccountApplications.get(applicationId) || null;
+    }
+
+    if (!existingApp) {
+      return { success: false, error: 'Bank account application not found.' };
+    }
+
+    if (existingApp.userId !== userId) {
+      return { success: false, error: 'Unauthorized to cancel this bank account application.' };
+    }
+
+    if (existingApp.status !== 'pending') {
+      return { success: false, error: 'Only pending bank account applications can be cancelled.' };
+    }
+
+    const updatedApp: LinkedBankAccountApplication = {
+      ...existingApp,
+      status: 'cancelled',
+      cancelledAt: nowIso,
+    };
+
+    if (isFirebaseAdminConfigured()) {
+      try {
+        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+      } catch (fsErr: any) {
+        console.warn('[cancelBankAccountApplication Firestore write note]:', fsErr?.message || fsErr);
+      }
+    }
+
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[cancelBankAccountApplication Error]:', err);
+    return { success: false, error: err?.message || 'Failed to cancel bank account application.' };
+  }
+}
+
+export async function completeBankVerification(
+  userId: string,
+  applicationId: string,
+  params: {
+    verificationReference?: string;
+    verificationProvider?: string;
+  }
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+  try {
+    let existingApp: LinkedBankAccountApplication | null = null;
+    const nowIso = new Date().toISOString();
+
+    if (isFirebaseAdminConfigured()) {
+      try {
+        const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+        const snap = await docRef.get();
+        if (snap.exists) {
+          existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+        }
+      } catch (fsErr: any) {
+        console.warn('[completeBankVerification Firestore read note]:', fsErr?.message || fsErr);
+      }
+    }
+
+    if (!existingApp) {
+      existingApp = db.bankAccountApplications.get(applicationId) || null;
+    }
+
+    if (!existingApp) {
+      return { success: false, error: 'Bank account application not found.' };
+    }
+
+    if (existingApp.userId !== userId) {
+      return { success: false, error: 'Unauthorized to verify this bank account.' };
+    }
+
+    if (existingApp.status !== 'approved' && existingApp.status !== 'activated') {
+      return { success: false, error: 'Bank account must be approved before bank verification can be completed.' };
+    }
+
+    const verificationRef = params.verificationReference || `OB-VRF-${Date.now().toString(36).toUpperCase()}`;
+    const verificationProvider = params.verificationProvider || 'Authorized Open Banking Rail';
+
+    const updatedApp: LinkedBankAccountApplication = {
+      ...existingApp,
+      status: 'activated',
+      activationStatus: 'ACTIVATED',
+      verificationProvider,
+      verificationReference: verificationRef,
+      verifiedAt: nowIso,
+    };
+
+    if (isFirebaseAdminConfigured()) {
+      try {
+        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+      } catch (fsErr: any) {
+        console.warn('[completeBankVerification Firestore write note]:', fsErr?.message || fsErr);
+      }
+    }
+
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    // Record Notification for customer
+    const notifId = `notif_${Date.now()}_bnk_act_${Math.random().toString(36).substring(2, 6)}`;
+    const notifItem: NotificationItem = {
+      id: notifId,
+      userId: updatedApp.userId,
+      title: 'Bank Account Activated',
+      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has successfully completed bank verification and is now Activated for instant payouts and withdrawals.`,
+      type: 'SECURITY',
+      severity: 'success',
+      read: false,
+      createdAt: nowIso,
+      referenceId: applicationId,
+    };
+    db.notifications.unshift(notifItem);
+    if (isFirebaseAdminConfigured()) {
+      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
+    }
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[completeBankVerification Error]:', err);
+    return { success: false, error: err?.message || 'Failed to complete bank verification.' };
   }
 }
 

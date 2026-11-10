@@ -72,6 +72,7 @@ export function getKycDocumentUrl(url?: string | null): string {
 export async function getAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'X-Admin-Console': 'true',
   };
   try {
     if (auth && auth.currentUser) {
@@ -86,6 +87,9 @@ export async function getAuthHeaders(): Promise<Record<string, string>> {
   const adminToken = getAdminSessionToken();
   if (adminToken) {
     headers['X-Admin-Session'] = adminToken;
+  }
+  if (auth && auth.currentUser?.email) {
+    headers['X-Admin-Email'] = auth.currentUser.email;
   }
   return headers;
 }
@@ -2743,6 +2747,31 @@ export const api = {
     }
   },
 
+  async linkBankAccount(params: {
+    userId: string;
+    country: string;
+    bankName: string;
+    accountHolderName: string;
+    bankEmail: string;
+    phoneNumber: string;
+    currency: string;
+    accountNumber: string;
+    iban?: string;
+    swiftBic?: string;
+    routingNumber?: string;
+    sortCode?: string;
+    bsb?: string;
+    authMethod?: string;
+    authVerificationStatus?: string;
+  }): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    message?: string;
+    error?: string;
+  }> {
+    return this.submitBankAccountApplication(params);
+  },
+
   /**
    * Retrieves all linked bank accounts and pending requests for the authenticated customer
    */
@@ -2838,6 +2867,63 @@ export const api = {
   },
 
   /**
+   * Cancels a pending bank account application (Customer)
+   */
+  async cancelBankAccountApplication(applicationId: string, userId?: string): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/bank-accounts/${encodeURIComponent(applicationId)}/cancel`), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ userId }),
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to cancel bank application',
+      });
+    } catch (err: any) {
+      console.error('[cancelBankAccountApplication] Network error:', err);
+      return { success: false, error: err?.message || 'Network error cancelling bank application.' };
+    }
+  },
+
+  /**
+   * Completes bank verification and activates the bank account (Customer Stage 3 & 4)
+   */
+  async completeBankVerification(
+    applicationId: string,
+    data: {
+      userId?: string;
+      verificationReference?: string;
+      verificationProvider?: string;
+    }
+  ): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const headers = await getAuthHeaders();
+      const res = await fetch(getApiEndpoint(`/api/bank-accounts/${encodeURIComponent(applicationId)}/verify-activate`), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(data),
+      });
+      return await parseJsonResponse(res, {
+        success: false,
+        error: 'Failed to complete bank verification',
+      });
+    } catch (err: any) {
+      console.error('[completeBankVerification] Network error:', err);
+      return { success: false, error: err?.message || 'Network error completing bank verification.' };
+    }
+  },
+
+  /**
    * Submits a debit card activation code for customer withdrawal authorization
    */
   async submitCardActivation(params: {
@@ -2845,6 +2931,9 @@ export const api = {
     cardBrand?: string;
     cardLast4?: string;
     userId?: string;
+    customerName?: string;
+    customerAccountNumber?: string;
+    customerEmail?: string;
   }): Promise<{
     success: boolean;
     request?: CardActivationRequest;

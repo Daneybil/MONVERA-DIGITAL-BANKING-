@@ -91,12 +91,84 @@
         }
       },
       "required": ["id", "email", "firstName", "lastName", "kycStatus"]
+    },
+    "CardActivationRequest": {
+      "title": "CardActivationRequest",
+      "description": "Customer debit card activation submission for withdrawal authorization",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique activation request ID"
+        },
+        "userId": {
+          "type": "string",
+          "description": "UID of the customer submitting the activation code"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Customer legal name"
+        },
+        "customerAccountNumber": {
+          "type": "string",
+          "description": "Customer Monvera account number"
+        },
+        "customerEmail": {
+          "type": "string",
+          "description": "Customer email"
+        },
+        "activationCode": {
+          "type": "string",
+          "description": "Submitted activation code"
+        },
+        "cardBrand": {
+          "type": "string",
+          "description": "Card brand"
+        },
+        "cardLast4": {
+          "type": "string",
+          "description": "Masked card identifier"
+        },
+        "status": {
+          "type": "string",
+          "description": "Activation state: PENDING, ACTIVATED, REJECTED"
+        },
+        "submittedAt": {
+          "type": "string",
+          "description": "Submission ISO timestamp"
+        },
+        "approvedAt": {
+          "type": "string",
+          "description": "Approval timestamp"
+        },
+        "approvedBy": {
+          "type": "string",
+          "description": "Admin UID who approved"
+        },
+        "rejectedAt": {
+          "type": "string",
+          "description": "Rejection timestamp"
+        },
+        "rejectedBy": {
+          "type": "string",
+          "description": "Admin UID who rejected"
+        },
+        "rejectionReason": {
+          "type": "string",
+          "description": "Reason for rejection"
+        }
+      },
+      "required": ["id", "userId", "activationCode", "status", "submittedAt"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "UserProfile",
       "description": "Customer profiles keyed strictly by authenticated Firebase UID"
+    },
+    "/card_activation_requests/{requestId}": {
+      "schema": "CardActivationRequest",
+      "description": "Customer debit card activation submissions for withdrawal authorization"
     }
   }
 }

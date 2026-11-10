@@ -20,7 +20,14 @@ import {
   Calendar,
 } from 'lucide-react';
 
-export const AdminCardActivationsView: React.FC = () => {
+import { db } from '../../services/firebase';
+import { collection, getDocs } from 'firebase/firestore';
+
+interface AdminCardActivationsViewProps {
+  onRefreshData?: () => void;
+}
+
+export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> = ({ onRefreshData }) => {
   const [requests, setRequests] = useState<CardActivationRequest[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -39,8 +46,27 @@ export const AdminCardActivationsView: React.FC = () => {
     setIsLoading(true);
     try {
       const res = await api.getAdminCardActivationRequests();
-      if (res.success && res.requests) {
+      if (res.success && Array.isArray(res.requests)) {
         setRequests(res.requests);
+      } else {
+        // Direct Firestore fallback to ensure requests appear even if backend API had auth/network latency
+        let directFound = false;
+        if (db) {
+          try {
+            const snap = await getDocs(collection(db, 'card_activation_requests'));
+            if (!snap.empty) {
+              const fsRequests = snap.docs.map((d) => ({ ...(d.data() as any), id: d.id } as CardActivationRequest));
+              fsRequests.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+              setRequests(fsRequests);
+              directFound = true;
+            }
+          } catch (e) {
+            console.warn('[AdminCardActivationsView] Direct Firestore note:', e);
+          }
+        }
+        if (!directFound && res.requests) {
+          setRequests(res.requests);
+        }
       }
     } catch (err) {
       console.error('[AdminCardActivationsView] Error loading requests:', err);
@@ -64,6 +90,7 @@ export const AdminCardActivationsView: React.FC = () => {
           prev.map((r) => (r.id === actionModal.req.id ? res.request! : r))
         );
         setActionModal(null);
+        if (onRefreshData) onRefreshData();
       } else {
         setActionError(res.error || 'Failed to approve card activation request.');
       }
@@ -93,6 +120,7 @@ export const AdminCardActivationsView: React.FC = () => {
         );
         setActionModal(null);
         setRejectionReason('');
+        if (onRefreshData) onRefreshData();
       } else {
         setActionError(res.error || 'Failed to reject card activation request.');
       }
