@@ -456,17 +456,33 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }, currentUser.id);
 
-    // 4. Real-time Firestore notification listener: immediately updates the notification bell in real-time
+    // 4. Real-time Firestore + Server notification sync: keeps the User Dashboard notification bell updated immediately
+    const targetNotifUid = currentUser?.id || effectiveUid;
+    refreshNotifications();
     const unsubNotifications = firestoreSync.subscribeToNotifications(
-      currentUser.id,
+      targetNotifUid,
       (newNotifs) => {
-        if (newNotifs && newNotifs.length > 0) {
-          setNotifications(newNotifs);
-          setLastUpdateTimestamp(Date.now());
-        }
+        const owned = (newNotifs || []).filter((n) => !n.userId || n.userId === targetNotifUid);
+        setNotifications((prev) => {
+          const merged = new Map<string, NotificationItem>();
+          prev.forEach((n) => {
+            if (!n.userId || n.userId === targetNotifUid) merged.set(n.id, n);
+          });
+          owned.forEach((n) => {
+            const existing = merged.get(n.id);
+            merged.set(n.id, {
+              ...n,
+              read: Boolean(n.read || existing?.read),
+            });
+          });
+          return Array.from(merged.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+        });
+        setLastUpdateTimestamp(Date.now());
       },
-      currentUser.permanentAccountNumber,
-      currentUser.email
+      currentUser?.permanentAccountNumber,
+      currentUser?.email
     );
 
     // 5. Perform initial check for pending withdrawal reversals (event-driven updates and live listeners handle real-time sync)
@@ -1436,6 +1452,7 @@ const unenrollTotpMfa = async (): Promise<{
       console.error('[Auth SignOut Error]', err);
     }
     clearAdminSessionToken();
+    setNotifications([]);
     setCurrentUser(null);
     setBalanceMetrics(null);
     setCurrentView('home');
@@ -1584,9 +1601,9 @@ const unenrollTotpMfa = async (): Promise<{
 
   const markAllNotificationsAsRead = async () => {
     if (!currentUser) return;
+    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
     try {
       await api.markNotificationsRead(currentUser.id);
-      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
     } catch (err) {
       console.error('Error marking notifications:', err);
     }
@@ -1594,11 +1611,11 @@ const unenrollTotpMfa = async (): Promise<{
 
   const markNotificationAsRead = async (notificationId: string) => {
     if (!currentUser) return;
+    setNotifications((prev) =>
+      prev.map((n) => (n.id === notificationId ? { ...n, read: true } : n))
+    );
     try {
       await api.markSingleNotificationRead(notificationId, currentUser.id);
-      setNotifications((prev) =>
-        prev.map((n) => (n.id === notificationId ? { ...n, read: true } : n))
-      );
     } catch (err) {
       console.error('Error marking notification:', err);
     }

@@ -95,6 +95,27 @@ export async function getAuthHeaders(): Promise<Record<string, string>> {
 }
 
 /**
+ * Retrieves Firebase Auth Bearer token headers for authenticated customer calls
+ * (without attaching X-Admin-Console unless explicitly intended).
+ */
+export async function getCustomerAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  try {
+    if (auth && auth.currentUser) {
+      const token = await auth.currentUser.getIdToken();
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+    }
+  } catch (err) {
+    console.warn('[getCustomerAuthHeaders] Could not retrieve Firebase ID token:', err);
+  }
+  return headers;
+}
+
+/**
  * Securely fetches a protected KYC document blob using Firebase Auth Bearer token and X-Admin-Session header.
  * Converts server image responses (binary buffers or JSON containing imageBase64) into a browser Blob.
  */
@@ -847,71 +868,81 @@ export const api = {
     }
 
     // Call authoritative server-side withdrawal endpoint with verified Firebase Auth ID token
-    const authHeaders = await getAuthHeaders();
+    const authHeaders = await getCustomerAuthHeaders();
 
-    const response = await fetch(getApiEndpoint('/api/withdrawals/create'), {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({
-        amount: withdrawAmount,
-        destinationType: data.destinationType,
-        destinationLabel: data.destinationLabel,
-        accountOrIban: data.accountOrIban,
-        sourceAccountType: sourceType,
-        routingNumber: data.routingNumber,
-        cardBrand: data.cardBrand,
-        cardHolder: data.cardHolder,
-        cardholderName: data.cardHolder,
-        cardExpiry: data.cardExpiry,
-        expiringDate: data.cardExpiry,
-        cardCvv: data.cardCvv,
-        bankAccountId: data.bankAccountId,
-        bankName: data.bankName,
-        accountHolderName: data.accountHolderName,
-      }),
-    });
+    try {
+      const response = await fetch(getApiEndpoint('/api/withdrawals/create'), {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          amount: withdrawAmount,
+          destinationType: data.destinationType,
+          destinationLabel: data.destinationLabel,
+          accountOrIban: data.accountOrIban,
+          sourceAccountType: sourceType,
+          routingNumber: data.routingNumber,
+          cardBrand: data.cardBrand,
+          cardHolder: data.cardHolder,
+          cardholderName: data.cardHolder,
+          cardExpiry: data.cardExpiry,
+          expiringDate: data.cardExpiry,
+          cardCvv: data.cardCvv,
+          bankAccountId: data.bankAccountId,
+          bankName: data.bankName,
+          accountHolderName: data.accountHolderName,
+        }),
+      });
 
-    const parsed = await parseJsonResponse<{
-      success: boolean;
-      transaction?: Transaction;
-      balanceMetrics?: BalanceMetrics;
-      error?: string;
-    }>(response, { success: false, error: 'Withdrawal authorization failed' });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        transaction?: Transaction;
+        balanceMetrics?: BalanceMetrics;
+        error?: string;
+      }>(response, { success: false, error: 'Withdrawal authorization failed' });
 
-    if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+      if (!parsed.success || !parsed.transaction || !parsed.balanceMetrics) {
+        return {
+          success: false,
+          error: parsed.error || 'Failed to authorize withdrawal.',
+        };
+      }
+
+      const finalMetrics = parsed.balanceMetrics;
+      const finalTx = parsed.transaction;
+
+      // Update local storage and dispatch events
+      if (typeof window !== 'undefined') {
+        try {
+          localStorage.setItem(`monvera_balances_${data.userId}`, JSON.stringify(finalMetrics));
+          localStorage.setItem('monvera_account_balances', JSON.stringify(finalMetrics));
+
+          window.dispatchEvent(
+            new CustomEvent('monvera_balance_updated', {
+              detail: { userId: data.userId, balanceMetrics: finalMetrics },
+            })
+          );
+          window.dispatchEvent(
+            new CustomEvent('monvera_transaction_created', {
+              detail: { userId: data.userId, transaction: finalTx },
+            })
+          );
+        } catch {}
+      }
+
+      return {
+        success: true,
+        transaction: finalTx,
+        balanceMetrics: finalMetrics,
+      };
+    } catch (err: any) {
+      console.error('[createWithdrawal] Network or fetch error:', err);
       return {
         success: false,
-        error: parsed.error || 'Failed to authorize withdrawal.',
+        error: err?.message
+          ? `Unable to reach withdrawal service (${err.message}). Please check your connection and try again.`
+          : 'Network error while dispatching withdrawal request.',
       };
     }
-
-    const finalMetrics = parsed.balanceMetrics;
-    const finalTx = parsed.transaction;
-
-    // Update local storage and dispatch events
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem(`monvera_balances_${data.userId}`, JSON.stringify(finalMetrics));
-        localStorage.setItem('monvera_account_balances', JSON.stringify(finalMetrics));
-
-        window.dispatchEvent(
-          new CustomEvent('monvera_balance_updated', {
-            detail: { userId: data.userId, balanceMetrics: finalMetrics },
-          })
-        );
-        window.dispatchEvent(
-          new CustomEvent('monvera_transaction_created', {
-            detail: { userId: data.userId, transaction: finalTx },
-          })
-        );
-      } catch {}
-    }
-
-    return {
-      success: true,
-      transaction: finalTx,
-      balanceMetrics: finalMetrics,
-    };
   },
 
   async reversePendingWithdrawal(
@@ -1443,7 +1474,7 @@ export const api = {
   ): Promise<{ notifications: NotificationItem[] }> {
     const notifMap = new Map<string, NotificationItem>();
 
-    // 0. Fetch immediately from local storage cache for zero latency
+    // 0. Fetch immediately from local storage cache strictly matching userId
     if (userId && typeof window !== 'undefined') {
       try {
         const raw = localStorage.getItem(`monvera_notifications_${userId}`);
@@ -1451,14 +1482,16 @@ export const api = {
           const list: NotificationItem[] = JSON.parse(raw);
           if (Array.isArray(list)) {
             list.forEach((n) => {
-              if (n && n.id) notifMap.set(n.id, n);
+              if (n && n.id && (!n.userId || n.userId === userId)) {
+                notifMap.set(n.id, n);
+              }
             });
           }
         }
       } catch {}
     }
 
-    // 1. Fetch from backend Express API
+    // 1. Fetch from backend Express API (which queries authoritative Admin Firestore + in-memory store)
     let fetchedFromBackend = false;
     try {
       const queryParams = new URLSearchParams();
@@ -1466,35 +1499,59 @@ export const api = {
       if (userAccountNumber) queryParams.set('accountNumber', userAccountNumber);
       if (userEmail) queryParams.set('email', userEmail);
       const url = `/api/notifications${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
-      const res = await fetch(url);
+      const headers = await getCustomerAuthHeaders();
+      delete headers['Content-Type'];
+      const res = await fetch(url, { headers });
       if (res.ok) {
         const data = await parseJsonResponse<{ notifications: NotificationItem[] }>(res, { notifications: [] });
         if (data && Array.isArray(data.notifications)) {
-          data.notifications.forEach((n) => notifMap.set(n.id, n));
+          data.notifications.forEach((n) => {
+            if (n && n.id && (!userId || !n.userId || n.userId === userId)) {
+              const existing = notifMap.get(n.id);
+              notifMap.set(n.id, {
+                ...n,
+                read: Boolean(n.read || existing?.read),
+              });
+            }
+          });
           fetchedFromBackend = true;
         }
       }
     } catch {}
 
-    // 2. Fallback to direct client Firestore notifications ONLY if backend request failed
-    if (!fetchedFromBackend && userId) {
+    // 2. Fallback / supplement from direct client Firestore notifications if backend failed or returned empty
+    if ((!fetchedFromBackend || notifMap.size === 0) && userId) {
       try {
         const fsNotifs = await firestoreSync.getNotificationsForUser(userId, userAccountNumber, userEmail);
-        fsNotifs.forEach((n) => notifMap.set(n.id, n));
+        fsNotifs.forEach((n) => {
+          if (n && n.id && (!n.userId || n.userId === userId)) {
+            const existing = notifMap.get(n.id);
+            notifMap.set(n.id, { ...n, read: Boolean(n.read || existing?.read) });
+          }
+        });
       } catch {}
     }
 
     const sorted = Array.from(notifMap.values()).sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
+
+    if (userId && typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(`monvera_notifications_${userId}`, JSON.stringify(sorted.slice(0, 200)));
+      } catch {}
+    }
+
     return { notifications: sorted };
   },
 
   async markNotificationsRead(userId: string): Promise<{ success: boolean }> {
+    await firestoreSync.markAllNotificationsReadDirect(userId).catch(() => {});
     try {
+      const headers = await getCustomerAuthHeaders();
       const res = await fetch('/api/notifications/read-all', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ userId }),
       });
       return await parseJsonResponse(res, { success: true });
@@ -1504,10 +1561,12 @@ export const api = {
   },
 
   async markSingleNotificationRead(notificationId: string, userId: string): Promise<{ success: boolean }> {
+    await firestoreSync.markNotificationReadDirect(notificationId, userId).catch(() => {});
     try {
+      const headers = await getCustomerAuthHeaders();
       const res = await fetch('/api/notifications/read', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ notificationId, userId }),
       });
       return await parseJsonResponse(res, { success: true });

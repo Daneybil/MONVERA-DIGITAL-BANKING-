@@ -83,6 +83,46 @@ export const TransactionsView: React.FC = () => {
     };
   }, [effectiveUid, currentUser, balanceMetrics, lastUpdateTimestamp]);
 
+  useEffect(() => {
+    if (!transactions || transactions.length === 0) return;
+    const focusTxFromNav = (rawTarget?: any) => {
+      try {
+        let target = rawTarget;
+        if (!target && typeof window !== 'undefined') {
+          const saved = sessionStorage.getItem('monvera_notification_nav_target');
+          if (saved) target = JSON.parse(saved);
+        }
+        if (target && target.actionView === 'transactions') {
+          const refOrId = target.referenceNumber || target.actionRecordId;
+          if (refOrId) {
+            const matched = transactions.find(
+              (t) => t.id === refOrId || t.referenceNumber === refOrId
+            );
+            if (matched) {
+              setSelectedTxForReceipt(matched);
+            } else {
+              setSearchQuery(String(refOrId));
+            }
+          }
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem('monvera_notification_nav_target');
+          }
+        }
+      } catch {}
+    };
+
+    focusTxFromNav();
+    const onNavigate = (e: any) => focusTxFromNav(e?.detail);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_notification_navigate', onNavigate);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_notification_navigate', onNavigate);
+      }
+    };
+  }, [transactions]);
+
   if (!currentUser) return null;
 
   const categories = ['ALL', 'Transfers', 'Deposits', 'Withdrawals', 'Investments', 'Shopping', 'Payroll'];

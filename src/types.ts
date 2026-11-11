@@ -367,6 +367,27 @@ export interface NotificationItem {
   read: boolean;
   createdAt: string;
   referenceId?: string;
+  actionView?: 'overview' | 'transactions' | 'accounts' | 'transfers' | 'investments' | 'loans' | 'cards' | 'profile';
+  actionModal?: 'withdraw' | 'deposit' | 'send' | 'invest' | 'receive';
+  actionSection?: string;
+  actionRecordId?: string;
+  metadata?: {
+    category?: string;
+    eventType?: string;
+    customerName?: string;
+    accountNumberMasked?: string;
+    transactionType?: string;
+    direction?: 'CREDIT' | 'DEBIT';
+    amount?: number;
+    currency?: string;
+    status?: string;
+    referenceNumber?: string;
+    applicationType?: string;
+    requestType?: string;
+    reason?: string;
+    date?: string;
+    [key: string]: any;
+  };
   supportTicketId?: string;
   supportRepName?: string;
   supportRepRole?: string;

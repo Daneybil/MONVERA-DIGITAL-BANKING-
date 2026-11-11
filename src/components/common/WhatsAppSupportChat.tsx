@@ -48,6 +48,7 @@ export const WhatsAppSupportChat: React.FC = () => {
   const [inputValue, setInputValue] = useState('');
   const [adminIsTyping, setAdminIsTyping] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [dismissedPreviewMsgId, setDismissedPreviewMsgId] = useState<string | null>(null);
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [callNotice, setCallNotice] = useState<string | null>(null);
@@ -220,6 +221,8 @@ export const WhatsAppSupportChat: React.FC = () => {
   useEffect(() => {
     if (!currentUser || !currentUser.id) {
       setMessages([]);
+      setUnreadCount(0);
+      setIsOpen(false);
       return;
     }
 
@@ -227,10 +230,11 @@ export const WhatsAppSupportChat: React.FC = () => {
 
     // 1. Subscribe to Firestore & local chat messages
     const unsubscribeMsgs = firestoreSync.subscribeToChatMessages(currentUserId, (liveList) => {
-      if (liveList && liveList.length > 0) {
-        setMessages(liveList);
-        // Calculate unread messages from support
-        const unreadSupportMsgs = liveList.filter((m) => m.sender === 'support' && m.status !== 'read');
+      const ownedList = (liveList || []).filter((m) => m && m.userId === currentUserId);
+      if (ownedList.length > 0) {
+        setMessages(ownedList);
+        // Calculate unread messages strictly from support for this customer
+        const unreadSupportMsgs = ownedList.filter((m) => m.sender === 'support' && m.status !== 'read');
         setUnreadCount(unreadSupportMsgs.length);
       } else {
         // Welcome message if thread is completely fresh - permanently committed to memory
@@ -259,6 +263,7 @@ export const WhatsAppSupportChat: React.FC = () => {
           },
         ];
         setMessages(defaultWelcome);
+        setUnreadCount(0);
         firestoreSync.saveChatMessage(defaultWelcome[0]);
         firestoreSync.saveChatMessage(defaultWelcome[1]);
       }
@@ -275,20 +280,37 @@ export const WhatsAppSupportChat: React.FC = () => {
     };
   }, [currentUser?.id, currentUser?.firstName, userAcc]);
 
-  // Mark messages as read when user opens the chat
+  // Mark messages as read immediately when chat opens OR when new support replies arrive while chat is open
   useEffect(() => {
-    if (isOpen && currentUser?.id) {
-      firestoreSync.markChatMessagesAsRead(currentUser.id, 'user').catch(() => {});
+    if (!isOpen || !currentUser?.id) return;
+
+    const hasUnreadSupport = messages.some(
+      (m) => m.userId === currentUser.id && m.sender === 'support' && m.status !== 'read'
+    );
+
+    if (hasUnreadSupport) {
+      setMessages((prev) =>
+        prev.map((m) => (m.sender === 'support' && m.status !== 'read' ? { ...m, status: 'read' as const } : m))
+      );
       setUnreadCount(0);
-      setTimeout(scrollToBottom, 150);
+      firestoreSync.markChatMessagesAsRead(currentUser.id, 'user').catch(() => {});
+    } else if (unreadCount > 0) {
+      setUnreadCount(0);
+      firestoreSync.markChatMessagesAsRead(currentUser.id, 'user').catch(() => {});
     }
-  }, [isOpen, currentUser?.id]);
+  }, [isOpen, currentUser?.id, messages, unreadCount]);
 
   useEffect(() => {
     if (isOpen) {
-      scrollToBottom();
+      setTimeout(scrollToBottom, 120);
     }
-  }, [messages, adminIsTyping]);
+  }, [isOpen, messages, adminIsTyping]);
+
+  const unreadSupportMessages = currentUser?.id
+    ? messages.filter((m) => m.userId === currentUser.id && m.sender === 'support' && m.status !== 'read')
+    : [];
+  const latestUnreadSupportMsg =
+    unreadSupportMessages.length > 0 ? unreadSupportMessages[unreadSupportMessages.length - 1] : null;
 
   const handleOpenLauncher = () => {
     if (!currentUser) {
@@ -555,6 +577,56 @@ export const WhatsAppSupportChat: React.FC = () => {
           }`}
           title="Drag and shift anywhere on screen, or click to chat"
         >
+          {/* Professional Unread Support Message Preview Card */}
+          {unreadCount > 0 && latestUnreadSupportMsg && dismissedPreviewMsgId !== latestUnreadSupportMsg.id && (
+            <div
+              id="whatsapp-support-preview-toast"
+              onClick={(e) => {
+                if (dragRef.current.hasMoved) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  return;
+                }
+                handleOpenLauncher();
+              }}
+              className="w-64 sm:w-72 mb-1 p-3 rounded-2xl bg-white text-slate-900 shadow-[0_14px_35px_rgba(15,23,42,0.28)] border-2 border-emerald-500/70 cursor-pointer hover:border-[#25D366] transition-all animate-in fade-in slide-in-from-bottom-2"
+            >
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="w-2 h-2 rounded-full bg-red-600 animate-pulse shrink-0" />
+                  <span className="text-[11px] font-black text-emerald-900 uppercase tracking-wide truncate">
+                    Customer Support Replied
+                  </span>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  <span className="px-1.5 py-0.5 rounded-full bg-red-600 text-white text-[10px] font-black leading-none">
+                    {unreadCount} new
+                  </span>
+                  <button
+                    type="button"
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setDismissedPreviewMsgId(latestUnreadSupportMsg.id);
+                    }}
+                    className="p-0.5 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+                    aria-label="Dismiss support preview"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+              <p className="text-xs font-bold text-slate-800 line-clamp-2 leading-snug">
+                {latestUnreadSupportMsg.attachmentName
+                  ? `Attachment: ${latestUnreadSupportMsg.attachmentName}`
+                  : latestUnreadSupportMsg.message}
+              </p>
+              <div className="mt-1.5 text-[10px] font-extrabold text-emerald-700">
+                Click to view message & reply
+              </div>
+            </div>
+          )}
+
           {/* Authentic WhatsApp Green Floating Button - Prominent & Bold */}
           <button
             id="whatsapp-support-launcher-btn"
@@ -582,10 +654,13 @@ export const WhatsAppSupportChat: React.FC = () => {
               <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51l-.57-.01c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L0 24l6.335-1.662c1.746.953 3.71 1.456 5.711 1.457h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z" />
             </svg>
 
-            {/* Unread Counter Badge */}
+            {/* Unread Counter Red Badge */}
             {unreadCount > 0 && (
-              <span className="absolute -top-1 -right-1 w-6 h-6 rounded-full bg-rose-600 border-2 border-white text-white font-extrabold text-xs flex items-center justify-center animate-bounce">
-                {unreadCount}
+              <span
+                id="whatsapp-unread-badge"
+                className="absolute -top-1.5 -right-1.5 min-w-[26px] h-[26px] px-1.5 rounded-full bg-red-600 border-2 border-white text-white font-black text-xs flex items-center justify-center shadow-lg animate-bounce"
+              >
+                {unreadCount > 99 ? '99+' : unreadCount}
               </span>
             )}
           </button>

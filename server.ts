@@ -5,6 +5,7 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
 import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
+import { persistCustomerNotification, maskAccountNumber, resolveCustomerNotificationContext } from './server/services/notificationStore';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest, createAdminSessionToken, verifyAdminSessionToken } from './server/authMiddleware';
@@ -48,7 +49,7 @@ app.use((req, res, next) => {
   const origin = req.headers.origin || '*';
   res.header('Access-Control-Allow-Origin', origin);
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Admin-Session');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Admin-Session, X-Admin-Console, X-Admin-Email');
   res.header('Access-Control-Allow-Credentials', 'true');
 
   if (req.method === 'OPTIONS') {
@@ -828,6 +829,34 @@ app.post('/api/kyc/submit', optionalFirebaseAuth, async (req: AuthenticatedReque
       kycStatus: 'pending' as const,
     };
 
+    // Persistent KYC Submitted / Resubmitted notification for customer
+    const kycTimeKey = now.replace(/[^0-9]/g, '');
+    await persistCustomerNotification({
+      id: `notif_kyc_${isResubmission ? 'resub' : 'sub'}_${targetUserId}_${kycTimeKey}`,
+      userId: targetUserId,
+      title: isResubmission ? 'KYC Verification Resubmitted' : 'KYC Verification Submitted',
+      message: isResubmission
+        ? `Your updated KYC verification documents (${documentType}) have been resubmitted and are now under compliance review.`
+        : `Your KYC identity verification application (${documentType}) has been submitted and is currently pending compliance review.`,
+      type: 'SECURITY',
+      severity: 'info',
+      createdAt: now,
+      referenceId: targetUserId,
+      actionView: 'profile',
+      actionSection: 'kyc',
+      actionRecordId: targetUserId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: isResubmission ? 'KYC_RESUBMITTED' : 'KYC_SUBMITTED',
+        customerName: cleanFullName,
+        accountNumberMasked: maskAccountNumber(existingData.permanentAccountNumber || existingUser?.permanentAccountNumber),
+        applicationType: isResubmission ? 'KYC Resubmission' : 'KYC Verification',
+        documentType,
+        status: 'pending',
+        date: now,
+      },
+    });
+
     res.json({ success: true, user: updatedUser });
   } catch (err: any) {
     console.error('[POST /api/kyc/submit] Error:', err);
@@ -921,12 +950,26 @@ async function executeAuthoritativeKycApproval(userId: string, adminId: string, 
     db.users.set(userId, memUser);
   }
 
-  // Create audit log & notification
-  serverNotificationDispatcher.dispatchNotification(userId, {
+  // Create audit log & persistent notification
+  await serverNotificationDispatcher.dispatchNotification(userId, {
+    id: `notif_kyc_appr_${userId}_${now.replace(/[^0-9]/g, '').slice(0, 12)}`,
     title: 'KYC Verification Approved by Compliance',
     message: 'Your banking profile has been officially verified by Monvera Compliance Operations. Full account limits ($1,000,000/day) and verified status are active.',
     type: 'SECURITY',
     severity: 'success',
+    referenceId: userId,
+    actionView: 'profile',
+    actionSection: 'kyc',
+    actionRecordId: userId,
+    metadata: {
+      category: 'SECURITY',
+      eventType: 'KYC_APPROVED',
+      customerName: verifiedLegalName,
+      accountNumberMasked: maskAccountNumber(userData.permanentAccountNumber || memUser?.permanentAccountNumber),
+      applicationType: 'KYC Verification',
+      status: 'verified',
+      date: now,
+    },
   });
 
   return { success: true, user: { ...userData, ...approvalUpdate } };
@@ -1240,6 +1283,33 @@ app.post('/api/transfers/internal', optionalFirebaseAuth, async (req: Authentica
   );
 
   const updatedMetrics = db.getUserBalanceMetrics(userId);
+  if (tx) {
+    const cleanKey = (tx.referenceNumber || tx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+    persistCustomerNotification({
+      id: `notif_int_${cleanKey}_${userId}`,
+      userId,
+      title: 'Internal Account Transfer Completed',
+      message: `$${Number(amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} transferred from ${fromAccountType} to ${toAccountType}. Reference: ${tx.referenceNumber}.`,
+      type: 'TRANSACTION',
+      severity: 'success',
+      createdAt: tx.createdAt,
+      referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'INTERNAL_TRANSFER',
+        customerName: `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || undefined,
+        accountNumberMasked: maskAccountNumber(userData.permanentAccountNumber),
+        transactionType: 'INTERNAL_TRANSFER',
+        amount: Number(amount),
+        currency: 'USD',
+        status: tx.status,
+        referenceNumber: tx.referenceNumber,
+        date: tx.createdAt,
+      },
+    }).catch(() => {});
+  }
   res.json({ success: true, transaction: tx, balanceMetrics: updatedMetrics });
 });
 
@@ -2565,22 +2635,31 @@ app.post('/api/cards/:id/toggle-freeze', optionalFirebaseAuth, async (req: Authe
     card.status = card.status === 'ACTIVE' ? 'FROZEN' : 'ACTIVE';
   }
 
-  // Notification
+  // Persistent deterministic notification for card freeze/unfreeze
   try {
-    const notifItem = {
-      id: `notif_card_${Date.now()}`,
+    const tsKey = (card.updatedAt || new Date().toISOString()).replace(/[^0-9]/g, '');
+    await persistCustomerNotification({
+      id: `notif_card_frz_${id}_${tsKey}`,
       userId: card.userId,
       title: `Card ${card.status === 'FROZEN' ? 'Frozen' : 'Reactivated'}`,
-      message: `Your ${card.cardTier} (•••• ${(card.maskedNumber || card.cardNumber || '0000').slice(-4)}) has been ${
+      message: `Your ${card.cardTier || 'Monvera'} card (•••• ${(card.maskedNumber || card.cardNumber || '0000').slice(-4)}) has been ${
         card.status === 'FROZEN' ? 'locked' : 'unlocked'
       }.`,
       type: 'SECURITY',
       severity: card.status === 'FROZEN' ? 'warning' : 'success',
-      read: false,
-      createdAt: new Date().toISOString(),
-    };
-    db.notifications.unshift(notifItem as any);
-    await adminFirestore.collection('notifications').doc(notifItem.id).set(notifItem, { merge: true });
+      createdAt: card.updatedAt || new Date().toISOString(),
+      referenceId: id,
+      actionView: 'cards',
+      actionRecordId: id,
+      metadata: {
+        category: 'SECURITY',
+        eventType: card.status === 'FROZEN' ? 'CARD_FROZEN' : 'CARD_UNFROZEN',
+        requestType: 'Debit / Virtual Card Security',
+        status: card.status,
+        cardId: id,
+        date: card.updatedAt || new Date().toISOString(),
+      },
+    });
   } catch {}
 
   res.json({ success: true, card });
@@ -2630,45 +2709,182 @@ app.post('/api/cards/:id/update-limits', optionalFirebaseAuth, async (req: Authe
 });
 
 // --- NOTIFICATIONS & SECURITY ---
-app.get('/api/notifications', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
-  const accountNumber = req.query.accountNumber as string;
-  if (!userId) return res.status(400).json({ error: 'userId is required' });
+app.get('/api/notifications', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
 
-  const matchedUserIds = new Set<string>([userId]);
-  const user = db.users.get(userId) || Array.from(db.users.values()).find(
-    (u) =>
-      u.id === userId ||
-      (accountNumber && u.permanentAccountNumber === accountNumber) ||
-      (userId.includes('@') && u.email.toLowerCase() === userId.toLowerCase())
-  );
-  if (user) {
-    matchedUserIds.add(user.id);
-    if (user.permanentAccountNumber) matchedUserIds.add(user.permanentAccountNumber);
+  const requestedUserId = (req.query.userId as string | undefined)?.trim();
+  const accountNumber = (req.query.accountNumber as string | undefined)?.trim();
+
+  if (callerUid && !isCallerAdmin && requestedUserId && requestedUserId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You are not authorized to view another customer\'s notifications.' });
   }
-  if (accountNumber) matchedUserIds.add(accountNumber);
 
-  const userNotifs = db.notifications.filter((n) => matchedUserIds.has(n.userId) || n.userId === 'all');
-  // Sort latest first
-  userNotifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const targetUserId = isCallerAdmin && requestedUserId ? requestedUserId : (callerUid || requestedUserId);
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  const matchedUserIds = new Set<string>([targetUserId]);
+  const user =
+    db.users.get(targetUserId) ||
+    Array.from(db.users.values()).find(
+      (u) =>
+        u.id === targetUserId ||
+        (accountNumber && u.permanentAccountNumber === accountNumber)
+    );
+  if (user && user.id === targetUserId && user.permanentAccountNumber) {
+    matchedUserIds.add(user.permanentAccountNumber);
+  }
+  if (accountNumber && (!user || user.id === targetUserId)) {
+    matchedUserIds.add(accountNumber);
+  }
+
+  const notifMap = new Map<string, any>();
+
+  // 1. Authoritative notifications from Firestore (only belonging to targetUserId)
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const fsSnap = await adminFirestore
+        .collection('notifications')
+        .where('userId', '==', targetUserId)
+        .get();
+      fsSnap.forEach((d) => {
+        const data = d.data();
+        const id = d.id || data?.id;
+        if (id && data?.userId === targetUserId) {
+          notifMap.set(id, { id, ...data });
+        }
+      });
+
+      // Also include any legacy docs keyed by customer accountNumber if different from UID
+      if (accountNumber && accountNumber !== targetUserId) {
+        try {
+          const accSnap = await adminFirestore
+            .collection('notifications')
+            .where('userId', '==', accountNumber)
+            .get();
+          accSnap.forEach((d) => {
+            const data = d.data();
+            const id = d.id || data?.id;
+            if (id && !notifMap.has(id)) {
+              notifMap.set(id, { id, ...data, userId: targetUserId });
+            }
+          });
+        } catch {}
+      }
+    } catch (fsErr: any) {
+      console.warn('[/api/notifications] Firestore read note:', fsErr?.message || fsErr);
+    }
+  }
+
+  // 2. Merge in-memory notifications belonging strictly to targetUserId (never leak other users or global 'all')
+  db.notifications.forEach((n) => {
+    if (!n || !n.id) return;
+    if (matchedUserIds.has(n.userId)) {
+      const existing = notifMap.get(n.id);
+      if (!existing) {
+        notifMap.set(n.id, n);
+      } else if (n.read && !existing.read) {
+        notifMap.set(n.id, { ...existing, read: true });
+      }
+    }
+  });
+
+  const userNotifs = Array.from(notifMap.values()).sort(
+    (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+  );
+
   res.json({ notifications: userNotifs });
 });
 
-app.post('/api/notifications/read', (req: Request, res: Response) => {
-  const { notificationId, userId } = req.body;
-  if (!notificationId || !userId) {
+app.post('/api/notifications/read', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+
+  const { notificationId, userId: bodyUserId } = req.body || {};
+  if (!notificationId || !bodyUserId) {
     return res.status(400).json({ error: 'notificationId and userId are required' });
   }
 
-  const success = db.markNotificationAsRead(notificationId, userId);
-  res.json({ success });
+  if (callerUid && !isCallerAdmin && bodyUserId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You cannot modify another customer\'s notification state.' });
+  }
+
+  const targetUserId = isCallerAdmin ? bodyUserId : (callerUid || bodyUserId);
+  const readAt = new Date().toISOString();
+  let updated = db.markNotificationAsRead(notificationId, targetUserId);
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const docRef = adminFirestore.collection('notifications').doc(notificationId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        const data = snap.data() || {};
+        if (!isCallerAdmin && data.userId && data.userId !== targetUserId) {
+          return res.status(403).json({ error: 'FORBIDDEN: Notification belongs to another customer.' });
+        }
+        await docRef.set({ read: true, readAt }, { merge: true });
+        updated = true;
+      }
+    } catch (err: any) {
+      console.warn('[/api/notifications/read] Firestore update note:', err?.message || err);
+    }
+  }
+
+  res.json({ success: updated });
 });
 
-app.post('/api/notifications/read-all', (req: Request, res: Response) => {
-  const { userId } = req.body;
+app.post('/api/notifications/read-all', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+
+  const { userId: bodyUserId } = req.body || {};
+  if (!bodyUserId && !callerUid) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  if (callerUid && !isCallerAdmin && bodyUserId && bodyUserId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You cannot mark another customer\'s notifications as read.' });
+  }
+
+  const targetUserId = isCallerAdmin && bodyUserId ? bodyUserId : (callerUid || bodyUserId);
+  const readAt = new Date().toISOString();
+
   db.notifications.forEach((n) => {
-    if (n.userId === userId) n.read = true;
+    if (n.userId === targetUserId) {
+      n.read = true;
+    }
   });
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = await adminFirestore
+        .collection('notifications')
+        .where('userId', '==', targetUserId)
+        .where('read', '==', false)
+        .get();
+      if (!snap.empty) {
+        const batch = adminFirestore.batch();
+        snap.docs.forEach((d) => {
+          batch.set(d.ref, { read: true, readAt }, { merge: true });
+        });
+        await batch.commit();
+      }
+    } catch (err: any) {
+      console.warn('[/api/notifications/read-all] Firestore batch update note:', err?.message || err);
+    }
+  }
+
   res.json({ success: true });
 });
 
@@ -3296,6 +3512,33 @@ app.post('/api/admin/customers/:id/toggle-status', requireAdminAuth, async (req:
     result: 'SUCCESS',
   });
 
+  // Persist customer security notification
+  persistCustomerNotification({
+    id: `notif_acc_status_${canonicalUid}_${nowIso.replace(/[^0-9]/g, '').slice(0, 14)}`,
+    userId: canonicalUid,
+    title: nextStatus === 'frozen' ? 'Account Restricted / Placed on Hold' : 'Account Restrictions Lifted',
+    message:
+      nextStatus === 'frozen'
+        ? `Your Monvera banking profile has been temporarily restricted by Compliance. Reason: ${reason || 'Administrative compliance review'}.`
+        : `Good news — your Monvera banking profile is active and full transactional access has been restored.`,
+    type: 'SECURITY',
+    severity: nextStatus === 'frozen' ? 'warning' : 'success',
+    createdAt: nowIso,
+    referenceId: canonicalUid,
+    actionView: 'profile',
+    actionRecordId: canonicalUid,
+    metadata: {
+      category: 'SECURITY',
+      eventType: nextStatus === 'frozen' ? 'ACCOUNT_FROZEN' : 'ACCOUNT_UNFROZEN',
+      customerName: `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Account Holder',
+      accountNumberMasked: maskAccountNumber(user.permanentAccountNumber),
+      requestType: 'Account Security Status',
+      status: nextStatus,
+      reason: reason || undefined,
+      date: nowIso,
+    },
+  }).catch(() => {});
+
   res.json({ success: true, user, status: nextStatus, canonicalUid });
 });
 
@@ -3352,6 +3595,28 @@ app.post('/api/user/unfreeze', requireAdminAuth, async (req: AuthenticatedReques
     result: 'SUCCESS',
   });
 
+  persistCustomerNotification({
+    id: `notif_acc_unfreeze_${canonicalUid}_${nowIso.replace(/[^0-9]/g, '').slice(0, 14)}`,
+    userId: canonicalUid,
+    title: 'Account Restrictions Lifted',
+    message: 'Your Monvera banking profile is active and full transactional capabilities have been restored.',
+    type: 'SECURITY',
+    severity: 'success',
+    createdAt: nowIso,
+    referenceId: canonicalUid,
+    actionView: 'profile',
+    actionRecordId: canonicalUid,
+    metadata: {
+      category: 'SECURITY',
+      eventType: 'ACCOUNT_UNFROZEN',
+      accountNumberMasked: maskAccountNumber(user?.permanentAccountNumber),
+      requestType: 'Account Security Status',
+      status: 'active',
+      reason: reason || undefined,
+      date: nowIso,
+    },
+  }).catch(() => {});
+
   res.json({ success: true, status: 'active', user, canonicalUid });
 });
 
@@ -3398,11 +3663,24 @@ app.post('/api/admin/kyc/reject', requireAdminAuth, async (req: AuthenticatedReq
       db.users.set(userId, memUser);
     }
 
-    serverNotificationDispatcher.dispatchNotification(userId, {
+    await serverNotificationDispatcher.dispatchNotification(userId, {
+      id: `notif_kyc_rej_${userId}_${now.replace(/[^0-9]/g, '').slice(0, 14)}`,
       title: 'KYC Verification Update: Action Required',
-      message: `Your verification application requires correction: "${rejectionReason}". Please review and resubmit in your Profile.`,
+      message: `Your KYC verification requires attention: "${rejectionReason}". Please review and resubmit in your Profile.`,
       type: 'SECURITY',
       severity: 'warning',
+      referenceId: userId,
+      actionView: 'profile',
+      actionSection: 'kyc',
+      actionRecordId: userId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'KYC_REJECTED',
+        applicationType: 'KYC Verification',
+        status: 'action_required',
+        reason: rejectionReason,
+        date: now,
+      },
     });
 
     res.json(result);
@@ -3520,6 +3798,55 @@ app.post('/api/admin/kyc/review-item', requireAdminAuth, async (req: Authenticat
       db.users.set(userId, memUser);
     }
 
+    if (allApproved) {
+      await persistCustomerNotification({
+        id: `notif_kyc_appr_${userId}_${now.replace(/[^0-9]/g, '').slice(0, 12)}`,
+        userId,
+        title: 'KYC Verification Approved by Compliance',
+        message: 'All required KYC documents have been approved by Compliance Operations. Full account limits ($1,000,000/day) are now active.',
+        type: 'SECURITY',
+        severity: 'success',
+        createdAt: now,
+        referenceId: userId,
+        actionView: 'profile',
+        actionSection: 'kyc',
+        actionRecordId: userId,
+        metadata: {
+          category: 'SECURITY',
+          eventType: 'KYC_APPROVED',
+          customerName: itemUpdate.verifiedLegalName || userData.fullName || undefined,
+          accountNumberMasked: maskAccountNumber(userData.permanentAccountNumber),
+          applicationType: 'KYC Verification',
+          status: 'verified',
+          date: now,
+        },
+      });
+    } else if (status === 'rejected' || hasRejected) {
+      await persistCustomerNotification({
+        id: `notif_kyc_item_rej_${userId}_${itemName}_${now.replace(/[^0-9]/g, '').slice(0, 12)}`,
+        userId,
+        title: 'KYC Verification Update: Resubmission Required',
+        message: `Your ${itemName} document check requires correction: "${newRejectionReason || 'Please upload a clearer copy'}". Please resubmit in Profile.`,
+        type: 'SECURITY',
+        severity: 'warning',
+        createdAt: now,
+        referenceId: userId,
+        actionView: 'profile',
+        actionSection: 'kyc',
+        actionRecordId: userId,
+        metadata: {
+          category: 'SECURITY',
+          eventType: 'KYC_ITEM_REJECTED',
+          customerName: userData.kycFullName || userData.fullName || undefined,
+          accountNumberMasked: maskAccountNumber(userData.permanentAccountNumber),
+          applicationType: `KYC (${itemName})`,
+          status: 'action_required',
+          reason: newRejectionReason || undefined,
+          date: now,
+        },
+      });
+    }
+
     res.json({ success: true, user: { ...userData, ...itemUpdate } });
   } catch (err: any) {
     console.error('[POST /api/admin/kyc/review-item] Error:', err);
@@ -3528,14 +3855,87 @@ app.post('/api/admin/kyc/review-item', requireAdminAuth, async (req: Authenticat
 });
 
 // Admin Transaction Status Endpoint
-app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const { status, reason } = req.body;
   if (!status) return res.status(400).json({ error: 'status is required' });
 
   const adminId = req.auth!.uid;
-  const result = db.updateTransactionStatus({ txId: id, status, adminId, reason });
-  if (!result.success) return res.status(400).json({ error: result.error });
+  let result = db.updateTransactionStatus({ txId: id, status, adminId, reason });
+  let updatedTx = result.transaction;
+
+  // Also check / sync Firestore transaction status if needed
+  if (isFirebaseAdminConfigured()) {
+    try {
+      let txRef = adminFirestore.collection('transactions').doc(id);
+      let snap = await txRef.get();
+      if (!snap.exists) {
+        const qSnap = await adminFirestore.collection('transactions').where('referenceNumber', '==', id).limit(1).get();
+        if (!qSnap.empty) {
+          txRef = qSnap.docs[0].ref;
+          snap = qSnap.docs[0];
+        }
+      }
+      if (snap.exists) {
+        const fsTx = snap.data() as any;
+        const nowIso = new Date().toISOString();
+        await txRef.set(
+          {
+            status,
+            ...(status === 'COMPLETED' ? { completedAt: nowIso } : {}),
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        );
+        if (!updatedTx) {
+          updatedTx = { ...fsTx, id: snap.id, status };
+          result = { success: true, transaction: updatedTx };
+        }
+      }
+    } catch (fsErr) {
+      console.warn('[/api/admin/transactions/:id/update-status] Firestore note:', fsErr);
+    }
+  }
+
+  if (!result.success || !updatedTx) return res.status(400).json({ error: result.error || 'Transaction record not found.' });
+
+  const targetCustomerUid = updatedTx.userId || updatedTx.recipientUserId || updatedTx.senderUserId;
+  if (targetCustomerUid) {
+    const cleanRefKey = (updatedTx.referenceNumber || updatedTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+    const isCredit =
+      updatedTx.type === 'DEPOSIT' ||
+      updatedTx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+      updatedTx.type === 'REVERSAL' ||
+      status === 'REVERSED' ||
+      updatedTx.recipientUserId === targetCustomerUid;
+
+    await persistCustomerNotification({
+      id: `notif_tx_sts_${cleanRefKey}_${status}_${targetCustomerUid}`,
+      userId: targetCustomerUid,
+      title: `Transaction ${status === 'FAILED' ? 'Failed' : status === 'REVERSED' ? 'Reversed' : 'Status Updated'}`,
+      message: `Transaction ${updatedTx.referenceNumber} ($${Number(updatedTx.amount || 0).toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })}) status is now ${status}.${reason ? ` Note: ${reason}` : ''}`,
+      type: 'TRANSACTION',
+      severity: status === 'FAILED' ? 'error' : status === 'REVERSED' ? 'warning' : 'success',
+      createdAt: new Date().toISOString(),
+      referenceId: updatedTx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: updatedTx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'TRANSACTION_STATUS_UPDATED',
+        transactionType: updatedTx.type,
+        direction: isCredit ? 'CREDIT' : 'DEBIT',
+        amount: Number(updatedTx.amount || 0),
+        currency: updatedTx.currency || 'USD',
+        status,
+        referenceNumber: updatedTx.referenceNumber,
+        reason: reason || undefined,
+        date: new Date().toISOString(),
+      },
+    });
+  }
 
   res.json(result);
 });
@@ -3829,6 +4229,34 @@ app.post('/api/loans/apply', optionalFirebaseAuth, async (req: AuthenticatedRequ
     } catch (fsErr) {
       console.warn('Failed to persist loan to Firestore in server.ts:', fsErr);
     }
+
+    // Persistent Loan Application Submitted notification for customer
+    await persistCustomerNotification({
+      id: `notif_loan_sub_${result.loan.id}`,
+      userId: result.loan.userId || effectiveUserId,
+      title: 'Loan Application Submitted',
+      message: `Your credit facility application for $${Number(result.loan.amount || 0).toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+      })} (${result.loan.termMonths} months) has been submitted and is Pending review.`,
+      type: 'SYSTEM',
+      severity: 'info',
+      createdAt: result.loan.createdAt || new Date().toISOString(),
+      referenceId: result.loan.id,
+      actionView: 'loans',
+      actionRecordId: result.loan.id,
+      metadata: {
+        category: 'SYSTEM',
+        eventType: 'LOAN_APPLIED',
+        customerName: result.loan.applicantName,
+        accountNumberMasked: maskAccountNumber(result.loan.permanentAccountNumber),
+        applicationType: 'Credit Facility Loan',
+        amount: Number(result.loan.amount || 0),
+        currency: 'USD',
+        status: 'PENDING',
+        referenceNumber: result.loan.id,
+        date: result.loan.createdAt || new Date().toISOString(),
+      },
+    });
   }
 
   res.json(result);
@@ -3923,23 +4351,33 @@ app.post('/api/admin/loans/reject', requireAdminAuth, async (req: AuthenticatedR
 
     await loanDocRef.set(loanData, { merge: true });
 
-    // Dispatch security notification to borrower
+    // Dispatch persistent deterministic notification to borrower
     if (loanData.userId) {
-      const notifId = `notif_${Date.now()}_loan_rej`;
-      await adminFirestore.collection('notifications').doc(notifId).set(
-        {
-          id: notifId,
-          userId: loanData.userId,
-          title: 'Loan Application Update',
-          message: `Your credit facility application (#${loanId.slice(-6).toUpperCase()}) was declined. Reason: "${rejectionReason}".`,
-          type: 'SYSTEM',
-          severity: 'error',
-          read: false,
-          createdAt: nowIso,
-          referenceId: loanId,
+      await persistCustomerNotification({
+        id: `notif_loan_rej_${loanId}`,
+        userId: loanData.userId,
+        title: 'Loan Application Update',
+        message: `Your credit facility application (#${loanId.slice(-6).toUpperCase()}) was declined. Reason: "${rejectionReason}".`,
+        type: 'SYSTEM',
+        severity: 'error',
+        createdAt: nowIso,
+        referenceId: loanId,
+        actionView: 'loans',
+        actionRecordId: loanId,
+        metadata: {
+          category: 'SYSTEM',
+          eventType: 'LOAN_REJECTED',
+          customerName: loanData.applicantName,
+          accountNumberMasked: maskAccountNumber(loanData.permanentAccountNumber),
+          applicationType: 'Credit Facility Loan',
+          amount: Number(loanData.amount || 0),
+          currency: 'USD',
+          status: 'REJECTED',
+          reason: rejectionReason,
+          referenceNumber: loanId,
+          date: nowIso,
         },
-        { merge: true }
-      );
+      });
     }
   } catch (fsErr: any) {
     console.error('[/api/admin/loans/reject] Firestore error:', fsErr);
@@ -4010,41 +4448,144 @@ app.post('/api/loans/repay', optionalFirebaseAuth, async (req: AuthenticatedRequ
 });
 
 // --- SUPPORT CHAT LIVE PERSISTENCE ---
-app.get('/api/support/messages', (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
-  const allMessages = Array.from(db.supportMessages.values());
-  if (!userId) {
-    return res.json({ messages: allMessages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()) });
+app.get('/api/support/messages', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+
+  const requestedUserId = (req.query.userId as string | undefined)?.trim();
+
+  if (callerUid && !isCallerAdmin && requestedUserId && requestedUserId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You are not authorized to access another customer\'s support chat.' });
   }
-  const userMessages = allMessages
-    .filter((m) => m.userId === userId || m.userEmail === userId || m.userAccountNumber === userId)
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-  res.json({ messages: userMessages });
+
+  if (!requestedUserId && !isCallerAdmin) {
+    return res.status(403).json({ error: 'FORBIDDEN: userId is required for customer support chat access.' });
+  }
+
+  const targetUserId = isCallerAdmin ? requestedUserId : (callerUid || requestedUserId);
+  const msgMap = new Map<string, any>();
+
+  // 1. Authoritative messages from Firestore
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = targetUserId
+        ? await adminFirestore.collection('support_messages').where('userId', '==', targetUserId).get()
+        : await adminFirestore.collection('support_messages').get();
+      snap.forEach((d) => {
+        const data = d.data();
+        const id = data?.id || d.id;
+        if (id && (!targetUserId || data?.userId === targetUserId)) {
+          msgMap.set(id, { ...data, id });
+        }
+      });
+    } catch (err: any) {
+      console.warn('[/api/support/messages GET] Firestore note:', err?.message || err);
+    }
+  }
+
+  // 2. Merge in-memory messages (strictly filtered by exact userId ownership)
+  for (const m of db.supportMessages.values()) {
+    if (!m || !m.id) continue;
+    if (targetUserId && m.userId !== targetUserId) continue;
+    const existing = msgMap.get(m.id);
+    if (!existing) {
+      msgMap.set(m.id, m);
+    } else if (m.status === 'read' && existing.status !== 'read') {
+      msgMap.set(m.id, { ...existing, status: 'read' });
+    }
+  }
+
+  const messages = Array.from(msgMap.values()).sort(
+    (a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime()
+  );
+  res.json({ messages });
 });
 
-app.post('/api/support/messages', (req: Request, res: Response) => {
+app.post('/api/support/messages', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+
   const msg = req.body;
   if (!msg || !msg.id || !msg.userId) {
     return res.status(400).json({ error: 'Valid message with id and userId required.' });
   }
-  db.supportMessages.set(msg.id, msg);
-  res.json({ success: true, message: msg });
+
+  if (callerUid && !isCallerAdmin && msg.userId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You can only send support messages in your own conversation.' });
+  }
+
+  const cleanMsg = {
+    ...msg,
+    status: msg.status || 'sent',
+    syncedAt: new Date().toISOString(),
+  };
+
+  db.supportMessages.set(cleanMsg.id, cleanMsg);
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      await adminFirestore.collection('support_messages').doc(cleanMsg.id).set(cleanMsg, { merge: true });
+    } catch (err: any) {
+      console.warn('[/api/support/messages POST] Firestore note:', err?.message || err);
+    }
+  }
+
+  res.json({ success: true, message: cleanMsg });
 });
 
-app.post('/api/support/messages/read', (req: Request, res: Response) => {
-  const { userId, role } = req.body;
+app.post('/api/support/messages/read', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+
+  const { userId, role } = req.body || {};
   if (!userId) {
     return res.status(400).json({ error: 'userId is required' });
   }
+
+  if (callerUid && !isCallerAdmin && userId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You cannot modify another customer\'s support chat.' });
+  }
+
+  const targetSender = role === 'admin' ? 'user' : 'support';
+  const readAt = new Date().toISOString();
+
   for (const [id, msg] of db.supportMessages.entries()) {
-    if (msg.userId === userId) {
-      if (role === 'admin' && msg.sender === 'user') {
-        db.supportMessages.set(id, { ...msg, status: 'read' });
-      } else if (role === 'user' && msg.sender === 'support') {
-        db.supportMessages.set(id, { ...msg, status: 'read' });
-      }
+    if (msg.userId === userId && msg.sender === targetSender) {
+      db.supportMessages.set(id, { ...msg, status: 'read', readAt });
     }
   }
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const snap = await adminFirestore
+        .collection('support_messages')
+        .where('userId', '==', userId)
+        .where('sender', '==', targetSender)
+        .get();
+      if (!snap.empty) {
+        const batch = adminFirestore.batch();
+        snap.docs.forEach((d) => {
+          const data = d.data();
+          if (data.status !== 'read') {
+            batch.set(d.ref, { status: 'read', readAt }, { merge: true });
+          }
+        });
+        await batch.commit();
+      }
+    } catch (err: any) {
+      console.warn('[/api/support/messages/read POST] Firestore note:', err?.message || err);
+    }
+  }
+
   res.json({ success: true });
 });
 

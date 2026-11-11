@@ -417,7 +417,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
       senderAvatar: currentUser?.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
       message: text,
       timestamp: new Date().toISOString(),
-      status: 'read',
+      status: 'sent',
     };
 
     // Save to Firestore
@@ -449,7 +449,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
           senderAvatar: currentUser?.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
           message: `Official Clearance Document: ${file.name}`,
           timestamp: new Date().toISOString(),
-          status: 'read',
+          status: 'sent',
           attachmentUrl: dataUrl,
           attachmentType: isImg ? 'image' : 'document',
           attachmentName: file.name,

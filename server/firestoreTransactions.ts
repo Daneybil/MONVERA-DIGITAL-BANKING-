@@ -15,6 +15,7 @@ import {
   CardActivationRequest,
 } from '../src/types';
 import { evaluateAndProcessWelcomeReward } from './welcomeRewardService';
+import { persistCustomerNotification, maskAccountNumber } from './services/notificationStore';
 
 export interface TransferParams {
   senderUid: string;
@@ -527,6 +528,7 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
   let finalTx: Transaction | null = null;
   let finalSenderMetrics: BalanceMetrics | null = null;
   let finalRecipientMetrics: BalanceMetrics | null = null;
+  let isDuplicate = false;
 
   try {
     if (isFirebaseAdminConfigured()) {
@@ -544,6 +546,7 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
         if (!existingRefQuery.empty) {
           const existingTx = existingRefQuery.docs[0].data() as Transaction;
           if (existingTx.status === 'COMPLETED') {
+            isDuplicate = true;
             finalTx = existingTx;
             const sSnap = await transaction.get(senderAccRef);
             if (sSnap.exists) {
@@ -838,11 +841,76 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
         db.accounts.get(rChkId)!.availableBalance = finalRecipientMetrics.availableBalance;
       }
 
+      // Dispatch persistent in-app notifications for both recipient (CREDIT) and sender (DEBIT) on non-duplicate transfers
+      if (!isDuplicate) {
+        const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        const amtFormatted = transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 });
+
+        // Recipient notification (CREDIT)
+        persistCustomerNotification({
+          id: `notif_trf_cr_${cleanKey}_${recipientUid}`,
+          userId: recipientUid,
+          title: 'Money Received',
+          message: `You received $${amtFormatted} from ${senderName} (${maskAccountNumber(senderAcc)}). Reference: ${finalTx.referenceNumber}.`,
+          type: 'TRANSACTION',
+          severity: 'success',
+          createdAt: finalTx.createdAt,
+          referenceId: finalTx.referenceNumber,
+          actionView: 'transactions',
+          actionRecordId: finalTx.id,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'MONEY_RECEIVED',
+            customerName: recipientName,
+            accountNumberMasked: maskAccountNumber(recipientAcc),
+            counterpartyName: senderName,
+            counterpartyAccountMasked: maskAccountNumber(senderAcc),
+            transactionType: 'TRANSFER',
+            direction: 'CREDIT',
+            amount: transferAmount,
+            currency: finalTx.currency || 'USD',
+            status: finalTx.status,
+            referenceNumber: finalTx.referenceNumber,
+            date: finalTx.createdAt,
+          },
+        }).catch(() => {});
+
+        // Sender notification (DEBIT)
+        persistCustomerNotification({
+          id: `notif_trf_db_${cleanKey}_${senderUid}`,
+          userId: senderUid,
+          title: 'Money Sent',
+          message: `You sent $${amtFormatted} to ${recipientName} (${maskAccountNumber(recipientAcc)}). Reference: ${finalTx.referenceNumber}.`,
+          type: 'TRANSACTION',
+          severity: 'info',
+          createdAt: finalTx.createdAt,
+          referenceId: finalTx.referenceNumber,
+          actionView: 'transactions',
+          actionRecordId: finalTx.id,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'MONEY_SENT',
+            customerName: senderName,
+            accountNumberMasked: maskAccountNumber(senderAcc),
+            counterpartyName: recipientName,
+            counterpartyAccountMasked: maskAccountNumber(recipientAcc),
+            transactionType: 'TRANSFER',
+            direction: 'DEBIT',
+            amount: transferAmount,
+            currency: finalTx.currency || 'USD',
+            status: finalTx.status,
+            referenceNumber: finalTx.referenceNumber,
+            date: finalTx.createdAt,
+          },
+        }).catch(() => {});
+      }
+
       return {
         success: true,
         transaction: finalTx,
         senderBalanceMetrics: finalSenderMetrics || undefined,
         recipientBalanceMetrics: finalRecipientMetrics || undefined,
+        isDuplicate,
       };
     }
 
@@ -906,6 +974,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
+  let isDuplicate = false;
 
   try {
     await adminFirestore.runTransaction(async (transaction) => {
@@ -916,6 +985,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
 
       if (!existingRefQuery.empty) {
         const existingTx = existingRefQuery.docs[0].data() as Transaction;
+        isDuplicate = true;
         finalTx = existingTx;
         const sSnap = await transaction.get(accRef);
         if (sSnap.exists) {
@@ -1215,6 +1285,39 @@ const maskedCardNumber = fullCardNumber;
       if (finalTx.id && schedAt) {
         scheduleTargetedWithdrawalReversal(finalTx.id, userId, new Date(schedAt).getTime());
       }
+
+      if (!isDuplicate) {
+        const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        const amtFormatted = withdrawAmount.toLocaleString('en-US', { minimumFractionDigits: 2 });
+        const destAccDisplay = cleanLast4 && cleanLast4 !== 'Unavailable' ? `•••• ${cleanLast4}` : 'Linked Destination';
+        persistCustomerNotification({
+          id: `notif_wth_${cleanKey}_${userId}`,
+          userId,
+          title: `Withdrawal ${finalTx.status === 'COMPLETED' ? 'Completed' : 'Initiated'}`,
+          message: `-$${amtFormatted} withdrawal to ${destinationLabel} (${destAccDisplay}) is ${finalTx.status}. Reference: ${finalTx.referenceNumber}.`,
+          type: 'TRANSACTION',
+          severity: finalTx.status === 'COMPLETED' ? 'success' : 'info',
+          createdAt: finalTx.createdAt,
+          referenceId: finalTx.referenceNumber,
+          actionView: 'transactions',
+          actionRecordId: finalTx.id,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'WITHDRAWAL',
+            customerName: customerFullName || 'Monvera Client',
+            accountNumberMasked: maskAccountNumber(userAcc),
+            transactionType: 'WITHDRAWAL',
+            direction: 'DEBIT',
+            amount: withdrawAmount,
+            currency: finalTx.currency || 'USD',
+            status: finalTx.status,
+            referenceNumber: finalTx.referenceNumber,
+            destinationLabel,
+            date: finalTx.createdAt,
+          },
+        }).catch(() => {});
+      }
+
       return {
         success: true,
         transaction: finalTx,
@@ -1287,6 +1390,7 @@ export async function reverseServerFirestoreWithdrawal(
   const accRef = adminFirestore.collection('accounts').doc(effectiveUserId);
   let finalReversedTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
+  let didReverse = false;
 
   try {
     await adminFirestore.runTransaction(async (transaction) => {
@@ -1380,6 +1484,7 @@ export async function reverseServerFirestoreWithdrawal(
         const supRef = adminFirestore.collection('withdrawal_support_records').doc(tData.id);
         transaction.set(supRef, { status: 'REVERSED', updatedAt: nowIso }, { merge: true });
       }
+      didReverse = true;
     });
 
     if (finalReversedTx?.id) {
@@ -1387,6 +1492,37 @@ export async function reverseServerFirestoreWithdrawal(
       if (memSup) {
         memSup.status = 'REVERSED';
       }
+    }
+
+    if (didReverse && finalReversedTx) {
+      const revTx = finalReversedTx as Transaction;
+      const revAmt = Number(revTx.amount || 0);
+      const cleanKey = (revTx.referenceNumber || revTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+      persistCustomerNotification({
+        id: `notif_wth_rev_${cleanKey}_${effectiveUserId}`,
+        userId: effectiveUserId,
+        title: 'Withdrawal Reversed — Funds Credited Back',
+        message: `+$${revAmt.toLocaleString('en-US', { minimumFractionDigits: 2 })} from reversed withdrawal (${revTx.referenceNumber}) has been returned to your account.`,
+        type: 'TRANSACTION',
+        severity: 'warning',
+        createdAt: nowIso,
+        referenceId: revTx.referenceNumber,
+        actionView: 'transactions',
+        actionRecordId: revTx.id,
+        metadata: {
+          category: 'TRANSACTION',
+          eventType: 'WITHDRAWAL_REVERSED',
+          customerName: revTx.senderName || 'Monvera Client',
+          accountNumberMasked: maskAccountNumber(revTx.senderAccountNumber),
+          transactionType: 'REVERSAL',
+          direction: 'CREDIT',
+          amount: revAmt,
+          currency: revTx.currency || 'USD',
+          status: 'REVERSED',
+          referenceNumber: revTx.referenceNumber,
+          date: nowIso,
+        },
+      }).catch(() => {});
     }
 
     return {
@@ -2034,22 +2170,35 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
     });
 
     if (finalTx) {
-      // Create user notification asynchronously
-      const notifId = `notif_${Date.now()}_dep_${Math.random().toString(36).substring(2, 6)}`;
-      adminFirestore.collection('notifications').doc(notifId).set({
-        id: notifId,
-        userId,
-        title: 'Deposit Settled & Available',
-        message: `+$${depositAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} has been securely credited to your Monvera ${isChecking ? 'Checking Account' : 'High-Yield Savings'}.`,
-        type: 'TRANSACTION',
-        severity: 'success',
-        read: false,
-        createdAt: new Date().toISOString(),
-        referenceId: finalTx.referenceNumber,
-      }).catch((e) => console.warn('[executeServerDeposit] Notification write note:', e?.message || e));
-
-      // Authoritatively evaluate Welcome Reward threshold ($10,000 deposits -> $1,000 reward)
       if (!isDuplicate) {
+        const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        persistCustomerNotification({
+          id: `notif_dep_${cleanKey}_${userId}`,
+          userId,
+          title: 'Deposit Settled & Available',
+          message: `+$${depositAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} has been securely credited to your Monvera ${isChecking ? 'Checking Account' : 'High-Yield Savings'}. Reference: ${finalTx.referenceNumber}.`,
+          type: 'TRANSACTION',
+          severity: 'success',
+          createdAt: finalTx.createdAt,
+          referenceId: finalTx.referenceNumber,
+          actionView: 'transactions',
+          actionRecordId: finalTx.id,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'DEPOSIT',
+            customerName: userName,
+            accountNumberMasked: maskAccountNumber(userAcc),
+            transactionType: 'DEPOSIT',
+            direction: 'CREDIT',
+            amount: depositAmount,
+            currency: finalTx.currency || 'USD',
+            status: finalTx.status,
+            referenceNumber: finalTx.referenceNumber,
+            date: finalTx.createdAt,
+          },
+        }).catch((e) => console.warn('[executeServerDeposit] Notification write note:', e?.message || e));
+
+        // Authoritatively evaluate Welcome Reward threshold ($10,000 deposits -> $1,000 reward)
         evaluateAndProcessWelcomeReward(userId).catch((e) =>
           console.warn('[executeServerDeposit] Welcome reward evaluation note:', e?.message || e)
         );
@@ -2291,19 +2440,36 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
     });
 
     if (finalTx) {
-      // Save notification to Firestore for recipient
-      const notifId = `notif_${Date.now()}_adm_${Math.random().toString(36).substring(2, 6)}`;
-      adminFirestore.collection('notifications').doc(notifId).set({
-        id: notifId,
-        userId: recipientUid,
-        title: 'Money Received',
-        message: `Received $${transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} from Bennett Johnson (MVB •••• 0001).`,
-        type: 'TRANSACTION',
-        severity: 'success',
-        read: false,
-        createdAt: new Date().toISOString(),
-        referenceId: finalTx.referenceNumber,
-      }).catch((e) => console.warn('[executeServerAdminTransfer] Notification write note:', e?.message || e));
+      if (!isDuplicate) {
+        const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        persistCustomerNotification({
+          id: `notif_adm_trf_${cleanKey}_${recipientUid}`,
+          userId: recipientUid,
+          title: 'Money Received',
+          message: `Received +$${transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} from Bennett Johnson (MVB •••• 0001). Reference: ${finalTx.referenceNumber}.`,
+          type: 'TRANSACTION',
+          severity: 'success',
+          createdAt: finalTx.createdAt,
+          referenceId: finalTx.referenceNumber,
+          actionView: 'transactions',
+          actionRecordId: finalTx.id,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'ADMIN_TRANSFER',
+            customerName: recipientDisplayName,
+            accountNumberMasked: maskAccountNumber(recipientAcc),
+            counterpartyName: 'Bennett Johnson',
+            counterpartyAccountMasked: 'MVB •••• 0001',
+            transactionType: 'TRANSFER',
+            direction: 'CREDIT',
+            amount: transferAmount,
+            currency: finalTx.currency || 'USD',
+            status: finalTx.status,
+            referenceNumber: finalTx.referenceNumber,
+            date: finalTx.createdAt,
+          },
+        }).catch((e) => console.warn('[executeServerAdminTransfer] Notification write note:', e?.message || e));
+      }
 
       return {
         success: true,
@@ -2528,19 +2694,34 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
     });
 
     if (finalTx) {
-      // Save notification to Firestore for target user
-      const notifId = `notif_${Date.now()}_dev_${Math.random().toString(36).substring(2, 6)}`;
-      adminFirestore.collection('notifications').doc(notifId).set({
-        id: notifId,
-        userId: targetUid,
-        title: 'Sandbox Liquidity Injected',
-        message: `+$${fundingAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} dev testing capital has been credited to your account.`,
-        type: 'TRANSACTION',
-        severity: 'success',
-        read: false,
-        createdAt: new Date().toISOString(),
-        referenceId: finalTx.referenceNumber,
-      }).catch((e) => console.warn('[executeServerAdminDevFunding] Notification write note:', e?.message || e));
+      if (!isDuplicate) {
+        const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        persistCustomerNotification({
+          id: `notif_dev_fund_${cleanKey}_${targetUid}`,
+          userId: targetUid,
+          title: 'Account Liquidity Credited',
+          message: `+$${fundingAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} has been credited to your ${targetType} account. Reference: ${finalTx.referenceNumber}.`,
+          type: 'TRANSACTION',
+          severity: 'success',
+          createdAt: finalTx.createdAt,
+          referenceId: finalTx.referenceNumber,
+          actionView: 'transactions',
+          actionRecordId: finalTx.id,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'ADMIN_DEVELOPMENT_FUNDING',
+            customerName: targetDisplayName,
+            accountNumberMasked: maskAccountNumber(targetAcc),
+            transactionType: 'ADMIN_DEVELOPMENT_FUNDING',
+            direction: 'CREDIT',
+            amount: fundingAmount,
+            currency: finalTx.currency || 'USD',
+            status: finalTx.status,
+            referenceNumber: finalTx.referenceNumber,
+            date: finalTx.createdAt,
+          },
+        }).catch((e) => console.warn('[executeServerAdminDevFunding] Notification write note:', e?.message || e));
+      }
 
       return {
         success: true,
@@ -2919,12 +3100,29 @@ export async function executeServerLoanDisbursement(
         title: '🎉 Loan Approved & Disbursed!',
         message: `Congratulations! Your loan application for $${loanAmount.toLocaleString('en-US', {
           minimumFractionDigits: 2,
-        })} has been approved and the capital has been credited directly into your Checking Account.`,
+        })} has been approved and credited directly to your Checking Account.`,
         type: 'TRANSACTION',
         severity: 'success',
         read: false,
         createdAt: now,
-        referenceId: loanId,
+        referenceId: deterministicRef,
+        actionView: 'loans',
+        actionRecordId: loanId,
+        metadata: {
+          category: 'TRANSACTION',
+          eventType: 'LOAN_DISBURSED',
+          customerName: loanData.applicantName || 'Valued Client',
+          accountNumberMasked: maskAccountNumber(userAcc),
+          applicationType: 'Commercial Credit Facility',
+          transactionType: 'LOAN_DISBURSEMENT',
+          direction: 'CREDIT',
+          amount: loanAmount,
+          currency: 'USD',
+          status: 'ACTIVE',
+          referenceNumber: deterministicRef,
+          loanId,
+          date: now,
+        },
       };
       transaction.set(notifRef, finalNotif, { merge: true });
     });
@@ -3208,25 +3406,43 @@ export async function executeServerLoanRepayment(
       };
       transaction.set(txRef, finalTx, { merge: true });
 
-      // 7. Atomically commit notification
-      const notifId = `notif_rep_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      // 7. Atomically commit notification (deterministic ID prevents duplicates on retry)
+      const cleanRepKey = finalRef.replace(/[^a-zA-Z0-9_-]/g, '');
+      const notifId = `notif_loan_rep_${cleanRepKey}_${userId}`;
       const notifRef = adminFirestore.collection('notifications').doc(notifId);
       const notifItem: NotificationItem = {
         id: notifId,
         userId,
         title: isFullyPaid ? '🎉 Loan Settled in Full!' : 'Loan Repayment Applied',
         message: isFullyPaid
-          ? `Your loan facility (${loanData.id}) has been paid off completely! Thank you for maintaining excellent credit history with Monvera.`
-          : `Payment of $${actualRepay.toLocaleString('en-US', {
+          ? `Your loan facility (${loanData.id}) has been paid off completely! Reference: ${finalRef}.`
+          : `-$${actualRepay.toLocaleString('en-US', {
               minimumFractionDigits: 2,
-            })} applied successfully! Outstanding balance is now $${newRemaining.toLocaleString('en-US', {
+            })} loan repayment applied. Remaining balance: $${newRemaining.toLocaleString('en-US', {
               minimumFractionDigits: 2,
-            })}.`,
+            })}. Reference: ${finalRef}.`,
         type: 'TRANSACTION',
         severity: 'success',
         read: false,
         createdAt: now,
-        referenceId: loanData.id,
+        referenceId: finalRef,
+        actionView: 'loans',
+        actionRecordId: loanData.id,
+        metadata: {
+          category: 'TRANSACTION',
+          eventType: 'LOAN_REPAYMENT',
+          customerName: loanData.applicantName || 'Account Holder',
+          accountNumberMasked: maskAccountNumber(userAcc),
+          applicationType: 'Loan Repayment',
+          transactionType: 'LOAN_REPAYMENT',
+          direction: 'DEBIT',
+          amount: actualRepay,
+          currency: 'USD',
+          status: isFullyPaid ? 'PAID' : 'ACTIVE',
+          referenceNumber: finalRef,
+          loanId: loanData.id,
+          date: now,
+        },
       };
       transaction.set(notifRef, notifItem, { merge: true });
     });
@@ -3506,8 +3722,9 @@ export async function executeServerInvestmentCreation(
       };
       transaction.set(txRef, finalTx, { merge: true });
 
-      // 8. Atomically commit notification
-      const notifId = `notif_inv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      // 8. Atomically commit deterministic notification
+      const cleanInvKey = refKey.replace(/[^a-zA-Z0-9_-]/g, '');
+      const notifId = `notif_inv_${cleanInvKey}_${userId}`;
       const notifRef = adminFirestore.collection('notifications').doc(notifId);
       finalNotif = {
         id: notifId,
@@ -3521,6 +3738,20 @@ export async function executeServerInvestmentCreation(
         read: false,
         createdAt: nowIso,
         referenceId: refKey,
+        actionView: 'investments',
+        actionRecordId: invId,
+        metadata: {
+          category: 'INVESTMENT',
+          eventType: 'INVESTMENT_CREATED',
+          accountNumberMasked: maskAccountNumber(userAcc),
+          transactionType: 'INVESTMENT',
+          direction: 'DEBIT',
+          amount: principal,
+          currency: 'USD',
+          status: 'ACTIVE',
+          referenceNumber: refKey,
+          date: nowIso,
+        },
       };
       transaction.set(notifRef, finalNotif, { merge: true });
     });
@@ -3725,14 +3956,14 @@ export async function executeServerInvestmentMaturity(
       };
       transaction.set(txRef, finalTx, { merge: true });
 
-      // 10. Atomically commit notification
-      const notifId = `notif_mat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+      // 10. Atomically commit deterministic notification
+      const notifId = `notif_mat_${investmentId}_${userId}`;
       const notifRef = adminFirestore.collection('notifications').doc(notifId);
       const notifItem: NotificationItem = {
         id: notifId,
         userId,
         title: 'Investment Matured & Settled',
-        message: `Your ${inv.termDays}-Day term investment matured! $${payoutTotal.toLocaleString('en-US', {
+        message: `Your ${inv.termDays}-Day term investment matured! +$${payoutTotal.toLocaleString('en-US', {
           minimumFractionDigits: 2,
         })} has been credited to your Checking account.`,
         type: 'INVESTMENT',
@@ -3740,6 +3971,20 @@ export async function executeServerInvestmentMaturity(
         read: false,
         createdAt: nowIso,
         referenceId: `MV-MAT-${investmentId}`,
+        actionView: 'investments',
+        actionRecordId: investmentId,
+        metadata: {
+          category: 'INVESTMENT',
+          eventType: 'INVESTMENT_MATURED',
+          accountNumberMasked: maskAccountNumber(userAcc),
+          transactionType: 'INVESTMENT_MATURITY',
+          direction: 'CREDIT',
+          amount: payoutTotal,
+          currency: 'USD',
+          status: 'MATURED',
+          referenceNumber: `MV-MAT-${investmentId}`,
+          date: nowIso,
+        },
       };
       transaction.set(notifRef, notifItem, { merge: true });
     });
@@ -4083,13 +4328,13 @@ export async function executeServerCardIssuance(
         },
       };
 
-      // 8. Create notification record
-      const notifId = `notif_${Date.now()}_card_created`;
+      // 8. Create deterministic notification record
+      const notifId = `notif_card_iss_${cardId}_${userId}`;
       const notifItem: NotificationItem = {
         id: notifId,
         userId,
         title: `${brandName} Card Issued & Activated`,
-        message: `Your new ${defaultTier} (${brandName} • ${completeNumber}) has been successfully issued. $${feeAmount.toFixed(
+        message: `Your new ${defaultTier} (${brandName} •••• ${completeNumber.slice(-4)}) has been successfully issued. $${feeAmount.toFixed(
           2
         )} card issuance fee debited from your checking balance.`,
         type: 'TRANSACTION',
@@ -4097,6 +4342,21 @@ export async function executeServerCardIssuance(
         read: false,
         createdAt: nowIso,
         referenceId: txRefNum,
+        actionView: 'cards',
+        actionRecordId: cardId,
+        metadata: {
+          category: 'TRANSACTION',
+          eventType: 'CARD_ISSUANCE',
+          customerName: holderName,
+          accountNumberMasked: maskAccountNumber(userAcc),
+          transactionType: 'CARD_PURCHASE',
+          direction: 'DEBIT',
+          amount: feeAmount,
+          currency: 'USD',
+          status: 'COMPLETED',
+          referenceNumber: txRefNum,
+          date: nowIso,
+        },
       };
 
       // 9. Atomic commits in Firestore transaction
@@ -4267,6 +4527,32 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
     // Save in memory
     db.bankAccountApplications.set(appId, application);
 
+    // Persistent notification for bank linking submission
+    await persistCustomerNotification({
+      id: `notif_bnk_sub_${appId}`,
+      userId,
+      title: 'Bank Account Linking Submitted',
+      message: `Your ${application.bankName} (${application.maskedAccountNumber}) bank linking application has been submitted and is Pending review.`,
+      type: 'SECURITY',
+      severity: 'info',
+      createdAt: nowIso,
+      referenceId: appId,
+      actionModal: 'withdraw',
+      actionSection: 'BANK',
+      actionRecordId: appId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_LINK_SUBMITTED',
+        customerName: application.customerName,
+        accountNumberMasked: maskAccountNumber(application.customerAccountNumber),
+        requestType: 'Bank Linking Application',
+        status: 'pending',
+        bankName: application.bankName,
+        bankAccountMasked: application.maskedAccountNumber,
+        date: nowIso,
+      },
+    });
+
     return {
       success: true,
       application,
@@ -4406,23 +4692,31 @@ export async function approveBankAccountApplication(
       adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
     }
 
-    // Create Notification for customer
-    const notifId = `notif_${Date.now()}_bnk_app_${Math.random().toString(36).substring(2, 6)}`;
-    const notifItem: NotificationItem = {
-      id: notifId,
+    // Create deterministic Notification for customer
+    await persistCustomerNotification({
+      id: `notif_bnk_app_${applicationId}`,
       userId: updatedApp.userId,
-      title: 'Bank Account Approved',
-      message: `Your bank account has been approved. Complete bank verification to activate it.`,
+      title: 'Bank Account Linking Approved',
+      message: `Your ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) account linking request has been approved. Complete bank verification in Bank Activation to activate payouts.`,
       type: 'SECURITY',
       severity: 'success',
-      read: false,
       createdAt: nowIso,
       referenceId: applicationId,
-    };
-    db.notifications.unshift(notifItem);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
-    }
+      actionModal: 'withdraw',
+      actionSection: 'BANK_ACTIVATION',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_LINK_APPROVED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Bank Linking Application',
+        status: 'approved',
+        bankName: updatedApp.bankName,
+        bankAccountMasked: updatedApp.maskedAccountNumber,
+        date: nowIso,
+      },
+    });
 
     return { success: true, application: updatedApp };
   } catch (err: any) {
@@ -4501,23 +4795,31 @@ export async function rejectBankAccountApplication(
       adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
     }
 
-    // Create Notification for customer
-    const notifId = `notif_${Date.now()}_bnk_rej_${Math.random().toString(36).substring(2, 6)}`;
-    const notifItem: NotificationItem = {
-      id: notifId,
+    // Create deterministic Notification for customer
+    await persistCustomerNotification({
+      id: `notif_bnk_rej_${applicationId}`,
       userId: updatedApp.userId,
       title: 'Bank Account Application Update',
-      message: `Your ${updatedApp.bankName} account linking request was rejected. ${reason ? 'Reason: ' + reason : 'Please review and submit valid banking details.'}`,
+      message: `Your ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) linking request was rejected. ${reason ? 'Reason: ' + reason : 'Please review and submit valid banking details.'}`,
       type: 'SECURITY',
       severity: 'warning',
-      read: false,
       createdAt: nowIso,
       referenceId: applicationId,
-    };
-    db.notifications.unshift(notifItem);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
-    }
+      actionModal: 'withdraw',
+      actionSection: 'BANK',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_LINK_REJECTED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Bank Linking Application',
+        status: 'rejected',
+        bankName: updatedApp.bankName,
+        reason: updatedApp.rejectionReason,
+        date: nowIso,
+      },
+    });
 
     return { success: true, application: updatedApp };
   } catch (err: any) {
@@ -4577,6 +4879,30 @@ export async function cancelBankAccountApplication(
     }
 
     db.bankAccountApplications.set(applicationId, updatedApp);
+
+    await persistCustomerNotification({
+      id: `notif_bnk_can_${applicationId}`,
+      userId: updatedApp.userId,
+      title: 'Bank Account Application Cancelled',
+      message: `Your pending ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) linking application has been cancelled.`,
+      type: 'SECURITY',
+      severity: 'info',
+      createdAt: nowIso,
+      referenceId: applicationId,
+      actionModal: 'withdraw',
+      actionSection: 'BANK',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_LINK_CANCELLED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Bank Linking Application',
+        status: 'cancelled',
+        bankName: updatedApp.bankName,
+        date: nowIso,
+      },
+    });
 
     return { success: true, application: updatedApp };
   } catch (err: any) {
@@ -4647,23 +4973,32 @@ export async function completeBankVerification(
 
     db.bankAccountApplications.set(applicationId, updatedApp);
 
-    // Record Notification for customer
-    const notifId = `notif_${Date.now()}_bnk_act_${Math.random().toString(36).substring(2, 6)}`;
-    const notifItem: NotificationItem = {
-      id: notifId,
+    // Record deterministic Notification for customer
+    await persistCustomerNotification({
+      id: `notif_bnk_act_${applicationId}`,
       userId: updatedApp.userId,
       title: 'Bank Account Activated',
-      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has successfully completed bank verification and is now Activated for instant payouts and withdrawals.`,
+      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has completed bank verification and is now Activated for payouts and withdrawals.`,
       type: 'SECURITY',
       severity: 'success',
-      read: false,
       createdAt: nowIso,
       referenceId: applicationId,
-    };
-    db.notifications.unshift(notifItem);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
-    }
+      actionModal: 'withdraw',
+      actionSection: 'BANK_ACTIVATION',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_ACTIVATED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Bank Activation',
+        status: 'activated',
+        bankName: updatedApp.bankName,
+        bankAccountMasked: updatedApp.maskedAccountNumber,
+        referenceNumber: verificationRef,
+        date: nowIso,
+      },
+    });
 
     return { success: true, application: updatedApp };
   } catch (err: any) {
@@ -4752,23 +5087,30 @@ export async function submitCardActivationRequest(params: SubmitCardActivationPa
     // Save to Memory
     db.cardActivationRequests.set(requestId, newRequest);
 
-    // Create notification for customer
-    const notifId = `notif_${Date.now()}_card_act_sub_${Math.random().toString(36).substring(2, 6)}`;
-    const notifItem: NotificationItem = {
-      id: notifId,
+    // Create deterministic notification for customer
+    await persistCustomerNotification({
+      id: `notif_card_act_sub_${requestId}`,
       userId,
       title: 'Debit Card Activation Submitted',
-      message: `Your activation code (${activationCode}) has been submitted. Status: Pending.`,
+      message: `Your debit card activation request (${activationCode}) has been submitted. Status: Pending verification.`,
       type: 'SECURITY',
       severity: 'info',
-      read: false,
       createdAt: nowIso,
       referenceId: requestId,
-    };
-    db.notifications.unshift(notifItem);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
-    }
+      actionModal: 'withdraw',
+      actionSection: 'ACTIVATION',
+      actionRecordId: requestId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'CARD_ACTIVATION_SUBMITTED',
+        customerName,
+        accountNumberMasked: maskAccountNumber(customerAccountNumber),
+        requestType: 'Debit Card Activation',
+        status: 'PENDING',
+        cardBrand: newRequest.cardBrand,
+        date: nowIso,
+      },
+    });
 
     return {
       success: true,
@@ -4911,23 +5253,30 @@ export async function approveCardActivationRequest(
       adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
     }
 
-    // Create Notification for customer
-    const notifId = `notif_${Date.now()}_card_act_app_${Math.random().toString(36).substring(2, 6)}`;
-    const notifItem: NotificationItem = {
-      id: notifId,
+    // Create deterministic Notification for customer
+    await persistCustomerNotification({
+      id: `notif_card_act_app_${requestId}`,
       userId: updatedReq.userId,
       title: 'Debit Card Activated for Withdrawal',
-      message: 'Your debit card is now Activated for instant withdrawals.',
+      message: 'Your debit card activation request has been approved and is now Activated for instant withdrawals.',
       type: 'SECURITY',
       severity: 'success',
-      read: false,
       createdAt: nowIso,
       referenceId: requestId,
-    };
-    db.notifications.unshift(notifItem);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
-    }
+      actionModal: 'withdraw',
+      actionSection: 'ACTIVATION',
+      actionRecordId: requestId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'CARD_ACTIVATION_APPROVED',
+        customerName: updatedReq.customerName,
+        accountNumberMasked: maskAccountNumber(updatedReq.customerAccountNumber),
+        requestType: 'Debit Card Activation',
+        status: 'ACTIVATED',
+        cardBrand: updatedReq.cardBrand,
+        date: nowIso,
+      },
+    });
 
     return { success: true, request: updatedReq };
   } catch (err: any) {
@@ -5001,23 +5350,31 @@ export async function rejectCardActivationRequest(
       adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
     }
 
-    // Create Notification for customer
-    const notifId = `notif_${Date.now()}_card_act_rej_${Math.random().toString(36).substring(2, 6)}`;
-    const notifItem: NotificationItem = {
-      id: notifId,
+    // Create deterministic Notification for customer
+    await persistCustomerNotification({
+      id: `notif_card_act_rej_${requestId}`,
       userId: updatedReq.userId,
       title: 'Debit Card Activation Rejected',
       message: `Your debit card activation request was rejected. Reason: ${rejectionReason}`,
       type: 'SECURITY',
       severity: 'warning',
-      read: false,
       createdAt: nowIso,
       referenceId: requestId,
-    };
-    db.notifications.unshift(notifItem);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('notifications').doc(notifId).set(notifItem).catch(() => {});
-    }
+      actionModal: 'withdraw',
+      actionSection: 'ACTIVATION',
+      actionRecordId: requestId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'CARD_ACTIVATION_REJECTED',
+        customerName: updatedReq.customerName,
+        accountNumberMasked: maskAccountNumber(updatedReq.customerAccountNumber),
+        requestType: 'Debit Card Activation',
+        status: 'REJECTED',
+        reason: rejectionReason,
+        cardBrand: updatedReq.cardBrand,
+        date: nowIso,
+      },
+    });
 
     return { success: true, request: updatedReq };
   } catch (err: any) {

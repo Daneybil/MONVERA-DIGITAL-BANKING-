@@ -424,12 +424,34 @@ export const firestoreSync = {
   },
 
   /**
+   * Build authenticated headers for backend sync calls without creating circular imports with api.ts
+   */
+  async _getSyncHeaders(): Promise<Record<string, string>> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    try {
+      if (auth?.currentUser) {
+        const token = await auth.currentUser.getIdToken();
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        if (auth.currentUser.email) headers['X-Admin-Email'] = auth.currentUser.email;
+      }
+    } catch {}
+    try {
+      if (typeof window !== 'undefined') {
+        const adminTok = sessionStorage.getItem('monvera_admin_session_token');
+        if (adminTok) headers['X-Admin-Session'] = adminTok;
+      }
+    } catch {}
+    return headers;
+  },
+
+  /**
    * Fetch all notifications for a specific user from Firestore and Local Cache
    */
   async getNotificationsForUser(userId: string, userAccountNumber?: string, userEmail?: string): Promise<NotificationItem[]> {
     if (!userId) return [];
-    const notifs: NotificationItem[] = [];
-    const notifIds = new Set<string>();
+    const notifMap = new Map<string, NotificationItem>();
 
     // 1. Load immediately from local storage cache for zero-latency retrieval
     try {
@@ -440,9 +462,8 @@ export const firestoreSync = {
           const parsed: NotificationItem[] = JSON.parse(raw);
           if (Array.isArray(parsed)) {
             parsed.forEach((n) => {
-              if (n && n.id && !notifIds.has(n.id)) {
-                notifIds.add(n.id);
-                notifs.push(n);
+              if (n && n.id && (!n.userId || n.userId === userId)) {
+                notifMap.set(n.id, n);
               }
             });
           }
@@ -451,7 +472,9 @@ export const firestoreSync = {
     } catch {}
 
     if (!db) {
-      return notifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      return Array.from(notifMap.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
     }
 
     try {
@@ -462,33 +485,81 @@ export const firestoreSync = {
       snap.forEach((d) => {
         const item = d.data() as NotificationItem;
         const id = d.id || item.id;
-        if (!notifIds.has(id)) {
-          notifIds.add(id);
-          notifs.push({ id, ...item });
+        if (id && item?.userId === userId) {
+          const existing = notifMap.get(id);
+          notifMap.set(id, {
+            ...item,
+            id,
+            read: Boolean(item.read || existing?.read),
+          });
         }
       });
 
-      // Also query by accountNumber if different
-      if (userAccountNumber) {
-        try {
-          const qAcc = query(notifCol, where('userId', '==', userAccountNumber));
-          const snapAcc = await getDocs(qAcc);
-          snapAcc.forEach((d) => {
-            const item = d.data() as NotificationItem;
-            const id = d.id || item.id;
-            if (!notifIds.has(id)) {
-              notifIds.add(id);
-              notifs.push({ id, ...item });
-            }
-          });
-        } catch {}
-      }
-
-      return notifs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      const sorted = Array.from(notifMap.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+      try {
+        if (typeof window !== 'undefined') {
+          localStorage.setItem(`monvera_notifications_${userId}`, JSON.stringify(sorted.slice(0, 200)));
+        }
+      } catch {}
+      return sorted;
     } catch (err) {
       console.warn('[Firestore] Error fetching user notifications:', err);
-      return [];
+      return Array.from(notifMap.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
     }
+  },
+
+  /**
+   * Direct Firestore fallback to mark a single notification read
+   */
+  async markNotificationReadDirect(notificationId: string, userId?: string): Promise<void> {
+    if (!notificationId) return;
+    if (userId && typeof window !== 'undefined') {
+      try {
+        const localKey = `monvera_notifications_${userId}`;
+        const raw = localStorage.getItem(localKey);
+        if (raw) {
+          const list: NotificationItem[] = JSON.parse(raw);
+          const updated = list.map((n) => (n.id === notificationId ? { ...n, read: true } : n));
+          localStorage.setItem(localKey, JSON.stringify(updated));
+        }
+      } catch {}
+    }
+    if (!db) return;
+    try {
+      await setDoc(doc(db, 'notifications', notificationId), { read: true, readAt: new Date().toISOString() }, { merge: true });
+    } catch {}
+  },
+
+  /**
+   * Direct Firestore fallback to mark all notifications for a user read
+   */
+  async markAllNotificationsReadDirect(userId: string): Promise<void> {
+    if (!userId) return;
+    if (typeof window !== 'undefined') {
+      try {
+        const localKey = `monvera_notifications_${userId}`;
+        const raw = localStorage.getItem(localKey);
+        if (raw) {
+          const list: NotificationItem[] = JSON.parse(raw);
+          const updated = list.map((n) => ({ ...n, read: true }));
+          localStorage.setItem(localKey, JSON.stringify(updated));
+        }
+      } catch {}
+    }
+    if (!db) return;
+    try {
+      const notifCol = collection(db, 'notifications');
+      const qNotifs = query(notifCol, where('userId', '==', userId), where('read', '==', false));
+      const snap = await getDocs(qNotifs);
+      const readAt = new Date().toISOString();
+      snap.forEach((d) => {
+        setDoc(d.ref, { read: true, readAt }, { merge: true }).catch(() => {});
+      });
+    } catch {}
   },
 
   /**
@@ -515,9 +586,17 @@ export const firestoreSync = {
           (snap) => {
             const list: NotificationItem[] = [];
             snap.forEach((d) => {
-              list.push({ id: d.id, ...(d.data() as any) });
+              const data = d.data() as any;
+              if (data?.userId === userId) {
+                list.push({ ...data, id: d.id });
+              }
             });
             list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            try {
+              if (typeof window !== 'undefined') {
+                localStorage.setItem(`monvera_notifications_${userId}`, JSON.stringify(list.slice(0, 200)));
+              }
+            } catch {}
             onUpdate(list);
           },
           (err) => {
@@ -1863,12 +1942,13 @@ export const firestoreSync = {
       }
     } catch {}
 
-    // 2. Server API persistence
+    // 2. Server API persistence with auth headers
     try {
       if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
+        const headers = await this._getSyncHeaders();
         fetch('/api/support/messages', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify(msg),
         }).catch(() => {});
       }
@@ -1947,33 +2027,44 @@ export const firestoreSync = {
     if (!userId) return [];
     const map = new Map<string, ChatMessage>();
 
-    // 1. Read from localStorage first
+    const mergeMsg = (incoming: ChatMessage) => {
+      if (!incoming || !incoming.id || incoming.userId !== userId) return;
+      const existing = map.get(incoming.id);
+      if (!existing) {
+        map.set(incoming.id, incoming);
+      } else {
+        const resolvedStatus = existing.status === 'read' || incoming.status === 'read' ? 'read' : (incoming.status || existing.status);
+        map.set(incoming.id, { ...existing, ...incoming, status: resolvedStatus });
+      }
+    };
+
+    // 1. Read from localStorage first (strictly owned by userId)
     try {
       const localStr = localStorage.getItem(`monvera_chat_${userId}`);
       if (localStr) {
         const localList: ChatMessage[] = JSON.parse(localStr);
-        localList.forEach((m) => {
-          if (m && m.id) map.set(m.id, m);
-        });
+        if (Array.isArray(localList)) {
+          localList.forEach(mergeMsg);
+        }
       }
     } catch {}
 
-    // 2. Fetch from backend API
+    // 2. Fetch from backend API with auth headers
     try {
       if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
-        const res = await fetch(`/api/support/messages?userId=${encodeURIComponent(userId)}`);
+        const headers = await this._getSyncHeaders();
+        delete headers['Content-Type'];
+        const res = await fetch(`/api/support/messages?userId=${encodeURIComponent(userId)}`, { headers });
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data.messages)) {
-            data.messages.forEach((m: ChatMessage) => {
-              if (m && m.id) map.set(m.id, m);
-            });
+            data.messages.forEach(mergeMsg);
           }
         }
       }
     } catch {}
 
-    // 3. Fetch from Firestore if available
+    // 3. Fetch from Firestore if available (strictly owned by userId)
     if (db) {
       try {
         const msgCol = collection(db, 'support_messages');
@@ -1982,7 +2073,7 @@ export const firestoreSync = {
         snap.forEach((d) => {
           const item = d.data() as ChatMessage;
           if (item && (item.id || d.id)) {
-            map.set(item.id || d.id, item);
+            mergeMsg({ ...item, id: item.id || d.id });
           }
         });
       } catch (err) {
@@ -2013,8 +2104,9 @@ export const firestoreSync = {
       const localStr = localStorage.getItem(`monvera_chat_${userId}`);
       if (localStr) {
         const cached: ChatMessage[] = JSON.parse(localStr);
-        if (cached && cached.length > 0) {
-          onUpdate(cached.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()));
+        const owned = Array.isArray(cached) ? cached.filter((m) => m && m.userId === userId) : [];
+        if (owned.length > 0) {
+          onUpdate(owned.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()));
         }
       }
     } catch {}
@@ -2024,7 +2116,9 @@ export const firestoreSync = {
       if (list && list.length > 0) onUpdate(list);
     });
 
-    const handleLocalBroadcast = () => {
+    const handleLocalBroadcast = (e?: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      if (detail?.userId && detail.userId !== userId) return;
       this.getChatMessagesForUser(userId).then(onUpdate);
     };
 
@@ -2033,8 +2127,17 @@ export const firestoreSync = {
       window.addEventListener('storage', handleLocalBroadcast);
     }
 
+    // Periodic silent background sync so admin replies sent via backend/other sessions always arrive without page refresh
+    const pollInterval =
+      typeof window !== 'undefined'
+        ? window.setInterval(() => {
+            this.getChatMessagesForUser(userId).then(onUpdate).catch(() => {});
+          }, 12000)
+        : undefined;
+
     if (!db) {
       return () => {
+        if (pollInterval !== undefined) window.clearInterval(pollInterval);
         if (typeof window !== 'undefined') {
           window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
           window.removeEventListener('storage', handleLocalBroadcast);
@@ -2049,22 +2152,27 @@ export const firestoreSync = {
         q,
         (snap) => {
           const map = new Map<string, ChatMessage>();
-          // Preserve all known local messages
+          // Preserve all known local messages belonging strictly to userId
           try {
             const raw = localStorage.getItem(`monvera_chat_${userId}`);
             if (raw) {
               const localList: ChatMessage[] = JSON.parse(raw);
-              localList.forEach((m) => {
-                if (m && m.id) map.set(m.id, m);
-              });
+              if (Array.isArray(localList)) {
+                localList.forEach((m) => {
+                  if (m && m.id && m.userId === userId) map.set(m.id, m);
+                });
+              }
             }
           } catch {}
 
-          // Merge live snapshot messages
+          // Merge live snapshot messages belonging strictly to userId
           snap.forEach((d) => {
             const item = d.data() as ChatMessage;
-            if (item && (item.id || d.id)) {
-              map.set(item.id || d.id, item);
+            const id = item?.id || d.id;
+            if (id && item?.userId === userId) {
+              const existing = map.get(id);
+              const resolvedStatus = existing?.status === 'read' || item.status === 'read' ? 'read' : (item.status || existing?.status);
+              map.set(id, { ...existing, ...item, id, status: resolvedStatus });
             }
           });
 
@@ -2083,6 +2191,7 @@ export const firestoreSync = {
         }
       );
       return () => {
+        if (pollInterval !== undefined) window.clearInterval(pollInterval);
         if (typeof window !== 'undefined') {
           window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
           window.removeEventListener('storage', handleLocalBroadcast);
@@ -2092,6 +2201,7 @@ export const firestoreSync = {
     } catch (err) {
       console.warn('[Firestore] Error subscribing to live chat:', err);
       return () => {
+        if (pollInterval !== undefined) window.clearInterval(pollInterval);
         if (typeof window !== 'undefined') {
           window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
           window.removeEventListener('storage', handleLocalBroadcast);
@@ -2286,6 +2396,7 @@ export const firestoreSync = {
    */
   async markChatMessagesAsRead(userId: string, reader: 'admin' | 'user'): Promise<void> {
     if (!userId) return;
+    const readAt = new Date().toISOString();
     try {
       const localKey = `monvera_chat_${userId}`;
       const raw = localStorage.getItem(localKey);
@@ -2298,6 +2409,31 @@ export const firestoreSync = {
         });
         localStorage.setItem(localKey, JSON.stringify(updated));
       }
+
+      const globalKey = 'monvera_all_chat_messages';
+      const gRaw = localStorage.getItem(globalKey);
+      if (gRaw) {
+        const gList: ChatMessage[] = JSON.parse(gRaw);
+        const gUpdated = gList.map((m) => {
+          if (m.userId !== userId) return m;
+          if (reader === 'admin' && m.sender === 'user') return { ...m, status: 'read' as const };
+          if (reader === 'user' && m.sender === 'support') return { ...m, status: 'read' as const };
+          return m;
+        });
+        localStorage.setItem(globalKey, JSON.stringify(gUpdated));
+      }
+    } catch {}
+
+    // Persist read state via backend API (server handles Admin SDK batch update & in-memory db)
+    try {
+      if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
+        const headers = await this._getSyncHeaders();
+        await fetch('/api/support/messages/read', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ userId, role: reader }),
+        }).catch(() => {});
+      }
     } catch {}
 
     if (!db) return;
@@ -2309,7 +2445,7 @@ export const firestoreSync = {
       snap.forEach((d) => {
         const data = d.data() as ChatMessage;
         if (data.status !== 'read') {
-          setDoc(d.ref, { status: 'read' }, { merge: true }).catch(() => {});
+          setDoc(d.ref, { status: 'read', readAt }, { merge: true }).catch(() => {});
         }
       });
     } catch {}

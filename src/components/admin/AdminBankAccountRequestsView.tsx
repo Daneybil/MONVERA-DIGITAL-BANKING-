@@ -137,7 +137,10 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
       app.accountHolderName.toLowerCase().includes(q) ||
       app.userId.toLowerCase().includes(q) ||
       (app.verificationReference && app.verificationReference.toLowerCase().includes(q)) ||
-      (app.maskedAccountNumber && app.maskedAccountNumber.toLowerCase().includes(q))
+      (app.maskedAccountNumber && app.maskedAccountNumber.toLowerCase().includes(q)) ||
+      (app.swiftBic && app.swiftBic.toLowerCase().includes(q)) ||
+      (app.iban && app.iban.toLowerCase().includes(q)) ||
+      (app.maskedIban && app.maskedIban.toLowerCase().includes(q))
     );
   });
 
@@ -276,7 +279,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                   <th className="px-5 py-4">Customer</th>
                   <th className="px-5 py-4">Bank & Country</th>
                   <th className="px-5 py-4">Account Holder</th>
-                  <th className="px-5 py-4">Account Number / IBAN</th>
+                  <th className="px-5 py-4">Account / SWIFT / IBAN</th>
                   <th className="px-5 py-4">Contact Info</th>
                   <th className="px-5 py-4">Submitted</th>
                   <th className="px-5 py-4 text-center">Status</th>
@@ -335,12 +338,17 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                         )}
                       </td>
 
-                      {/* Account / IBAN */}
+                      {/* Account / SWIFT / IBAN */}
                       <td className="px-5 py-4">
                         <div className="font-mono font-bold text-slate-900">{app.maskedAccountNumber}</div>
-                        {app.maskedIban && (
-                          <div className="font-mono text-[11px] text-slate-500 mt-0.5">
-                            IBAN: {app.maskedIban}
+                        {app.swiftBic && (
+                          <div className="font-mono text-[11px] text-slate-700 font-semibold mt-0.5">
+                            SWIFT/BIC: {app.swiftBic}
+                          </div>
+                        )}
+                        {(app.iban || app.maskedIban) && (
+                          <div className="font-mono text-[11px] text-slate-600 mt-0.5 break-all">
+                            IBAN: {app.iban || app.maskedIban}
                           </div>
                         )}
                         {app.routingNumber && (
@@ -590,6 +598,20 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       )}
                     </div>
                   </div>
+                  {selectedApp.swiftBic && (
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">SWIFT / BIC Code</span>
+                      <strong className="font-mono text-slate-950 select-all">{selectedApp.swiftBic}</strong>
+                    </div>
+                  )}
+                  {(selectedApp.iban || selectedApp.maskedIban) && (
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">IBAN (International)</span>
+                      <strong className="font-mono text-slate-950 break-all select-all">
+                        {selectedApp.iban || selectedApp.maskedIban}
+                      </strong>
+                    </div>
+                  )}
                   {selectedApp.routingNumber && (
                     <div>
                       <span className="text-slate-400 block text-[10px]">Routing Number</span>
@@ -741,6 +763,20 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                 <span className="text-slate-400">Beneficiary:</span>{' '}
                 <strong className="text-slate-950">{actionModal.app.accountHolderName}</strong>
               </div>
+              {actionModal.app.swiftBic && (
+                <div>
+                  <span className="text-slate-400">SWIFT / BIC:</span>{' '}
+                  <strong className="font-mono text-slate-950">{actionModal.app.swiftBic}</strong>
+                </div>
+              )}
+              {(actionModal.app.iban || actionModal.app.maskedIban) && (
+                <div>
+                  <span className="text-slate-400">IBAN:</span>{' '}
+                  <strong className="font-mono text-slate-950 break-all">
+                    {actionModal.app.iban || actionModal.app.maskedIban}
+                  </strong>
+                </div>
+              )}
             </div>
 
             {actionModal.type === 'REJECT' && (

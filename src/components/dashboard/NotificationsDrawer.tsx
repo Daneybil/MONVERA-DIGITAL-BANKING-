@@ -32,9 +32,16 @@ interface NotificationsDrawerProps {
 }
 
 export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen, onClose }) => {
-  const { notifications, markAllNotificationsAsRead, markNotificationAsRead, replyToSupport, unreadNotifsCount } =
-    useAuth();
-  const [selectedFilter, setSelectedFilter] = useState<'ALL' | 'TRANSACTION' | 'SUPPORT' | 'SECURITY' | 'INVESTMENT'>('ALL');
+  const {
+    notifications,
+    markAllNotificationsAsRead,
+    markNotificationAsRead,
+    replyToSupport,
+    unreadNotifsCount,
+    setCurrentView,
+    openModal,
+  } = useAuth();
+  const [selectedFilter, setSelectedFilter] = useState<'ALL' | 'TRANSACTION' | 'SYSTEM' | 'INVESTMENT' | 'SECURITY' | 'SUPPORT'>('ALL');
   const [selectedNotification, setSelectedNotification] = useState<NotificationItem | null>(null);
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [isSubmittingReply, setIsSubmittingReply] = useState<Record<string, boolean>>({});
@@ -46,6 +53,104 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
     if (selectedFilter === 'ALL') return true;
     return n.type === selectedFilter;
   });
+
+  const resolveNavigationTarget = (n: NotificationItem): {
+    label: string;
+    actionView?: 'dashboard' | 'transactions' | 'investments' | 'loans' | 'cards' | 'profile';
+    actionModal?: 'deposit' | 'send' | 'receive' | 'withdraw' | 'invest';
+    actionSection?: string;
+    actionRecordId?: string;
+    referenceNumber?: string;
+  } => {
+    const titleLower = (n.title || '').toLowerCase();
+    const msgLower = (n.message || '').toLowerCase();
+    const eventType = (n.metadata?.eventType || '').toUpperCase();
+
+    const actionView = n.actionView;
+    const actionModal = n.actionModal;
+    const actionSection = n.actionSection;
+    const actionRecordId = n.actionRecordId || n.referenceId;
+    const referenceNumber = n.metadata?.referenceNumber || n.referenceId;
+
+    if (actionModal === 'withdraw') {
+      const label =
+        actionSection === 'ACTIVATION'
+          ? 'Open Card Activation'
+          : actionSection === 'BANK_ACTIVATION'
+          ? 'Open Bank Activation'
+          : 'Open Bank Linking';
+      return { label, actionModal: 'withdraw', actionSection, actionRecordId, referenceNumber };
+    }
+
+    if (actionView === 'transactions' || (n.type === 'TRANSACTION' && !actionModal)) {
+      return { label: 'View in Transactions', actionView: 'transactions', actionSection, actionRecordId, referenceNumber };
+    }
+    if (actionView === 'loans' || eventType.startsWith('LOAN_') || titleLower.includes('loan')) {
+      return { label: 'View Loan Application', actionView: 'loans', actionSection, actionRecordId, referenceNumber };
+    }
+    if (actionView === 'investments' || n.type === 'INVESTMENT') {
+      return { label: 'View Investments', actionView: 'investments', actionSection, actionRecordId, referenceNumber };
+    }
+    if (actionView === 'cards' || eventType.includes('CARD_')) {
+      return { label: 'View My Cards', actionView: 'cards', actionSection, actionRecordId, referenceNumber };
+    }
+    if (actionView === 'profile' || eventType.startsWith('KYC_') || titleLower.includes('kyc') || msgLower.includes('kyc')) {
+      const isKyc = actionSection === 'kyc' || eventType.startsWith('KYC_') || titleLower.includes('kyc');
+      return {
+        label: isKyc ? 'Open KYC Verification' : 'Open Profile & Security',
+        actionView: 'profile',
+        actionSection: isKyc ? 'kyc' : actionSection,
+        actionRecordId,
+        referenceNumber,
+      };
+    }
+
+    if (titleLower.includes('bank') && (titleLower.includes('activat') || titleLower.includes('verif'))) {
+      return { label: 'Open Bank Activation', actionModal: 'withdraw', actionSection: 'BANK_ACTIVATION', actionRecordId, referenceNumber };
+    }
+    if (titleLower.includes('bank') && (titleLower.includes('link') || msgLower.includes('bank account'))) {
+      return { label: 'Open Bank Linking', actionModal: 'withdraw', actionSection: 'BANK', actionRecordId, referenceNumber };
+    }
+    if (titleLower.includes('card activation')) {
+      return { label: 'Open Card Activation', actionModal: 'withdraw', actionSection: 'ACTIVATION', actionRecordId, referenceNumber };
+    }
+    if (n.type === 'SECURITY') {
+      return { label: 'Open Security Settings', actionView: 'profile', actionSection, actionRecordId, referenceNumber };
+    }
+
+    return { label: 'Go to Dashboard', actionView: 'dashboard', actionSection, actionRecordId, referenceNumber };
+  };
+
+  const handleNavigateNotification = (n: NotificationItem) => {
+    if (!n.read) {
+      markNotificationAsRead(n.id);
+    }
+    const target = resolveNavigationTarget(n);
+    try {
+      const payload = {
+        notificationId: n.id,
+        actionView: target.actionView,
+        actionModal: target.actionModal,
+        actionSection: target.actionSection,
+        actionRecordId: target.actionRecordId,
+        referenceNumber: target.referenceNumber,
+        timestamp: Date.now(),
+      };
+      if (typeof window !== 'undefined') {
+        sessionStorage.setItem('monvera_notification_nav_target', JSON.stringify(payload));
+        window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: payload }));
+      }
+    } catch {}
+
+    setSelectedNotification(null);
+    onClose();
+
+    if (target.actionModal) {
+      openModal(target.actionModal);
+    } else if (target.actionView) {
+      setCurrentView(target.actionView);
+    }
+  };
 
   const handleSelectNotification = (n: NotificationItem) => {
     setSelectedNotification(n);
@@ -69,7 +174,10 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
     }
   };
 
-  const getIcon = (type: string) => {
+  const getIcon = (type: string, n?: NotificationItem) => {
+    if (n?.actionView === 'loans' || n?.metadata?.eventType?.startsWith('LOAN_') || n?.actionModal === 'withdraw') {
+      return Landmark;
+    }
     switch (type) {
       case 'TRANSACTION':
         return DollarSign;
@@ -79,10 +187,20 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
         return ShieldCheck;
       case 'INVESTMENT':
         return TrendingUp;
+      case 'SYSTEM':
+        return Landmark;
       default:
         return Info;
     }
   };
+
+  const formatMoney = (amount?: number, currency = 'USD') => {
+    if (typeof amount !== 'number' || Number.isNaN(amount)) return null;
+    return `$${Math.abs(amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
+  };
+
+  const detailTarget = selectedNotification ? resolveNavigationTarget(selectedNotification) : null;
+  const meta = selectedNotification?.metadata;
 
   return (
     <div
@@ -169,6 +287,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
               {[
                 { id: 'ALL', label: 'All Alerts' },
                 { id: 'TRANSACTION', label: 'Transactions' },
+                { id: 'SYSTEM', label: 'Loans & Account' },
                 { id: 'INVESTMENT', label: 'Investments' },
                 { id: 'SECURITY', label: 'Security & KYC' },
                 { id: 'SUPPORT', label: 'Support & Concierge' },
@@ -193,7 +312,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
         <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4">
           {selectedNotification ? (
             /* --- DETAIL VIEW OF SPECIFIC NOTIFICATION --- */
-            <div className="space-y-6 animate-fadeIn">
+            <div className="space-y-5 animate-fadeIn">
               {/* Top Banner Card */}
               <div className="p-6 rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-sky-950 text-white space-y-4 shadow-xl border-2 border-slate-800">
                 <div className="flex items-start justify-between gap-3">
@@ -206,10 +325,12 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                           ? 'bg-emerald-500/30 text-emerald-300 border-2 border-emerald-400'
                           : selectedNotification.severity === 'warning'
                           ? 'bg-amber-500/30 text-amber-300 border-2 border-amber-400'
+                          : selectedNotification.severity === 'error'
+                          ? 'bg-rose-500/30 text-rose-300 border-2 border-rose-400'
                           : 'bg-white/20 text-white border-2 border-white/30'
                       }`}
                     >
-                      {React.createElement(getIcon(selectedNotification.type), { className: 'w-6 h-6 stroke-[2.5]' })}
+                      {React.createElement(getIcon(selectedNotification.type, selectedNotification), { className: 'w-6 h-6 stroke-[2.5]' })}
                     </div>
                     <div>
                       <span className="text-xs font-mono font-black uppercase tracking-wider text-sky-400 block">
@@ -232,9 +353,9 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                       })}
                     </span>
                   </span>
-                  {selectedNotification.referenceId && (
+                  {(meta?.referenceNumber || selectedNotification.referenceId) && (
                     <span className="font-mono text-xs font-black bg-sky-900/80 border border-sky-400 px-3 py-1 rounded-lg text-sky-100">
-                      Ref: {selectedNotification.referenceId}
+                      Ref: {meta?.referenceNumber || selectedNotification.referenceId}
                     </span>
                   )}
                 </div>
@@ -249,6 +370,71 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                   {selectedNotification.message}
                 </p>
               </div>
+
+              {/* Structured Banking Record Metadata */}
+              {meta && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  {meta.customerName && (
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Customer Name</span>
+                      <div className="text-sm font-extrabold text-slate-950">{meta.customerName}</div>
+                    </div>
+                  )}
+                  {meta.accountNumberMasked && (
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Account</span>
+                      <div className="text-sm font-mono font-extrabold text-slate-950">{meta.accountNumberMasked}</div>
+                    </div>
+                  )}
+                  {(meta.transactionType || meta.applicationType || meta.requestType) && (
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                        {meta.transactionType ? 'Transaction Type' : meta.applicationType ? 'Application Type' : 'Request Type'}
+                      </span>
+                      <div className="text-sm font-extrabold text-slate-950">
+                        {meta.transactionType || meta.applicationType || meta.requestType}
+                      </div>
+                    </div>
+                  )}
+                  {(typeof meta.amount === 'number' || meta.direction) && (
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                        {meta.direction ? `${meta.direction} Amount` : 'Amount'}
+                      </span>
+                      <div
+                        className={`text-sm font-mono font-black ${
+                          meta.direction === 'CREDIT'
+                            ? 'text-emerald-700'
+                            : meta.direction === 'DEBIT'
+                            ? 'text-rose-700'
+                            : 'text-slate-950'
+                        }`}
+                      >
+                        {meta.direction === 'CREDIT' ? '+' : meta.direction === 'DEBIT' ? '-' : ''}
+                        {formatMoney(meta.amount, meta.currency || 'USD') || meta.direction}
+                      </div>
+                    </div>
+                  )}
+                  {meta.status && (
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Status</span>
+                      <div className="text-sm font-black text-slate-950">{meta.status}</div>
+                    </div>
+                  )}
+                  {meta.referenceNumber && (
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Reference ID</span>
+                      <div className="text-xs font-mono font-extrabold text-slate-950 break-all">{meta.referenceNumber}</div>
+                    </div>
+                  )}
+                  {meta.reason && (
+                    <div className="sm:col-span-2 p-4 rounded-2xl bg-rose-50 border-2 border-rose-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-rose-800 uppercase tracking-wider block">Reason / Review Note</span>
+                      <div className="text-sm font-bold text-rose-950">{meta.reason}</div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Metadata Attributes */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -319,7 +505,17 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
               )}
 
               {/* Action Buttons */}
-              <div className="pt-2 flex items-center gap-3">
+              <div className="pt-2 flex flex-col sm:flex-row items-center gap-3">
+                {detailTarget && (
+                  <button
+                    id="notification-navigate-action-btn"
+                    onClick={() => handleNavigateNotification(selectedNotification)}
+                    className="w-full py-4 px-6 rounded-2xl text-sm font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 border-2 border-emerald-500 transition-colors flex items-center justify-center gap-2 shadow-md cursor-pointer"
+                  >
+                    <span>{detailTarget.label}</span>
+                    <ExternalLink className="w-4 h-4 stroke-[2.5]" />
+                  </button>
+                )}
                 <button
                   onClick={() => setSelectedNotification(null)}
                   className="w-full py-4 px-6 rounded-2xl text-sm font-extrabold text-slate-950 bg-slate-200 hover:bg-slate-300 border-2 border-slate-300 transition-colors text-center shadow-xs cursor-pointer"
@@ -337,13 +533,15 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                 </div>
                 <div className="text-lg font-black text-slate-950">No Notifications</div>
                 <p className="text-sm font-bold text-slate-700 max-w-xs mx-auto leading-relaxed">
-                  No alerts found under this category. Transaction confirmations, deposits, withdrawals, and account updates will appear here.
+                  No alerts found under this category. Transaction confirmations, deposits, withdrawals, loans, KYC updates, and account updates will appear here.
                 </p>
               </div>
             ) : (
               filteredNotifications.map((n) => {
-                const Icon = getIcon(n.type);
+                const Icon = getIcon(n.type, n);
                 const isSupport = n.type === 'SUPPORT';
+                const navTarget = resolveNavigationTarget(n);
+                const amountDisplay = formatMoney(n.metadata?.amount, n.metadata?.currency || 'USD');
 
                 return (
                   <div
@@ -363,6 +561,8 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                             ? 'bg-purple-100 text-purple-900 border-2 border-purple-300'
                             : n.severity === 'success'
                             ? 'bg-emerald-100 text-emerald-900 border-2 border-emerald-300'
+                            : n.severity === 'error'
+                            ? 'bg-rose-100 text-rose-900 border-2 border-rose-300'
                             : n.severity === 'warning'
                             ? 'bg-amber-100 text-amber-900 border-2 border-amber-300'
                             : 'bg-slate-100 text-slate-950 border-2 border-slate-300'
@@ -381,21 +581,58 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                               <span className="w-2.5 h-2.5 rounded-full bg-sky-600 shrink-0 shadow-xs" title="Unread" />
                             )}
                           </div>
-                          <span className="text-xs font-black text-slate-700 font-mono shrink-0">
+                          <span className="text-[11px] font-black text-slate-700 font-mono shrink-0">
+                            {new Date(n.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}{' '}
                             {new Date(n.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </span>
                         </div>
                         <p className="text-sm font-bold text-slate-900 line-clamp-2 leading-relaxed">
                           {n.message}
                         </p>
+                        {(amountDisplay || n.metadata?.status || n.metadata?.referenceNumber) && (
+                          <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                            {amountDisplay && (
+                              <span
+                                className={`text-[11px] font-mono font-black px-2 py-0.5 rounded-md border ${
+                                  n.metadata?.direction === 'CREDIT'
+                                    ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                                    : n.metadata?.direction === 'DEBIT'
+                                    ? 'bg-rose-100 text-rose-900 border-rose-300'
+                                    : 'bg-slate-100 text-slate-900 border-slate-300'
+                                }`}
+                              >
+                                {n.metadata?.direction === 'CREDIT' ? '+' : n.metadata?.direction === 'DEBIT' ? '-' : ''}
+                                {amountDisplay}
+                              </span>
+                            )}
+                            {n.metadata?.status && (
+                              <span className="text-[10px] font-mono font-black uppercase px-2 py-0.5 rounded-md bg-slate-100 text-slate-800 border border-slate-300">
+                                {n.metadata.status}
+                              </span>
+                            )}
+                            {n.metadata?.referenceNumber && (
+                              <span className="text-[10px] font-mono font-bold text-slate-600">
+                                Ref: {n.metadata.referenceNumber}
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
 
                     {/* Bottom action indicator */}
                     <div className="flex items-center justify-between pt-2.5 border-t-2 border-slate-200/80 text-xs">
-                      <span className="font-mono text-xs font-black text-slate-800 uppercase tracking-wider">
-                        {n.type} ALERT
-                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleNavigateNotification(n);
+                        }}
+                        className="font-mono text-xs font-black text-emerald-800 hover:text-emerald-950 hover:underline uppercase tracking-wider flex items-center gap-1 cursor-pointer"
+                      >
+                        <span>{navTarget.label}</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </button>
                       <span className="font-extrabold text-sky-800 group-hover:text-sky-950 flex items-center gap-1.5">
                         <span>Read full notice</span>
                         <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform stroke-[2.5]" />

@@ -1,6 +1,7 @@
 import { adminFirestore, isFirebaseAdminConfigured } from './firebaseAdmin';
 import { db } from './db';
 import { Transaction, WelcomeRewardInfo, WelcomeRewardStatus, BankAccount, BalanceMetrics } from '../src/types';
+import { persistCustomerNotification, maskAccountNumber } from './services/notificationStore';
 
 export const WELCOME_REWARD_TARGET = 10000.0; // $10,000.00 in qualifying deposits
 export const WELCOME_REWARD_AMOUNT = 1000.0; // $1,000.00 one-time welcome reward
@@ -337,19 +338,32 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
           return { alreadyPaid: false, record: rewardRecord };
         });
 
-        // Dispatch asynchronous customer notification
+        // Dispatch asynchronous customer notification (deterministic ID prevents duplicates)
         if (!creditResult.alreadyPaid) {
-          const notifId = `notif_rwd_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-          adminFirestore.collection('notifications').doc(notifId).set({
-            id: notifId,
+          persistCustomerNotification({
+            id: `notif_welcome_${userId}`,
             userId,
             title: 'Welcome Reward Credited! 🎉',
-            message: `Congratulations! You completed $10,000 in qualifying deposits and your $1,000 Welcome Reward has been credited to your Monvera Checking Account.`,
+            message: `Congratulations! You completed $10,000 in qualifying deposits and your $1,000.00 Welcome Reward has been credited to your Monvera Checking Account.`,
             type: 'TRANSACTION',
             severity: 'success',
-            read: false,
             createdAt: nowIso,
             referenceId: idempotencyKey,
+            actionView: 'transactions',
+            actionRecordId: rewardTxId,
+            metadata: {
+              category: 'TRANSACTION',
+              eventType: 'WELCOME_REWARD',
+              customerName,
+              accountNumberMasked: maskAccountNumber(permanentAccountNumber),
+              transactionType: 'WELCOME_REWARD',
+              direction: 'CREDIT',
+              amount: WELCOME_REWARD_AMOUNT,
+              currency: 'USD',
+              status: 'COMPLETED',
+              referenceNumber: idempotencyKey,
+              date: nowIso,
+            },
           }).catch((e) => console.warn('[WelcomeReward] Notification error:', e?.message || e));
         }
 

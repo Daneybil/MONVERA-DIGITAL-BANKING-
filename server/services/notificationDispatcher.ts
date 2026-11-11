@@ -3,6 +3,7 @@
 
 import { smsService, SmsDispatchResult } from './smsService';
 import { emailService, EmailDispatchResult } from './emailService';
+import { persistCustomerNotification } from './notificationStore';
 
 export interface DispatchNotificationEvent {
   transactionId: string;
@@ -190,21 +191,50 @@ class ServerNotificationDispatcher {
   }
 
   /**
-   * Dispatch a typed notification to a user with multi-channel fallback
+   * Dispatch a typed notification to a user with persistent Firestore storage and multi-channel fallback
    */
   public async dispatchNotification(
     userId: string,
     notification: {
+      id?: string;
       title: string;
       message: string;
-      type?: 'SECURITY' | 'TRANSACTION' | 'SYSTEM';
-      severity?: 'info' | 'success' | 'warning' | 'error';
+      type?: 'SECURITY' | 'TRANSACTION' | 'INVESTMENT' | 'SYSTEM' | 'SUPPORT';
+      severity?: 'info' | 'success' | 'warning' | 'error' | 'support';
+      referenceId?: string;
+      actionView?: 'overview' | 'transactions' | 'accounts' | 'transfers' | 'investments' | 'loans' | 'cards' | 'profile';
+      actionModal?: 'withdraw' | 'deposit' | 'send' | 'invest' | 'receive';
+      actionSection?: string;
+      actionRecordId?: string;
+      metadata?: Record<string, any>;
     }
   ): Promise<void> {
-    console.log(`[Notification Dispatcher] Notification dispatched to user ${userId}: "${notification.title}"`);
+    if (!userId) return;
+    const nowIso = new Date().toISOString();
+    const safeRef = notification.referenceId || `NOTIF-${Date.now().toString().slice(-8)}`;
+    const notifId =
+      notification.id ||
+      `notif_sys_${userId}_${safeRef.replace(/[^a-zA-Z0-9_-]/g, '')}_${Date.now()}`;
+
+    await persistCustomerNotification({
+      id: notifId,
+      userId,
+      title: notification.title,
+      message: notification.message,
+      type: notification.type || 'SECURITY',
+      severity: notification.severity || 'info',
+      referenceId: notification.referenceId,
+      createdAt: nowIso,
+      actionView: notification.actionView,
+      actionModal: notification.actionModal,
+      actionSection: notification.actionSection,
+      actionRecordId: notification.actionRecordId,
+      metadata: notification.metadata,
+    }).catch((err) => console.warn('[Notification Dispatcher] Persist note:', err?.message || err));
+
     await this.dispatch({
-      transactionId: `sys_${Date.now()}`,
-      referenceNumber: `NOTIF-${Date.now().toString().slice(-6)}`,
+      transactionId: notifId,
+      referenceNumber: safeRef,
       type: 'SECURITY',
       userId,
     }).catch(() => {});

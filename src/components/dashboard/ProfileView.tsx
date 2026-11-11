@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { firestoreSync } from '../../services/firestoreSync';
@@ -140,6 +140,38 @@ export const ProfileView: React.FC = () => {
 
   // KYC Verification Modal State
   const [isKycModalOpen, setIsKycModalOpen] = useState(false);
+
+  useEffect(() => {
+    const scrollIfKycTarget = (rawTarget?: any) => {
+      try {
+        let target = rawTarget;
+        if (!target && typeof window !== 'undefined') {
+          const saved = sessionStorage.getItem('monvera_notification_nav_target');
+          if (saved) target = JSON.parse(saved);
+        }
+        if (target && target.actionView === 'profile' && target.actionSection === 'kyc') {
+          setTimeout(() => {
+            const el = document.getElementById('kyc-verification-section');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, 120);
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem('monvera_notification_nav_target');
+          }
+        }
+      } catch {}
+    };
+
+    scrollIfKycTarget();
+    const onNavigate = (e: any) => scrollIfKycTarget(e?.detail);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_notification_navigate', onNavigate);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_notification_navigate', onNavigate);
+      }
+    };
+  }, []);
 
   if (!currentUser) return null;
 
@@ -1308,7 +1340,7 @@ export const ProfileView: React.FC = () => {
         </div>
 
         {/* KYC Verification & Identity Clearance Section (US vs International) */}
-        <div className="p-6 sm:p-8 rounded-3xl bg-white border-2 border-slate-200 shadow-sm space-y-6">
+        <div id="kyc-verification-section" className="p-6 sm:p-8 rounded-3xl bg-white border-2 border-slate-200 shadow-sm space-y-6">
           <div className="flex items-center justify-between pb-3 border-b-2 border-slate-100">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-slate-900 text-sky-400 flex items-center justify-center shadow-xs">

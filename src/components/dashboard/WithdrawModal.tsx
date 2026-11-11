@@ -76,6 +76,8 @@ export const WithdrawModal: React.FC = () => {
   const [bankPhone, setBankPhone] = useState<string>('');
   const [bankCurrency, setBankCurrency] = useState<string>('USD');
   const [bankAccountNumber, setBankAccountNumber] = useState<string>('');
+  const [bankSwiftBic, setBankSwiftBic] = useState<string>('');
+  const [bankIban, setBankIban] = useState<string>('');
 
   // Debit Card Activation states
   const [activationCodeInput, setActivationCodeInput] = useState<string>('');
@@ -137,7 +139,28 @@ export const WithdrawModal: React.FC = () => {
   };
 
   useEffect(() => {
+    const applyNavTarget = (rawTarget?: any) => {
+      try {
+        let target = rawTarget;
+        if (!target && typeof window !== 'undefined') {
+          const saved = sessionStorage.getItem('monvera_notification_nav_target');
+          if (saved) target = JSON.parse(saved);
+        }
+        if (target && target.actionModal === 'withdraw' && target.actionSection) {
+          const sec = target.actionSection;
+          if (sec === 'BANK' || sec === 'BANK_ACTIVATION' || sec === 'ACTIVATION' || sec === 'CARD') {
+            setDestinationType(sec);
+            setErrorMessage(null);
+          }
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem('monvera_notification_nav_target');
+          }
+        }
+      } catch {}
+    };
+
     if (activeModal === 'withdraw' && currentUser?.id) {
+      applyNavTarget();
       loadCardActivationStatus();
       loadBankAccounts();
       if (!cardHolder) {
@@ -163,6 +186,16 @@ export const WithdrawModal: React.FC = () => {
         setBankPhone(currentUser.phone);
       }
     }
+
+    const onNavigate = (e: any) => applyNavTarget(e?.detail);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_notification_navigate', onNavigate);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_notification_navigate', onNavigate);
+      }
+    };
   }, [activeModal, currentUser]);
 
   if (activeModal !== 'withdraw' || !currentUser) return null;
@@ -302,7 +335,7 @@ export const WithdrawModal: React.FC = () => {
         setErrorMessage(res.error || "We couldn't complete this withdrawal. Please try again.");
       }
     } catch (err: any) {
-      setErrorMessage('Network error while dispatching withdrawal request.');
+      setErrorMessage(err?.message || 'Network error while dispatching withdrawal request.');
     } finally {
       setIsProcessing(false);
     }
@@ -335,6 +368,24 @@ export const WithdrawModal: React.FC = () => {
       return;
     }
 
+    const cleanSwiftBic = bankSwiftBic.replace(/\s+/g, '').toUpperCase();
+    if (cleanSwiftBic && !/^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(cleanSwiftBic)) {
+      setBankLinkFeedback({
+        type: 'error',
+        text: 'Please enter a valid 8- or 11-character SWIFT / BIC code (e.g. CHASUS33), or leave it blank.',
+      });
+      return;
+    }
+
+    const cleanIban = bankIban.replace(/\s+/g, '').toUpperCase();
+    if (cleanIban && !/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(cleanIban)) {
+      setBankLinkFeedback({
+        type: 'error',
+        text: 'Please enter a valid international IBAN (e.g. GB29NWBK60161331926819), or leave it blank.',
+      });
+      return;
+    }
+
     setIsSubmittingBankLink(true);
     try {
       const res = await api.linkBankAccount({
@@ -346,6 +397,8 @@ export const WithdrawModal: React.FC = () => {
         phoneNumber: bankPhone.trim(),
         currency: bankCurrency,
         accountNumber: bankAccountNumber.trim(),
+        ...(cleanSwiftBic ? { swiftBic: cleanSwiftBic } : {}),
+        ...(cleanIban ? { iban: cleanIban } : {}),
         authMethod: 'Direct Bank Settlement (ACH/Wire)',
       });
 
@@ -358,6 +411,8 @@ export const WithdrawModal: React.FC = () => {
         setIsLinkingNewBank(false);
         setSelectedBankId(res.application.id);
         setBankAccountNumber('');
+        setBankSwiftBic('');
+        setBankIban('');
         if (isOtherBank) setCustomBankName('');
       } else {
         setBankLinkFeedback({
@@ -510,7 +565,7 @@ export const WithdrawModal: React.FC = () => {
         setErrorMessage(res.error || "We couldn't complete this withdrawal. Please try again.");
       }
     } catch (err: any) {
-      setErrorMessage('Network error while dispatching bank withdrawal request.');
+      setErrorMessage(err?.message || 'Network error while dispatching bank withdrawal request.');
     } finally {
       setIsProcessing(false);
     }
@@ -1995,7 +2050,7 @@ export const WithdrawModal: React.FC = () => {
                         </div>
                       </div>
 
-                      {/* 5. Account Number (TASK 2: Routing number, sort code, and international section removed) */}
+                      {/* 5. Account Number */}
                       <div className="space-y-1.5">
                         <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
                           Bank Account Number
@@ -2010,6 +2065,43 @@ export const WithdrawModal: React.FC = () => {
                             placeholder="Enter your complete bank account number"
                             className="w-full pl-10 pr-4 py-3.5 rounded-xl border-2 border-slate-400 text-slate-950 font-mono font-black text-base focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 bg-white shadow-xs"
                           />
+                        </div>
+                      </div>
+
+                      {/* 6. SWIFT / BIC Code & IBAN (Optional International Banking Fields) */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                        <div className="space-y-1.5">
+                          <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
+                            SWIFT / BIC Code (Optional)
+                          </label>
+                          <div className="relative">
+                            <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+                            <input
+                              type="text"
+                              value={bankSwiftBic}
+                              onChange={(e) => setBankSwiftBic(e.target.value.toUpperCase())}
+                              placeholder="e.g. CHASUS33"
+                              maxLength={11}
+                              className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 uppercase placeholder:normal-case placeholder:font-sans focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 shadow-xs"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
+                            IBAN (Optional / International)
+                          </label>
+                          <div className="relative">
+                            <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+                            <input
+                              type="text"
+                              value={bankIban}
+                              onChange={(e) => setBankIban(e.target.value.toUpperCase())}
+                              placeholder="e.g. GB29NWBK60161331926819"
+                              maxLength={42}
+                              className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 uppercase placeholder:normal-case placeholder:font-sans focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 shadow-xs"
+                            />
+                          </div>
                         </div>
                       </div>
 
