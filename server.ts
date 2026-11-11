@@ -9,7 +9,7 @@ import { persistCustomerNotification, maskAccountNumber, resolveCustomerNotifica
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest, createAdminSessionToken, verifyAdminSessionToken } from './server/authMiddleware';
-import { adminAuth, adminFirestore, isFirebaseAdminConfigured } from './server/firebaseAdmin';
+import { adminAuth, adminFirestore, isFirebaseAdminConfigured, getFirebaseAdminDiagnostics } from './server/firebaseAdmin';
 import {
   executeServerTransfer,
   executeServerWithdrawal,
@@ -3035,12 +3035,15 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
 
     // Administrator credentials verified successfully!
     if (!isFirebaseAdminConfigured()) {
-      console.warn('[POST /api/admin/login] Firebase Admin SDK is not configured in this environment.');
+      const fbDiag = getFirebaseAdminDiagnostics();
+      console.warn('[POST /api/admin/login] Firebase Admin SDK unavailable:', fbDiag.error || 'not configured');
       return res.status(503).json({
         success: false,
         isAdminAttempt: true,
         errorCode: 'CONFIG_UNAVAILABLE',
-        error: 'SERVICE_UNAVAILABLE: Firebase Admin service account is not configured on the server.',
+        error: fbDiag.error
+          ? `SERVICE_UNAVAILABLE: ${fbDiag.error}`
+          : 'SERVICE_UNAVAILABLE: Firebase Admin service account is not configured on the server.',
       });
     }
 
@@ -3061,14 +3064,25 @@ app.post('/api/admin/login', async (req: Request, res: Response) => {
       }
     }
 
-    // Keep Firebase Auth record updated with emailVerified, password, and custom claims
-    try {
-      await adminAuth.updateUser(userRecord.uid, {
-        emailVerified: true,
-        password: configuredPassword,
+    if (userRecord.disabled) {
+      console.warn(`[Admin Login] Administrator Firebase Auth account is disabled for ${cleanEmail}`);
+      return res.status(403).json({
+        success: false,
+        isAdminAttempt: true,
+        errorCode: 'ACCOUNT_DISABLED',
+        error: 'Administrator Firebase Authentication account is disabled. Enable the account in Firebase Console.',
       });
-    } catch (syncErr) {
-      console.warn('[Admin Login] Notice: Could not sync password to Firebase user record:', syncErr);
+    }
+
+    // Ensure emailVerified is true without overwriting password (updating password bumps tokensValidAfterTime before createCustomToken)
+    if (!userRecord.emailVerified) {
+      try {
+        await adminAuth.updateUser(userRecord.uid, {
+          emailVerified: true,
+        });
+      } catch (syncErr) {
+        console.warn('[Admin Login] Notice: Could not update emailVerified on Firebase user record:', syncErr);
+      }
     }
 
     // Create cryptographically signed administrator session token

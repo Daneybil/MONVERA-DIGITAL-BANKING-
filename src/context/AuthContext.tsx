@@ -1411,11 +1411,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (isHydratingSessionRef.current === '__pending_login__') {
           isHydratingSessionRef.current = null;
         }
-        console.error('[Admin Auth] Firebase Custom Token exchange error:', fbErr);
+        const fbCode = typeof fbErr?.code === 'string' ? fbErr.code : '';
+        console.error('[Admin Auth] Firebase Custom Token exchange error:', fbCode || fbErr?.message || 'unknown-error');
+
+        let diagnosticMsg = `Cryptographic session exchange failed${fbCode ? ` (${fbCode})` : ''}: Firebase was unable to accept the administrator session token.`;
+        if (fbCode === 'auth/custom-token-mismatch') {
+          diagnosticMsg =
+            'Firebase rejected the administrator custom token (auth/custom-token-mismatch): the backend Firebase Admin service account project does not match frontend project "monvera-digital-banking".';
+        } else if (fbCode === 'auth/invalid-custom-token') {
+          diagnosticMsg =
+            'Firebase rejected the administrator custom token (auth/invalid-custom-token): verify the backend Firebase Admin service account credentials and project configuration.';
+        } else if (fbCode === 'auth/user-disabled') {
+          diagnosticMsg =
+            'Firebase rejected the administrator session (auth/user-disabled): this administrator account is disabled in Firebase Authentication.';
+        } else if (fbCode === 'auth/network-request-failed') {
+          diagnosticMsg =
+            'Network failure contacting Firebase Authentication (auth/network-request-failed). Please check connectivity and try again.';
+        }
+
         return {
           success: false,
           errorCode: 'TOKEN_AUTH_FAILED',
-          error: 'Cryptographic session exchange failed: Firebase was unable to accept the administrator session token.',
+          error: diagnosticMsg,
         };
       }
 
