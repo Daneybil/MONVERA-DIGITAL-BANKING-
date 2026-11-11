@@ -1015,7 +1015,7 @@ export const WithdrawModal: React.FC = () => {
                           Security code (CVV)
                         </label>
                         <input
-                          type="password"
+                          type="text"
                           required
                           maxLength={4}
                           value={cardCvv}
