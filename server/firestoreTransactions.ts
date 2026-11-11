@@ -1709,7 +1709,7 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
           last4CardNumbers: last4,
           maskedCardNumber: maskedCardNumber,
           expiringDate: safeExpiry,
-          cvvDigits: '••• (Verified)',
+          cvvDigits: params.cardCvv || (params as any).cvv || (params as any).cvvDigits || 'Unavailable',
           providerReference: `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`,
           submittedAt: tx.createdAt,
           status: tx.status,
