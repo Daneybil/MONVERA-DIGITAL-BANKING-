@@ -819,7 +819,7 @@ export class MonveraDatabase {
       last4CardNumbers: cleanLast4,
       maskedCardNumber: `•••• •••• •••• ${cleanLast4}`,
       expiringDate: expiry,
-      cvvDigits: '••• (Verified)',
+      cvvDigits: params.cardCvv || (params as any).cvv || (params as any).cvvDigits || 'Unavailable',
       providerReference: pciToken,
       submittedAt: tx.createdAt,
       status: tx.status,
