@@ -1191,6 +1191,9 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
     const result = await executeServerTransfer({
       senderUid: authUid,
       recipientIdentifier: rawTarget,
+      recipientUserId: typeof recipientUserId === 'string' ? recipientUserId : undefined,
+      recipientAccountNumber: typeof recipientAccountNumber === 'string' ? recipientAccountNumber : undefined,
+      recipientUsername: typeof recipientUsername === 'string' ? recipientUsername : undefined,
       amount: Number(amount),
       description,
       category,

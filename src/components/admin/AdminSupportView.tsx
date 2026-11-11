@@ -47,12 +47,16 @@ interface AdminSupportViewProps {
   customers: (UserProfile & { balanceMetrics?: any })[];
   onSelectCustomer?: (customer: UserProfile & { balanceMetrics?: any }) => void;
   onRefreshData?: () => Promise<void>;
+  sharedChatMessages?: ChatMessage[];
+  sharedSupportTickets?: NotificationItem[];
 }
 
 export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
   customers,
   onSelectCustomer,
   onRefreshData,
+  sharedChatMessages,
+  sharedSupportTickets,
 }) => {
   const { currentUser } = useAuth();
 
@@ -60,7 +64,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
   const [activeMode, setActiveMode] = useState<'chat' | 'tickets'>('chat');
 
   // --- LIVE CHAT STATE ---
-  const [allChatMessages, setAllChatMessages] = useState<ChatMessage[]>([]);
+  const [allChatMessages, setAllChatMessages] = useState<ChatMessage[]>(sharedChatMessages || []);
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null);
   const [chatReplyInput, setChatReplyInput] = useState('');
   const [customerIsTyping, setCustomerIsTyping] = useState(false);
@@ -162,8 +166,15 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     'Your administrative clearance is complete and your transactional limits have been restored.',
   ];
 
-  // 1. Subscribe to all Live Chat Messages in real-time
+  // 1. Sync or subscribe to all Live Chat Messages in real-time (reuse AdminDashboard listener when provided)
   useEffect(() => {
+    if (sharedChatMessages !== undefined) {
+      setAllChatMessages(sharedChatMessages);
+    }
+  }, [sharedChatMessages]);
+
+  useEffect(() => {
+    if (sharedChatMessages !== undefined) return;
     const unsubscribeChat = firestoreSync.subscribeToAllChatMessages((liveList) => {
       if (liveList) {
         setAllChatMessages(liveList);
@@ -173,19 +184,20 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     return () => {
       if (typeof unsubscribeChat === 'function') unsubscribeChat();
     };
-  }, []);
+  }, [sharedChatMessages === undefined]);
 
-  // 2. Subscribe to Support Tickets in real-time
+  // 2. Sync or subscribe to Support Tickets in real-time (reuse AdminDashboard listener when provided)
   useEffect(() => {
-    const fetchInitialTickets = async () => {
-      const allTickets = await firestoreSync.getAllSupportTickets();
-      if (allTickets && allTickets.length > 0) {
-        setTickets(allTickets);
-        if (!selectedTicketId) setSelectedTicketId(allTickets[0].id);
+    if (sharedSupportTickets !== undefined) {
+      setTickets(sharedSupportTickets);
+      if (sharedSupportTickets.length > 0) {
+        setSelectedTicketId((curr) => curr || sharedSupportTickets[0].id);
       }
-    };
-    fetchInitialTickets();
+    }
+  }, [sharedSupportTickets]);
 
+  useEffect(() => {
+    if (sharedSupportTickets !== undefined) return;
     const unsubscribeTickets = firestoreSync.subscribeToSupportTickets((liveTickets) => {
       if (liveTickets && liveTickets.length > 0) {
         setTickets(liveTickets);
@@ -196,7 +208,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     return () => {
       if (typeof unsubscribeTickets === 'function') unsubscribeTickets();
     };
-  }, []);
+  }, [sharedSupportTickets === undefined]);
 
   // 3. Group chat messages by user ID to build active conversation threads
   const chatThreads = React.useMemo(() => {

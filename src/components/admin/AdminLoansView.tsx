@@ -34,11 +34,15 @@ import { api } from '../../services/api';
 import { firestoreSync } from '../../services/firestoreSync';
 import { LoanApplication, LoanStatus, Transaction } from '../../types';
 
-export const AdminLoansView: React.FC = () => {
+interface AdminLoansViewProps {
+  sharedLoans?: LoanApplication[];
+}
+
+export const AdminLoansView: React.FC<AdminLoansViewProps> = ({ sharedLoans }) => {
   const { currentUser, refreshBalance } = useAuth();
 
-  const [loans, setLoans] = useState<LoanApplication[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [loans, setLoans] = useState<LoanApplication[]>(sharedLoans || []);
+  const [isLoading, setIsLoading] = useState<boolean>(sharedLoans === undefined);
   const [searchQuery, setSearchQuery] = useState<string>('');
 
   // Approval Modal State
@@ -82,6 +86,23 @@ export const AdminLoansView: React.FC = () => {
   };
 
   useEffect(() => {
+    if (sharedLoans !== undefined) {
+      setLoans(sharedLoans);
+      setIsLoading(false);
+    }
+  }, [sharedLoans]);
+
+  useEffect(() => {
+    if (sharedLoans !== undefined) {
+      const handleLoanEvent = () => {
+        fetchLoans();
+      };
+      window.addEventListener('monvera_loan_updated', handleLoanEvent);
+      return () => {
+        window.removeEventListener('monvera_loan_updated', handleLoanEvent);
+      };
+    }
+
     fetchLoans();
     const unsubscribe = firestoreSync.subscribeToLoans((all) => {
       setLoans(all);
@@ -94,7 +115,7 @@ export const AdminLoansView: React.FC = () => {
       unsubscribe();
       window.removeEventListener('monvera_loan_updated', handleLoanEvent);
     };
-  }, []);
+  }, [sharedLoans === undefined]);
 
   const handleToggleInspection = async (loan: LoanApplication) => {
     if (expandedLedgerLoanId === loan.id) {

@@ -113,7 +113,7 @@ export const SendMoneyModal: React.FC = () => {
       try {
         const [users, adminCust] = await Promise.all([
           api.getUsers().catch(() => []),
-          api.getAdminCustomers().catch(() => ({ customers: [] })),
+          isAdmin ? api.getAdminCustomers().catch(() => ({ customers: [] })) : Promise.resolve({ customers: [] }),
         ]);
         if (isMounted) {
           const list: any[] = [];
@@ -159,7 +159,7 @@ export const SendMoneyModal: React.FC = () => {
     return () => {
       isMounted = false;
     };
-  }, [activeModal, currentUser]);
+  }, [activeModal, isAdmin, currentUser?.permanentAccountNumber]);
 
   if (activeModal !== 'send' || (!currentUser && !isAdmin)) return null;
 
@@ -326,16 +326,18 @@ export const SendMoneyModal: React.FC = () => {
         });
 
         if (res.success && res.transaction) {
+          // Authoritative balanceMetrics is already dispatched synchronously by api.sendMonveraTransfer,
+          // and live Firestore onSnapshot listeners update balances and notifications automatically.
           setCompletedTx(res.transaction);
           setStep('SUCCESS');
-          await refreshBalance();
-          await refreshNotifications();
-          confetti({
-            particleCount: 80,
-            spread: 60,
-            origin: { y: 0.6 },
-            colors: ['#059669', '#10b981', '#0f172a', '#d97706'],
-          });
+          try {
+            confetti({
+              particleCount: 80,
+              spread: 60,
+              origin: { y: 0.6 },
+              colors: ['#059669', '#10b981', '#0f172a', '#d97706'],
+            });
+          } catch {}
         } else {
           setErrorMessage(res.error || 'Transfer failed. Your balance has not been changed.');
           setStep('CONFIRM');

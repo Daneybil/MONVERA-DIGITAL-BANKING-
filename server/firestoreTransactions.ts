@@ -20,6 +20,9 @@ import { persistCustomerNotification, maskAccountNumber } from './services/notif
 export interface TransferParams {
   senderUid: string;
   recipientIdentifier: string; // Recipient UID, account number, username, or email
+  recipientUserId?: string;
+  recipientAccountNumber?: string;
+  recipientUsername?: string;
   amount: number;
   description?: string;
   category?: string;
@@ -142,110 +145,119 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
     const usersCol = adminFirestore.collection('users');
     const accountsCol = adminFirestore.collection('accounts');
 
-    // Strategy 1: Direct document ID lookup in users/accounts or Firebase Admin Auth
-    try {
-      const directUserSnap = await usersCol.doc(targetStr).get();
-      if (directUserSnap.exists) {
-        const userData = directUserSnap.data() || {};
-        const canonicalUid = directUserSnap.id;
-        const permanentAcc = userData.permanentAccountNumber || userData.accountNumber || '1000000000';
-        const fName = userData.firstName || 'Monvera';
-        const lName = userData.lastName || 'Customer';
-
-        return {
-          success: true,
-          uid: canonicalUid,
-          data: {
-            ...userData,
-            id: canonicalUid,
-            uid: canonicalUid,
-            firstName: fName,
-            lastName: lName,
-            fullName: userData.fullName || `${fName} ${lName}`.trim(),
-            permanentAccountNumber: permanentAcc,
-            email: userData.email,
-            username: userData.username || cleanTarget,
-          },
-        };
-      }
-
-      const directAccSnap = await accountsCol.doc(targetStr).get();
-      if (directAccSnap.exists) {
-        const accData = directAccSnap.data() || {};
-        const canonicalUid = accData.userId || directAccSnap.id;
-        const uSnap = await usersCol.doc(canonicalUid).get();
-        const userData = uSnap.exists ? uSnap.data() || {} : {};
-        const permanentAcc = accData.permanentAccountNumber || accData.accountNumber || userData.permanentAccountNumber || '1000000000';
-        const fName = userData.firstName || 'Monvera';
-        const lName = userData.lastName || 'Customer';
-
-        return {
-          success: true,
-          uid: canonicalUid,
-          data: {
-            ...accData,
-            ...userData,
-            id: canonicalUid,
-            uid: canonicalUid,
-            firstName: fName,
-            lastName: lName,
-            fullName: userData.fullName || `${fName} ${lName}`.trim(),
-            permanentAccountNumber: permanentAcc,
-            email: userData.email || accData.email,
-            username: userData.username || cleanTarget,
-          },
-        };
-      }
-
+    // Strategy 1: Direct document ID lookup in users/accounts or Firebase Admin Auth (skip when clearly @handle or email)
+    if (!targetStr.startsWith('@') && !targetStr.includes('@')) {
       try {
-        const authUser = await adminAuth.getUser(targetStr);
-        if (authUser) {
-          const uSnap = await usersCol.doc(authUser.uid).get();
-          const uData = uSnap.exists ? uSnap.data() || {} : {};
-          const fName = uData.firstName || authUser.displayName?.split(' ')[0] || 'Monvera';
-          const lName = uData.lastName || authUser.displayName?.split(' ').slice(1).join(' ') || 'Customer';
+        const [directUserSnap, directAccSnap] = await Promise.all([
+          usersCol.doc(targetStr).get(),
+          accountsCol.doc(targetStr).get(),
+        ]);
+
+        if (directUserSnap.exists) {
+          const userData = directUserSnap.data() || {};
+          const canonicalUid = directUserSnap.id;
+          const permanentAcc = userData.permanentAccountNumber || userData.accountNumber || '1000000000';
+          const fName = userData.firstName || 'Monvera';
+          const lName = userData.lastName || 'Customer';
+
           return {
             success: true,
-            uid: authUser.uid,
+            uid: canonicalUid,
             data: {
-              ...uData,
-              id: authUser.uid,
-              uid: authUser.uid,
+              ...userData,
+              id: canonicalUid,
+              uid: canonicalUid,
               firstName: fName,
               lastName: lName,
-              fullName: uData.fullName || `${fName} ${lName}`.trim(),
-              permanentAccountNumber: uData.permanentAccountNumber || '1000000000',
-              email: uData.email || authUser.email,
-              username: uData.username || cleanTarget,
+              fullName: userData.fullName || `${fName} ${lName}`.trim(),
+              permanentAccountNumber: permanentAcc,
+              email: userData.email,
+              username: userData.username || cleanTarget,
             },
           };
         }
-      } catch {}
-    } catch {}
 
-    // Strategy 2: Exact Account Number Lookup (permanentAccountNumber or legacy accountNumber)
+        if (directAccSnap.exists) {
+          const accData = directAccSnap.data() || {};
+          const canonicalUid = accData.userId || directAccSnap.id;
+          const uSnap = await usersCol.doc(canonicalUid).get();
+          const userData = uSnap.exists ? uSnap.data() || {} : {};
+          const permanentAcc = accData.permanentAccountNumber || accData.accountNumber || userData.permanentAccountNumber || '1000000000';
+          const fName = userData.firstName || 'Monvera';
+          const lName = userData.lastName || 'Customer';
+
+          return {
+            success: true,
+            uid: canonicalUid,
+            data: {
+              ...accData,
+              ...userData,
+              id: canonicalUid,
+              uid: canonicalUid,
+              firstName: fName,
+              lastName: lName,
+              fullName: userData.fullName || `${fName} ${lName}`.trim(),
+              permanentAccountNumber: permanentAcc,
+              email: userData.email || accData.email,
+              username: userData.username || cleanTarget,
+            },
+          };
+        }
+
+        if (isCanonicalAuthUid(targetStr)) {
+          try {
+            const authUser = await adminAuth.getUser(targetStr);
+            if (authUser) {
+              const uSnap = await usersCol.doc(authUser.uid).get();
+              const uData = uSnap.exists ? uSnap.data() || {} : {};
+              const fName = uData.firstName || authUser.displayName?.split(' ')[0] || 'Monvera';
+              const lName = uData.lastName || authUser.displayName?.split(' ').slice(1).join(' ') || 'Customer';
+              return {
+                success: true,
+                uid: authUser.uid,
+                data: {
+                  ...uData,
+                  id: authUser.uid,
+                  uid: authUser.uid,
+                  firstName: fName,
+                  lastName: lName,
+                  fullName: uData.fullName || `${fName} ${lName}`.trim(),
+                  permanentAccountNumber: uData.permanentAccountNumber || '1000000000',
+                  email: uData.email || authUser.email,
+                  username: uData.username || cleanTarget,
+                },
+              };
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    // Strategy 2: Exact Account Number Lookup (parallelized across permanentAccountNumber & legacy fields)
     if (cleanDigits && /^\d{6,14}$/.test(cleanDigits)) {
       const matchesMap = new Map<string, { uid: string; data: any }>();
       try {
-        const qPerm = await usersCol.where('permanentAccountNumber', '==', cleanDigits).get();
+        const [qPerm, qLegacy, qAcc, directAccNumSnap] = await Promise.all([
+          usersCol.where('permanentAccountNumber', '==', cleanDigits).get(),
+          usersCol.where('accountNumber', '==', cleanDigits).get(),
+          accountsCol.where('permanentAccountNumber', '==', cleanDigits).get(),
+          accountsCol.doc(cleanDigits).get(),
+        ]);
         qPerm.docs.forEach((doc) => {
           const d = doc.data() || {};
           const uid = d.uid || d.id || doc.id;
           if (uid && uid !== 'usr_admin') matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
         });
-        const qLegacy = await usersCol.where('accountNumber', '==', cleanDigits).get();
         qLegacy.docs.forEach((doc) => {
           const d = doc.data() || {};
           const uid = d.uid || d.id || doc.id;
           if (uid && uid !== 'usr_admin') matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
         });
-        const qAcc = await accountsCol.where('permanentAccountNumber', '==', cleanDigits).get();
         qAcc.docs.forEach((doc) => {
           const d = doc.data() || {};
           const uid = d.userId || d.uid || doc.id;
           if (uid && uid !== 'usr_admin' && !matchesMap.has(uid)) matchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
         });
-        const directAccNumSnap = await accountsCol.doc(cleanDigits).get();
         if (directAccNumSnap.exists) {
           const d = directAccNumSnap.data() || {};
           const uid = d.userId || d.uid || cleanDigits;
@@ -273,35 +285,37 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
       }
     }
 
-    // Strategy 3: Email Lookup
+    // Strategy 3: Email Lookup (parallelized)
     if (cleanTarget.includes('@')) {
       const emailMatchesMap = new Map<string, { uid: string; data: any }>();
       try {
-        const qEmail = await usersCol.where('email', '==', cleanTarget).get();
+        const [qEmail, qEmailRaw, authUser] = await Promise.all([
+          usersCol.where('email', '==', cleanTarget).get(),
+          targetStr.toLowerCase() !== cleanTarget
+            ? usersCol.where('email', '==', targetStr.toLowerCase()).get()
+            : Promise.resolve(null),
+          adminAuth.getUserByEmail(cleanTarget).catch(() => null),
+        ]);
         qEmail.docs.forEach((doc) => {
           const d = doc.data() || {};
           const uid = d.uid || d.id || doc.id;
           if (uid && uid !== 'usr_admin') emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
         });
-        if (targetStr.toLowerCase() !== cleanTarget) {
-          const qEmailRaw = await usersCol.where('email', '==', targetStr.toLowerCase()).get();
+        if (qEmailRaw) {
           qEmailRaw.docs.forEach((doc) => {
             const d = doc.data() || {};
             const uid = d.uid || d.id || doc.id;
             if (uid && uid !== 'usr_admin' && !emailMatchesMap.has(uid)) emailMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
           });
         }
-        try {
-          const authUser = await adminAuth.getUserByEmail(cleanTarget);
-          if (authUser && authUser.uid !== 'usr_admin' && !emailMatchesMap.has(authUser.uid)) {
-            const uDoc = await usersCol.doc(authUser.uid).get();
-            const uData = uDoc.exists ? uDoc.data() || {} : {};
-            emailMatchesMap.set(authUser.uid, {
-              uid: authUser.uid,
-              data: { ...uData, id: authUser.uid, uid: authUser.uid, email: cleanTarget },
-            });
-          }
-        } catch {}
+        if (authUser && authUser.uid !== 'usr_admin' && !emailMatchesMap.has(authUser.uid)) {
+          const uDoc = await usersCol.doc(authUser.uid).get();
+          const uData = uDoc.exists ? uDoc.data() || {} : {};
+          emailMatchesMap.set(authUser.uid, {
+            uid: authUser.uid,
+            data: { ...uData, id: authUser.uid, uid: authUser.uid, email: cleanTarget },
+          });
+        }
       } catch {}
 
       const matches = Array.from(emailMatchesMap.values());
@@ -322,24 +336,26 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
       }
     }
 
-    // Strategy 4: Username Lookup with Duplicate Ambiguity Detection
+    // Strategy 4: Username Lookup with Duplicate Ambiguity Detection (parallelized)
     if (cleanTarget.length >= 2) {
       const usernameMatchesMap = new Map<string, { uid: string; data: any }>();
       try {
-        const qUserLower = await usersCol.where('usernameLower', '==', cleanTarget).get();
+        const [qUserLower, qUser, qRaw] = await Promise.all([
+          usersCol.where('usernameLower', '==', cleanTarget).get(),
+          usersCol.where('username', '==', cleanTarget).get(),
+          cleanNoAt !== cleanTarget ? usersCol.where('username', '==', cleanNoAt).get() : Promise.resolve(null),
+        ]);
         qUserLower.docs.forEach((doc) => {
           const d = doc.data() || {};
           const uid = d.uid || d.id || doc.id;
           if (uid && uid !== 'usr_admin') usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
         });
-        const qUser = await usersCol.where('username', '==', cleanTarget).get();
         qUser.docs.forEach((doc) => {
           const d = doc.data() || {};
           const uid = d.uid || d.id || doc.id;
           if (uid && uid !== 'usr_admin') usernameMatchesMap.set(uid, { uid, data: { ...d, id: uid, uid } });
         });
-        if (cleanNoAt !== cleanTarget) {
-          const qRaw = await usersCol.where('username', '==', cleanNoAt).get();
+        if (qRaw) {
           qRaw.docs.forEach((doc) => {
             const d = doc.data() || {};
             const uid = d.uid || d.id || doc.id;
@@ -439,15 +455,77 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
  * Server-authoritative Monvera-to-Monvera transfer inside a single Firestore transaction.
  */
 export async function executeServerTransfer(params: TransferParams): Promise<TransferResult> {
-  const { senderUid, recipientIdentifier, amount, description, category, referenceNumber } = params;
+  const {
+    senderUid,
+    recipientIdentifier,
+    recipientUserId,
+    recipientAccountNumber,
+    recipientUsername,
+    amount,
+    description,
+    category,
+    referenceNumber,
+  } = params;
   const transferAmount = Number(amount);
 
   if (!senderUid || isNaN(transferAmount) || transferAmount <= 0) {
     return { success: false, error: 'Sender ID and a positive transfer amount are required.' };
   }
 
-  // 1. Resolve recipient BEFORE modifying balances
-  const recipientRecord = await resolveRecipientUser(recipientIdentifier);
+  // 1. Concurrently resolve sender profile and direct recipient UID (when supplied & verified)
+  const cleanDirectRecipUid = typeof recipientUserId === 'string' ? recipientUserId.trim() : '';
+  const canUseDirectRecipRead =
+    isFirebaseAdminConfigured() &&
+    Boolean(cleanDirectRecipUid) &&
+    cleanDirectRecipUid !== 'usr_admin' &&
+    cleanDirectRecipUid !== senderUid;
+
+  const [senderDocSnap, directRecipSnap] = isFirebaseAdminConfigured()
+    ? await Promise.all([
+        adminFirestore.collection('users').doc(senderUid).get().catch(() => null),
+        canUseDirectRecipRead
+          ? adminFirestore.collection('users').doc(cleanDirectRecipUid).get().catch(() => null)
+          : Promise.resolve(null),
+      ])
+    : [null, null];
+
+  let recipientRecord: RecipientResolveResult | null = null;
+  if (directRecipSnap && directRecipSnap.exists) {
+    const rData = directRecipSnap.data() || {};
+    const canonicalUid = directRecipSnap.id;
+    const expectedAcc = (recipientAccountNumber || '').replace(/[-\s]/g, '');
+    const actualAcc = String(rData.permanentAccountNumber || rData.accountNumber || '').replace(/[-\s]/g, '');
+    const expectedUsername = (recipientUsername || '').replace(/^@/, '').trim().toLowerCase();
+    const actualUsername = String(rData.usernameLower || rData.username || '').replace(/^@/, '').trim().toLowerCase();
+
+    const accMatches = !expectedAcc || !actualAcc || expectedAcc === actualAcc;
+    const userMatches = !expectedUsername || !actualUsername || expectedUsername === actualUsername;
+
+    if (accMatches && userMatches) {
+      const fName = rData.firstName || 'Monvera';
+      const lName = rData.lastName || 'Customer';
+      recipientRecord = {
+        success: true,
+        uid: canonicalUid,
+        data: {
+          ...rData,
+          id: canonicalUid,
+          uid: canonicalUid,
+          firstName: fName,
+          lastName: lName,
+          fullName: rData.fullName || `${fName} ${lName}`.trim(),
+          permanentAccountNumber: rData.permanentAccountNumber || rData.accountNumber || '1000000000',
+          email: rData.email,
+          username: rData.username || expectedUsername,
+        },
+      };
+    }
+  }
+
+  if (!recipientRecord) {
+    recipientRecord = await resolveRecipientUser(recipientIdentifier);
+  }
+
   if (!recipientRecord || !recipientRecord.success || !recipientRecord.uid) {
     return {
       success: false,
@@ -466,17 +544,11 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
     };
   }
 
-  // 3. Resolve sender profile info
+  // 3. Extract sender profile info
   let senderData: any = {};
-  if (isFirebaseAdminConfigured()) {
-    try {
-      const senderDocSnap = await adminFirestore.collection('users').doc(senderUid).get();
-      if (senderDocSnap.exists) {
-        senderData = senderDocSnap.data()!;
-      }
-    } catch {}
-  }
-  if (!senderData.id && db.users.has(senderUid)) {
+  if (senderDocSnap && senderDocSnap.exists) {
+    senderData = senderDocSnap.data()!;
+  } else if (db.users.has(senderUid)) {
     senderData = db.users.get(senderUid)!;
   }
 
@@ -538,19 +610,22 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
       const txRef = adminFirestore.collection('transactions').doc(txId);
 
       await adminFirestore.runTransaction(async (transaction) => {
-        // Check idempotency by referenceNumber
-        const existingRefQuery = await transaction.get(
-          adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
-        );
+        // Run idempotency check, sender balance read, and recipient balance read concurrently inside the atomic transaction
+        const [existingRefQuery, primarySenderSnap, primaryRecipientSnap] = await Promise.all([
+          transaction.get(
+            adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
+          ),
+          transaction.get(senderAccRef),
+          transaction.get(recipientAccRef),
+        ]);
 
         if (!existingRefQuery.empty) {
           const existingTx = existingRefQuery.docs[0].data() as Transaction;
           if (existingTx.status === 'COMPLETED') {
             isDuplicate = true;
             finalTx = existingTx;
-            const sSnap = await transaction.get(senderAccRef);
-            if (sSnap.exists) {
-              const sd = sSnap.data()!;
+            if (primarySenderSnap.exists) {
+              const sd = primarySenderSnap.data()!;
               finalSenderMetrics = {
                 checkingBalance: Number(sd.checkingBalance ?? 0),
                 savingsBalance: Number(sd.savingsBalance ?? 0),
@@ -563,9 +638,8 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
                 accounts: sd.accounts || [],
               };
             }
-            const rSnap = await transaction.get(recipientAccRef);
-            if (rSnap.exists) {
-              const rd = rSnap.data()!;
+            if (primaryRecipientSnap.exists) {
+              const rd = primaryRecipientSnap.data()!;
               finalRecipientMetrics = {
                 checkingBalance: Number(rd.checkingBalance ?? 0),
                 savingsBalance: Number(rd.savingsBalance ?? 0),
@@ -582,26 +656,33 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
           }
         }
 
-        // Read sender account
-        let senderAccSnap = await transaction.get(senderAccRef);
+        // Resolve legacy account number docs concurrently only if primary UID docs do not exist
+        const needLegacySender = !primarySenderSnap.exists && Boolean(senderAcc) && senderAcc !== senderUid;
+        const needLegacyRecipient = !primaryRecipientSnap.exists && Boolean(recipientAcc) && recipientAcc !== recipientUid;
+        const [legacySenderSnap, legacyRecipSnap] =
+          needLegacySender || needLegacyRecipient
+            ? await Promise.all([
+                needLegacySender
+                  ? transaction.get(adminFirestore.collection('accounts').doc(senderAcc))
+                  : Promise.resolve(null),
+                needLegacyRecipient
+                  ? transaction.get(adminFirestore.collection('accounts').doc(recipientAcc))
+                  : Promise.resolve(null),
+              ])
+            : [null, null];
+
+        let senderAccSnap = primarySenderSnap;
         let actualSenderRef = senderAccRef;
-        if (!senderAccSnap.exists && senderAcc && senderAcc !== senderUid) {
-          const legacySenderSnap = await transaction.get(adminFirestore.collection('accounts').doc(senderAcc));
-          if (legacySenderSnap.exists) {
-            senderAccSnap = legacySenderSnap;
-            actualSenderRef = adminFirestore.collection('accounts').doc(senderAcc);
-          }
+        if (legacySenderSnap && legacySenderSnap.exists) {
+          senderAccSnap = legacySenderSnap;
+          actualSenderRef = adminFirestore.collection('accounts').doc(senderAcc);
         }
 
-        // Read recipient account
-        let recipientAccSnap = await transaction.get(recipientAccRef);
+        let recipientAccSnap = primaryRecipientSnap;
         let actualRecipientRef = recipientAccRef;
-        if (!recipientAccSnap.exists && recipientAcc && recipientAcc !== recipientUid) {
-          const legacyRecipSnap = await transaction.get(adminFirestore.collection('accounts').doc(recipientAcc));
-          if (legacyRecipSnap.exists) {
-            recipientAccSnap = legacyRecipSnap;
-            actualRecipientRef = adminFirestore.collection('accounts').doc(recipientAcc);
-          }
+        if (legacyRecipSnap && legacyRecipSnap.exists) {
+          recipientAccSnap = legacyRecipSnap;
+          actualRecipientRef = adminFirestore.collection('accounts').doc(recipientAcc);
         }
 
         let senderChecking = 0;

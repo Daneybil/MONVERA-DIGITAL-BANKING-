@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 
 export const KycStatusAlertModal: React.FC = () => {
-  const { currentUser, refreshNotifications, setCurrentView } = useAuth();
+  const { currentUser, setCurrentView } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [activeType, setActiveType] = useState<'rejected' | 'verified' | null>(null);
 
@@ -51,7 +51,6 @@ export const KycStatusAlertModal: React.FC = () => {
       if (!detail || !currentUser?.id) return;
 
       if (detail.userId === currentUser.id) {
-        refreshNotifications();
         if (detail.kycStatus === 'action_required' || detail.kycStatus === 'rejected') {
           const reason = detail.user?.kycRejectionReason || currentUser.kycRejectionReason || '';
           sessionStorage.removeItem(`monvera_kyc_dismiss_${currentUser.id}_rejected_${reason}`);
@@ -69,7 +68,7 @@ export const KycStatusAlertModal: React.FC = () => {
     return () => {
       window.removeEventListener('monvera_kyc_status_updated', handleKycStatusUpdated);
     };
-  }, [currentUser?.id, currentUser?.kycRejectionReason, refreshNotifications]);
+  }, [currentUser?.id, currentUser?.kycRejectionReason]);
 
   const handleDismiss = () => {
     if (!currentUser?.id) {

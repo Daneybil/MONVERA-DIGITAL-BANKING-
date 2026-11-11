@@ -161,7 +161,6 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
     const applicant = customers.find((c) => c.id === userId);
     try {
       await onReviewKycItem(userId, itemName, 'approved', undefined, applicant);
-      if (onRefreshData) onRefreshData().catch(() => {});
     } catch (err) {
       console.error('Failed to approve KYC item:', err);
     }
@@ -192,7 +191,6 @@ export const AdminKycView: React.FC<AdminKycViewProps> = ({
       action: async (reason: string) => {
         if (onReviewKycItem) {
           await onReviewKycItem(userId, itemName, 'rejected', reason, applicant);
-          if (onRefreshData) onRefreshData().catch(() => {});
         }
       },
     });

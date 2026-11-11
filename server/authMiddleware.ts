@@ -18,7 +18,8 @@ export interface AuthenticatedRequest extends Request {
  * If ADMIN_PASSWORD is not configured, returns an empty string (causing all signatures to fail closed).
  */
 function getAdminSessionSecret(): string {
-  const password = (process.env.ADMIN_PASSWORD || 'monvera-admin-default-pass-2026').replace(/^["']|["']$/g, '').trim();
+  const password = (process.env.ADMIN_PASSWORD || '').replace(/^["']|["']$/g, '').trim();
+  if (!password) return '';
   const salt = process.env.ADMIN_SESSION_SALT || 'monvera-admin-auth-secure-hmac-salt-v1';
   return crypto.createHmac('sha256', salt).update(password).digest('hex');
 }
@@ -241,6 +242,7 @@ export async function isCallerAdministrator(
   sessionToken?: string
 ): Promise<boolean> {
   if (!uid && !email) return false;
+  if (!getAdminSessionSecret()) return false;
 
   const normalizedEmail = (email || '').toLowerCase().trim();
   const configuredEmails = getConfiguredAdminEmails();
@@ -280,6 +282,12 @@ export async function requireAdminAuth(req: AuthenticatedRequest, res: Response,
   if (!isFirebaseAdminConfigured()) {
     return res.status(503).json({
       error: 'SERVICE_UNAVAILABLE: Administrator authentication service is unavailable because Firebase Admin credentials are not configured.',
+    });
+  }
+  if (!getAdminSessionSecret()) {
+    return res.status(503).json({
+      error: 'SERVICE_UNAVAILABLE: Server administrator configuration (ADMIN_PASSWORD) is not configured.',
+      errorCode: 'CONFIG_UNAVAILABLE',
     });
   }
   const authHeader = req.headers.authorization;

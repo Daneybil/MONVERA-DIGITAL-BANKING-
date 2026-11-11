@@ -37,7 +37,7 @@ import { firestoreSync } from '../../services/firestoreSync';
 import { WelcomeRewardCard } from './WelcomeRewardCard';
 
 export const DashboardOverview: React.FC = () => {
-  const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance, lastUpdateTimestamp } = useAuth();
+  const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
   const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
   const [hideBalances, setHideBalances] = useState<boolean>(false);
@@ -46,6 +46,11 @@ export const DashboardOverview: React.FC = () => {
   const [isRewardModalOpen, setIsRewardModalOpen] = useState<boolean>(false);
 
   const effectiveUid = auth.currentUser?.uid || currentUser?.id;
+  const refreshBalanceRef = React.useRef(refreshBalance);
+  refreshBalanceRef.current = refreshBalance;
+  const hasLiveBalanceRef = React.useRef(Boolean(liveBalanceMetrics));
+  hasLiveBalanceRef.current = Boolean(liveBalanceMetrics);
+  const prevBalanceSignatureRef = React.useRef<string | null>(null);
 
   // Authoritative balance metrics: live authoritative balanceMetrics from Firestore.
   // When live metrics are in-flight or temporarily reconnecting, fallback to verified last-known cache
@@ -112,6 +117,7 @@ export const DashboardOverview: React.FC = () => {
 
   useEffect(() => {
     const currentEffectiveUid = auth.currentUser?.uid || currentUser?.id;
+    prevBalanceSignatureRef.current = null;
 
     async function loadTx() {
       if (currentEffectiveUid) {
@@ -129,21 +135,24 @@ export const DashboardOverview: React.FC = () => {
       }
     }
 
-    refreshBalance();
+    if (!hasLiveBalanceRef.current) {
+      refreshBalanceRef.current();
+    }
     loadTx();
 
     const handleTxCreated = (e: any) => {
       const detail = e?.detail;
       if (!detail || !currentEffectiveUid || !detail.userId || detail.userId === currentEffectiveUid) {
         loadTx();
-        refreshBalance();
+        refreshBalanceRef.current();
       }
     };
 
     const handleBalanceUpdated = (e: any) => {
       const detail = e?.detail;
       if (!detail || !currentEffectiveUid || !detail.userId || detail.userId === currentEffectiveUid) {
-        refreshBalance();
+        refreshBalanceRef.current();
+        loadTx();
       }
     };
 
@@ -157,7 +166,34 @@ export const DashboardOverview: React.FC = () => {
         window.removeEventListener('monvera_balance_updated', handleBalanceUpdated);
       }
     };
-  }, [currentUser?.id, currentUser?.permanentAccountNumber, lastUpdateTimestamp, refreshBalance]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber]);
+
+  // Refresh recent transactions only when authoritative balances actually change (never on ordinary notifications)
+  useEffect(() => {
+    const currentEffectiveUid = auth.currentUser?.uid || currentUser?.id;
+    if (!currentEffectiveUid || !liveBalanceMetrics) return;
+    const signature = `${liveBalanceMetrics.checkingBalance}|${liveBalanceMetrics.savingsBalance}|${liveBalanceMetrics.investedBalance}|${liveBalanceMetrics.totalBalance}`;
+    if (prevBalanceSignatureRef.current === null) {
+      prevBalanceSignatureRef.current = signature;
+      return;
+    }
+    if (prevBalanceSignatureRef.current === signature) return;
+    prevBalanceSignatureRef.current = signature;
+
+    api.getTransactions({ userId: currentEffectiveUid })
+      .then((res) => {
+        if (res?.transactions) {
+          setRecentTransactions(res.transactions.slice(0, 8));
+        }
+      })
+      .catch(() => {});
+  }, [
+    currentUser?.id,
+    liveBalanceMetrics?.checkingBalance,
+    liveBalanceMetrics?.savingsBalance,
+    liveBalanceMetrics?.investedBalance,
+    liveBalanceMetrics?.totalBalance,
+  ]);
 
   if (!currentUser) {
     return (

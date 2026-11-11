@@ -193,6 +193,10 @@ export const WhatsAppSupportChat: React.FC = () => {
   const userId = currentUser?.id || '';
   const userName = currentUser ? `${currentUser.firstName} ${currentUser.lastName}`.trim() : 'Valued Customer';
   const userAcc = currentUser?.permanentAccountNumber || '1000000000';
+  const firstNameRef = useRef(currentUser?.firstName || 'there');
+  firstNameRef.current = currentUser?.firstName || 'there';
+  const userAccRef = useRef(userAcc);
+  userAccRef.current = userAcc;
 
   const handleMessagesScroll = () => {
     const el = messagesContainerRef.current;
@@ -246,7 +250,7 @@ export const WhatsAppSupportChat: React.FC = () => {
             senderName: 'Specialist',
             senderRole: 'Specialist',
             senderAvatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-            message: `Hello ${currentUser?.firstName || 'there'}! 👋 Welcome to Monvera Official Customer Support. I am your dedicated Private Wealth Specialist.`,
+            message: `Hello ${firstNameRef.current}! 👋 Welcome to Monvera Official Customer Support. I am your dedicated Private Wealth Specialist.`,
             timestamp: new Date().toISOString(),
             status: 'read',
           },
@@ -257,7 +261,7 @@ export const WhatsAppSupportChat: React.FC = () => {
             senderName: 'Specialist',
             senderRole: 'Specialist',
             senderAvatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150&auto=format&fit=crop&q=80',
-            message: `How may I assist you today with your accounts (MVB •••• ${userAcc.slice(-4)}), transfers, deposits, or document verification? You can also attach documents directly using the paperclip button.`,
+            message: `How may I assist you today with your accounts (MVB •••• ${userAccRef.current.slice(-4)}), transfers, deposits, or document verification? You can also attach documents directly using the paperclip button.`,
             timestamp: new Date().toISOString(),
             status: 'read',
           },
@@ -278,7 +282,7 @@ export const WhatsAppSupportChat: React.FC = () => {
       if (typeof unsubscribeMsgs === 'function') unsubscribeMsgs();
       if (typeof unsubscribeTyping === 'function') unsubscribeTyping();
     };
-  }, [currentUser?.id, currentUser?.firstName, userAcc]);
+  }, [currentUser?.id]);
 
   // Mark messages as read immediately when chat opens OR when new support replies arrive while chat is open
   useEffect(() => {

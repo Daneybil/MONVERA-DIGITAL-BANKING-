@@ -233,7 +233,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const res = await api.getUsers();
       if (res.users && res.users.length > 0) {
         setAvailableUsers(res.users);
-      } else {
+      } else if (auth?.currentUser) {
         const fsUsers = await firestoreSync.getAllUsers();
         if (fsUsers && fsUsers.length > 0) {
           setAvailableUsers(fsUsers);
@@ -241,12 +241,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (err) {
       console.error('Error fetching users:', err);
-      try {
-        const fsUsers = await firestoreSync.getAllUsers();
-        if (fsUsers && fsUsers.length > 0) {
-          setAvailableUsers(fsUsers);
-        }
-      } catch {}
+      if (auth?.currentUser) {
+        try {
+          const fsUsers = await firestoreSync.getAllUsers();
+          if (fsUsers && fsUsers.length > 0) {
+            setAvailableUsers(fsUsers);
+          }
+        } catch {}
+      }
     }
   }, []);
 
@@ -274,10 +276,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [fetchUsers]);
 
   const inflightBalancePromiseRef = React.useRef<Promise<void> | null>(null);
+  const inflightNotifsPromiseRef = React.useRef<Promise<void> | null>(null);
   const isHydratingSessionRef = React.useRef<string | null>(null);
+  const checkedReversalsUidRef = React.useRef<string | null>(null);
+  const syncedPushUidRef = React.useRef<string | null>(null);
+  const currentUserRef = React.useRef<UserProfile | null>(currentUser);
+  currentUserRef.current = currentUser;
 
   const refreshBalance = useCallback(async () => {
-    const effectiveUid = auth.currentUser?.uid || currentUser?.id;
+    const activeUser = currentUserRef.current;
+    const effectiveUid = auth.currentUser?.uid || activeUser?.id;
     if (!effectiveUid) return;
 
     if (inflightBalancePromiseRef.current) {
@@ -287,7 +295,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const promise = (async () => {
       try {
         // 1. Retrieve verified balances directly from permanent Firestore ledger: accounts/{effectiveUid}
-        const fsMetrics = await firestoreSync.getAccountBalances(effectiveUid, currentUser?.permanentAccountNumber);
+        const fsMetrics = await firestoreSync.getAccountBalances(effectiveUid, activeUser?.permanentAccountNumber);
         if (fsMetrics) {
           setBalanceMetrics(fsMetrics);
           cacheUserBalances(effectiveUid, fsMetrics);
@@ -295,7 +303,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
 
         // 2. Fetch backend metrics if Firestore client is initializing
-        const metrics = await api.getBalanceMetrics(effectiveUid, currentUser?.permanentAccountNumber);
+        const metrics = await api.getBalanceMetrics(effectiveUid, activeUser?.permanentAccountNumber);
         if (metrics) {
           setBalanceMetrics(metrics);
           cacheUserBalances(effectiveUid, metrics);
@@ -316,33 +324,53 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [currentUser?.id, currentUser?.permanentAccountNumber]);
 
   const refreshNotifications = useCallback(async () => {
-    if (!currentUser) return;
-    try {
-      const res = await api.getNotifications(currentUser.id, currentUser.permanentAccountNumber, currentUser.email);
-      if (res.notifications) {
-        setNotifications(res.notifications);
-        setLastUpdateTimestamp(Date.now());
-      }
-    } catch (err) {
-      console.error('Failed to fetch notifications:', err);
+    const activeUser = currentUserRef.current;
+    if (!activeUser?.id) return;
+
+    if (inflightNotifsPromiseRef.current) {
+      return inflightNotifsPromiseRef.current;
     }
-  }, [currentUser]);
+
+    const promise = (async () => {
+      try {
+        const res = await api.getNotifications(
+          activeUser.id,
+          activeUser.permanentAccountNumber,
+          activeUser.email
+        );
+        if (res.notifications) {
+          setNotifications(res.notifications);
+          setLastUpdateTimestamp(Date.now());
+        }
+      } catch (err) {
+        console.error('Failed to fetch notifications:', err);
+      } finally {
+        setTimeout(() => {
+          inflightNotifsPromiseRef.current = null;
+        }, 300);
+      }
+    })();
+
+    inflightNotifsPromiseRef.current = promise;
+    return promise;
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email]);
 
   const refreshProfile = useCallback(async () => {
-    if (!currentUser?.id) return;
+    const activeUser = currentUserRef.current;
+    if (!activeUser?.id) return;
     try {
       // 1. Authoritative Firestore document read (Firestore is the single source of truth)
-      const fsProfile = await firestoreSync.getUserProfile(currentUser.id);
+      const fsProfile = await firestoreSync.getUserProfile(activeUser.id);
       if (fsProfile) {
         // Strict protection: verified status can NEVER be downgraded to pending or unverified
-        const effectiveKycStatus = (currentUser.kycStatus === 'verified' && fsProfile.kycStatus !== 'verified')
+        const effectiveKycStatus = (activeUser.kycStatus === 'verified' && fsProfile.kycStatus !== 'verified')
           ? 'verified'
-          : (fsProfile.kycStatus || currentUser.kycStatus);
+          : (fsProfile.kycStatus || activeUser.kycStatus);
 
         const hasChanges =
-          effectiveKycStatus !== currentUser.kycStatus ||
-          (effectiveKycStatus === 'verified' && currentUser.dailyTransactionLimit !== 1000000) ||
-          (fsProfile.status && fsProfile.status !== currentUser.status);
+          effectiveKycStatus !== activeUser.kycStatus ||
+          (effectiveKycStatus === 'verified' && activeUser.dailyTransactionLimit !== 1000000) ||
+          (fsProfile.status && fsProfile.status !== activeUser.status);
 
         if (hasChanges) {
           setCurrentUser((prev) => {
@@ -361,13 +389,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       // 2. Only check backend server state if Firestore profile is not found
-      const backendRes = await api.getCurrentUser(currentUser.id);
+      const backendRes = await api.getCurrentUser(activeUser.id);
       if (backendRes?.user) {
-        const backendKyc = (currentUser.kycStatus === 'verified' && backendRes.user.kycStatus !== 'verified')
+        const backendKyc = (activeUser.kycStatus === 'verified' && backendRes.user.kycStatus !== 'verified')
           ? 'verified'
-          : (backendRes.user.kycStatus || currentUser.kycStatus);
+          : (backendRes.user.kycStatus || activeUser.kycStatus);
 
-        if (backendKyc !== currentUser.kycStatus || backendRes.user.dailyTransactionLimit !== currentUser.dailyTransactionLimit) {
+        if (backendKyc !== activeUser.kycStatus || backendRes.user.dailyTransactionLimit !== activeUser.dailyTransactionLimit) {
           setCurrentUser((prev) => {
             if (!prev) return backendRes.user;
             return {
@@ -381,7 +409,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
     } catch {}
-  }, [currentUser?.id, currentUser?.kycStatus, currentUser?.dailyTransactionLimit, currentUser?.status]);
+  }, [currentUser?.id]);
+
+  const refreshBalanceRef = React.useRef(refreshBalance);
+  refreshBalanceRef.current = refreshBalance;
+  const refreshNotificationsRef = React.useRef(refreshNotifications);
+  refreshNotificationsRef.current = refreshNotifications;
+  const refreshProfileRef = React.useRef(refreshProfile);
+  refreshProfileRef.current = refreshProfile;
 
   // Real-time synchronization interval & Firestore onSnapshot listeners
   useEffect(() => {
@@ -389,20 +424,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!effectiveUid) return;
 
     const isTargetUser = (target: any): boolean => {
+      const activeUser = currentUserRef.current;
       if (!target) return false;
       if (!target.userId && !target.accountNumber && !target.email && !target.fallbackUserId) return true;
-      if (target.userId === effectiveUid || target.fallbackUserId === effectiveUid || (currentUser && target.userId === currentUser.id)) return true;
+      if (target.userId === effectiveUid || target.fallbackUserId === effectiveUid || (activeUser && target.userId === activeUser.id)) return true;
       const cleanTargetAcc = (target.accountNumber || '').replace(/[-\s]/g, '');
-      const cleanUserAcc = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const cleanUserAcc = (activeUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
       if (cleanTargetAcc && cleanUserAcc && cleanTargetAcc === cleanUserAcc) return true;
-      if (target.email && currentUser?.email && target.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim()) return true;
+      if (target.email && activeUser?.email && target.email.toLowerCase().trim() === activeUser.email.toLowerCase().trim()) return true;
       return false;
     };
 
     // 1. Real-time Firestore account balance listener under accounts/{effectiveUid}
     const unsubBalance = firestoreSync.subscribeToAccountBalances(
       effectiveUid,
-      currentUser?.permanentAccountNumber,
+      currentUserRef.current?.permanentAccountNumber,
       (newMetrics) => {
         setBalanceMetrics(newMetrics);
         cacheUserBalances(effectiveUid, newMetrics);
@@ -422,43 +458,79 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               : (updatedProfile.kycStatus || prev.kycStatus);
             // Invariant: authoritatively accept the Firestore status (whether frozen or active)
             const effectiveStatus = updatedProfile.status || prev.status || 'active';
+            const nextLimit = effectiveKyc === 'verified' ? 1000000 : (updatedProfile.dailyTransactionLimit || prev.dailyTransactionLimit);
+            const nextAvatar = getPersistedAvatar(updatedProfile.id, updatedProfile.avatarUrl || prev.avatarUrl);
+
+            const isUnchanged =
+              prev.status === effectiveStatus &&
+              prev.kycStatus === effectiveKyc &&
+              prev.dailyTransactionLimit === nextLimit &&
+              prev.avatarUrl === nextAvatar &&
+              prev.kycRejectionReason === updatedProfile.kycRejectionReason &&
+              prev.kycVerifiedAt === updatedProfile.kycVerifiedAt &&
+              prev.kycSubmittedAt === updatedProfile.kycSubmittedAt &&
+              prev.firstName === (updatedProfile.firstName ?? prev.firstName) &&
+              prev.lastName === (updatedProfile.lastName ?? prev.lastName) &&
+              prev.fullName === (updatedProfile.fullName ?? prev.fullName) &&
+              prev.emailVerified === (updatedProfile.emailVerified ?? prev.emailVerified) &&
+              prev.twoFactorEnabled === (updatedProfile.twoFactorEnabled ?? prev.twoFactorEnabled) &&
+              prev.role === (updatedProfile.role ?? prev.role) &&
+              JSON.stringify(prev.kycItemReviews || null) === JSON.stringify(updatedProfile.kycItemReviews || null);
+
+            if (isUnchanged) return prev;
+
             return {
               ...prev,
               ...updatedProfile,
               status: effectiveStatus,
               kycStatus: effectiveKyc,
-              dailyTransactionLimit: effectiveKyc === 'verified' ? 1000000 : (updatedProfile.dailyTransactionLimit || prev.dailyTransactionLimit),
-              avatarUrl: getPersistedAvatar(updatedProfile.id, updatedProfile.avatarUrl || prev.avatarUrl),
+              dailyTransactionLimit: nextLimit,
+              avatarUrl: nextAvatar,
             };
           });
         }
       }
     );
 
-    // 3. Real-time Firestore loan listener: immediately reconcile active/approved loans into Checking Account balance & notification bell
+    // 3. Real-time Firestore loan listener: reconcile newly activated/approved loans into Checking Account balance & notification bell
+    const targetLoanUid = currentUser?.id || effectiveUid;
+    const seenLoanStatuses = new Map<string, string>();
+    let hasInitialLoanSnapshot = false;
     const unsubLoans = firestoreSync.subscribeToLoans((allLoans) => {
-      if (!currentUser) return;
-      const userCleanAcc = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
-      const userEmail = (currentUser.email || '').toLowerCase().trim();
+      const activeUser = currentUserRef.current;
+      if (!activeUser) return;
+      const userCleanAcc = (activeUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
+      const userEmail = (activeUser.email || '').toLowerCase().trim();
 
-      const userActiveLoans = allLoans.filter((l) => {
+      let newlyActivatedOrApproved = false;
+      allLoans.forEach((l) => {
         const lCleanAcc = (l.permanentAccountNumber || '').replace(/[-\s]/g, '');
         const lEmail = (l.applicantEmail || '').toLowerCase().trim();
-        const matches = l.userId === currentUser.id ||
+        const matches = l.userId === activeUser.id ||
           (userCleanAcc && lCleanAcc === userCleanAcc) ||
           (userEmail && lEmail === userEmail);
-        return matches && (l.status === 'ACTIVE' || l.status === 'APPROVED');
+        if (!matches) return;
+
+        const prevStatus = seenLoanStatuses.get(l.id);
+        seenLoanStatuses.set(l.id, l.status);
+        if (
+          hasInitialLoanSnapshot &&
+          prevStatus !== l.status &&
+          (l.status === 'ACTIVE' || l.status === 'APPROVED')
+        ) {
+          newlyActivatedOrApproved = true;
+        }
       });
+      hasInitialLoanSnapshot = true;
 
-      if (userActiveLoans.length > 0) {
-        refreshBalance();
-        refreshNotifications();
+      if (newlyActivatedOrApproved) {
+        refreshBalanceRef.current();
+        refreshNotificationsRef.current();
       }
-    }, currentUser.id);
+    }, targetLoanUid);
 
-    // 4. Real-time Firestore + Server notification sync: keeps the User Dashboard notification bell updated immediately
+    // 4. Real-time Firestore notification listener: keeps the User Dashboard notification bell updated immediately
     const targetNotifUid = currentUser?.id || effectiveUid;
-    refreshNotifications();
     const unsubNotifications = firestoreSync.subscribeToNotifications(
       targetNotifUid,
       (newNotifs) => {
@@ -481,28 +553,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         });
         setLastUpdateTimestamp(Date.now());
       },
-      currentUser?.permanentAccountNumber,
-      currentUser?.email
+      currentUserRef.current?.permanentAccountNumber,
+      currentUserRef.current?.email
     );
 
-    // 5. Perform initial check for pending withdrawal reversals (event-driven updates and live listeners handle real-time sync)
-    api.checkAndExecutePendingWithdrawalReversals(currentUser.id).catch(() => {});
+    // 5. Perform initial once-per-session check for pending withdrawal reversals (preserves reversal processing without re-running on profile updates)
+    if (targetNotifUid && checkedReversalsUidRef.current !== targetNotifUid) {
+      checkedReversalsUidRef.current = targetNotifUid;
+      api.checkAndExecutePendingWithdrawalReversals(targetNotifUid).catch(() => {});
+    }
 
-    // 6. Silently sync FCM registration token if browser permission is already granted
-    pushNotificationService.syncTokenForUser(currentUser.id).catch(() => {});
+    // 6. Silently sync FCM registration token once per session if browser permission is already granted
+    if (targetNotifUid && syncedPushUidRef.current !== targetNotifUid) {
+      syncedPushUidRef.current = targetNotifUid;
+      pushNotificationService.syncTokenForUser(targetNotifUid).catch(() => {});
+    }
 
     // 7. Listen to foreground push notifications while tab is open
     const unsubPush = pushNotificationService.listenToForegroundMessages(() => {
-      refreshNotifications();
-      refreshBalance();
+      refreshNotificationsRef.current();
+      refreshBalanceRef.current();
     });
 
     // 8. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
     const handleKycStatusUpdated = (e: any) => {
       const detail = e.detail;
+      const activeUser = currentUserRef.current;
       if (!detail) return;
-      if (currentUser?.id && detail.userId === currentUser.id) {
-        refreshNotifications();
+      if (activeUser?.id && detail.userId === activeUser.id) {
         if (detail.user) {
           setCurrentUser((prev) => {
             if (!prev) return detail.user;
@@ -546,8 +624,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (e.key === 'monvera_kyc_sync_event' && e.newValue) {
         try {
           const data = JSON.parse(e.newValue);
-          if (currentUser?.id && data.userId === currentUser.id) {
-            refreshProfile();
+          const activeUser = currentUserRef.current;
+          if (activeUser?.id && data.userId === activeUser.id) {
+            refreshProfileRef.current();
           }
         } catch {}
       }
@@ -559,14 +638,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const handleBalanceUpdated = (e: any) => {
       const detail = e.detail;
-      if (!detail) return;
+      const activeUser = currentUserRef.current;
+      if (!detail || !activeUser?.id) return;
       if (isTargetUser(detail)) {
         if (detail.balanceMetrics) {
           setBalanceMetrics(detail.balanceMetrics);
-          cacheUserBalances(currentUser.id, detail.balanceMetrics);
+          cacheUserBalances(activeUser.id, detail.balanceMetrics);
           setLastUpdateTimestamp(Date.now());
         } else {
-          refreshBalance();
+          refreshBalanceRef.current();
         }
       }
     };
@@ -582,8 +662,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return [detail.notification, ...prev];
           });
           setLastUpdateTimestamp(Date.now());
+        } else {
+          refreshNotificationsRef.current();
         }
-        refreshNotifications();
       }
     };
 
@@ -592,14 +673,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       syncChannel = new BroadcastChannel('monvera_sync_channel');
       syncChannel.onmessage = (event) => {
         const data = event.data;
-        if (!data) return;
+        const activeUser = currentUserRef.current;
+        if (!data || !activeUser?.id) return;
         if (isTargetUser(data)) {
           if (data.balanceMetrics) {
             setBalanceMetrics(data.balanceMetrics);
-            cacheUserBalances(currentUser.id, data.balanceMetrics);
+            cacheUserBalances(activeUser.id, data.balanceMetrics);
             setLastUpdateTimestamp(Date.now());
           } else {
-            refreshBalance();
+            refreshBalanceRef.current();
           }
           if (data.notification) {
             setNotifications((prev) => {
@@ -608,8 +690,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               return [data.notification, ...prev];
             });
             setLastUpdateTimestamp(Date.now());
+          } else {
+            refreshNotificationsRef.current();
           }
-          refreshNotifications();
         }
       };
     } catch {}
@@ -635,7 +718,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.removeEventListener('monvera_notification_created', handleNotificationCreated);
       window.removeEventListener('storage', handleStorageEvent);
     };
-  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, refreshBalance, refreshNotifications, refreshProfile]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email]);
 
   const getPersistedAvatar = (userId: string, defaultAvatar?: string) => {
     try {
@@ -743,22 +826,66 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!isMounted) return;
 
       if (firebaseUser) {
-        if (isHydratingSessionRef.current === firebaseUser.uid) {
+        if (
+          isHydratingSessionRef.current === '__pending_login__' ||
+          isHydratingSessionRef.current === firebaseUser.uid
+        ) {
           console.log('[Auth] Active session hydration already in progress for UID:', firebaseUser.uid, '- skipping redundant onAuthStateChanged queries.');
-          if (isMounted) setIsLoading(false);
           return;
         }
 
         try {
           console.log('[Auth] Authenticated Firebase user detected:', firebaseUser.uid);
-          
-          // Always prioritize authoritative Firestore balances across all browsers
-          let userProfile = await firestoreSync.getUserProfile(firebaseUser.uid);
+
+          // Fetch authoritative Firestore user profile and account balances concurrently
+          const [fsUserProfile, initialFsMetrics] = await Promise.all([
+            firestoreSync.getUserProfile(firebaseUser.uid),
+            firestoreSync.getAccountBalances(firebaseUser.uid).catch(() => null),
+          ]);
+          let userProfile = fsUserProfile;
 
           if (!userProfile) {
             // If user signed in but doc not yet synced, try api or fallback
             const res = await api.getCurrentUser(firebaseUser.uid);
             if (res.user) userProfile = res.user;
+          }
+
+          let hasAdminClaim = false;
+          try {
+            const tokenResult = await firebaseUser.getIdTokenResult();
+            hasAdminClaim =
+              tokenResult?.claims?.admin === true ||
+              tokenResult?.claims?.role === 'admin' ||
+              tokenResult?.claims?.role === 'super_admin';
+          } catch {}
+
+          const isAdminContext =
+            checkIsAdminPath() ||
+            hasAdminClaim ||
+            userProfile?.role === 'admin' ||
+            userProfile?.role === 'super_admin';
+
+          // Reconstruct transient in-memory profile for authenticated admins whose Firebase account has no users/{uid} doc yet
+          if (!userProfile && (checkIsAdminPath() || hasAdminClaim)) {
+            const emailStr = (firebaseUser.email || '').toLowerCase();
+            userProfile = {
+              id: firebaseUser.uid,
+              username: emailStr.split('@')[0] || `admin_${firebaseUser.uid.slice(0, 5)}`,
+              firstName: firebaseUser.displayName?.split(' ')[0] || 'Monvera',
+              lastName: firebaseUser.displayName?.split(' ').slice(1).join(' ') || 'Administrator',
+              fullName: firebaseUser.displayName || 'Monvera Administrator',
+              email: emailStr,
+              phone: '+1 (555) 000-0000',
+              permanentAccountNumber: '0000000000',
+              country: 'United States',
+              status: 'active',
+              role: 'customer',
+              membershipTier: 'Private Wealth',
+              twoFactorEnabled: false,
+              createdAt: new Date().toISOString(),
+              kycStatus: 'verified',
+              dailyTransactionLimit: 1000000,
+            };
           }
 
           if (userProfile && isMounted) {
@@ -769,24 +896,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               const enrolledFactors = multiFactor(firebaseUser).enrolledFactors;
               isMfaEnrolled = enrolledFactors.some((f) => f.factorId === TotpMultiFactorGenerator.FACTOR_ID);
             } catch {}
-            const resolvedUser = {
+
+            let resolvedRole = userProfile.role || 'customer';
+            if (isAdminContext) {
+              const adminCheck = await api.verifyAdminSession();
+              if (adminCheck.isAdmin) {
+                resolvedRole = 'admin';
+              } else if (!adminCheck.recoverable) {
+                // Explicit non-admin rejection: never trust client-side/Firebase claims alone as admin authorization
+                resolvedRole = resolvedRole === 'admin' || resolvedRole === 'super_admin' ? 'customer' : resolvedRole;
+              }
+            }
+
+            const resolvedUser: UserProfile = {
               ...userProfile,
               id: firebaseUser.uid,
+              role: resolvedRole,
               emailVerified: isEmailVerified,
               avatarUrl: persistedAvatar,
               twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
             };
-            
-            const cachedBalances = getCachedUserBalances(resolvedUser.id);
-            if (cachedBalances && isMounted) {
-              setBalanceMetrics((prev) => prev || cachedBalances);
-            }
 
-            // Concurrently fetch verified balances from Firestore
-            const [fsMetrics, notifRes] = await Promise.all([
-              firestoreSync.getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber).catch(() => null),
-              api.getNotifications(resolvedUser.id).catch(() => ({ notifications: [] }))
-            ]);
+            let fsMetrics = initialFsMetrics;
+            const isZeroOrMissing =
+              !fsMetrics ||
+              (Number(fsMetrics.checkingBalance ?? 0) === 0 && Number(fsMetrics.totalBalance ?? 0) === 0);
+            if (isZeroOrMissing && resolvedUser.permanentAccountNumber && resolvedUser.permanentAccountNumber !== '0000000000') {
+              fsMetrics = await firestoreSync
+                .getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber)
+                .catch(() => fsMetrics);
+            }
 
             if (fsMetrics && isMounted) {
               setBalanceMetrics(fsMetrics);
@@ -799,21 +938,30 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               }
             }
 
-            setCurrentUser(resolvedUser);
-            cacheUserInDirectory(resolvedUser);
-
-            // If email verification status changed in Firebase Auth, sync to Firestore
-            if (userProfile.emailVerified !== isEmailVerified) {
-              firestoreSync.saveUserProfile(userProfile.id, { emailVerified: isEmailVerified }).catch(console.error);
+            if (isMounted) {
+              setCurrentUser(resolvedUser);
+              cacheUserInDirectory(resolvedUser);
             }
 
-            if (notifRes?.notifications && isMounted) setNotifications(notifRes.notifications);
+            // Load nonessential notifications in background so slow HTTP requests never block session hydration
+            api.getNotifications(resolvedUser.id, resolvedUser.permanentAccountNumber, resolvedUser.email)
+              .then((notifRes) => {
+                if (notifRes?.notifications && isMounted) setNotifications(notifRes.notifications);
+              })
+              .catch(() => {});
+
+            // If email verification status changed in Firebase Auth, sync to Firestore
+            if (userProfile.permanentAccountNumber !== '0000000000' && userProfile.emailVerified !== isEmailVerified) {
+              firestoreSync.saveUserProfile(userProfile.id, { emailVerified: isEmailVerified }).catch(console.error);
+            }
           }
         } catch (err) {
           console.error('[Auth] Error fetching user profile on auth change:', err);
         }
       } else {
         // No authenticated session
+        checkedReversalsUidRef.current = null;
+        syncedPushUidRef.current = null;
         if (isMounted) {
           setCurrentUser(null);
           setBalanceMetrics(null);
@@ -837,8 +985,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const hydrateUserSession = async (
     firebaseUser: FirebaseUser,
     cleanPassword?: string,
-    emailFallback?: string
-  ): Promise<UserProfile> => {
+    emailFallback?: string,
+    options?: { isAdminLoginFlow?: boolean }
+  ): Promise<UserProfile & { _adminVerification?: { isAdmin: boolean; recoverable?: boolean; errorCode?: string; error?: string } }> => {
     const uid = firebaseUser.uid;
     const emailToAuth = firebaseUser.email || emailFallback || '';
     console.log(`[Auth] Hydrating session for Firebase User UID: ${uid}`);
@@ -847,8 +996,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isHydratingSessionRef.current = uid;
 
     try {
-      // 1. Fetch User Profile from Firestore: users/{uid}
-      let userProfile = await firestoreSync.getUserProfile(uid);
+      // 1. Fetch User Profile (users/{uid}) and Account Balances (accounts/{uid}) concurrently in a single RTT
+      const [fsProfile, initialFsMetrics] = await Promise.all([
+        firestoreSync.getUserProfile(uid),
+        firestoreSync.getAccountBalances(uid).catch(() => null),
+      ]);
+      let userProfile = fsProfile;
 
       // If not yet in Firestore, check directory cache or server before creating baseline
       if (!userProfile) {
@@ -875,18 +1028,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const fallbackProfile: UserProfile = {
             id: uid,
             username: emailToAuth.split('@')[0] || `user_${uid.slice(0, 5)}`,
-            firstName: emailToAuth.split('@')[0] || 'Valued',
-            lastName: 'Customer',
+            firstName: options?.isAdminLoginFlow ? 'Monvera' : (emailToAuth.split('@')[0] || 'Valued'),
+            lastName: options?.isAdminLoginFlow ? 'Administrator' : 'Customer',
             email: emailToAuth.toLowerCase(),
             phone: '+1 (555) 000-0000',
-            permanentAccountNumber: `10${Math.floor(10000000 + Math.random() * 90000000)}`,
+            permanentAccountNumber: options?.isAdminLoginFlow ? '0000000000' : `10${Math.floor(10000000 + Math.random() * 90000000)}`,
             country: 'United States',
             status: 'active',
             role: 'customer',
-            membershipTier: 'Standard',
+            membershipTier: options?.isAdminLoginFlow ? 'Private Wealth' : 'Standard',
             twoFactorEnabled: false,
             createdAt: new Date().toISOString(),
-            kycStatus: 'unverified',
+            kycStatus: options?.isAdminLoginFlow ? 'verified' : 'unverified',
             dailyTransactionLimit: 1000000,
           };
           // Frontend-only fallback: NEVER persist fallbackProfile with unverified status to Firestore
@@ -902,24 +1055,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } catch {}
 
       const persistedAvatar = getPersistedAvatar(userProfile.id, userProfile.avatarUrl);
+      let resolvedRole = userProfile.role || 'customer';
+      let isUserAdmin = false;
+      let adminVerification: { isAdmin: boolean; recoverable?: boolean; errorCode?: string; error?: string } | undefined;
+
+      // Verify administrator authorization with backend ONLY when on admin flow/path or profile already carries admin role
+      const shouldVerifyAdmin =
+        Boolean(options?.isAdminLoginFlow) ||
+        checkIsAdminPath() ||
+        resolvedRole === 'super_admin' ||
+        resolvedRole === 'admin';
+
+      if (shouldVerifyAdmin && firebaseUser) {
+        const adminCheck = await api.verifyAdminSession({ forceRefresh: Boolean(options?.isAdminLoginFlow) });
+        adminVerification = adminCheck;
+        if (adminCheck.isAdmin) {
+          isUserAdmin = true;
+          resolvedRole = 'admin';
+        } else if (!adminCheck.recoverable) {
+          // Explicit rejection from server: do NOT treat Firebase login or client role as admin authorization
+          isUserAdmin = false;
+          if (resolvedRole === 'admin' || resolvedRole === 'super_admin') {
+            resolvedRole = 'customer';
+          }
+        }
+      }
+
       const finalUser: UserProfile = {
         ...userProfile,
+        id: uid,
+        role: resolvedRole,
         avatarUrl: persistedAvatar,
         twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
       };
 
-      // Set user immediately for responsive UI feedback
-      setCurrentUser(finalUser);
-      cacheUserInDirectory(finalUser);
+      // 2. Resolve authoritative account balances (only run legacy accountNumber/API fallback if parallel primary read returned missing/zero)
+      let finalMetricsToSet = initialFsMetrics;
+      const isZeroOrMissing =
+        !finalMetricsToSet ||
+        (Number(finalMetricsToSet.checkingBalance ?? 0) === 0 && Number(finalMetricsToSet.totalBalance ?? 0) === 0);
 
-      // Hydrate with verified local cache balances immediately
-      const cachedBalances = getCachedUserBalances(uid);
-      if (cachedBalances) {
-        setBalanceMetrics((prev) => prev || cachedBalances);
+      if (isZeroOrMissing && finalUser.permanentAccountNumber && finalUser.permanentAccountNumber !== '0000000000') {
+        const legacyMetrics = await firestoreSync.getAccountBalances(uid, finalUser.permanentAccountNumber).catch(() => null);
+        if (legacyMetrics && (Number(legacyMetrics.checkingBalance ?? 0) > 0 || Number(legacyMetrics.totalBalance ?? 0) > 0)) {
+          finalMetricsToSet = legacyMetrics;
+        }
       }
-
-      // 2. Fetch verified account balances directly from permanent Firestore ledger accounts/{uid}
-      let finalMetricsToSet = await firestoreSync.getAccountBalances(uid, finalUser.permanentAccountNumber).catch(() => null);
 
       if (!finalMetricsToSet) {
         // Resilient fallback to backend API if Firestore accounts doc is initializing
@@ -940,6 +1121,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.warn(`[Auth] Authoritative account ledger document accounts/${uid} was not found. Financial records preserved.`);
       }
 
+      // Commit resolved user & navigation view cleanly once balances are ready
+      setCurrentUser(finalUser);
+      cacheUserInDirectory(finalUser);
+
       // 3. Asynchronously fetch notifications in background without blocking login navigation
       api.getNotifications(uid, finalUser.permanentAccountNumber, finalUser.email)
         .then((notifRes) => {
@@ -949,25 +1134,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         })
         .catch(() => {});
 
-      // 4. Verify admin role only when authenticating on the private admin path or when user has administrative role
-      let isUserAdmin = finalUser.role === 'super_admin' || finalUser.role === 'admin';
-      if ((isUserAdmin || checkIsAdminPath()) && firebaseUser) {
-        try {
-          const adminCheck = await api.verifyAdminSession();
-          if (adminCheck.isAdmin) {
-            isUserAdmin = true;
-            finalUser.role = 'admin';
-          }
-        } catch {}
-      }
-
-      if (isUserAdmin || checkIsAdminPath()) {
+      if (isUserAdmin || checkIsAdminPath() || options?.isAdminLoginFlow) {
         setCurrentView('admin');
       } else {
         setCurrentView('dashboard');
       }
       setActiveModal(null);
-      return finalUser;
+      return { ...finalUser, _adminVerification: adminVerification };
     } finally {
       setTimeout(() => {
         if (isHydratingSessionRef.current === uid) {
@@ -1033,17 +1206,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (!matchedEmail) {
           try {
             const usersCol = collection(db, 'users');
-            const [snapAcc, snapLegacyAcc, snapUser, snapUserLower] = await Promise.all([
+            const [snapAcc, snapLegacyAcc, snapUser, snapUserLower, snapUserFolded] = await Promise.all([
               cleanAcc ? getDocs(query(usersCol, where('permanentAccountNumber', '==', cleanAcc))) : Promise.resolve(null),
               cleanAcc ? getDocs(query(usersCol, where('accountNumber', '==', cleanAcc))) : Promise.resolve(null),
               getDocs(query(usersCol, where('username', '==', cleanIdentifier.replace(/^@/, '')))),
-              getDocs(query(usersCol, where('usernameLower', '==', cleanUser)))
+              getDocs(query(usersCol, where('usernameLower', '==', cleanUser))),
+              getDocs(query(usersCol, where('username', '==', cleanUser)))
             ]);
 
             const docSnap = (snapAcc && !snapAcc.empty && snapAcc.docs[0]) ||
                             (snapLegacyAcc && !snapLegacyAcc.empty && snapLegacyAcc.docs[0]) ||
                             (snapUser && !snapUser.empty && snapUser.docs[0]) ||
-                            (snapUserLower && !snapUserLower.empty && snapUserLower.docs[0]);
+                            (snapUserLower && !snapUserLower.empty && snapUserLower.docs[0]) ||
+                            (snapUserFolded && !snapUserFolded.empty && snapUserFolded.docs[0]);
 
             if (docSnap) {
               const userData = docSnap.data();
@@ -1074,68 +1249,88 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
 
-      // 0. Verify administrator credentials with backend environment variables (ADMIN_EMAIL, ADMIN_PASSWORD)
-      let adminAuthAttempted = false;
-      try {
-        const adminAuthRes = await api.adminLogin(emailToAuth, cleanPassword);
-        if (adminAuthRes.isAdminAttempt) {
-          adminAuthAttempted = true;
-          if (!adminAuthRes.success || !adminAuthRes.customToken) {
+      // 0. Only invoke administrator authentication endpoint when signing in through the private admin portal path
+      if (checkIsAdminPath()) {
+        let adminAuthAttempted = false;
+        try {
+          const adminAuthRes = await api.adminLogin(emailToAuth, cleanPassword);
+          if (adminAuthRes.isAdminAttempt) {
+            adminAuthAttempted = true;
+            if (!adminAuthRes.success || !adminAuthRes.customToken) {
+              return {
+                success: false,
+                errorCode: adminAuthRes.errorCode || 'INVALID_CREDENTIALS',
+                error: adminAuthRes.error || 'Invalid administrator email or password. Access denied.',
+              };
+            }
+
+            // Sign in using the cryptographically minted Firebase Custom Token
+            console.log(`[Auth] Authenticating administrator ${emailToAuth} via verified backend session...`);
+            isHydratingSessionRef.current = '__pending_login__';
+            let userCredential;
+            try {
+              userCredential = await signInWithCustomToken(auth, adminAuthRes.customToken);
+            } catch (fbSignErr) {
+              if (isHydratingSessionRef.current === '__pending_login__') {
+                isHydratingSessionRef.current = null;
+              }
+              throw fbSignErr;
+            }
+            const hydrated = await hydrateUserSession(userCredential.user, cleanPassword, emailToAuth, {
+              isAdminLoginFlow: true,
+            });
+            if (!hydrated._adminVerification?.isAdmin) {
+              if (!hydrated._adminVerification?.recoverable) {
+                await signOut(auth).catch(() => {});
+                clearAdminSessionToken();
+              }
+              return {
+                success: false,
+                errorCode: hydrated._adminVerification?.errorCode || 'ADMIN_SESSION_UNVERIFIED',
+                error:
+                  hydrated._adminVerification?.error ||
+                  'Administrator session could not be verified by the server.',
+              };
+            }
+            setCurrentViewState('admin');
+            return { success: true };
+          } else {
             return {
               success: false,
-              errorCode: adminAuthRes.errorCode || 'INVALID_CREDENTIALS',
-              error: adminAuthRes.error || 'Invalid administrator email or password. Access denied.',
+              errorCode: adminAuthRes.errorCode || 'EMAIL_NOT_ADMIN',
+              error: adminAuthRes.error || 'This email address is not recognized as an authorized administrator.',
             };
           }
-
-          // Sign in using the cryptographically minted Firebase Custom Token
-          console.log(`[Auth] Authenticating administrator ${emailToAuth} via verified backend session...`);
-          const userCredential = await signInWithCustomToken(auth, adminAuthRes.customToken);
-          await hydrateUserSession(userCredential.user, cleanPassword, emailToAuth);
-          if (checkIsAdminPath()) {
-            setCurrentViewState('admin');
-          }
-          return { success: true };
-        } else if (checkIsAdminPath()) {
-          // If on admin path and backend reported email is not an admin
-          return {
-            success: false,
-            errorCode: adminAuthRes.errorCode || 'EMAIL_NOT_ADMIN',
-            error: adminAuthRes.error || 'This email address is not recognized as an authorized administrator.',
-          };
-        }
-      } catch (adminErr: any) {
-        console.warn('[Auth] Administrator authentication check notice:', adminErr);
-        if (checkIsAdminPath()) {
+        } catch (adminErr: any) {
+          console.warn('[Auth] Administrator authentication check notice:', adminErr);
           return {
             success: false,
             errorCode: 'AUTH_FAILED',
             error: adminErr?.message || 'Administrator authentication failed. Access denied.',
           };
         }
+
+        if (adminAuthAttempted) {
+          return {
+            success: false,
+            errorCode: 'ADMIN_AUTH_FAILED',
+            error: 'Administrator authentication failed. Access denied.',
+          };
+        }
       }
 
-      if (adminAuthAttempted) {
-        // If an administrator login was attempted, NEVER fall through to standard customer login
-        return {
-          success: false,
-          errorCode: 'ADMIN_AUTH_FAILED',
-          error: 'Administrator authentication failed. Access denied.',
-        };
-      }
-
-      // If attempting login from the private admin path, require valid administrator credentials
-      if (checkIsAdminPath()) {
-        return {
-          success: false,
-          errorCode: 'EMAIL_NOT_ADMIN',
-          error: 'This portal requires authorized administrator credentials. Access denied.',
-        };
-      }
-
-      // 1. Authenticate with Firebase Authentication
+      // 1. Authenticate customer directly with Firebase Authentication (lock hydration before Firebase emits onAuthStateChanged)
       console.log(`[Auth] Authenticating ${emailToAuth} with Firebase Auth...`);
-      const userCredential = await signInWithEmailAndPassword(auth, emailToAuth, cleanPassword);
+      isHydratingSessionRef.current = '__pending_login__';
+      let userCredential;
+      try {
+        userCredential = await signInWithEmailAndPassword(auth, emailToAuth, cleanPassword);
+      } catch (fbLoginErr) {
+        if (isHydratingSessionRef.current === '__pending_login__') {
+          isHydratingSessionRef.current = null;
+        }
+        throw fbLoginErr;
+      }
       await hydrateUserSession(userCredential.user, cleanPassword, emailToAuth);
       return { success: true };
     } catch (err: any) {
@@ -1206,12 +1401,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
       }
 
-      // 2. Exchange cryptographically minted Firebase Custom Token
+      // 2. Exchange cryptographically minted Firebase Custom Token (lock hydration before Firebase emits onAuthStateChanged)
       console.log(`[Auth] Exchanging Firebase Custom Token for administrator session...`);
+      isHydratingSessionRef.current = '__pending_login__';
       let userCredential;
       try {
         userCredential = await signInWithCustomToken(auth, res.customToken);
       } catch (fbErr: any) {
+        if (isHydratingSessionRef.current === '__pending_login__') {
+          isHydratingSessionRef.current = null;
+        }
         console.error('[Admin Auth] Firebase Custom Token exchange error:', fbErr);
         return {
           success: false,
@@ -1220,12 +1419,33 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
       }
 
-      // 3. Hydrate administrator session and transition view
-      await hydrateUserSession(userCredential.user, cleanPassword, cleanEmail);
+      // 3. Hydrate administrator session and confirm server verification before reporting login success
+      const hydrated = await hydrateUserSession(userCredential.user, cleanPassword, cleanEmail, {
+        isAdminLoginFlow: true,
+      });
+
+      if (!hydrated._adminVerification?.isAdmin) {
+        if (!hydrated._adminVerification?.recoverable) {
+          await signOut(auth).catch(() => {});
+          clearAdminSessionToken();
+          setCurrentUser(null);
+        }
+        return {
+          success: false,
+          errorCode: hydrated._adminVerification?.errorCode || 'ADMIN_SESSION_UNVERIFIED',
+          error:
+            hydrated._adminVerification?.error ||
+            'Server could not confirm administrator authorization for this session.',
+        };
+      }
+
       setCurrentViewState('admin');
       setActiveModal(null);
       return { success: true };
     } catch (err: any) {
+      if (isHydratingSessionRef.current === '__pending_login__') {
+        isHydratingSessionRef.current = null;
+      }
       console.error('[Admin Auth] Unexpected administrator login error:', err);
       return {
         success: false,
@@ -1253,10 +1473,22 @@ const resolveTotpLogin = async (
       return { success: false, error: 'Please enter the 6-digit code from your authenticator app.' };
     }
     const assertion = TotpMultiFactorGenerator.assertionForSignIn(hintUid, cleanCode);
-    const userCredential = await resolver.resolveSignIn(assertion);
+    isHydratingSessionRef.current = '__pending_login__';
+    let userCredential;
+    try {
+      userCredential = await resolver.resolveSignIn(assertion);
+    } catch (mfaSignErr) {
+      if (isHydratingSessionRef.current === '__pending_login__') {
+        isHydratingSessionRef.current = null;
+      }
+      throw mfaSignErr;
+    }
     await hydrateUserSession(userCredential.user, cleanPassword);
     return { success: true };
   } catch (err: any) {
+    if (isHydratingSessionRef.current === '__pending_login__') {
+      isHydratingSessionRef.current = null;
+    }
     console.error('[MFA Resolve Error]', err);
     if (err?.code === 'auth/invalid-verification-code' || err?.code === 'auth/invalid-mfa-code') {
       return { success: false, error: 'Invalid authenticator code. Please check your authenticator app and try again.' };
@@ -1446,6 +1678,7 @@ const unenrollTotpMfa = async (): Promise<{
    * Monvera Sign-Out
    */
   const logout = async () => {
+    isHydratingSessionRef.current = null;
     try {
       await signOut(auth);
     } catch (err) {

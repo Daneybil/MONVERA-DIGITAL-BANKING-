@@ -573,8 +573,22 @@ export const firestoreSync = {
   ): () => void {
     if (!userId) return () => {};
 
-    // Initial load
-    this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
+    // Emit local cache immediately (0 Firestore reads) while onSnapshot connects
+    try {
+      if (typeof window !== 'undefined') {
+        const localKey = `monvera_notifications_${userId}`;
+        const raw = localStorage.getItem(localKey);
+        if (raw) {
+          const cached: NotificationItem[] = JSON.parse(raw);
+          if (Array.isArray(cached) && cached.length > 0) {
+            const owned = cached
+              .filter((n) => n && n.id && (!n.userId || n.userId === userId))
+              .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            if (owned.length > 0) onUpdate(owned);
+          }
+        }
+      }
+    } catch {}
 
     let fsUnsubscribe = () => {};
     if (db) {
@@ -601,11 +615,15 @@ export const firestoreSync = {
           },
           (err) => {
             console.warn('[Firestore] notifications subscription note:', err);
+            this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
           }
         );
       } catch (err) {
         console.warn('[Firestore] subscribeToNotifications setup note:', err);
+        this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
       }
+    } else {
+      this.getNotificationsForUser(userId, userAccountNumber, userEmail).then(onUpdate).catch(() => {});
     }
 
     return () => {
@@ -1332,9 +1350,6 @@ export const firestoreSync = {
                 };
               } else {
                 realUsers.push(lu);
-                if (db) {
-                  setDoc(doc(db, 'users', lu.id), lu, { merge: true }).catch(() => {});
-                }
               }
             }
           }
@@ -1479,15 +1494,18 @@ export const firestoreSync = {
    * Avoids continuous collection-wide snapshots and eliminates repetitive balance reading loops.
    */
   subscribeToUsersWithBalances(
-    onUpdate: (users: (UserProfile & { balanceMetrics?: BalanceMetrics })[]) => void
+    onUpdate: (users: (UserProfile & { balanceMetrics?: BalanceMetrics })[]) => void,
+    options?: { skipInitialFetch?: boolean }
   ): () => void {
     let currentUsersMap = new Map<string, UserProfile & { balanceMetrics?: BalanceMetrics }>();
 
-    // 1. Initial on-demand load
-    this.getAllUsersWithBalances().then((list) => {
-      list.forEach((u) => currentUsersMap.set(u.id, u));
-      onUpdate(Array.from(currentUsersMap.values()));
-    }).catch(() => {});
+    // 1. Initial on-demand load (skipped when caller already hydrates from authoritative server endpoint)
+    if (!options?.skipInitialFetch) {
+      this.getAllUsersWithBalances().then((list) => {
+        list.forEach((u) => currentUsersMap.set(u.id, u));
+        onUpdate(Array.from(currentUsersMap.values()));
+      }).catch(() => {});
+    }
 
     // 2. Targeted event-driven balance & status updates
     const handleBalanceUpdate = (e: any) => {
@@ -2099,27 +2117,33 @@ export const firestoreSync = {
   subscribeToChatMessages(userId: string, onUpdate: (messages: ChatMessage[]) => void): () => void {
     if (!userId) return () => {};
 
-    // 1. Synchronous 0ms immediate emission from local cache so the user sees past chats instantly
-    try {
-      const localStr = localStorage.getItem(`monvera_chat_${userId}`);
-      if (localStr) {
-        const cached: ChatMessage[] = JSON.parse(localStr);
-        const owned = Array.isArray(cached) ? cached.filter((m) => m && m.userId === userId) : [];
-        if (owned.length > 0) {
-          onUpdate(owned.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()));
+    const readCachedMessages = (): ChatMessage[] => {
+      try {
+        const localStr = localStorage.getItem(`monvera_chat_${userId}`);
+        if (localStr) {
+          const cached: ChatMessage[] = JSON.parse(localStr);
+          const owned = Array.isArray(cached) ? cached.filter((m) => m && m.userId === userId) : [];
+          return owned.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
         }
-      }
-    } catch {}
+      } catch {}
+      return [];
+    };
 
-    // 2. Async full multi-source refresh
-    this.getChatMessagesForUser(userId).then((list) => {
-      if (list && list.length > 0) onUpdate(list);
-    });
+    // 1. Synchronous 0ms immediate emission from local cache so the user sees past chats instantly
+    const initialCached = readCachedMessages();
+    if (initialCached.length > 0) {
+      onUpdate(initialCached);
+    }
 
     const handleLocalBroadcast = (e?: Event) => {
       const detail = (e as CustomEvent)?.detail;
       if (detail?.userId && detail.userId !== userId) return;
-      this.getChatMessagesForUser(userId).then(onUpdate);
+      if (db) {
+        const cached = readCachedMessages();
+        if (cached.length > 0) onUpdate(cached);
+      } else {
+        this.getChatMessagesForUser(userId).then(onUpdate).catch(() => {});
+      }
     };
 
     if (typeof window !== 'undefined') {
@@ -2127,17 +2151,21 @@ export const firestoreSync = {
       window.addEventListener('storage', handleLocalBroadcast);
     }
 
-    // Periodic silent background sync so admin replies sent via backend/other sessions always arrive without page refresh
-    const pollInterval =
-      typeof window !== 'undefined'
-        ? window.setInterval(() => {
-            this.getChatMessagesForUser(userId).then(onUpdate).catch(() => {});
-          }, 12000)
-        : undefined;
+    let fallbackInterval: number | undefined;
+    const startFallbackPolling = () => {
+      if (fallbackInterval !== undefined || typeof window === 'undefined') return;
+      this.getChatMessagesForUser(userId).then((list) => {
+        if (list && list.length > 0) onUpdate(list);
+      }).catch(() => {});
+      fallbackInterval = window.setInterval(() => {
+        this.getChatMessagesForUser(userId).then(onUpdate).catch(() => {});
+      }, 15000);
+    };
 
     if (!db) {
+      startFallbackPolling();
       return () => {
-        if (pollInterval !== undefined) window.clearInterval(pollInterval);
+        if (fallbackInterval !== undefined) window.clearInterval(fallbackInterval);
         if (typeof window !== 'undefined') {
           window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
           window.removeEventListener('storage', handleLocalBroadcast);
@@ -2188,10 +2216,11 @@ export const firestoreSync = {
         },
         (error) => {
           console.warn('[Firestore live chat subscription notice]:', error);
+          startFallbackPolling();
         }
       );
       return () => {
-        if (pollInterval !== undefined) window.clearInterval(pollInterval);
+        if (fallbackInterval !== undefined) window.clearInterval(fallbackInterval);
         if (typeof window !== 'undefined') {
           window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
           window.removeEventListener('storage', handleLocalBroadcast);
@@ -2200,8 +2229,9 @@ export const firestoreSync = {
       };
     } catch (err) {
       console.warn('[Firestore] Error subscribing to live chat:', err);
+      startFallbackPolling();
       return () => {
-        if (pollInterval !== undefined) window.clearInterval(pollInterval);
+        if (fallbackInterval !== undefined) window.clearInterval(fallbackInterval);
         if (typeof window !== 'undefined') {
           window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
           window.removeEventListener('storage', handleLocalBroadcast);

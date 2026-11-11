@@ -43,7 +43,27 @@ export function getAdminSessionToken(): string | null {
   }
 }
 
+export interface AdminSessionVerificationResult {
+  isAdmin: boolean;
+  uid?: string;
+  email?: string;
+  error?: string;
+  errorCode?: 'NO_TOKEN' | 'UNAUTHORIZED' | 'FORBIDDEN' | 'CONFIG_UNAVAILABLE' | 'SERVER_ERROR' | 'NETWORK_FAILURE';
+  recoverable?: boolean;
+}
+
+let inflightAdminVerifyPromise: Promise<AdminSessionVerificationResult> | null = null;
+let inflightAdminVerifyKey: string | null = null;
+let lastVerifiedAdminCache: { key: string; result: AdminSessionVerificationResult; verifiedAt: number } | null = null;
+
+export function invalidateAdminVerificationCache(): void {
+  inflightAdminVerifyPromise = null;
+  inflightAdminVerifyKey = null;
+  lastVerifiedAdminCache = null;
+}
+
 export function setAdminSessionToken(token: string): void {
+  invalidateAdminVerificationCache();
   if (typeof window === 'undefined') return;
   try {
     sessionStorage.setItem(ADMIN_SESSION_STORAGE_KEY, token);
@@ -51,6 +71,7 @@ export function setAdminSessionToken(token: string): void {
 }
 
 export function clearAdminSessionToken(): void {
+  invalidateAdminVerificationCache();
   if (typeof window === 'undefined') return;
   try {
     sessionStorage.removeItem(ADMIN_SESSION_STORAGE_KEY);
@@ -593,7 +614,7 @@ export const api = {
 
     // 1. Authoritative Backend Server API Resolution (checks canonical Firebase UIDs, accounts, emails, usernames)
     try {
-      const authHeaders = await getAuthHeaders();
+      const authHeaders = await getCustomerAuthHeaders();
       const res = await fetch(
         `/api/accounts/lookup?query=${encodeURIComponent(identifier)}&currentUserId=${encodeURIComponent(currentUserId || '')}`,
         { headers: authHeaders }
@@ -675,7 +696,7 @@ export const api = {
     }
 
     const refNum = data.referenceNumber || data.idempotencyKey || `MV-TRF-${Date.now()}-${Math.floor(100000 + Math.random() * 900000)}`;
-    const authHeaders = await getAuthHeaders();
+    const authHeaders = await getCustomerAuthHeaders();
 
     try {
       const response = await fetch('/api/transfers/monvera', {
@@ -1519,8 +1540,8 @@ export const api = {
       }
     } catch {}
 
-    // 2. Fallback / supplement from direct client Firestore notifications if backend failed or returned empty
-    if ((!fetchedFromBackend || notifMap.size === 0) && userId) {
+    // 2. Fallback from direct client Firestore notifications only if backend request failed
+    if (!fetchedFromBackend && userId) {
       try {
         const fsNotifs = await firestoreSync.getNotificationsForUser(userId, userAccountNumber, userEmail);
         fsNotifs.forEach((n) => {
@@ -1667,21 +1688,137 @@ export const api = {
     }
   },
 
-  async verifyAdminSession(): Promise<{ isAdmin: boolean; error?: string }> {
-    try {
-      const headers = await getAuthHeaders();
-      if (!headers['Authorization']) {
-        return { isAdmin: false, error: 'No authentication token available' };
-      }
-      const res = await fetch(getApiEndpoint('/api/admin/verify-session'), { headers });
-      if (res.ok) {
-        const data = await parseJsonResponse<{ success: boolean; isAdmin?: boolean }>(res, { success: false, isAdmin: false });
-        return { isAdmin: !!data.isAdmin };
-      }
-      return { isAdmin: false };
-    } catch {
-      return { isAdmin: false };
+  async verifyAdminSession(options?: { forceRefresh?: boolean }): Promise<AdminSessionVerificationResult> {
+    const fbUser = auth?.currentUser;
+    if (!fbUser) {
+      return {
+        isAdmin: false,
+        recoverable: false,
+        errorCode: 'NO_TOKEN',
+        error: 'No active Firebase authentication session.',
+      };
     }
+
+    const adminToken = getAdminSessionToken() || '';
+    const cacheKey = `${fbUser.uid}:${adminToken}`;
+
+    if (
+      !options?.forceRefresh &&
+      lastVerifiedAdminCache &&
+      lastVerifiedAdminCache.key === cacheKey &&
+      lastVerifiedAdminCache.result.isAdmin &&
+      Date.now() - lastVerifiedAdminCache.verifiedAt < 5000
+    ) {
+      return lastVerifiedAdminCache.result;
+    }
+
+    if (!options?.forceRefresh && inflightAdminVerifyPromise && inflightAdminVerifyKey === cacheKey) {
+      return inflightAdminVerifyPromise;
+    }
+
+    const runVerification = async (): Promise<AdminSessionVerificationResult> => {
+      const attemptVerify = async (forceIdTokenRefresh: boolean): Promise<{
+        ok: boolean;
+        status: number;
+        data?: any;
+        networkError?: boolean;
+      }> => {
+        try {
+          const currentFbUser = auth?.currentUser;
+          if (!currentFbUser) {
+            return { ok: false, status: 401, data: { error: 'No active Firebase user' } };
+          }
+          const idToken = await currentFbUser.getIdToken(forceIdTokenRefresh);
+          if (!idToken) {
+            return { ok: false, status: 401, data: { error: 'No Firebase ID token available' } };
+          }
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'X-Admin-Console': 'true',
+            Authorization: `Bearer ${idToken}`,
+          };
+          const storedAdminToken = getAdminSessionToken();
+          if (storedAdminToken) {
+            headers['X-Admin-Session'] = storedAdminToken;
+          }
+          if (currentFbUser.email) {
+            headers['X-Admin-Email'] = currentFbUser.email;
+          }
+          const res = await fetch(getApiEndpoint('/api/admin/verify-session'), { headers });
+          const data = await parseJsonResponse<any>(res, {});
+          return { ok: res.ok, status: res.status, data };
+        } catch (err: any) {
+          console.warn('[api.verifyAdminSession] Network/fetch error:', err?.message || err);
+          return { ok: false, status: 0, networkError: true, data: { error: err?.message } };
+        }
+      };
+
+      let attempt = await attemptVerify(!!options?.forceRefresh);
+
+      // Recover from stale cached Firebase ID token on initial 401 right after token minting/refresh
+      if (!attempt.ok && attempt.status === 401 && !options?.forceRefresh) {
+        attempt = await attemptVerify(true);
+      }
+
+      // Single automatic retry for transient 5xx or network cold-start errors
+      if (!attempt.ok && (attempt.networkError || attempt.status >= 500)) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        attempt = await attemptVerify(false);
+      }
+
+      if (attempt.ok && attempt.data?.isAdmin) {
+        const verifiedResult: AdminSessionVerificationResult = {
+          isAdmin: true,
+          uid: attempt.data.uid || fbUser.uid,
+          email: attempt.data.email || fbUser.email || undefined,
+          recoverable: false,
+        };
+        lastVerifiedAdminCache = {
+          key: `${fbUser.uid}:${getAdminSessionToken() || ''}`,
+          result: verifiedResult,
+          verifiedAt: Date.now(),
+        };
+        return verifiedResult;
+      }
+
+      if (attempt.status === 401 || attempt.status === 403) {
+        clearAdminSessionToken();
+        return {
+          isAdmin: false,
+          recoverable: false,
+          errorCode: attempt.status === 401 ? 'UNAUTHORIZED' : 'FORBIDDEN',
+          error: attempt.data?.error || 'Administrator session authorization rejected by server.',
+        };
+      }
+
+      if (attempt.status === 503 && attempt.data?.errorCode === 'CONFIG_UNAVAILABLE') {
+        return {
+          isAdmin: false,
+          recoverable: true,
+          errorCode: 'CONFIG_UNAVAILABLE',
+          error: attempt.data?.error || 'Server administrator configuration is unavailable.',
+        };
+      }
+
+      return {
+        isAdmin: false,
+        recoverable: true,
+        errorCode: attempt.networkError ? 'NETWORK_FAILURE' : 'SERVER_ERROR',
+        error:
+          attempt.data?.error ||
+          'Temporary error verifying administrator session with server. Please retry.',
+      };
+    };
+
+    inflightAdminVerifyKey = cacheKey;
+    const promise = runVerification().finally(() => {
+      if (inflightAdminVerifyPromise === promise) {
+        inflightAdminVerifyPromise = null;
+        inflightAdminVerifyKey = null;
+      }
+    });
+    inflightAdminVerifyPromise = promise;
+    return promise;
   },
 
   async getAdminOverview(): Promise<AdminSystemOverview> {
@@ -2209,37 +2346,39 @@ export const api = {
       
       // When queried for a specific user, ensure strict scoping to that user's UID
       if (userId) {
+        if (res.ok) {
+          const scoped = (data.loans || [])
+            .filter((l) => l && l.id && l.userId === userId)
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          return { loans: scoped };
+        }
         const fsLoans = await firestoreSync.getLoansForUser(userId, userAccountNumber, userEmail);
-        const map = new Map<string, LoanApplication>();
-        // Only accept loans that match the requested userId
-        (data.loans || []).forEach((l) => {
-          if (l && l.id && l.userId === userId) map.set(l.id, l);
-        });
-        // Authoritative Firestore loans override any stale in-memory data
-        fsLoans.forEach((l) => {
-          if (l && l.id && l.userId === userId) map.set(l.id, l);
-        });
         return {
-          loans: Array.from(map.values()).sort(
-            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          ),
+          loans: fsLoans
+            .filter((l) => l && l.id && l.userId === userId)
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()),
         };
       } else {
         // Full loan listings only for authorized administrators (validated by backend /api/loans)
-        if (data.loans && data.loans.length > 0) {
-          const fsLoans = await firestoreSync.getAllLoans().catch(() => []);
-          const map = new Map<string, LoanApplication>();
-          (data.loans || []).forEach((l) => map.set(l.id, l));
-          fsLoans.forEach((l) => map.set(l.id, l));
+        if (res.ok) {
           return {
-            loans: Array.from(map.values()).sort(
+            loans: (data.loans || []).sort(
               (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
             ),
           };
         }
-        return data;
+        const fsLoans = await firestoreSync.getAllLoans().catch(() => []);
+        return {
+          loans: fsLoans.sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          ),
+        };
       }
     } catch {
+      if (userId) {
+        const fsLoans = await firestoreSync.getLoansForUser(userId, userAccountNumber, userEmail).catch(() => []);
+        return { loans: fsLoans };
+      }
       return { loans: [] };
     }
   },

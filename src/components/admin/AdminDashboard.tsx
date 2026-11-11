@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { auth } from '../../services/firebase';
@@ -68,7 +69,7 @@ import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 import { AdminLoginForm } from './AdminLoginForm';
 
 export const AdminDashboard: React.FC = () => {
-  const { currentUser, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal, updateUser } = useAuth();
+  const { currentUser, isLoading: isAuthLoading, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal, updateUser } = useAuth();
 
   const [activeTab, setActiveTab] = useState<string>('overview');
   const [metrics, setMetrics] = useState<AdminSystemOverview | null>(null);
@@ -78,34 +79,120 @@ export const AdminDashboard: React.FC = () => {
   const [auditLogs, setAuditLogs] = useState<AdminAuditLog[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<(UserProfile & { balanceMetrics?: any }) | null>(null);
   const [pendingLiveChatsCount, setPendingLiveChatsCount] = useState<number>(0);
+  const [adminChatMessages, setAdminChatMessages] = useState<any[]>([]);
   const [adminLoans, setAdminLoans] = useState<LoanApplication[]>([]);
   const [pendingCardActivationsCount, setPendingCardActivationsCount] = useState<number>(0);
   const [pendingBankAppsCount, setPendingBankAppsCount] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
+  const [firebaseUid, setFirebaseUid] = useState<string | null>(() => auth?.currentUser?.uid || null);
+  const [isAuthInitialized, setIsAuthInitialized] = useState<boolean>(() => !auth);
   const [isServerAdminVerified, setIsServerAdminVerified] = useState<boolean | null>(null);
+  const [verificationStatus, setVerificationStatus] = useState<'checking' | 'verified' | 'denied' | 'error'>('checking');
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+  const [verifyAttempt, setVerifyAttempt] = useState<number>(0);
+  const verifiedUidRef = useRef<string | null>(null);
+
+  // Reactively track Firebase Auth user UID across sign-in, reload, and sign-out
+  useEffect(() => {
+    if (!auth) {
+      setIsAuthInitialized(true);
+      return;
+    }
+    const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
+      const nextUid = fbUser?.uid || null;
+      setFirebaseUid(nextUid);
+      setIsAuthInitialized(true);
+      if (!nextUid) {
+        verifiedUidRef.current = null;
+        setIsServerAdminVerified(false);
+        setVerificationStatus('denied');
+        setVerificationError(null);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Strict Administrator Authentication Gate: Requires verified backend administrator session
+  const isTestingAuthBypass = false;
+  const isAdmin = isTestingAuthBypass || Boolean(
+    currentUser &&
+    firebaseUid &&
+    isServerAdminVerified === true &&
+    verificationStatus === 'verified'
+  );
 
   useEffect(() => {
     let isMounted = true;
     async function verifyAdminSession() {
-      if (!auth?.currentUser) {
-        if (isMounted) setIsServerAdminVerified(false);
+      // Wait for AuthContext initial hydration or active login hydration to finish before evaluating
+      if (isAuthLoading) {
+        if (isMounted && !verifiedUidRef.current) {
+          setVerificationStatus('checking');
+        }
         return;
       }
-      // Never bypass server verification with client-side role claims
-      const check = await api.verifyAdminSession();
-      if (isMounted) {
-        setIsServerAdminVerified(check.isAdmin);
-        if (check.isAdmin && currentUser && currentUser.role !== 'admin') {
-          updateUser({ ...currentUser, role: 'admin' });
+
+      if (!firebaseUid) {
+        if (isMounted) {
+          verifiedUidRef.current = null;
+          setIsServerAdminVerified(false);
+          setVerificationStatus('denied');
+          setVerificationError(null);
         }
+        return;
+      }
+
+      // Avoid redundant backend verification if current UID is already verified and this is not a manual retry
+      if (
+        verifyAttempt === 0 &&
+        verifiedUidRef.current === firebaseUid &&
+        isServerAdminVerified === true &&
+        verificationStatus === 'verified'
+      ) {
+        return;
+      }
+
+      if (isMounted && verifiedUidRef.current !== firebaseUid) {
+        setVerificationStatus('checking');
+        setVerificationError(null);
+      }
+
+      // Never bypass server verification with client-side role claims
+      const check = await api.verifyAdminSession({ forceRefresh: verifyAttempt > 0 });
+      if (!isMounted) return;
+
+      if (check.isAdmin) {
+        verifiedUidRef.current = firebaseUid;
+        setIsServerAdminVerified(true);
+        setVerificationStatus('verified');
+        setVerificationError(null);
+        if (currentUser && currentUser.role !== 'admin') {
+          updateUser({ ...currentUser, role: 'admin' }, { skipFirestoreSync: true });
+        }
+      } else if (check.recoverable) {
+        // Temporary network/server failure: NEVER silently downgrade an already-verified administrator,
+        // and NEVER mark unverified sessions as authorized or convert them into a customer.
+        if (verifiedUidRef.current === firebaseUid && isServerAdminVerified === true) {
+          return;
+        }
+        setIsServerAdminVerified(false);
+        setVerificationStatus('error');
+        setVerificationError(
+          check.error || 'Unable to verify administrator session due to a temporary server or network issue.'
+        );
+      } else {
+        verifiedUidRef.current = null;
+        setIsServerAdminVerified(false);
+        setVerificationStatus('denied');
+        setVerificationError(null);
       }
     }
     verifyAdminSession();
     return () => {
       isMounted = false;
     };
-  }, [auth?.currentUser]);
+  }, [firebaseUid, currentUser?.id, isAuthLoading, verifyAttempt]);
 
   // Helper to merge Firestore users and server customers seamlessly without duplicate accounts
   const mergeCustomers = (
@@ -313,12 +400,11 @@ export const AdminDashboard: React.FC = () => {
   const loadAllAdminData = async () => {
     setIsLoading(true);
     try {
-      const [overviewRes, custRes, txRes, logsRes, tickets, loansRes, cardActRes, bankAppsRes] = await Promise.all([
+      const [overviewRes, custRes, txRes, logsRes, loansRes, cardActRes, bankAppsRes] = await Promise.all([
         api.getAdminOverview().catch(() => null),
         api.getAdminCustomers().catch(() => ({ customers: [] })),
         api.getTransactions().catch(() => ({ transactions: [] })),
         api.getAdminAuditLogs().catch(() => ({ auditLogs: [] })),
-        firestoreSync.getAllSupportTickets().catch(() => []),
         api.getLoans().catch(() => ({ loans: [] })),
         api.getAdminCardActivationRequests().catch(() => ({ requests: [] })),
         api.getAdminBankAccountApplications().catch(() => ({ applications: [] })),
@@ -327,7 +413,6 @@ export const AdminDashboard: React.FC = () => {
       const serverCustomers = custRes?.customers || [];
       const merged = mergeCustomers([], serverCustomers, currentUser);
       setCustomers(merged);
-      setSupportTickets(tickets || []);
       if (loansRes?.loans) setAdminLoans(loansRes.loans);
 
       const cardActivations = cardActRes?.requests || [];
@@ -373,28 +458,43 @@ export const AdminDashboard: React.FC = () => {
     }
   };
 
-  // Initial load and real-time subscription to newly registered users in Firestore
+  // Load admin data & attach admin listeners ONLY after verified administrator authorization
   useEffect(() => {
+    if (!isAdmin) return;
+
     loadAllAdminData();
 
-    // Subscribe to Firestore users with balances collection so new signups appear automatically
-    const unsubscribeUsers = firestoreSync.subscribeToUsersWithBalances((firestoreUsers) => {
-      if (firestoreUsers && firestoreUsers.length > 0) {
-        setCustomers((prevCustomers) => {
-          const merged = mergeCustomers(firestoreUsers, prevCustomers, currentUser);
-          setMetrics((prevMetrics) =>
-            prevMetrics
-              ? {
-                  ...prevMetrics,
-                  totalCustomers: merged.length,
-                  activeAccounts: merged.length * 2,
-                }
-              : null
-          );
-          return merged;
-        });
-      }
-    });
+    // Event-driven customer updates without redundant N+1 client-side users+accounts Firestore scan
+    const handleAdminBalanceUpdate = (e: any) => {
+      const detail = e?.detail;
+      if (!detail?.userId || !detail?.balanceMetrics) return;
+      setCustomers((prev) =>
+        prev.map((c) => (c.id === detail.userId ? { ...c, balanceMetrics: detail.balanceMetrics } : c))
+      );
+    };
+    const handleAdminStatusUpdate = (e: any) => {
+      const detail = e?.detail;
+      if (!detail?.userId || !detail?.status) return;
+      setCustomers((prev) =>
+        prev.map((c) => (c.id === detail.userId ? { ...c, status: detail.status } : c))
+      );
+    };
+    const handleAdminKycUpdate = (e: any) => {
+      const detail = e?.detail;
+      if (!detail?.userId) return;
+      setCustomers((prev) =>
+        prev.map((c) =>
+          c.id === detail.userId
+            ? { ...c, ...(detail.user || {}), kycStatus: detail.kycStatus || detail.user?.kycStatus || c.kycStatus }
+            : c
+        )
+      );
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_balance_updated', handleAdminBalanceUpdate);
+      window.addEventListener('monvera_user_status_changed', handleAdminStatusUpdate);
+      window.addEventListener('monvera_kyc_status_updated', handleAdminKycUpdate);
+    }
 
     // Subscribe to Support Tickets
     const unsubscribeTickets = firestoreSync.subscribeToSupportTickets((liveTickets) => {
@@ -406,6 +506,7 @@ export const AdminDashboard: React.FC = () => {
     // Subscribe to Live Customer Chat Messages (alerts admin when any customer sends a message)
     const unsubscribeChats = firestoreSync.subscribeToAllChatMessages((liveMessages) => {
       if (liveMessages) {
+        setAdminChatMessages(liveMessages);
         const unrepliedCustomerMsgs = liveMessages.filter(
           (m) => m.sender === 'user' && m.status !== 'read'
         );
@@ -422,12 +523,16 @@ export const AdminDashboard: React.FC = () => {
     });
 
     return () => {
-      if (unsubscribeUsers) unsubscribeUsers();
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_balance_updated', handleAdminBalanceUpdate);
+        window.removeEventListener('monvera_user_status_changed', handleAdminStatusUpdate);
+        window.removeEventListener('monvera_kyc_status_updated', handleAdminKycUpdate);
+      }
       if (unsubscribeTickets) unsubscribeTickets();
       if (unsubscribeChats) unsubscribeChats();
       if (unsubscribeLoans) unsubscribeLoans();
     };
-  }, []);
+  }, [isAdmin]);
 
   const handleToggleFreezeUser = async (userId: string, reason: string) => {
     try {
@@ -524,7 +629,9 @@ export const AdminDashboard: React.FC = () => {
           }
         }
       }
-      refreshNotifications().catch(() => {});
+      if (currentUser?.id === userId) {
+        refreshNotifications().catch(() => {});
+      }
     } catch (err) {
       console.error('Error approving KYC:', err);
       if (existingCust) {
@@ -600,7 +707,9 @@ export const AdminDashboard: React.FC = () => {
           }
         }
       }
-      refreshNotifications().catch(() => {});
+      if (currentUser?.id === userId) {
+        refreshNotifications().catch(() => {});
+      }
     } catch (err) {
       console.error('Error rejecting KYC:', err);
       if (existingCust) {
@@ -641,7 +750,9 @@ export const AdminDashboard: React.FC = () => {
           setSelectedCustomer((prev) => (prev ? { ...prev, ...res.user } : null));
         }
       }
-      refreshNotifications().catch(() => {});
+      if (currentUser?.id === userId) {
+        refreshNotifications().catch(() => {});
+      }
     } catch (err) {
       console.error('Error reviewing KYC item:', err);
     }
@@ -774,16 +885,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'audit', label: 'Audit Trail', icon: FileText },
   ];
 
-  // Strict Administrator Authentication Gate: Requires verified backend administrator session
-  const isTestingAuthBypass = false;
-
-  const isAdmin = isTestingAuthBypass || Boolean(
-    currentUser &&
-    auth?.currentUser &&
-    isServerAdminVerified === true
-  );
-
-  if (isServerAdminVerified === null && auth?.currentUser) {
+  if (!isAdmin && (!isAuthInitialized || (firebaseUid && (isAuthLoading || verificationStatus === 'checking')))) {
     return (
       <div id="monvera-admin-command-center" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
         <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-4">
@@ -797,11 +899,60 @@ export const AdminDashboard: React.FC = () => {
     );
   }
 
+  if (!isAdmin && firebaseUid && verificationStatus === 'error') {
+    return (
+      <div id="monvera-admin-command-center" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-5">
+          <div className="w-12 h-12 rounded-2xl bg-amber-400/10 border border-amber-400/30 text-amber-400 flex items-center justify-center mx-auto">
+            <AlertCircle className="w-6 h-6" />
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-lg font-bold text-white">Session Verification Interrupted</h2>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              {verificationError || 'A temporary network or server issue interrupted administrator session verification.'}
+            </p>
+          </div>
+          <div className="flex flex-col gap-2.5 pt-1">
+            <button
+              type="button"
+              onClick={() => {
+                setVerificationStatus('checking');
+                setVerifyAttempt((prev) => prev + 1);
+              }}
+              className="w-full py-2.5 px-4 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs tracking-wide transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Retry Server Verification</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                verifiedUidRef.current = null;
+                setVerificationStatus('denied');
+                setVerificationError(null);
+              }}
+              className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition-colors cursor-pointer"
+            >
+              Sign In With Credentials
+            </button>
+            <button
+              type="button"
+              onClick={() => setCurrentView('home')}
+              className="w-full py-2 px-4 rounded-xl text-slate-400 hover:text-white text-xs transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Return to Public Home</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (!isAdmin) {
     return (
       <AdminLoginForm
         onCancel={() => setCurrentView('home')}
-        onSuccess={() => loadAllAdminData()}
       />
     );
   }
@@ -1023,6 +1174,8 @@ export const AdminDashboard: React.FC = () => {
             customers={customers}
             onSelectCustomer={(cust) => setSelectedCustomer(cust)}
             onRefreshData={loadAllAdminData}
+            sharedChatMessages={adminChatMessages}
+            sharedSupportTickets={supportTickets}
           />
         )}
 
@@ -1076,7 +1229,7 @@ export const AdminDashboard: React.FC = () => {
         )}
 
         {activeTab === 'loans' && (
-          <AdminLoansView />
+          <AdminLoansView sharedLoans={adminLoans} />
         )}
 
         {activeTab === 'demo_funds' && (
