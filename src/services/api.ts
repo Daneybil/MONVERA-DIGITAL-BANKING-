@@ -93,7 +93,6 @@ export function getKycDocumentUrl(url?: string | null): string {
 export async function getAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'X-Admin-Console': 'true',
   };
   try {
     if (auth && auth.currentUser) {
@@ -109,15 +108,11 @@ export async function getAuthHeaders(): Promise<Record<string, string>> {
   if (adminToken) {
     headers['X-Admin-Session'] = adminToken;
   }
-  if (auth && auth.currentUser?.email) {
-    headers['X-Admin-Email'] = auth.currentUser.email;
-  }
   return headers;
 }
 
 /**
- * Retrieves Firebase Auth Bearer token headers for authenticated customer calls
- * (without attaching X-Admin-Console unless explicitly intended).
+ * Retrieves Firebase Auth Bearer token headers for authenticated customer calls.
  */
 export async function getCustomerAuthHeaders(): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
@@ -1657,14 +1652,25 @@ export const api = {
     error?: string;
   }> {
     try {
-      const res = await fetch(getApiEndpoint('/api/admin/login'), {
+      const targetUrl = getApiEndpoint('/api/admin/login');
+      const init: RequestInit = {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
         body: JSON.stringify({ email, password }),
-      });
+      };
+      let res: Response;
+      try {
+        res = await fetch(targetUrl, init);
+      } catch (primaryErr) {
+        if (targetUrl !== '/api/admin/login') {
+          res = await fetch('/api/admin/login', init);
+        } else {
+          throw primaryErr;
+        }
+      }
       const data = await parseJsonResponse<any>(res, { success: false });
       if (data.success && data.adminSessionToken) {
         setAdminSessionToken(data.adminSessionToken);
@@ -1734,17 +1740,23 @@ export const api = {
           }
           const headers: Record<string, string> = {
             'Content-Type': 'application/json',
-            'X-Admin-Console': 'true',
             Authorization: `Bearer ${idToken}`,
           };
           const storedAdminToken = getAdminSessionToken();
           if (storedAdminToken) {
             headers['X-Admin-Session'] = storedAdminToken;
           }
-          if (currentFbUser.email) {
-            headers['X-Admin-Email'] = currentFbUser.email;
+          const verifyUrl = getApiEndpoint('/api/admin/verify-session');
+          let res: Response;
+          try {
+            res = await fetch(verifyUrl, { headers });
+          } catch (primaryErr) {
+            if (verifyUrl !== '/api/admin/verify-session') {
+              res = await fetch('/api/admin/verify-session', { headers });
+            } else {
+              throw primaryErr;
+            }
           }
-          const res = await fetch(getApiEndpoint('/api/admin/verify-session'), { headers });
           const data = await parseJsonResponse<any>(res, {});
           return { ok: res.ok, status: res.status, data };
         } catch (err: any) {

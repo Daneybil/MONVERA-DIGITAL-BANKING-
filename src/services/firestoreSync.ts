@@ -434,7 +434,6 @@ export const firestoreSync = {
       if (auth?.currentUser) {
         const token = await auth.currentUser.getIdToken();
         if (token) headers['Authorization'] = `Bearer ${token}`;
-        if (auth.currentUser.email) headers['X-Admin-Email'] = auth.currentUser.email;
       }
     } catch {}
     try {

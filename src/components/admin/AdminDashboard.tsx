@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { useAuth } from '../../context/AuthContext';
-import { api } from '../../services/api';
+import { api, getAdminSessionToken } from '../../services/api';
 import { auth } from '../../services/firebase';
 import { firestoreSync, isNonExistentAccount } from '../../services/firestoreSync';
 import {
@@ -92,6 +92,7 @@ export const AdminDashboard: React.FC = () => {
   const [verificationError, setVerificationError] = useState<string | null>(null);
   const [verifyAttempt, setVerifyAttempt] = useState<number>(0);
   const verifiedUidRef = useRef<string | null>(null);
+  const lastCheckedKeyRef = useRef<string | null>(null);
 
   // Reactively track Firebase Auth user UID across sign-in, reload, and sign-out
   useEffect(() => {
@@ -127,7 +128,7 @@ export const AdminDashboard: React.FC = () => {
     async function verifyAdminSession() {
       // Wait for AuthContext initial hydration or active login hydration to finish before evaluating
       if (isAuthLoading) {
-        if (isMounted && !verifiedUidRef.current) {
+        if (isMounted && !verifiedUidRef.current && verificationStatus !== 'denied') {
           setVerificationStatus('checking');
         }
         return;
@@ -143,6 +144,8 @@ export const AdminDashboard: React.FC = () => {
         return;
       }
 
+      const checkKey = `${firebaseUid}:${getAdminSessionToken() || ''}:${verifyAttempt}`;
+
       // Avoid redundant backend verification if current UID is already verified and this is not a manual retry
       if (
         verifyAttempt === 0 &&
@@ -153,11 +156,21 @@ export const AdminDashboard: React.FC = () => {
         return;
       }
 
+      // Avoid re-verifying the exact same denied non-admin session when isAuthLoading toggles after a failed login attempt
+      if (
+        verifyAttempt === 0 &&
+        verificationStatus === 'denied' &&
+        lastCheckedKeyRef.current === checkKey
+      ) {
+        return;
+      }
+
       if (isMounted && verifiedUidRef.current !== firebaseUid) {
         setVerificationStatus('checking');
         setVerificationError(null);
       }
 
+      lastCheckedKeyRef.current = checkKey;
       // Never bypass server verification with client-side role claims
       const check = await api.verifyAdminSession({ forceRefresh: verifyAttempt > 0 });
       if (!isMounted) return;
@@ -885,7 +898,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'audit', label: 'Audit Trail', icon: FileText },
   ];
 
-  if (!isAdmin && (!isAuthInitialized || (firebaseUid && (isAuthLoading || verificationStatus === 'checking')))) {
+  if (!isAdmin && (!isAuthInitialized || (firebaseUid && verificationStatus === 'checking'))) {
     return (
       <div id="monvera-admin-command-center" className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
         <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl text-center space-y-4">
