@@ -4481,6 +4481,16 @@ export async function executeServerCardIssuance(
 // MANUAL BANK ACCOUNT LINKING & APPROVAL CORE
 // ==========================================
 
+function stripUndefinedFields<T extends Record<string, any>>(obj: T): T {
+  const cleaned: Record<string, any> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== undefined) {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned as T;
+}
+
 export interface SubmitBankAccountParams {
   userId: string;
   country: string;
@@ -4497,12 +4507,14 @@ export interface SubmitBankAccountParams {
   bsb?: string;
   authMethod?: string;
   authVerificationStatus?: string;
+  requestId?: string;
 }
 
 export async function submitBankAccountApplication(params: SubmitBankAccountParams): Promise<{
   success: boolean;
   application?: LinkedBankAccountApplication;
   error?: string;
+  statusCode?: number;
 }> {
   try {
     const {
@@ -4521,11 +4533,73 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       bsb,
       authMethod,
       authVerificationStatus,
+      requestId: clientRequestId,
     } = params;
 
-    if (!userId) return { success: false, error: 'User ID is required.' };
+    if (!userId) return { success: false, statusCode: 401, error: 'User ID is required.' };
     if (!country || !bankName || !accountHolderName || !bankEmail || !phoneNumber || !currency || !accountNumber) {
-      return { success: false, error: 'Please provide all required bank account fields.' };
+      return { success: false, statusCode: 400, error: 'Please provide all required bank account fields.' };
+    }
+
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: Bank account application could not be permanently saved.',
+      };
+    }
+
+    const trimmedIban = iban !== undefined && iban !== null ? String(iban).trim() : '';
+    if (trimmedIban.length > 64) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'IBAN must not exceed 64 characters.',
+      };
+    }
+
+    const trimmedSwiftBic = swiftBic !== undefined && swiftBic !== null ? String(swiftBic).trim() : '';
+    if (trimmedSwiftBic.length > 64) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'SWIFT / BIC code must not exceed 64 characters.',
+      };
+    }
+
+    const sanitizedRequestId =
+      clientRequestId && /^[a-zA-Z0-9_-]{8,80}$/.test(String(clientRequestId).trim())
+        ? String(clientRequestId).trim()
+        : null;
+    const appId = sanitizedRequestId || `bnk_app_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    // Idempotency check for retries using the same client-generated requestId
+    if (sanitizedRequestId) {
+      try {
+        const existingSnap = await adminFirestore.collection('bank_account_applications').doc(appId).get();
+        if (existingSnap.exists) {
+          const existingApp = { ...(existingSnap.data() as LinkedBankAccountApplication), id: existingSnap.id };
+          if (existingApp.userId !== userId) {
+            return {
+              success: false,
+              statusCode: 409,
+              error: 'Application reference conflict. Please submit again.',
+            };
+          }
+          db.bankAccountApplications.set(appId, existingApp);
+          return {
+            success: true,
+            application: existingApp,
+          };
+        }
+      } catch (idempErr: any) {
+        console.error('[submitBankAccountApplication] Firestore idempotency check failed:', idempErr?.message || idempErr);
+        return {
+          success: false,
+          statusCode: 503,
+          error: 'Failed to verify bank account application storage in database. Please try again.',
+        };
+      }
     }
 
     // Resolve customer name and permanent account number
@@ -4533,18 +4607,16 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
     let customerAccountNumber = '1000000000';
     let customerEmail = bankEmail;
 
-    if (isFirebaseAdminConfigured()) {
-      try {
-        const uSnap = await adminFirestore.collection('users').doc(userId).get();
-        if (uSnap.exists) {
-          const uData = uSnap.data()!;
-          customerName = `${uData.firstName || ''} ${uData.lastName || ''}`.trim() || uData.fullName || uData.kycFullName || customerName;
-          customerAccountNumber = uData.permanentAccountNumber || uData.accountNumber || customerAccountNumber;
-          if (uData.email) customerEmail = uData.email;
-        }
-      } catch (e) {
-        console.warn('[submitBankAccountApplication] Error reading user doc:', e);
+    try {
+      const uSnap = await adminFirestore.collection('users').doc(userId).get();
+      if (uSnap.exists) {
+        const uData = uSnap.data()!;
+        customerName = `${uData.firstName || ''} ${uData.lastName || ''}`.trim() || uData.fullName || uData.kycFullName || customerName;
+        customerAccountNumber = uData.permanentAccountNumber || uData.accountNumber || customerAccountNumber;
+        if (uData.email) customerEmail = uData.email;
       }
+    } catch (e) {
+      console.warn('[submitBankAccountApplication] Error reading user doc:', e);
     }
 
     const memUser = db.users.get(userId);
@@ -4558,38 +4630,39 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       if (memUser.email) customerEmail = memUser.email;
     }
 
-    const appId = `bnk_app_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const nowIso = new Date().toISOString();
 
-    const cleanAcc = accountNumber.replace(/\s+/g, '');
+    const cleanAcc = String(accountNumber).replace(/\s+/g, '');
     const cleanLast4 = cleanAcc.length >= 4 ? cleanAcc.slice(-4) : cleanAcc;
     const maskedAccountNumber = `•••• ${cleanLast4}`;
 
     let maskedIban: string | undefined = undefined;
-    if (iban && iban.trim()) {
-      const cleanIban = iban.replace(/\s+/g, '').toUpperCase();
-      maskedIban = cleanIban.length > 8
-        ? `${cleanIban.slice(0, 4)} •••• ${cleanIban.slice(-4)}`
-        : `•••• ${cleanIban.slice(-4)}`;
+    if (trimmedIban) {
+      const compactIban = trimmedIban.replace(/\s+/g, '');
+      maskedIban = compactIban.length > 8
+        ? `${compactIban.slice(0, 4)} •••• ${compactIban.slice(-4)}`
+        : compactIban.length >= 4
+          ? `•••• ${compactIban.slice(-4)}`
+          : compactIban;
     }
 
-    const application: LinkedBankAccountApplication = {
+    const application: LinkedBankAccountApplication = stripUndefinedFields({
       id: appId,
       userId,
       customerName,
       customerAccountNumber,
       customerEmail,
-      country: country.trim(),
-      bankName: bankName.trim(),
-      accountHolderName: accountHolderName.trim(),
-      bankEmail: bankEmail.trim(),
-      phoneNumber: phoneNumber.trim(),
-      currency: currency.trim().toUpperCase(),
+      country: String(country).trim(),
+      bankName: String(bankName).trim(),
+      accountHolderName: String(accountHolderName).trim(),
+      bankEmail: String(bankEmail).trim(),
+      phoneNumber: String(phoneNumber).trim(),
+      currency: String(currency).trim().toUpperCase(),
       accountNumber: cleanAcc,
       maskedAccountNumber,
-      ...(iban?.trim() ? { iban: iban.trim().toUpperCase() } : {}),
+      ...(trimmedIban ? { iban: trimmedIban } : {}),
       ...(maskedIban ? { maskedIban } : {}),
-      ...(swiftBic?.trim() ? { swiftBic: swiftBic.trim().toUpperCase() } : {}),
+      ...(trimmedSwiftBic ? { swiftBic: trimmedSwiftBic } : {}),
       ...(routingNumber?.trim() ? { routingNumber: routingNumber.trim() } : {}),
       ...(sortCode?.trim() ? { sortCode: sortCode.trim() } : {}),
       ...(bsb?.trim() ? { bsb: bsb.trim() } : {}),
@@ -4598,14 +4671,21 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       status: 'pending',
       activationStatus: 'NOT_ACTIVATED',
       submittedAt: nowIso,
-    };
+    });
 
-    // Save in Firestore
-    if (isFirebaseAdminConfigured()) {
+    // Save permanently in Firestore; fail closed if persistence fails
+    try {
       await adminFirestore.collection('bank_account_applications').doc(appId).set(application);
+    } catch (fsErr: any) {
+      console.error('[submitBankAccountApplication] Firestore write failed:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to permanently save bank account application to database. Please try again.',
+      };
     }
 
-    // Save in memory
+    // Update runtime cache only after permanent Firestore persistence succeeds
     db.bankAccountApplications.set(appId, application);
 
     // Persistent notification for bank linking submission
@@ -4640,97 +4720,95 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
     };
   } catch (err: any) {
     console.error('[submitBankAccountApplication Error]:', err);
-    return { success: false, error: err?.message || 'Failed to submit bank account application.' };
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to submit bank account application.' };
   }
 }
 
 export async function getCustomerBankAccountApplications(userId: string): Promise<LinkedBankAccountApplication[]> {
-  const map = new Map<string, LinkedBankAccountApplication>();
-
-  // 1. From Firestore
-  if (isFirebaseAdminConfigured()) {
-    try {
-      const snap = await adminFirestore
-        .collection('bank_account_applications')
-        .where('userId', '==', userId)
-        .get();
-      for (const doc of snap.docs) {
-        map.set(doc.id, { ...(doc.data() as LinkedBankAccountApplication), id: doc.id });
-      }
-    } catch (e) {
-      console.warn('[getCustomerBankAccountApplications] Firestore query note:', e);
-    }
+  if (!isFirebaseAdminConfigured()) {
+    throw Object.assign(
+      new Error('Database service unavailable: cannot retrieve linked bank accounts.'),
+      { statusCode: 503 }
+    );
   }
 
-  // 2. Merge memory
-  for (const [id, app] of db.bankAccountApplications.entries()) {
-    if (app.userId === userId && !map.has(id)) {
-      map.set(id, app);
-    }
-  }
+  try {
+    const snap = await adminFirestore
+      .collection('bank_account_applications')
+      .where('userId', '==', userId)
+      .get();
 
-  const list = Array.from(map.values());
-  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
-  return list;
+    const list = snap.docs.map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }));
+    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    return list;
+  } catch (fsErr: any) {
+    console.error('[getCustomerBankAccountApplications] Firestore read failed:', fsErr?.message || fsErr);
+    throw Object.assign(
+      new Error('Database read error: unable to retrieve linked bank accounts.'),
+      { statusCode: 503 }
+    );
+  }
 }
 
 export async function getAllBankAccountApplicationsAdmin(): Promise<LinkedBankAccountApplication[]> {
-  const map = new Map<string, LinkedBankAccountApplication>();
-
-  // 1. From Firestore
-  if (isFirebaseAdminConfigured()) {
-    try {
-      const snap = await adminFirestore.collection('bank_account_applications').get();
-      for (const doc of snap.docs) {
-        map.set(doc.id, { ...(doc.data() as LinkedBankAccountApplication), id: doc.id });
-      }
-    } catch (e) {
-      console.warn('[getAllBankAccountApplicationsAdmin] Firestore read note:', e);
-    }
+  if (!isFirebaseAdminConfigured()) {
+    throw Object.assign(
+      new Error('Database service unavailable: cannot retrieve bank account approval requests.'),
+      { statusCode: 503 }
+    );
   }
 
-  // 2. Merge memory
-  for (const [id, app] of db.bankAccountApplications.entries()) {
-    if (!map.has(id)) {
-      map.set(id, app);
-    }
+  try {
+    const snap = await adminFirestore.collection('bank_account_applications').get();
+    const list = snap.docs.map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }));
+    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    return list;
+  } catch (fsErr: any) {
+    console.error('[getAllBankAccountApplicationsAdmin] Firestore read failed:', fsErr?.message || fsErr);
+    throw Object.assign(
+      new Error('Database read error: unable to retrieve bank account approval requests.'),
+      { statusCode: 503 }
+    );
   }
-
-  const list = Array.from(map.values());
-  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
-  return list;
 }
 
 export async function approveBankAccountApplication(
   adminId: string,
   applicationId: string
-): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string; statusCode?: number }> {
   try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: bank account approval could not be saved.',
+      };
+    }
+
     let existingApp: LinkedBankAccountApplication | null = null;
     const nowIso = new Date().toISOString();
 
-    if (isFirebaseAdminConfigured()) {
-      try {
-        const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
-        const snap = await docRef.get();
-        if (snap.exists) {
-          existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
-        }
-      } catch (fsErr: any) {
-        console.warn('[approveBankAccountApplication Firestore read note]:', fsErr?.message || fsErr);
+    try {
+      const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
       }
+    } catch (fsErr: any) {
+      console.error('[approveBankAccountApplication Firestore read error]:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to load bank account application from database.',
+      };
     }
 
     if (!existingApp) {
-      existingApp = db.bankAccountApplications.get(applicationId) || null;
-    }
-
-    if (!existingApp) {
-      return { success: false, error: 'Bank account application not found.' };
+      return { success: false, statusCode: 404, error: 'Bank account application not found.' };
     }
 
     if (existingApp.status === 'approved') {
-      return { success: false, error: 'This bank account application is already approved.' };
+      return { success: false, statusCode: 400, error: 'This bank account application is already approved.' };
     }
 
     const updatedApp: LinkedBankAccountApplication = {
@@ -4741,16 +4819,19 @@ export async function approveBankAccountApplication(
       approvedBy: adminId,
     };
 
-    // Update in Firestore
-    if (isFirebaseAdminConfigured()) {
-      try {
-        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
-      } catch (fsErr: any) {
-        console.warn('[approveBankAccountApplication Firestore write note]:', fsErr?.message || fsErr);
-      }
+    // Persist permanently in Firestore; never report success if write fails
+    try {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[approveBankAccountApplication Firestore write error]:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to persist bank account approval to database. Please try again.',
+      };
     }
 
-    // Update in memory
+    // Update runtime cache only after Firestore write succeeds
     db.bankAccountApplications.set(applicationId, updatedApp);
 
     // Record Admin Audit Log
@@ -4769,9 +4850,7 @@ export async function approveBankAccountApplication(
       result: 'SUCCESS' as const,
     };
     db.auditLogs.unshift(auditEntry);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
-    }
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
 
     // Create deterministic Notification for customer
     await persistCustomerNotification({
@@ -4802,7 +4881,7 @@ export async function approveBankAccountApplication(
     return { success: true, application: updatedApp };
   } catch (err: any) {
     console.error('[approveBankAccountApplication Error]:', err);
-    return { success: false, error: err?.message || 'Failed to approve bank account application.' };
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to approve bank account application.' };
   }
 }
 
@@ -4810,29 +4889,36 @@ export async function rejectBankAccountApplication(
   adminId: string,
   applicationId: string,
   reason?: string
-): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string; statusCode?: number }> {
   try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: bank account rejection could not be saved.',
+      };
+    }
+
     let existingApp: LinkedBankAccountApplication | null = null;
     const nowIso = new Date().toISOString();
 
-    if (isFirebaseAdminConfigured()) {
-      try {
-        const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
-        const snap = await docRef.get();
-        if (snap.exists) {
-          existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
-        }
-      } catch (fsErr: any) {
-        console.warn('[rejectBankAccountApplication Firestore read note]:', fsErr?.message || fsErr);
+    try {
+      const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
       }
+    } catch (fsErr: any) {
+      console.error('[rejectBankAccountApplication Firestore read error]:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to load bank account application from database.',
+      };
     }
 
     if (!existingApp) {
-      existingApp = db.bankAccountApplications.get(applicationId) || null;
-    }
-
-    if (!existingApp) {
-      return { success: false, error: 'Bank account application not found.' };
+      return { success: false, statusCode: 404, error: 'Bank account application not found.' };
     }
 
     const updatedApp: LinkedBankAccountApplication = {
@@ -4841,19 +4927,22 @@ export async function rejectBankAccountApplication(
       activationStatus: 'REJECTED',
       rejectedAt: nowIso,
       rejectedBy: adminId,
-      rejectionReason: reason || 'Information could not be verified by compliance review.',
+      rejectionReason: reason?.trim() || 'Information could not be verified by compliance review.',
     };
 
-    // Update in Firestore
-    if (isFirebaseAdminConfigured()) {
-      try {
-        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
-      } catch (fsErr: any) {
-        console.warn('[rejectBankAccountApplication Firestore write note]:', fsErr?.message || fsErr);
-      }
+    // Persist permanently in Firestore; never report success if write fails
+    try {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[rejectBankAccountApplication Firestore write error]:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to persist bank account rejection to database. Please try again.',
+      };
     }
 
-    // Update in memory
+    // Update runtime cache only after Firestore write succeeds
     db.bankAccountApplications.set(applicationId, updatedApp);
 
     // Record Admin Audit Log
@@ -4866,22 +4955,20 @@ export async function rejectBankAccountApplication(
       targetUserId: updatedApp.userId,
       targetAccountNumber: updatedApp.customerAccountNumber,
       amount: 0,
-      reason: reason || 'Application rejected by compliance review.',
+      reason: updatedApp.rejectionReason || 'Application rejected by compliance review.',
       timestamp: nowIso,
       ipAddress: '127.0.0.1 (Admin Console)',
       result: 'SUCCESS' as const,
     };
     db.auditLogs.unshift(auditEntry);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
-    }
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
 
     // Create deterministic Notification for customer
     await persistCustomerNotification({
       id: `notif_bnk_rej_${applicationId}`,
       userId: updatedApp.userId,
       title: 'Bank Account Application Update',
-      message: `Your ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) linking request was rejected. ${reason ? 'Reason: ' + reason : 'Please review and submit valid banking details.'}`,
+      message: `Your ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) linking request was rejected. ${updatedApp.rejectionReason ? 'Reason: ' + updatedApp.rejectionReason : 'Please review and submit valid banking details.'}`,
       type: 'SECURITY',
       severity: 'warning',
       createdAt: nowIso,
@@ -4905,7 +4992,7 @@ export async function rejectBankAccountApplication(
     return { success: true, application: updatedApp };
   } catch (err: any) {
     console.error('[rejectBankAccountApplication Error]:', err);
-    return { success: false, error: err?.message || 'Failed to reject bank account application.' };
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to reject bank account application.' };
   }
 }
 
@@ -5100,72 +5187,150 @@ export interface SubmitCardActivationParams {
   customerName?: string;
   customerAccountNumber?: string;
   customerEmail?: string;
+  requestId?: string;
 }
 
 export async function submitCardActivationRequest(params: SubmitCardActivationParams): Promise<{
   success: boolean;
   request?: CardActivationRequest;
   error?: string;
+  statusCode?: number;
 }> {
   try {
-    const userId = (params.userId || '').trim();
-    const activationCode = (params.activationCode || '').trim().toUpperCase();
+    const userId = String(params.userId || '').trim();
+    const activationCode = String(params.activationCode || '').trim().toUpperCase();
 
     if (!userId) {
-      return { success: false, error: 'Authentication required to activate card.' };
+      return { success: false, statusCode: 401, error: 'Authentication required to activate card.' };
     }
-    if (!activationCode) {
-      return { success: false, error: 'Please enter a valid activation code.' };
+    if (!activationCode || !/^[A-Z0-9][A-Z0-9\-_]{2,62}[A-Z0-9]$/.test(activationCode)) {
+      return { success: false, statusCode: 400, error: 'Please enter a valid Monvera card activation code (at least 4 characters).' };
+    }
+
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: Card activation request could not be permanently saved.',
+      };
+    }
+
+    const sanitizedRequestId =
+      params.requestId && /^[a-zA-Z0-9_-]{8,80}$/.test(String(params.requestId).trim())
+        ? String(params.requestId).trim()
+        : null;
+    const requestId = sanitizedRequestId || `act_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    // Idempotency check for network retry with the same requestId
+    if (sanitizedRequestId) {
+      try {
+        const existingDoc = await adminFirestore.collection('card_activation_requests').doc(requestId).get();
+        if (existingDoc.exists) {
+          const existingReq = { ...(existingDoc.data() as CardActivationRequest), id: existingDoc.id };
+          if (existingReq.userId !== userId) {
+            return {
+              success: false,
+              statusCode: 409,
+              error: 'Card activation reference conflict. Please submit again.',
+            };
+          }
+          db.cardActivationRequests.set(requestId, existingReq);
+          return {
+            success: true,
+            request: existingReq,
+          };
+        }
+      } catch (idempErr: any) {
+        console.error('[submitCardActivationRequest] Firestore idempotency check failed:', idempErr?.message || idempErr);
+        return {
+          success: false,
+          statusCode: 503,
+          error: 'Failed to verify card activation storage in database. Please try again.',
+        };
+      }
+    }
+
+    // Prevent duplicate pending or post-activation submissions
+    const existingStatus = await getCustomerCardActivationStatus(userId);
+    const activatedReq = existingStatus.requests.find((r) => r.status === 'ACTIVATED');
+    if (activatedReq) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'Your debit card is already activated for withdrawals.',
+        request: activatedReq,
+      };
+    }
+    const pendingReq = existingStatus.requests.find((r) => r.status === 'PENDING');
+    if (pendingReq) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'You already have a pending card activation request under review.',
+        request: pendingReq,
+      };
     }
 
     const nowIso = new Date().toISOString();
-    const requestId = `act_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-    // Resolve customer info
+    // Resolve customer info without letting stale memory records overwrite Firestore profile
     let customerName = (params.customerName || '').trim() || 'Monvera Client';
     let customerAccountNumber = (params.customerAccountNumber || '').trim() || 'Unavailable';
-    let customerEmail: string | undefined = params.customerEmail;
+    let customerEmail: string | undefined = params.customerEmail?.trim() || undefined;
+    let foundFirestoreUser = false;
 
-    if (isFirebaseAdminConfigured()) {
-      try {
-        const uSnap = await adminFirestore.collection('users').doc(userId).get();
-        if (uSnap.exists) {
-          const uData = uSnap.data() as any;
-          customerName = `${uData.firstName || ''} ${uData.lastName || ''}`.trim() || uData.fullName || uData.kycFullName || customerName;
-          customerAccountNumber = uData.permanentAccountNumber || uData.accountNumber || customerAccountNumber;
-          if (uData.email) customerEmail = uData.email;
-        }
-      } catch (e) {
-        console.warn('[submitCardActivationRequest] Error reading user doc:', e);
+    try {
+      const uSnap = await adminFirestore.collection('users').doc(userId).get();
+      if (uSnap.exists) {
+        foundFirestoreUser = true;
+        const uData = uSnap.data() as any;
+        customerName = `${uData.firstName || ''} ${uData.lastName || ''}`.trim() || uData.fullName || uData.kycFullName || customerName;
+        customerAccountNumber = uData.permanentAccountNumber || uData.accountNumber || customerAccountNumber;
+        if (uData.email) customerEmail = uData.email;
       }
+    } catch (e) {
+      console.warn('[submitCardActivationRequest] Error reading user doc:', e);
     }
 
     const memUser = db.users.get(userId);
     if (memUser) {
-      customerName = `${memUser.firstName || ''} ${memUser.lastName || ''}`.trim() || memUser.fullName || memUser.kycFullName || customerName;
-      customerAccountNumber = memUser.permanentAccountNumber || customerAccountNumber;
-      if (memUser.email) customerEmail = memUser.email;
+      if (!foundFirestoreUser || customerName === 'Monvera Client') {
+        customerName = `${memUser.firstName || ''} ${memUser.lastName || ''}`.trim() || memUser.fullName || memUser.kycFullName || customerName;
+      }
+      if (!foundFirestoreUser || customerAccountNumber === 'Unavailable') {
+        customerAccountNumber = memUser.permanentAccountNumber || customerAccountNumber;
+      }
+      if ((!foundFirestoreUser || !customerEmail) && memUser.email) {
+        customerEmail = memUser.email;
+      }
     }
 
-    const newRequest: CardActivationRequest = {
+    const newRequest: CardActivationRequest = stripUndefinedFields({
       id: requestId,
       userId,
       customerName,
       customerAccountNumber,
-      customerEmail,
+      ...(customerEmail ? { customerEmail } : {}),
       activationCode,
       cardBrand: params.cardBrand || 'VISA',
       cardLast4: params.cardLast4 || 'Debit Card',
       status: 'PENDING',
       submittedAt: nowIso,
-    };
+    });
 
-    // Save to Firestore
-    if (isFirebaseAdminConfigured()) {
+    // Save permanently to Firestore; never report success if write fails
+    try {
       await adminFirestore.collection('card_activation_requests').doc(requestId).set(newRequest);
+    } catch (fsErr: any) {
+      console.error('[submitCardActivationRequest] Firestore write failed:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to permanently save card activation request to database. Please try again.',
+      };
     }
 
-    // Save to Memory
+    // Update runtime cache only after Firestore persistence succeeds
     db.cardActivationRequests.set(requestId, newRequest);
 
     // Create deterministic notification for customer
@@ -5199,7 +5364,11 @@ export async function submitCardActivationRequest(params: SubmitCardActivationPa
     };
   } catch (err: any) {
     console.error('[submitCardActivationRequest Error]:', err);
-    return { success: false, error: err?.message || 'Failed to submit card activation request.' };
+    return {
+      success: false,
+      statusCode: err?.statusCode || 500,
+      error: err?.message || 'Failed to submit card activation request.',
+    };
   }
 }
 
@@ -5208,110 +5377,127 @@ export async function getCustomerCardActivationStatus(userId: string): Promise<{
   latestRequest: CardActivationRequest | null;
   requests: CardActivationRequest[];
 }> {
-  const map = new Map<string, CardActivationRequest>();
-
-  // 1. From Firestore
-  if (isFirebaseAdminConfigured()) {
-    try {
-      const snap = await adminFirestore
-        .collection('card_activation_requests')
-        .where('userId', '==', userId)
-        .get();
-      for (const doc of snap.docs) {
-        map.set(doc.id, { ...(doc.data() as CardActivationRequest), id: doc.id });
-      }
-    } catch (e) {
-      console.warn('[getCustomerCardActivationStatus] Firestore query note:', e);
-    }
+  if (!isFirebaseAdminConfigured()) {
+    throw Object.assign(
+      new Error('Database service unavailable: cannot retrieve card activation status.'),
+      { statusCode: 503 }
+    );
   }
 
-  // 2. From Memory
-  for (const [id, req] of db.cardActivationRequests.entries()) {
-    if (req.userId === userId && !map.has(id)) {
-      map.set(id, req);
-    }
+  try {
+    const snap = await adminFirestore
+      .collection('card_activation_requests')
+      .where('userId', '==', userId)
+      .get();
+
+    const list = snap.docs.map((doc) => ({ ...(doc.data() as CardActivationRequest), id: doc.id }));
+    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+
+    return {
+      success: true,
+      latestRequest: list.length > 0 ? list[0] : null,
+      requests: list,
+    };
+  } catch (fsErr: any) {
+    console.error('[getCustomerCardActivationStatus] Firestore read failed:', fsErr?.message || fsErr);
+    throw Object.assign(
+      new Error('Database read error: unable to retrieve card activation status.'),
+      { statusCode: 503 }
+    );
   }
-
-  const list = Array.from(map.values());
-  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
-
-  return {
-    success: true,
-    latestRequest: list.length > 0 ? list[0] : null,
-    requests: list,
-  };
 }
 
 export async function getAllCardActivationRequestsAdmin(): Promise<CardActivationRequest[]> {
-  const map = new Map<string, CardActivationRequest>();
-
-  // 1. From Firestore
-  if (isFirebaseAdminConfigured()) {
-    try {
-      const snap = await adminFirestore.collection('card_activation_requests').get();
-      for (const doc of snap.docs) {
-        map.set(doc.id, { ...(doc.data() as CardActivationRequest), id: doc.id });
-      }
-    } catch (e) {
-      console.warn('[getAllCardActivationRequestsAdmin] Firestore read note:', e);
-    }
+  if (!isFirebaseAdminConfigured()) {
+    throw Object.assign(
+      new Error('Database service unavailable: cannot retrieve card activation requests.'),
+      { statusCode: 503 }
+    );
   }
 
-  // 2. From Memory
-  for (const [id, req] of db.cardActivationRequests.entries()) {
-    if (!map.has(id)) {
-      map.set(id, req);
-    }
+  try {
+    const snap = await adminFirestore.collection('card_activation_requests').get();
+    const list = snap.docs.map((doc) => ({ ...(doc.data() as CardActivationRequest), id: doc.id }));
+    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    return list;
+  } catch (fsErr: any) {
+    console.error('[getAllCardActivationRequestsAdmin] Firestore read failed:', fsErr?.message || fsErr);
+    throw Object.assign(
+      new Error('Database read error: unable to retrieve card activation requests.'),
+      { statusCode: 503 }
+    );
   }
-
-  const list = Array.from(map.values());
-  list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
-  return list;
 }
 
 export async function approveCardActivationRequest(
   adminId: string,
   requestId: string
-): Promise<{ success: boolean; request?: CardActivationRequest; error?: string }> {
+): Promise<{ success: boolean; request?: CardActivationRequest; error?: string; statusCode?: number }> {
   try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: cannot approve card activation request.',
+      };
+    }
+
     let existingReq: CardActivationRequest | null = null;
     const nowIso = new Date().toISOString();
 
-    if (isFirebaseAdminConfigured()) {
+    try {
       const docRef = adminFirestore.collection('card_activation_requests').doc(requestId);
       const snap = await docRef.get();
       if (snap.exists) {
         existingReq = { ...(snap.data() as CardActivationRequest), id: snap.id };
       }
+    } catch (fsErr: any) {
+      console.error('[approveCardActivationRequest Firestore read error]:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to load card activation request from database.',
+      };
     }
 
     if (!existingReq) {
-      existingReq = db.cardActivationRequests.get(requestId) || null;
-    }
-
-    if (!existingReq) {
-      return { success: false, error: 'Card activation request not found.' };
+      return { success: false, statusCode: 404, error: 'Card activation request not found.' };
     }
 
     if (existingReq.status === 'ACTIVATED') {
-      return { success: false, error: 'This card activation request is already activated.' };
+      return { success: false, statusCode: 400, error: 'This card activation request is already activated.' };
     }
 
-    const updatedReq: CardActivationRequest = {
-      ...existingReq,
+    // Prevent activating a second request if customer already has an active request
+    const customerStatus = await getCustomerCardActivationStatus(existingReq.userId);
+    const otherActivated = customerStatus.requests.find((r) => r.id !== requestId && r.status === 'ACTIVATED');
+    if (otherActivated) {
+      return { success: false, statusCode: 400, error: 'This customer already has an activated debit card request.' };
+    }
+
+    const baseReq: Record<string, any> = { ...existingReq };
+    delete baseReq.rejectionReason;
+    delete baseReq.rejectedAt;
+    delete baseReq.rejectedBy;
+
+    const updatedReq: CardActivationRequest = stripUndefinedFields({
+      ...(baseReq as CardActivationRequest),
       status: 'ACTIVATED',
       approvedAt: nowIso,
       reviewedAt: nowIso,
       approvedBy: adminId,
       reviewedBy: adminId,
-    };
+    });
 
-    // Update in Firestore
-    if (isFirebaseAdminConfigured()) {
-      await adminFirestore.collection('card_activation_requests').doc(requestId).set(updatedReq, { merge: true });
+    // Update in Firestore (full document replace clears prior rejection metadata if re-approved)
+    try {
+      await adminFirestore.collection('card_activation_requests').doc(requestId).set(updatedReq);
+    } catch (fsErr: any) {
+      console.error('[approveCardActivationRequest Firestore write error]:', fsErr?.message || fsErr);
+      return { success: false, statusCode: 503, error: 'Failed to persist card activation approval to database.' };
     }
 
-    // Update in memory
+    // Update in memory only after Firestore write succeeds
     db.cardActivationRequests.set(requestId, updatedReq);
 
     // Record Admin Audit Log
@@ -5330,9 +5516,7 @@ export async function approveCardActivationRequest(
       result: 'SUCCESS' as const,
     };
     db.auditLogs.unshift(auditEntry);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
-    }
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
 
     // Create deterministic Notification for customer
     await persistCustomerNotification({
@@ -5362,7 +5546,11 @@ export async function approveCardActivationRequest(
     return { success: true, request: updatedReq };
   } catch (err: any) {
     console.error('[approveCardActivationRequest Error]:', err);
-    return { success: false, error: err?.message || 'Failed to approve card activation request.' };
+    return {
+      success: false,
+      statusCode: err?.statusCode || 500,
+      error: err?.message || 'Failed to approve card activation request.',
+    };
   }
 }
 
@@ -5370,30 +5558,49 @@ export async function rejectCardActivationRequest(
   adminId: string,
   requestId: string,
   reason?: string
-): Promise<{ success: boolean; request?: CardActivationRequest; error?: string }> {
+): Promise<{ success: boolean; request?: CardActivationRequest; error?: string; statusCode?: number }> {
   try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: cannot reject card activation request.',
+      };
+    }
+
     let existingReq: CardActivationRequest | null = null;
     const nowIso = new Date().toISOString();
 
-    if (isFirebaseAdminConfigured()) {
+    try {
       const docRef = adminFirestore.collection('card_activation_requests').doc(requestId);
       const snap = await docRef.get();
       if (snap.exists) {
         existingReq = { ...(snap.data() as CardActivationRequest), id: snap.id };
       }
+    } catch (fsErr: any) {
+      console.error('[rejectCardActivationRequest Firestore read error]:', fsErr?.message || fsErr);
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Failed to load card activation request from database.',
+      };
     }
 
     if (!existingReq) {
-      existingReq = db.cardActivationRequests.get(requestId) || null;
+      return { success: false, statusCode: 404, error: 'Card activation request not found.' };
     }
 
-    if (!existingReq) {
-      return { success: false, error: 'Card activation request not found.' };
+    if (existingReq.status === 'ACTIVATED') {
+      return { success: false, statusCode: 400, error: 'Cannot reject a card activation request that is already activated.' };
+    }
+
+    if (existingReq.status === 'REJECTED') {
+      return { success: false, statusCode: 400, error: 'This card activation request has already been rejected.' };
     }
 
     const rejectionReason = reason?.trim() || 'Activation code could not be verified by compliance.';
 
-    const updatedReq: CardActivationRequest = {
+    const updatedReq: CardActivationRequest = stripUndefinedFields({
       ...existingReq,
       status: 'REJECTED',
       rejectionReason,
@@ -5401,14 +5608,17 @@ export async function rejectCardActivationRequest(
       reviewedAt: nowIso,
       rejectedBy: adminId,
       reviewedBy: adminId,
-    };
+    });
 
-    // Update in Firestore
-    if (isFirebaseAdminConfigured()) {
+    // Update in Firestore; never report success if write fails
+    try {
       await adminFirestore.collection('card_activation_requests').doc(requestId).set(updatedReq, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[rejectCardActivationRequest Firestore write error]:', fsErr?.message || fsErr);
+      return { success: false, statusCode: 503, error: 'Failed to persist card activation rejection to database.' };
     }
 
-    // Update in memory
+    // Update in memory only after Firestore write succeeds
     db.cardActivationRequests.set(requestId, updatedReq);
 
     // Record Admin Audit Log
@@ -5427,9 +5637,7 @@ export async function rejectCardActivationRequest(
       result: 'SUCCESS' as const,
     };
     db.auditLogs.unshift(auditEntry);
-    if (isFirebaseAdminConfigured()) {
-      adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
-    }
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
 
     // Create deterministic Notification for customer
     await persistCustomerNotification({
@@ -5460,6 +5668,10 @@ export async function rejectCardActivationRequest(
     return { success: true, request: updatedReq };
   } catch (err: any) {
     console.error('[rejectCardActivationRequest Error]:', err);
-    return { success: false, error: err?.message || 'Failed to reject card activation request.' };
+    return {
+      success: false,
+      statusCode: err?.statusCode || 500,
+      error: err?.message || 'Failed to reject card activation request.',
+    };
   }
 }

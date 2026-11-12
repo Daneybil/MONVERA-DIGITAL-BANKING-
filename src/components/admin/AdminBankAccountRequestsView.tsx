@@ -44,23 +44,47 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   const [rejectionReason, setRejectionReason] = useState<string>('');
   const [isSubmittingAction, setIsSubmittingAction] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const loadRequests = async () => {
-    setIsLoading(true);
+  const loadRequests = async (silent = false) => {
+    if (!silent) {
+      setIsLoading(true);
+    }
     try {
       const res = await api.getAdminBankAccountApplications();
       if (res.success && res.applications) {
         setApplications(res.applications);
+        setLoadError(null);
+      } else {
+        setLoadError(res.error || 'Unable to load bank account approval requests. Please verify your connection and retry.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('[AdminBankAccountRequestsView] Error loading requests:', err);
+      setLoadError(err?.message || 'Network error loading bank account approval requests.');
     } finally {
-      setIsLoading(false);
+      if (!silent) {
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    loadRequests();
+    loadRequests(false);
+    const intervalId = window.setInterval(() => {
+      loadRequests(true);
+    }, 10000);
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        loadRequests(true);
+      }
+    };
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+    };
   }, []);
 
   const handleApprove = async () => {
@@ -131,11 +155,15 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
     return (
+      app.id.toLowerCase().includes(q) ||
       app.customerName.toLowerCase().includes(q) ||
       app.customerAccountNumber.toLowerCase().includes(q) ||
       app.bankName.toLowerCase().includes(q) ||
       app.accountHolderName.toLowerCase().includes(q) ||
       app.userId.toLowerCase().includes(q) ||
+      (app.accountNumber && app.accountNumber.toLowerCase().includes(q)) ||
+      (app.bankEmail && app.bankEmail.toLowerCase().includes(q)) ||
+      (app.phoneNumber && app.phoneNumber.toLowerCase().includes(q)) ||
       (app.verificationReference && app.verificationReference.toLowerCase().includes(q)) ||
       (app.maskedAccountNumber && app.maskedAccountNumber.toLowerCase().includes(q)) ||
       (app.swiftBic && app.swiftBic.toLowerCase().includes(q)) ||
@@ -172,7 +200,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
 
           <div className="flex items-center gap-3">
             <button
-              onClick={loadRequests}
+              onClick={() => loadRequests(false)}
               disabled={isLoading}
               className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition-colors flex items-center gap-2 border border-slate-700 cursor-pointer disabled:opacity-50"
             >
@@ -252,6 +280,23 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         </div>
       </div>
 
+      {/* Load Error Alert */}
+      {loadError && (
+        <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 text-rose-900 text-xs font-semibold">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{loadError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => loadRequests(false)}
+            className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors cursor-pointer self-start sm:self-auto"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Applications Table / Cards */}
       <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
         {isLoading ? (
@@ -301,8 +346,11 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                           <Hash className="w-3 h-3 text-slate-400" />
                           <span>MVB: {app.customerAccountNumber}</span>
                         </div>
-                        <div className="text-[10px] text-slate-400 font-mono truncate max-w-[140px]" title={app.userId}>
+                        <div className="text-[10px] text-slate-400 font-mono truncate max-w-[160px]" title={app.userId}>
                           UID: {app.userId.slice(0, 10)}...
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono truncate max-w-[160px]" title={app.id}>
+                          App: {app.id}
                         </div>
                       </td>
 
@@ -340,14 +388,16 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
 
                       {/* Account / SWIFT / IBAN */}
                       <td className="px-5 py-4">
-                        <div className="font-mono font-bold text-slate-900">{app.maskedAccountNumber}</div>
+                        <div className="font-mono font-bold text-slate-900 select-all">
+                          {app.accountNumber || app.maskedAccountNumber}
+                        </div>
                         {app.swiftBic && (
-                          <div className="font-mono text-[11px] text-slate-700 font-semibold mt-0.5">
+                          <div className="font-mono text-[11px] text-slate-700 font-semibold mt-0.5 select-all">
                             SWIFT/BIC: {app.swiftBic}
                           </div>
                         )}
                         {(app.iban || app.maskedIban) && (
-                          <div className="font-mono text-[11px] text-slate-600 mt-0.5 break-all">
+                          <div className="font-mono text-[11px] text-slate-600 mt-0.5 break-all select-all">
                             IBAN: {app.iban || app.maskedIban}
                           </div>
                         )}
@@ -566,8 +616,15 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                     <strong className="text-slate-950">{selectedApp.accountHolderName}</strong>
                   </div>
                   <div>
-                    <span className="text-slate-400 block text-[10px]">Masked Account Number</span>
-                    <strong className="font-mono text-slate-950">{selectedApp.maskedAccountNumber}</strong>
+                    <span className="text-slate-400 block text-[10px]">Bank Account Number</span>
+                    <strong className="font-mono text-slate-950 select-all">
+                      {selectedApp.accountNumber || selectedApp.maskedAccountNumber}
+                    </strong>
+                    {selectedApp.maskedAccountNumber && selectedApp.accountNumber && (
+                      <span className="block text-[10px] font-mono text-slate-400">
+                        Masked: {selectedApp.maskedAccountNumber}
+                      </span>
+                    )}
                   </div>
                   <div className="col-span-2 pt-2 border-t border-slate-200/80">
                     <span className="text-slate-400 block text-[10px]">Bank Activation & Rail Verification</span>
@@ -598,20 +655,18 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       )}
                     </div>
                   </div>
-                  {selectedApp.swiftBic && (
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">SWIFT / BIC Code</span>
-                      <strong className="font-mono text-slate-950 select-all">{selectedApp.swiftBic}</strong>
-                    </div>
-                  )}
-                  {(selectedApp.iban || selectedApp.maskedIban) && (
-                    <div>
-                      <span className="text-slate-400 block text-[10px]">IBAN (International)</span>
-                      <strong className="font-mono text-slate-950 break-all select-all">
-                        {selectedApp.iban || selectedApp.maskedIban}
-                      </strong>
-                    </div>
-                  )}
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">SWIFT / BIC Code</span>
+                    <strong className="font-mono text-slate-950 select-all">
+                      {selectedApp.swiftBic || 'Not provided'}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">IBAN (International)</span>
+                    <strong className="font-mono text-slate-950 break-all select-all">
+                      {selectedApp.iban || selectedApp.maskedIban || 'Not provided'}
+                    </strong>
+                  </div>
                   {selectedApp.routingNumber && (
                     <div>
                       <span className="text-slate-400 block text-[10px]">Routing Number</span>
@@ -756,7 +811,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               <div>
                 <span className="text-slate-400">Bank:</span>{' '}
                 <strong className="text-slate-950">
-                  {actionModal.app.bankName} ({actionModal.app.maskedAccountNumber})
+                  {actionModal.app.bankName} ({actionModal.app.accountNumber || actionModal.app.maskedAccountNumber})
                 </strong>
               </div>
               <div>

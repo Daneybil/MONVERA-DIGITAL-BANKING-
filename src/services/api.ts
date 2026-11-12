@@ -21,7 +21,7 @@ import {
   CardActivationStatus,
 } from '../types';
 import { db, auth } from './firebase';
-import { collection, query, where, getDocs, doc, getDoc } from 'firebase/firestore';
+import { collection, query, where, getDocs, doc, getDoc, setDoc, deleteField } from 'firebase/firestore';
 import { firestoreSync } from './firestoreSync';
 import { notificationDispatcher } from './notificationDispatcher';
 
@@ -30,6 +30,19 @@ const API_BASE_URL = ((import.meta as any).env?.VITE_API_URL || '').replace(/\/+
 export function getApiEndpoint(endpoint: string): string {
   const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   return API_BASE_URL ? `${API_BASE_URL}${cleanEndpoint}` : cleanEndpoint;
+}
+
+async function fetchWithSameOriginFallback(endpoint: string, init?: RequestInit): Promise<Response> {
+  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  const targetUrl = getApiEndpoint(cleanEndpoint);
+  try {
+    return await fetch(targetUrl, init);
+  } catch (primaryErr) {
+    if (targetUrl !== cleanEndpoint) {
+      return await fetch(cleanEndpoint, init);
+    }
+    throw primaryErr;
+  }
 }
 
 const ADMIN_SESSION_STORAGE_KEY = 'monvera_admin_session_token';
@@ -2934,6 +2947,7 @@ export const api = {
     bsb?: string;
     authMethod?: string;
     authVerificationStatus?: string;
+    requestId?: string;
   }): Promise<{
     success: boolean;
     application?: LinkedBankAccountApplication;
@@ -2941,16 +2955,29 @@ export const api = {
     error?: string;
   }> {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint('/api/bank-accounts/link'), {
+      const headers = await getCustomerAuthHeaders();
+      const res = await fetchWithSameOriginFallback('/api/bank-accounts/link', {
         method: 'POST',
         headers,
         body: JSON.stringify(params),
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        message?: string;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to submit bank account details',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to submit bank account details (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[submitBankAccountApplication] Network error:', err);
       return { success: false, error: err?.message || 'Network error submitting bank account details.' };
@@ -2973,6 +3000,7 @@ export const api = {
     bsb?: string;
     authMethod?: string;
     authVerificationStatus?: string;
+    requestId?: string;
   }): Promise<{
     success: boolean;
     application?: LinkedBankAccountApplication;
@@ -2991,15 +3019,27 @@ export const api = {
     error?: string;
   }> {
     try {
-      const headers = await getAuthHeaders();
-      const url = userId
-        ? getApiEndpoint(`/api/bank-accounts/my?userId=${encodeURIComponent(userId)}`)
-        : getApiEndpoint('/api/bank-accounts/my');
-      const res = await fetch(url, { headers });
-      return await parseJsonResponse(res, {
+      const headers = await getCustomerAuthHeaders();
+      const path = userId
+        ? `/api/bank-accounts/my?userId=${encodeURIComponent(userId)}`
+        : '/api/bank-accounts/my';
+      const res = await fetchWithSameOriginFallback(path, { headers });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        applications?: LinkedBankAccountApplication[];
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to retrieve linked bank accounts',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to retrieve linked bank accounts (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[getMyBankAccountApplications] Network error:', err);
       return { success: false, error: err?.message || 'Network error retrieving linked bank accounts.' };
@@ -3016,11 +3056,23 @@ export const api = {
   }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint('/api/admin/bank-accounts'), { headers });
-      return await parseJsonResponse(res, {
+      const res = await fetchWithSameOriginFallback('/api/admin/bank-accounts', { headers });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        applications?: LinkedBankAccountApplication[];
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to retrieve bank approval requests',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to retrieve bank approval requests (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[getAdminBankAccountApplications] Network error:', err);
       return { success: false, error: err?.message || 'Network error retrieving bank approval requests.' };
@@ -3037,14 +3089,26 @@ export const api = {
   }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint(`/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/approve`), {
+      const res = await fetchWithSameOriginFallback(`/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/approve`, {
         method: 'POST',
         headers,
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to approve bank account',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to approve bank account (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[approveBankAccountApplication] Network error:', err);
       return { success: false, error: err?.message || 'Network error approving bank account.' };
@@ -3061,15 +3125,27 @@ export const api = {
   }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint(`/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/reject`), {
+      const res = await fetchWithSameOriginFallback(`/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/reject`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ reason }),
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to reject bank account',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to reject bank account (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[rejectBankAccountApplication] Network error:', err);
       return { success: false, error: err?.message || 'Network error rejecting bank account.' };
@@ -3085,16 +3161,28 @@ export const api = {
     error?: string;
   }> {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint(`/api/bank-accounts/${encodeURIComponent(applicationId)}/cancel`), {
+      const headers = await getCustomerAuthHeaders();
+      const res = await fetchWithSameOriginFallback(`/api/bank-accounts/${encodeURIComponent(applicationId)}/cancel`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ userId }),
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to cancel bank application',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to cancel bank application (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[cancelBankAccountApplication] Network error:', err);
       return { success: false, error: err?.message || 'Network error cancelling bank application.' };
@@ -3117,16 +3205,28 @@ export const api = {
     error?: string;
   }> {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint(`/api/bank-accounts/${encodeURIComponent(applicationId)}/verify-activate`), {
+      const headers = await getCustomerAuthHeaders();
+      const res = await fetchWithSameOriginFallback(`/api/bank-accounts/${encodeURIComponent(applicationId)}/verify-activate`, {
         method: 'POST',
         headers,
         body: JSON.stringify(data),
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to complete bank verification',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to complete bank verification (${res.status})`,
+        };
+      }
+      return parsed;
     } catch (err: any) {
       console.error('[completeBankVerification] Network error:', err);
       return { success: false, error: err?.message || 'Network error completing bank verification.' };
@@ -3144,26 +3244,53 @@ export const api = {
     customerName?: string;
     customerAccountNumber?: string;
     customerEmail?: string;
+    requestId?: string;
   }): Promise<{
     success: boolean;
     request?: CardActivationRequest;
     message?: string;
     error?: string;
   }> {
+    const cleanCode = String(params.activationCode || '').trim().toUpperCase();
+    if (!cleanCode || !/^[A-Z0-9][A-Z0-9\-_]{2,62}[A-Z0-9]$/.test(cleanCode)) {
+      return {
+        success: false,
+        error: 'Please enter a valid Monvera card activation code (at least 4 characters).',
+      };
+    }
+
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint('/api/card-activations/submit'), {
+      const headers = await getCustomerAuthHeaders();
+      const res = await fetchWithSameOriginFallback('/api/card-activations/submit', {
         method: 'POST',
         headers,
-        body: JSON.stringify(params),
+        body: JSON.stringify({ ...params, activationCode: cleanCode }),
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        request?: CardActivationRequest;
+        message?: string;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to submit card activation code.',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          ...(parsed.request ? { request: parsed.request } : {}),
+          error: parsed.error || `Failed to submit card activation code (${res.status}).`,
+        };
+      }
+
+      return parsed;
     } catch (err: any) {
       console.error('[submitCardActivation] Network error:', err);
-      return { success: false, error: err?.message || 'Network error submitting card activation code.' };
+      return {
+        success: false,
+        error: err?.message || 'Network error submitting card activation code.',
+      };
     }
   },
 
@@ -3177,19 +3304,38 @@ export const api = {
     error?: string;
   }> {
     try {
-      const headers = await getAuthHeaders();
-      const endpoint = userId
-        ? getApiEndpoint(`/api/card-activations/my?userId=${encodeURIComponent(userId)}`)
-        : getApiEndpoint('/api/card-activations/my');
-      const res = await fetch(endpoint, { headers });
-      return await parseJsonResponse(res, {
+      const headers = await getCustomerAuthHeaders();
+      const path = userId
+        ? `/api/card-activations/my?userId=${encodeURIComponent(userId)}`
+        : '/api/card-activations/my';
+      const res = await fetchWithSameOriginFallback(path, { headers });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        latestRequest: CardActivationRequest | null;
+        requests?: CardActivationRequest[];
+        error?: string;
+      }>(res, {
         success: false,
         latestRequest: null,
         error: 'Failed to retrieve card activation status.',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          latestRequest: null,
+          error: parsed.error || `Failed to retrieve card activation status (${res.status}).`,
+        };
+      }
+
+      return parsed;
     } catch (err: any) {
       console.error('[getMyCardActivationStatus] Network error:', err);
-      return { success: false, latestRequest: null, error: err?.message || 'Network error retrieving card activation status.' };
+      return {
+        success: false,
+        latestRequest: null,
+        error: err?.message || 'Network error retrieving card activation status.',
+      };
     }
   },
 
@@ -3203,14 +3349,30 @@ export const api = {
   }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint('/api/admin/card-activations'), { headers });
-      return await parseJsonResponse(res, {
+      const res = await fetchWithSameOriginFallback('/api/admin/card-activations', { headers });
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        requests?: CardActivationRequest[];
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to retrieve card activation requests.',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to retrieve card activation requests (${res.status}).`,
+        };
+      }
+
+      return parsed;
     } catch (err: any) {
       console.error('[getAdminCardActivationRequests] Network error:', err);
-      return { success: false, error: err?.message || 'Network error retrieving card activation requests.' };
+      return {
+        success: false,
+        error: err?.message || 'Network error retrieving card activation requests.',
+      };
     }
   },
 
@@ -3224,17 +3386,33 @@ export const api = {
   }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint(`/api/admin/card-activations/${encodeURIComponent(requestId)}/approve`), {
+      const res = await fetchWithSameOriginFallback(`/api/admin/card-activations/${encodeURIComponent(requestId)}/approve`, {
         method: 'POST',
         headers,
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        request?: CardActivationRequest;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to approve card activation.',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to approve card activation (${res.status}).`,
+        };
+      }
+
+      return parsed;
     } catch (err: any) {
       console.error('[approveCardActivationRequest] Network error:', err);
-      return { success: false, error: err?.message || 'Network error approving card activation.' };
+      return {
+        success: false,
+        error: err?.message || 'Network error approving card activation.',
+      };
     }
   },
 
@@ -3248,18 +3426,34 @@ export const api = {
   }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint(`/api/admin/card-activations/${encodeURIComponent(requestId)}/reject`), {
+      const res = await fetchWithSameOriginFallback(`/api/admin/card-activations/${encodeURIComponent(requestId)}/reject`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ reason }),
       });
-      return await parseJsonResponse(res, {
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        request?: CardActivationRequest;
+        error?: string;
+      }>(res, {
         success: false,
         error: 'Failed to reject card activation.',
       });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to reject card activation (${res.status}).`,
+        };
+      }
+
+      return parsed;
     } catch (err: any) {
       console.error('[rejectCardActivationRequest] Network error:', err);
-      return { success: false, error: err?.message || 'Network error rejecting card activation.' };
+      return {
+        success: false,
+        error: err?.message || 'Network error rejecting card activation.',
+      };
     }
   },
 };

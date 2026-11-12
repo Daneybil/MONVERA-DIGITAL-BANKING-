@@ -20,9 +20,6 @@ import {
   Calendar,
 } from 'lucide-react';
 
-import { db } from '../../services/firebase';
-import { collection, getDocs } from 'firebase/firestore';
-
 interface AdminCardActivationsViewProps {
   onRefreshData?: () => void;
 }
@@ -41,42 +38,50 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
   const [rejectionReason, setRejectionReason] = useState<string>('');
   const [isSubmittingAction, setIsSubmittingAction] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const loadRequests = async () => {
-    setIsLoading(true);
+  const loadRequests = async (silent = false) => {
+    if (!silent) {
+      setIsLoading(true);
+    }
     try {
       const res = await api.getAdminCardActivationRequests();
       if (res.success && Array.isArray(res.requests)) {
-        setRequests(res.requests);
+        const list = [...res.requests].sort(
+          (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
+        );
+        setRequests(list);
+        setLoadError(null);
       } else {
-        // Direct Firestore fallback to ensure requests appear even if backend API had auth/network latency
-        let directFound = false;
-        if (db) {
-          try {
-            const snap = await getDocs(collection(db, 'card_activation_requests'));
-            if (!snap.empty) {
-              const fsRequests = snap.docs.map((d) => ({ ...(d.data() as any), id: d.id } as CardActivationRequest));
-              fsRequests.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
-              setRequests(fsRequests);
-              directFound = true;
-            }
-          } catch (e) {
-            console.warn('[AdminCardActivationsView] Direct Firestore note:', e);
-          }
-        }
-        if (!directFound && res.requests) {
-          setRequests(res.requests);
-        }
+        setLoadError(res.error || 'Unable to load card activation requests. Please verify your connection and try again.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('[AdminCardActivationsView] Error loading requests:', err);
+      setLoadError(err?.message || 'Unexpected error loading card activation requests.');
     } finally {
-      setIsLoading(false);
+      if (!silent) {
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    loadRequests();
+    loadRequests(false);
+    const intervalId = window.setInterval(() => {
+      loadRequests(true);
+    }, 10000);
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        loadRequests(true);
+      }
+    };
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+    };
   }, []);
 
   const handleApprove = async () => {
@@ -137,6 +142,7 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
     const query = searchQuery.toLowerCase().trim();
     const matchesSearch =
       !query ||
+      r.id.toLowerCase().includes(query) ||
       r.customerName.toLowerCase().includes(query) ||
       r.customerAccountNumber.toLowerCase().includes(query) ||
       r.activationCode.toLowerCase().includes(query) ||
@@ -171,7 +177,7 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
         </div>
 
         <button
-          onClick={loadRequests}
+          onClick={() => loadRequests(false)}
           disabled={isLoading}
           className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/20 text-xs font-bold text-white transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50 self-start md:self-auto"
         >
@@ -259,6 +265,23 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
         </div>
       </div>
 
+      {/* Load Error Alert */}
+      {loadError && (
+        <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 text-rose-900 text-xs font-semibold">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{loadError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => loadRequests(false)}
+            className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors cursor-pointer self-start sm:self-auto"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Table of Requests */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         {isLoading ? (
@@ -312,6 +335,9 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
                             <span>{req.customerEmail}</span>
                           </div>
                         )}
+                        <div className="text-[10px] font-mono text-slate-400 mt-0.5 truncate max-w-[180px]" title={req.id}>
+                          ID: {req.id}
+                        </div>
                       </td>
 
                       <td className="p-4">

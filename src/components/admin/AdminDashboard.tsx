@@ -83,6 +83,8 @@ export const AdminDashboard: React.FC = () => {
   const [adminLoans, setAdminLoans] = useState<LoanApplication[]>([]);
   const [pendingCardActivationsCount, setPendingCardActivationsCount] = useState<number>(0);
   const [pendingBankAppsCount, setPendingBankAppsCount] = useState<number>(0);
+  const [cardActivationsLoadError, setCardActivationsLoadError] = useState<string | null>(null);
+  const [bankAppsLoadError, setBankAppsLoadError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
   const [firebaseUid, setFirebaseUid] = useState<string | null>(() => auth?.currentUser?.uid || null);
@@ -419,8 +421,16 @@ export const AdminDashboard: React.FC = () => {
         api.getTransactions().catch(() => ({ transactions: [] })),
         api.getAdminAuditLogs().catch(() => ({ auditLogs: [] })),
         api.getLoans().catch(() => ({ loans: [] })),
-        api.getAdminCardActivationRequests().catch(() => ({ requests: [] })),
-        api.getAdminBankAccountApplications().catch(() => ({ applications: [] })),
+        api.getAdminCardActivationRequests().catch((err: any) => ({
+          success: false,
+          requests: [],
+          error: err?.message || 'Network error retrieving card activation requests.',
+        })),
+        api.getAdminBankAccountApplications().catch((err: any) => ({
+          success: false,
+          applications: [],
+          error: err?.message || 'Network error retrieving bank approval requests.',
+        })),
       ]);
 
       const serverCustomers = custRes?.customers || [];
@@ -428,13 +438,21 @@ export const AdminDashboard: React.FC = () => {
       setCustomers(merged);
       if (loansRes?.loans) setAdminLoans(loansRes.loans);
 
-      const cardActivations = cardActRes?.requests || [];
-      const pendingActivations = cardActivations.filter((r) => r.status === 'PENDING').length;
-      setPendingCardActivationsCount(pendingActivations);
+      if (cardActRes?.success && Array.isArray(cardActRes.requests)) {
+        const pendingActivations = cardActRes.requests.filter((r) => r.status === 'PENDING').length;
+        setPendingCardActivationsCount(pendingActivations);
+        setCardActivationsLoadError(null);
+      } else {
+        setCardActivationsLoadError(cardActRes?.error || 'Unable to load debit card activation requests.');
+      }
 
-      const bankApps = bankAppsRes?.applications || [];
-      const pendingBankApps = bankApps.filter((a: any) => a.status === 'pending').length;
-      setPendingBankAppsCount(pendingBankApps);
+      if (bankAppsRes?.success && Array.isArray(bankAppsRes.applications)) {
+        const pendingBankApps = bankAppsRes.applications.filter((a: any) => a.status === 'pending').length;
+        setPendingBankAppsCount(pendingBankApps);
+        setBankAppsLoadError(null);
+      } else {
+        setBankAppsLoadError(bankAppsRes?.error || 'Unable to load bank account approval requests.');
+      }
 
       const totalUserDeposits = merged.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0);
 
@@ -535,8 +553,58 @@ export const AdminDashboard: React.FC = () => {
       }
     });
 
+    // Background polling every 10s (and on tab visibility/focus) to keep bank & card badges current
+    const refreshApprovalBadges = async () => {
+      try {
+        const [cardActRes, bankAppsRes] = await Promise.all([
+          api.getAdminCardActivationRequests().catch((err: any) => ({
+            success: false,
+            requests: [],
+            error: err?.message || 'Network error retrieving card activation requests.',
+          })),
+          api.getAdminBankAccountApplications().catch((err: any) => ({
+            success: false,
+            applications: [],
+            error: err?.message || 'Network error retrieving bank approval requests.',
+          })),
+        ]);
+
+        if (cardActRes?.success && Array.isArray(cardActRes.requests)) {
+          setPendingCardActivationsCount(cardActRes.requests.filter((r) => r.status === 'PENDING').length);
+          setCardActivationsLoadError(null);
+        } else {
+          setCardActivationsLoadError(cardActRes?.error || 'Unable to load debit card activation requests.');
+        }
+
+        if (bankAppsRes?.success && Array.isArray(bankAppsRes.applications)) {
+          setPendingBankAppsCount(bankAppsRes.applications.filter((a: any) => a.status === 'pending').length);
+          setBankAppsLoadError(null);
+        } else {
+          setBankAppsLoadError(bankAppsRes?.error || 'Unable to load bank account approval requests.');
+        }
+      } catch (err: any) {
+        console.warn('[AdminDashboard] Badge polling error:', err);
+      }
+    };
+
+    const badgePollInterval = window.setInterval(() => {
+      refreshApprovalBadges();
+    }, 10000);
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        refreshApprovalBadges();
+      }
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleVisibilityOrFocus);
+      document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    }
+
     return () => {
+      window.clearInterval(badgePollInterval);
       if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', handleVisibilityOrFocus);
+        document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
         window.removeEventListener('monvera_balance_updated', handleAdminBalanceUpdate);
         window.removeEventListener('monvera_user_status_changed', handleAdminStatusUpdate);
         window.removeEventListener('monvera_kyc_status_updated', handleAdminKycUpdate);
@@ -1149,6 +1217,25 @@ export const AdminDashboard: React.FC = () => {
             </button>
           </div>
         </div>
+
+        {(bankAppsLoadError || cardActivationsLoadError) && (
+          <div className="mb-5 p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-start gap-2.5 text-xs font-bold">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                {bankAppsLoadError && <div>Bank Requests Sync Error: {bankAppsLoadError}</div>}
+                {cardActivationsLoadError && <div>Card Activations Sync Error: {cardActivationsLoadError}</div>}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={loadAllAdminData}
+              className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors cursor-pointer self-start sm:self-auto shrink-0"
+            >
+              Retry Sync
+            </button>
+          </div>
+        )}
 
         {activeTab === 'overview' && (
           <AdminOverviewView

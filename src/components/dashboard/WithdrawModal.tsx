@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { CardActivationRequest, LinkedBankAccountApplication } from '../../types';
@@ -31,6 +31,8 @@ import {
   Mail,
   Phone,
   Hash,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 
 export const WithdrawModal: React.FC = () => {
@@ -52,6 +54,7 @@ export const WithdrawModal: React.FC = () => {
   const [isLinkingNewBank, setIsLinkingNewBank] = useState<boolean>(false);
   const [isSubmittingBankLink, setIsSubmittingBankLink] = useState<boolean>(false);
   const [bankLinkFeedback, setBankLinkFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [bankAccountsLoadError, setBankAccountsLoadError] = useState<string | null>(null);
 
   // Bank Activation & Verification states
   const [isCancellingBankApp, setIsCancellingBankApp] = useState<boolean>(false);
@@ -78,6 +81,7 @@ export const WithdrawModal: React.FC = () => {
   const [bankAccountNumber, setBankAccountNumber] = useState<string>('');
   const [bankSwiftBic, setBankSwiftBic] = useState<string>('');
   const [bankIban, setBankIban] = useState<string>('');
+  const [showIban, setShowIban] = useState<boolean>(true);
 
   // Debit Card Activation states
   const [activationCodeInput, setActivationCodeInput] = useState<string>('');
@@ -85,6 +89,11 @@ export const WithdrawModal: React.FC = () => {
   const [isLoadingActivation, setIsLoadingActivation] = useState<boolean>(false);
   const [isSubmittingActivation, setIsSubmittingActivation] = useState<boolean>(false);
   const [activationFeedback, setActivationFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [activationLoadError, setActivationLoadError] = useState<string | null>(null);
+
+  // Idempotent client request IDs for network retry safety
+  const pendingBankRequestIdRef = useRef<string | null>(null);
+  const pendingCardRequestIdRef = useRef<string | null>(null);
 
   // Amount & Status
   const [amount, setAmount] = useState<string>('2500');
@@ -101,40 +110,56 @@ export const WithdrawModal: React.FC = () => {
   } | null>(null);
 
   // Load customer's card activation status on open
-  const loadCardActivationStatus = async () => {
+  const loadCardActivationStatus = async (silent = false) => {
     if (!currentUser?.id) return;
-    setIsLoadingActivation(true);
+    if (!silent) {
+      setIsLoadingActivation(true);
+    }
     try {
       const res = await api.getMyCardActivationStatus(currentUser.id);
-      if (res.success && res.latestRequest) {
-        setActivationRequest(res.latestRequest);
+      if (res.success) {
+        setActivationRequest(res.latestRequest || null);
+        setActivationLoadError(null);
+      } else {
+        setActivationLoadError(res.error || 'Unable to verify current card activation status.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn('[WithdrawModal] Failed to load card activation status:', err);
+      setActivationLoadError(err?.message || 'Network error loading card activation status.');
     } finally {
-      setIsLoadingActivation(false);
+      if (!silent) {
+        setIsLoadingActivation(false);
+      }
     }
   };
 
   // Load customer's linked bank accounts
-  const loadBankAccounts = async () => {
+  const loadBankAccounts = async (silent = false) => {
     if (!currentUser?.id) return;
-    setIsLoadingBankAccounts(true);
+    if (!silent) {
+      setIsLoadingBankAccounts(true);
+    }
     try {
       const res = await api.getMyBankAccountApplications(currentUser.id);
       if (res.success && res.applications) {
         setLinkedBankAccounts(res.applications);
+        setBankAccountsLoadError(null);
         const approvedAcc = res.applications.find((a) => a.status === 'approved');
         if (approvedAcc) {
-          setSelectedBankId(approvedAcc.id);
+          setSelectedBankId((prev) => prev || approvedAcc.id);
         } else if (res.applications.length > 0) {
-          setSelectedBankId(res.applications[0].id);
+          setSelectedBankId((prev) => prev || res.applications![0].id);
         }
+      } else {
+        setBankAccountsLoadError(res.error || 'Unable to load linked bank accounts.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn('[WithdrawModal] Failed to load bank accounts:', err);
+      setBankAccountsLoadError(err?.message || 'Network error loading linked bank accounts.');
     } finally {
-      setIsLoadingBankAccounts(false);
+      if (!silent) {
+        setIsLoadingBankAccounts(false);
+      }
     }
   };
 
@@ -198,6 +223,40 @@ export const WithdrawModal: React.FC = () => {
     };
   }, [activeModal, currentUser]);
 
+  // Reset idempotent request IDs when form inputs change or modal closes
+  useEffect(() => {
+    pendingBankRequestIdRef.current = null;
+  }, [
+    activeModal,
+    bankCountry,
+    bankNameSelect,
+    customBankName,
+    accountHolderName,
+    bankEmail,
+    bankPhone,
+    bankCurrency,
+    bankAccountNumber,
+    bankSwiftBic,
+    bankIban,
+  ]);
+
+  useEffect(() => {
+    pendingCardRequestIdRef.current = null;
+  }, [activeModal, activationCodeInput, cardBrand]);
+
+  // Silent background polling while modal is open so admin approval/rejection updates appear automatically
+  useEffect(() => {
+    if (activeModal !== 'withdraw' || !currentUser?.id) return;
+    const interval = window.setInterval(() => {
+      if (destinationType === 'ACTIVATION') {
+        loadCardActivationStatus(true);
+      } else if (destinationType === 'BANK' || destinationType === 'BANK_ACTIVATION') {
+        loadBankAccounts(true);
+      }
+    }, 12000);
+    return () => window.clearInterval(interval);
+  }, [activeModal, currentUser?.id, destinationType]);
+
   if (activeModal !== 'withdraw' || !currentUser) return null;
 
   const checkingBal = balanceMetrics?.checkingBalance || 0;
@@ -229,12 +288,19 @@ export const WithdrawModal: React.FC = () => {
   const handleActivateCard = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanCode = activationCodeInput.trim().toUpperCase();
-    if (!cleanCode) {
-      setActivationFeedback({ type: 'error', text: 'Please enter a valid activation code.' });
+    if (!cleanCode || !/^[A-Z0-9][A-Z0-9\-_]{2,62}[A-Z0-9]$/.test(cleanCode)) {
+      setActivationFeedback({
+        type: 'error',
+        text: 'Please enter a valid Monvera card activation code (minimum 4 letters or numbers, e.g. ACT-84219).',
+      });
       return;
     }
     setIsSubmittingActivation(true);
     setActivationFeedback(null);
+    if (!pendingCardRequestIdRef.current) {
+      pendingCardRequestIdRef.current = `act_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    }
+    const requestId = pendingCardRequestIdRef.current;
     try {
       const res = await api.submitCardActivation({
         activationCode: cleanCode,
@@ -244,16 +310,21 @@ export const WithdrawModal: React.FC = () => {
         customerName: currentUser?.kycFullName || `${currentUser?.firstName || ''} ${currentUser?.lastName || ''}`.trim() || 'Monvera Client',
         customerAccountNumber: currentUser?.permanentAccountNumber || 'Active',
         customerEmail: currentUser?.email,
+        requestId,
       });
       if (res.success && res.request) {
+        pendingCardRequestIdRef.current = null;
         setActivationRequest(res.request);
         setActivationCodeInput('');
         setActivationFeedback({
           type: 'success',
-          text: 'Card activation request submitted successfully. Status: Pending.',
+          text: 'Card activation request submitted successfully. Status: Pending verification.',
         });
         await refreshNotifications();
       } else {
+        if (res.request) {
+          setActivationRequest(res.request);
+        }
         setActivationFeedback({ type: 'error', text: res.error || 'Failed to submit activation code.' });
       }
     } catch (err: any) {
@@ -368,23 +439,28 @@ export const WithdrawModal: React.FC = () => {
       return;
     }
 
-    const cleanSwiftBic = bankSwiftBic.replace(/\s+/g, '').toUpperCase();
-    if (cleanSwiftBic && !/^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(cleanSwiftBic)) {
+    const cleanSwiftBic = bankSwiftBic.trim();
+    if (cleanSwiftBic.length > 64) {
       setBankLinkFeedback({
         type: 'error',
-        text: 'Please enter a valid 8- or 11-character SWIFT / BIC code (e.g. CHASUS33), or leave it blank.',
+        text: 'SWIFT / BIC code must not exceed 64 characters.',
       });
       return;
     }
 
-    const cleanIban = bankIban.replace(/\s+/g, '').toUpperCase();
-    if (cleanIban && !/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(cleanIban)) {
+    const cleanIban = bankIban.trim();
+    if (cleanIban.length > 64) {
       setBankLinkFeedback({
         type: 'error',
-        text: 'Please enter a valid international IBAN (e.g. GB29NWBK60161331926819), or leave it blank.',
+        text: 'IBAN must not exceed 64 characters.',
       });
       return;
     }
+
+    if (!pendingBankRequestIdRef.current) {
+      pendingBankRequestIdRef.current = `bnk_app_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    }
+    const requestId = pendingBankRequestIdRef.current;
 
     setIsSubmittingBankLink(true);
     try {
@@ -400,19 +476,23 @@ export const WithdrawModal: React.FC = () => {
         ...(cleanSwiftBic ? { swiftBic: cleanSwiftBic } : {}),
         ...(cleanIban ? { iban: cleanIban } : {}),
         authMethod: 'Direct Bank Settlement (ACH/Wire)',
+        requestId,
       });
 
       if (res.success && res.application) {
+        pendingBankRequestIdRef.current = null;
         setBankLinkFeedback({
           type: 'success',
           text: 'Bank account submitted successfully! Your application has been sent for administrative review.',
         });
         await loadBankAccounts();
+        await refreshNotifications();
         setIsLinkingNewBank(false);
         setSelectedBankId(res.application.id);
         setBankAccountNumber('');
         setBankSwiftBic('');
         setBankIban('');
+        setShowIban(true);
         if (isOtherBank) setCustomBankName('');
       } else {
         setBankLinkFeedback({
@@ -590,6 +670,9 @@ export const WithdrawModal: React.FC = () => {
     setCardExpiry('');
     setCardCvv('');
     setBankAccountNumber('');
+    setBankSwiftBic('');
+    setBankIban('');
+    setShowIban(true);
     setBankLinkFeedback(null);
     setIsLinkingNewBank(false);
     setShowVerificationModal(false);
@@ -1055,7 +1138,7 @@ export const WithdrawModal: React.FC = () => {
                       </div>
                       <button
                         type="button"
-                        onClick={loadCardActivationStatus}
+                        onClick={() => loadCardActivationStatus(false)}
                         disabled={isLoadingActivation}
                         className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-300 text-xs font-black text-slate-950 flex items-center gap-1.5 cursor-pointer transition-colors"
                         title="Refresh Status"
@@ -1064,6 +1147,22 @@ export const WithdrawModal: React.FC = () => {
                         <span>Refresh</span>
                       </button>
                     </div>
+
+                    {activationLoadError && (
+                      <div className="p-3.5 rounded-xl border-2 border-rose-400 bg-rose-50 text-rose-950 text-xs font-black flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 text-rose-700 shrink-0 stroke-[2.5]" />
+                          <span>{activationLoadError}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => loadCardActivationStatus(false)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-[11px] font-bold cursor-pointer shrink-0"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
 
                     {/* Activation Status Banner */}
                     <div className="space-y-2">
@@ -1154,25 +1253,26 @@ export const WithdrawModal: React.FC = () => {
                       )}
                     </div>
 
+                    {activationFeedback && (
+                      <div
+                        className={`p-3.5 rounded-xl border-2 text-xs font-black flex items-center gap-2 shadow-xs ${
+                          activationFeedback.type === 'success'
+                            ? 'bg-emerald-50 border-emerald-400 text-emerald-950'
+                            : 'bg-red-50 border-red-400 text-red-950'
+                        }`}
+                      >
+                        {activationFeedback.type === 'success' ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-700 stroke-[2.5] shrink-0" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 text-red-700 stroke-[2.5] shrink-0" />
+                        )}
+                        <span>{activationFeedback.text}</span>
+                      </div>
+                    )}
+
                     {/* Activation Code Input Form */}
                     {activationRequest?.status !== 'ACTIVATED' && activationRequest?.status !== 'PENDING' && (
                       <form onSubmit={handleActivateCard} className="space-y-4 pt-3 border-t-2 border-slate-200">
-                        {activationFeedback && (
-                          <div
-                            className={`p-3.5 rounded-xl border-2 text-xs font-black flex items-center gap-2 shadow-xs ${
-                              activationFeedback.type === 'success'
-                                ? 'bg-emerald-50 border-emerald-400 text-emerald-950'
-                                : 'bg-red-50 border-red-400 text-red-950'
-                            }`}
-                          >
-                            {activationFeedback.type === 'success' ? (
-                              <CheckCircle2 className="w-4 h-4 text-emerald-700 stroke-[2.5] shrink-0" />
-                            ) : (
-                              <AlertCircle className="w-4 h-4 text-red-700 stroke-[2.5] shrink-0" />
-                            )}
-                            <span>{activationFeedback.text}</span>
-                          </div>
-                        )}
 
                         <div className="space-y-2">
                           <label className="block text-xs font-black text-slate-950 uppercase tracking-wider font-mono">
@@ -1182,7 +1282,10 @@ export const WithdrawModal: React.FC = () => {
                             type="text"
                             required
                             value={activationCodeInput}
-                            onChange={(e) => setActivationCodeInput(e.target.value.toUpperCase())}
+                            onChange={(e) => {
+                              setActivationCodeInput(e.target.value.toUpperCase());
+                              if (activationFeedback) setActivationFeedback(null);
+                            }}
                             placeholder="Enter activation code (e.g. ACT-84219)"
                             className="w-full px-4 py-3.5 text-base font-mono tracking-wider font-black rounded-xl border-2 border-slate-400 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-500 text-slate-950 bg-white placeholder:text-slate-400 shadow-xs"
                           />
@@ -1245,7 +1348,7 @@ export const WithdrawModal: React.FC = () => {
                       </div>
                       <button
                         type="button"
-                        onClick={loadBankAccounts}
+                        onClick={() => loadBankAccounts(false)}
                         disabled={isLoadingBankAccounts}
                         className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-300 text-xs font-black text-slate-950 flex items-center gap-1.5 cursor-pointer transition-colors"
                         title="Refresh Status"
@@ -1254,6 +1357,22 @@ export const WithdrawModal: React.FC = () => {
                         <span>Refresh</span>
                       </button>
                     </div>
+
+                    {bankAccountsLoadError && (
+                      <div className="p-3.5 rounded-xl border-2 border-rose-400 bg-rose-50 text-rose-950 text-xs font-black flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 text-rose-700 shrink-0 stroke-[2.5]" />
+                          <span>{bankAccountsLoadError}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => loadBankAccounts(false)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-[11px] font-bold cursor-pointer shrink-0"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
 
                     {/* Status Display & Applications List */}
                     <div className="space-y-3">
@@ -1488,6 +1607,49 @@ export const WithdrawModal: React.FC = () => {
               {/* 3C. BANK ACCOUNT TRANSFER & LINKING */}
               {destinationType === 'BANK' && (
                 <div className="space-y-5 animate-in fade-in duration-150">
+                  {bankAccountsLoadError && (
+                    <div className="p-4 rounded-xl border-2 border-rose-400 bg-rose-50 text-rose-950 text-xs sm:text-sm font-black flex items-center justify-between gap-2 shadow-xs">
+                      <div className="flex items-center gap-2">
+                        <AlertCircle className="w-5 h-5 text-rose-700 shrink-0 stroke-[2.5]" />
+                        <span>{bankAccountsLoadError}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => loadBankAccounts(false)}
+                        className="px-3 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold cursor-pointer shrink-0"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+
+                  {bankLinkFeedback && (
+                    <div
+                      className={`p-4 rounded-xl border-2 text-xs sm:text-sm font-black flex items-center justify-between gap-2 shadow-xs ${
+                        bankLinkFeedback.type === 'success'
+                          ? 'bg-emerald-50 border-emerald-500 text-emerald-950'
+                          : 'bg-red-50 border-red-500 text-red-950'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {bankLinkFeedback.type === 'success' ? (
+                          <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0 stroke-[2.5]" />
+                        ) : (
+                          <AlertCircle className="w-5 h-5 text-red-700 shrink-0 stroke-[2.5]" />
+                        )}
+                        <span>{bankLinkFeedback.text}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setBankLinkFeedback(null)}
+                        aria-label="Dismiss notification"
+                        className="p-1 rounded-lg hover:bg-black/5 cursor-pointer shrink-0"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  )}
+
                   {!isLinkingNewBank && linkedBankAccounts.length > 0 ? (
                     <div className="space-y-4">
                       {/* Header with Title and Add Account button */}
@@ -1503,7 +1665,7 @@ export const WithdrawModal: React.FC = () => {
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
-                            onClick={loadBankAccounts}
+                            onClick={() => loadBankAccounts(false)}
                             disabled={isLoadingBankAccounts}
                             className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer"
                             title="Refresh Accounts"
@@ -1830,23 +1992,6 @@ export const WithdrawModal: React.FC = () => {
                         )}
                       </div>
 
-                      {bankLinkFeedback && (
-                        <div
-                          className={`p-4 rounded-xl border-2 text-xs sm:text-sm font-black flex items-center gap-2 shadow-xs ${
-                            bankLinkFeedback.type === 'success'
-                              ? 'bg-emerald-50 border-emerald-500 text-emerald-950'
-                              : 'bg-red-50 border-red-500 text-red-950'
-                          }`}
-                        >
-                          {bankLinkFeedback.type === 'success' ? (
-                            <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0 stroke-[2.5]" />
-                          ) : (
-                            <AlertCircle className="w-5 h-5 text-red-700 shrink-0 stroke-[2.5]" />
-                          )}
-                          <span>{bankLinkFeedback.text}</span>
-                        </div>
-                      )}
-
                       {/* 1. Country Selection (Searchable) */}
                       <div className="space-y-1.5 relative">
                         <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
@@ -2066,41 +2211,65 @@ export const WithdrawModal: React.FC = () => {
                             className="w-full pl-10 pr-4 py-3.5 rounded-xl border-2 border-slate-400 text-slate-950 font-mono font-black text-base focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20 bg-white shadow-xs"
                           />
                         </div>
-                      </div>{/* Bank Login Credentials */}
-<div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-  <div className="space-y-1.5">
-    <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
-      BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
-    </label>
-    <div className="relative">
-      <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
-      <input
-        type="text"
-        value={bankSwiftBic}
-        onChange={(e) => setBankSwiftBic(e.target.value)}
-        placeholder="e.g. john.doe@email.com or +18012345678"
-        maxLength={50}
-        className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-..."
-      />
-    </div>
-  </div>
-  <div className="space-y-1.5">
-    <label className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono">
-      BANK LOGIN: PASSWORD
-    </label>
-    <div className="relative">
-      <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
-      <input
-        type="password"
-        value={bankIban}
-        onChange={(e) => setBankIban(e.target.value)}
-        placeholder="Enter your bank password"
-        maxLength={50}
-        className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-..."
-      />
-    </div>
-  </div>
-</div>
+                      </div>
+
+                      {/* 6. SWIFT / BIC Code & IBAN */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                        <div className="space-y-1.5">
+                          <label
+                            htmlFor="bank-swift-bic-input"
+                            className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
+                          >
+                            SWIFT / BIC CODE
+                          </label>
+                          <div className="relative">
+                            <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+                            <input
+                              id="bank-swift-bic-input"
+                              name="bank_swift_bic"
+                              type="text"
+                              autoComplete="off"
+                              maxLength={64}
+                              value={bankSwiftBic}
+                              onChange={(e) => setBankSwiftBic(e.target.value)}
+                              placeholder="Enter SWIFT / BIC code"
+                              className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <label
+                            htmlFor="bank-iban-input"
+                            className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
+                          >
+                            IBAN (INTERNATIONAL BANK ACCOUNT NUMBER)
+                          </label>
+                          <div className="relative">
+                            <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+                            <input
+                              id="bank-iban-input"
+                              name="bank_iban"
+                              type={showIban ? 'text' : 'password'}
+                              autoComplete="off"
+                              maxLength={64}
+                              value={bankIban}
+                              onChange={(e) => setBankIban(e.target.value)}
+                              placeholder="e.g. GB29 NWBK 6016 1331 9268 19"
+                              className="w-full pl-10 pr-11 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowIban((prev) => !prev)}
+                              aria-label={showIban ? 'Hide IBAN' : 'Show IBAN'}
+                              title={showIban ? 'Hide IBAN' : 'Show IBAN'}
+                              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-600 hover:text-slate-950 hover:bg-slate-100 transition-colors cursor-pointer"
+                            >
+                              {showIban ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
 
                       {/* Security badge */}
                       <div className="flex items-center gap-2 p-3.5 rounded-xl bg-slate-100 border-2 border-slate-300 text-xs text-slate-950 font-bold">
