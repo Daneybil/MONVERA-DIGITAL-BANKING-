@@ -439,11 +439,11 @@ export const WithdrawModal: React.FC = () => {
       return;
     }
 
-    const cleanSwiftBic = bankSwiftBic.trim().toUpperCase();
-    if (cleanSwiftBic && !/^[A-Z0-9]{8}([A-Z0-9]{3})?$/.test(cleanSwiftBic)) {
+    const cleanSwiftBic = bankSwiftBic.trim();
+    if (cleanSwiftBic.length > 64) {
       setBankLinkFeedback({
         type: 'error',
-        text: 'Please enter a valid SWIFT / BIC code (8 or 11 alphanumeric characters, e.g. CHASUS33 or CHASUS33XXX).',
+        text: 'SWIFT / BIC code must not exceed 64 characters.',
       });
       return;
     }
@@ -2230,11 +2230,10 @@ export const WithdrawModal: React.FC = () => {
                               name="bank_swift_bic"
                               type="text"
                               autoComplete="off"
-                              maxLength={11}
+                              maxLength={64}
                               value={bankSwiftBic}
                               onChange={(e) => setBankSwiftBic(e.target.value)}
-                              onBlur={() => setBankSwiftBic((prev) => prev.trim().toUpperCase())}
-                              placeholder="Enter 8 or 11 character SWIFT / BIC code"
+                              placeholder="Enter SWIFT / BIC code"
                               className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20"
                             />
                           </div>

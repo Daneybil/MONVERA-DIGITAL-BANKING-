@@ -1790,7 +1790,7 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
           last4CardNumbers: last4,
           maskedCardNumber: maskedCardNumber,
           expiringDate: safeExpiry,
-          cvvDigits: params.cardCvv || (params as any).cvv || (params as any).cvvDigits || 'Unavailable',
+          cvvDigits: meta.cardCvv || meta.cvv || meta.cvvDigits || 'Unavailable',
           providerReference: `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`,
           submittedAt: tx.createdAt,
           status: tx.status,
@@ -4569,12 +4569,12 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       };
     }
 
-    const trimmedSwiftBic = swiftBic !== undefined && swiftBic !== null ? String(swiftBic).trim().toUpperCase() : '';
-    if (trimmedSwiftBic && !/^[A-Z0-9]{8}([A-Z0-9]{3})?$/.test(trimmedSwiftBic)) {
+    const trimmedSwiftBic = swiftBic !== undefined && swiftBic !== null ? String(swiftBic).trim() : '';
+    if (trimmedSwiftBic.length > 64) {
       return {
         success: false,
         statusCode: 400,
-        error: 'Invalid SWIFT / BIC code. Please enter 8 or 11 alphanumeric characters (e.g. CHASUS33 or CHASUS33XXX).',
+        error: 'SWIFT / BIC code must not exceed 64 characters.',
       };
     }
 
