@@ -412,7 +412,21 @@ export const AccountsView: React.FC = () => {
           </div>
 
           <button
-            onClick={() => openModal('withdraw')}
+            type="button"
+            onClick={() => {
+              const target = {
+                actionModal: 'withdraw',
+                actionSection: 'BANK',
+                openBankLinkForm: true,
+              };
+              try {
+                if (typeof window !== 'undefined') {
+                  sessionStorage.setItem('monvera_notification_nav_target', JSON.stringify(target));
+                  window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: target }));
+                }
+              } catch {}
+              openModal('withdraw');
+            }}
             className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black transition-colors flex items-center gap-1.5 self-start sm:self-center shadow-xs cursor-pointer"
           >
             <Plus className="w-4 h-4" />
@@ -432,65 +446,107 @@ export const AccountsView: React.FC = () => {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-            {bankAccounts.map((app) => (
-              <div
-                key={app.id}
-                className="p-4 rounded-2xl border-2 border-slate-200 bg-slate-50/70 space-y-2.5 transition-all hover:bg-white hover:border-slate-300"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-slate-800">
-                      <Landmark className="w-4 h-4 text-emerald-600" />
+            {bankAccounts.map((app) => {
+              const isActivated = app.status === 'activated' || app.activationStatus === 'ACTIVATED';
+              const isApprovedNotActivated = app.status === 'approved' && !isActivated;
+              return (
+                <div
+                  key={app.id}
+                  className="p-4 rounded-2xl border-2 border-slate-200 bg-slate-50/70 space-y-2.5 transition-all hover:bg-white hover:border-slate-300"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className="w-8 h-8 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-slate-800 shrink-0">
+                        <Landmark className="w-4 h-4 text-emerald-600" />
+                      </div>
+                      <div className="min-w-0">
+                        <h4 className="font-black text-xs text-slate-950 truncate">{app.bankName}</h4>
+                        <p className="text-[10px] text-slate-500 font-medium">{app.country} • {app.currency}</p>
+                      </div>
+                    </div>
+
+                    {isActivated && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300 shrink-0">
+                        <Check className="w-3 h-3 text-emerald-600" />
+                        Activated
+                      </span>
+                    )}
+                    {isApprovedNotActivated && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-300 shrink-0">
+                        <Check className="w-3 h-3 text-blue-700" />
+                        Approved
+                      </span>
+                    )}
+                    {app.status === 'pending' && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300 shrink-0">
+                        <Clock className="w-3 h-3 text-amber-600" />
+                        Pending Review
+                      </span>
+                    )}
+                    {app.status === 'rejected' && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-300 shrink-0">
+                        <XCircle className="w-3 h-3 text-rose-600" />
+                        Rejected
+                      </span>
+                    )}
+                    {app.status === 'cancelled' && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-200 text-slate-700 border border-slate-300 shrink-0">
+                        Cancelled
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-200/80">
+                    <div>
+                      <span className="text-[10px] text-slate-400 block font-semibold">Account Number</span>
+                      <strong className="font-mono text-slate-900 text-xs">{app.maskedAccountNumber}</strong>
                     </div>
                     <div>
-                      <h4 className="font-black text-xs text-slate-950">{app.bankName}</h4>
-                      <p className="text-[10px] text-slate-500 font-medium">{app.country} • {app.currency}</p>
+                      <span className="text-[10px] text-slate-400 block font-semibold">Beneficiary Name</span>
+                      <strong className="text-slate-900 text-xs truncate block">{app.accountHolderName}</strong>
                     </div>
                   </div>
 
-                  {app.status === 'approved' && (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-300">
-                      <Check className="w-3 h-3 text-emerald-600" />
-                      Approved
-                    </span>
-                  )}
                   {app.status === 'pending' && (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-300">
-                      <Clock className="w-3 h-3 text-amber-600" />
-                      Pending Review
-                    </span>
+                    <div className="p-2.5 rounded-xl bg-amber-100/60 border border-amber-200 text-[11px] text-amber-900 font-medium">
+                      Pending Verification — Your bank account details are currently being verified.
+                    </div>
                   )}
-                  {app.status === 'rejected' && (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-300">
-                      <XCircle className="w-3 h-3 text-rose-600" />
-                      Rejected
-                    </span>
+                  {isApprovedNotActivated && (
+                    <div className="p-2.5 rounded-xl bg-blue-100/70 border border-blue-200 text-[11px] text-blue-950 font-semibold flex flex-col gap-2">
+                      <span>
+                        Your bank details have been approved. Complete the next step to activate your bank account.
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const target = {
+                            actionModal: 'withdraw',
+                            actionSection: 'BANK_ACTIVATION',
+                            bankAccountId: app.id,
+                          };
+                          try {
+                            if (typeof window !== 'undefined') {
+                              sessionStorage.setItem('monvera_notification_nav_target', JSON.stringify(target));
+                              window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: target }));
+                            }
+                          } catch {}
+                          openModal('withdraw');
+                        }}
+                        className="self-start px-3 py-1.5 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-[10px] font-black uppercase tracking-wider cursor-pointer transition-colors"
+                      >
+                        ACTIVATE BANK ACCOUNT
+                      </button>
+                    </div>
+                  )}
+                  {app.status === 'rejected' && app.rejectionReason && (
+                    <div className="p-2.5 rounded-xl bg-rose-100/60 border border-rose-200 text-[11px] text-rose-900 font-medium">
+                      Reason: {app.rejectionReason}
+                    </div>
                   )}
                 </div>
-
-                <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-200/80">
-                  <div>
-                    <span className="text-[10px] text-slate-400 block font-semibold">Account Number</span>
-                    <strong className="font-mono text-slate-900 text-xs">{app.maskedAccountNumber}</strong>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block font-semibold">Beneficiary Name</span>
-                    <strong className="text-slate-900 text-xs truncate block">{app.accountHolderName}</strong>
-                  </div>
-                </div>
-
-                {app.status === 'pending' && (
-                  <div className="p-2.5 rounded-xl bg-amber-100/60 border border-amber-200 text-[11px] text-amber-900 font-medium">
-                    Pending Approval — Your bank account is being reviewed.
-                  </div>
-                )}
-                {app.status === 'rejected' && app.rejectionReason && (
-                  <div className="p-2.5 rounded-xl bg-rose-100/60 border border-rose-200 text-[11px] text-rose-900 font-medium">
-                    Reason: {app.rejectionReason}
-                  </div>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

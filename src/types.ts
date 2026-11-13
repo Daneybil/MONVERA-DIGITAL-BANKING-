@@ -206,6 +206,19 @@ export interface LinkedBankAccountApplication {
   verificationCodeStatus?: 'PENDING' | 'APPROVED' | 'REJECTED';
   verificationSubmittedAt?: string;
   verificationRejectionReason?: string;
+  lastVerificationRejectionReason?: string;
+  verificationApprovedAt?: string;
+  verificationApprovedBy?: string;
+  verificationRejectedAt?: string;
+  verificationRejectedBy?: string;
+  verificationHistory?: Array<{
+    reference: string;
+    submittedAt: string;
+    decision: 'APPROVED' | 'REJECTED';
+    decidedAt: string;
+    decidedBy: string;
+    reason?: string;
+  }>;
   verifiedAt?: string;
   submittedAt: string;
   approvedAt?: string;

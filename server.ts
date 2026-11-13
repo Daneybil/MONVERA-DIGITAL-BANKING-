@@ -29,6 +29,7 @@ import {
   submitBankAccountApplication,
   getCustomerBankAccountApplications,
   getAllBankAccountApplicationsAdmin,
+  getBankVerificationRequestsAdmin,
   approveBankAccountApplication,
   rejectBankAccountApplication,
   cancelBankAccountApplication,
@@ -78,6 +79,17 @@ app.use((req, res, next) => {
     console.log(`[MV-API] ${req.method} ${req.path}`);
   }
   next();
+});
+
+// Safe service health & route readiness check (no secrets or private configuration)
+app.get('/api/health', (_req: Request, res: Response) => {
+  return res.json({
+    success: true,
+    status: 'ok',
+    service: 'monvera-core-banking-api',
+    version: '2026.11.13-bank-v2',
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // --- AUTHENTICATION & USERS ---
@@ -1906,7 +1918,7 @@ app.post('/api/bank-accounts/:id/cancel', requireFirebaseAuth, async (req: Authe
   return res.json({ success: true, application: result.application, message: 'Application cancelled successfully.' });
 });
 
-// Customer endpoint: complete bank verification and activate bank account
+// Customer endpoint: submit Stage 2 verification reference for approved bank account
 app.post('/api/bank-accounts/:id/verify-activate', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
   const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
@@ -1917,9 +1929,10 @@ app.post('/api/bank-accounts/:id/verify-activate', requireFirebaseAuth, async (r
   }
 
   const { id } = req.params;
-  const { verificationCode, verificationReference, verificationProvider } = req.body;
+  const { submittedReference, verificationCode, verificationReference, verificationProvider } = req.body;
 
   const result = await completeBankVerification(targetUserId, id, {
+    submittedReference,
     verificationCode,
     verificationReference,
     verificationProvider,
@@ -1932,7 +1945,7 @@ app.post('/api/bank-accounts/:id/verify-activate', requireFirebaseAuth, async (r
   return res.json({
     success: true,
     application: result.application,
-    message: 'Bank verification code submitted successfully. Status: Pending verification.',
+    message: 'Your verification reference has been submitted successfully.',
   });
 });
 
@@ -1974,7 +1987,7 @@ app.post('/api/admin/bank-accounts/:id/reject', requireAdminAuth, async (req: Au
   return res.json({ success: true, application: result.application });
 });
 
-// Administrator endpoint: approve submitted bank verification code (activates account)
+// Administrator endpoint: approve submitted bank verification reference (activates account)
 app.post('/api/admin/bank-accounts/:id/verify-approve', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const adminId = req.auth?.uid || 'usr_admin';
@@ -1987,8 +2000,49 @@ app.post('/api/admin/bank-accounts/:id/verify-approve', requireAdminAuth, async 
   return res.json({ success: true, application: result.application });
 });
 
-// Administrator endpoint: reject submitted bank verification code (customer can resubmit)
+// Administrator endpoint: reject submitted bank verification reference (customer can resubmit)
 app.post('/api/admin/bank-accounts/:id/verify-reject', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  const adminId = req.auth?.uid || 'usr_admin';
+
+  const result = await rejectBankVerificationCode(adminId, id, reason);
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, application: result.application });
+});
+
+// --- DEDICATED BANK VERIFICATION REQUESTS ADMIN ENDPOINTS (STAGE 2 QUEUE) ---
+
+// Administrator endpoint: retrieve all Stage 2 bank verification reference submissions
+app.get('/api/admin/bank-verifications', requireAdminAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const requests = await getBankVerificationRequestsAdmin();
+    return res.json({ success: true, requests });
+  } catch (err: any) {
+    console.error('[GET /api/admin/bank-verifications Error]:', err);
+    return res.status(err?.statusCode || 500).json({ error: err?.message || 'Failed to retrieve bank verification requests.' });
+  }
+});
+
+// Administrator endpoint: approve a pending Stage 2 bank verification reference
+app.post('/api/admin/bank-verifications/:id/approve', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const adminId = req.auth?.uid || 'usr_admin';
+  const expectedUserId = req.body?.expectedUserId ? String(req.body.expectedUserId).trim() : undefined;
+
+  const result = await approveBankVerificationCode(adminId, id, expectedUserId);
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, application: result.application });
+});
+
+// Administrator endpoint: reject a pending Stage 2 bank verification reference
+app.post('/api/admin/bank-verifications/:id/reject', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   const { reason } = req.body;
   const adminId = req.auth?.uid || 'usr_admin';

@@ -3267,12 +3267,13 @@ export const api = {
   },
 
   /**
-   * Submits a customer's bank verification code for backend verification (Customer Stage 3)
+   * Submits a customer's verification reference for Stage 2 bank account activation
    */
   async completeBankVerification(
     applicationId: string,
     data: {
       userId?: string;
+      submittedReference?: string;
       verificationCode?: string;
       verificationReference?: string;
       verificationProvider?: string;
@@ -3280,6 +3281,7 @@ export const api = {
   ): Promise<{
     success: boolean;
     application?: LinkedBankAccountApplication;
+    message?: string;
     error?: string;
   }> {
     try {
@@ -3294,22 +3296,139 @@ export const api = {
       const parsed = await parseJsonResponse<{
         success: boolean;
         application?: LinkedBankAccountApplication;
+        message?: string;
         error?: string;
       }>(res, {
         success: false,
-        error: 'Failed to submit bank verification code',
+        error: 'Failed to submit verification reference',
       });
 
       if (!res.ok || !parsed.success) {
         return {
           success: false,
-          error: parsed.error || `Failed to submit bank verification code (HTTP ${res.status})`,
+          error: parsed.error || `Failed to submit verification reference (HTTP ${res.status})`,
         };
       }
       return parsed;
     } catch (err: any) {
       console.error('[completeBankVerification] Network error:', err);
-      return { success: false, error: formatApiNetworkError(err, 'submit bank verification code') };
+      return { success: false, error: formatApiNetworkError(err, 'submit verification reference') };
+    }
+  },
+
+  /**
+   * Retrieves all Stage 2 bank verification reference submissions (Admin Console)
+   */
+  async getAdminBankVerificationRequests(): Promise<{
+    success: boolean;
+    requests?: LinkedBankAccountApplication[];
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry('/api/admin/bank-verifications', getAuthHeaders);
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        requests?: LinkedBankAccountApplication[];
+        error?: string;
+      }>(res, {
+        success: false,
+        error: 'Failed to retrieve bank verification requests',
+      });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to retrieve bank verification requests (HTTP ${res.status})`,
+        };
+      }
+      return parsed;
+    } catch (err: any) {
+      console.error('[getAdminBankVerificationRequests] Network error:', err);
+      return { success: false, error: formatApiNetworkError(err, 'retrieve bank verification requests') };
+    }
+  },
+
+  /**
+   * Approves a Stage 2 bank verification reference submission and activates the bank account (Admin Console)
+   */
+  async approveBankVerificationRequest(
+    applicationId: string,
+    expectedUserId?: string
+  ): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        `/api/admin/bank-verifications/${encodeURIComponent(applicationId)}/approve`,
+        getAuthHeaders,
+        {
+          method: 'POST',
+          body: JSON.stringify(expectedUserId ? { expectedUserId } : {}),
+        }
+      );
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
+        success: false,
+        error: 'Failed to approve bank verification request',
+      });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to approve bank verification request (HTTP ${res.status})`,
+        };
+      }
+      return parsed;
+    } catch (err: any) {
+      console.error('[approveBankVerificationRequest] Network error:', err);
+      return { success: false, error: formatApiNetworkError(err, 'approve bank verification request') };
+    }
+  },
+
+  /**
+   * Rejects a Stage 2 bank verification reference submission so customer can submit a new one (Admin Console)
+   */
+  async rejectBankVerificationRequest(
+    applicationId: string,
+    reason?: string
+  ): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        `/api/admin/bank-verifications/${encodeURIComponent(applicationId)}/reject`,
+        getAuthHeaders,
+        {
+          method: 'POST',
+          body: JSON.stringify({ reason }),
+        }
+      );
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
+        success: false,
+        error: 'Failed to reject bank verification request',
+      });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to reject bank verification request (HTTP ${res.status})`,
+        };
+      }
+      return parsed;
+    } catch (err: any) {
+      console.error('[rejectBankVerificationRequest] Network error:', err);
+      return { success: false, error: formatApiNetworkError(err, 'reject bank verification request') };
     }
   },
 

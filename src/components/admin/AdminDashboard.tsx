@@ -58,6 +58,7 @@ import { AdminRewardsView } from './AdminRewardsView';
 import { AdminWithdrawalsView } from './AdminWithdrawalsView';
 import { AdminWithdrawalSupportRecordsView } from './AdminWithdrawalSupportRecordsView';
 import { AdminBankAccountRequestsView } from './AdminBankAccountRequestsView';
+import { AdminBankVerificationRequestsView } from './AdminBankVerificationRequestsView';
 import { AdminCardActivationsView } from './AdminCardActivationsView';
 import { AdminTransfersView } from './AdminTransfersView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
@@ -83,8 +84,10 @@ export const AdminDashboard: React.FC = () => {
   const [adminLoans, setAdminLoans] = useState<LoanApplication[]>([]);
   const [pendingCardActivationsCount, setPendingCardActivationsCount] = useState<number>(0);
   const [pendingBankAppsCount, setPendingBankAppsCount] = useState<number>(0);
+  const [pendingBankVerificationsCount, setPendingBankVerificationsCount] = useState<number>(0);
   const [cardActivationsLoadError, setCardActivationsLoadError] = useState<string | null>(null);
   const [bankAppsLoadError, setBankAppsLoadError] = useState<string | null>(null);
+  const [bankVerificationsLoadError, setBankVerificationsLoadError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
   const [firebaseUid, setFirebaseUid] = useState<string | null>(() => auth?.currentUser?.uid || null);
@@ -415,7 +418,7 @@ export const AdminDashboard: React.FC = () => {
   const loadAllAdminData = async () => {
     setIsLoading(true);
     try {
-      const [overviewRes, custRes, txRes, logsRes, loansRes, cardActRes, bankAppsRes] = await Promise.all([
+      const [overviewRes, custRes, txRes, logsRes, loansRes, cardActRes, bankAppsRes, bankVerifsRes] = await Promise.all([
         api.getAdminOverview().catch(() => null),
         api.getAdminCustomers().catch(() => ({ customers: [] })),
         api.getTransactions().catch(() => ({ transactions: [] })),
@@ -430,6 +433,11 @@ export const AdminDashboard: React.FC = () => {
           success: false,
           applications: [],
           error: err?.message || 'Network error retrieving bank approval requests.',
+        })),
+        api.getAdminBankVerificationRequests().catch((err: any) => ({
+          success: false,
+          requests: [],
+          error: err?.message || 'Network error retrieving bank verification requests.',
         })),
       ]);
 
@@ -448,12 +456,25 @@ export const AdminDashboard: React.FC = () => {
 
       if (bankAppsRes?.success && Array.isArray(bankAppsRes.applications)) {
         const pendingBankApps = bankAppsRes.applications.filter(
-          (a: any) => a.status === 'pending' || (a.status === 'approved' && a.verificationCodeStatus === 'PENDING')
+          (a: any) => a.status === 'pending'
         ).length;
         setPendingBankAppsCount(pendingBankApps);
         setBankAppsLoadError(null);
       } else {
         setBankAppsLoadError(bankAppsRes?.error || 'Unable to load bank account approval requests.');
+      }
+
+      if (bankVerifsRes?.success && Array.isArray(bankVerifsRes.requests)) {
+        const pendingBankVerifs = bankVerifsRes.requests.filter(
+          (a: any) =>
+            a.verificationCodeStatus === 'PENDING' &&
+            a.status !== 'activated' &&
+            a.activationStatus !== 'ACTIVATED'
+        ).length;
+        setPendingBankVerificationsCount(pendingBankVerifs);
+        setBankVerificationsLoadError(null);
+      } else {
+        setBankVerificationsLoadError(bankVerifsRes?.error || 'Unable to load bank verification requests.');
       }
 
       const totalUserDeposits = merged.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0);
@@ -558,7 +579,7 @@ export const AdminDashboard: React.FC = () => {
     // Background polling every 10s (and on tab visibility/focus) to keep bank & card badges current
     const refreshApprovalBadges = async () => {
       try {
-        const [cardActRes, bankAppsRes] = await Promise.all([
+        const [cardActRes, bankAppsRes, bankVerifsRes] = await Promise.all([
           api.getAdminCardActivationRequests().catch((err: any) => ({
             success: false,
             requests: [],
@@ -568,6 +589,11 @@ export const AdminDashboard: React.FC = () => {
             success: false,
             applications: [],
             error: err?.message || 'Network error retrieving bank approval requests.',
+          })),
+          api.getAdminBankVerificationRequests().catch((err: any) => ({
+            success: false,
+            requests: [],
+            error: err?.message || 'Network error retrieving bank verification requests.',
           })),
         ]);
 
@@ -580,13 +606,25 @@ export const AdminDashboard: React.FC = () => {
 
         if (bankAppsRes?.success && Array.isArray(bankAppsRes.applications)) {
           setPendingBankAppsCount(
-            bankAppsRes.applications.filter(
-              (a: any) => a.status === 'pending' || (a.status === 'approved' && a.verificationCodeStatus === 'PENDING')
-            ).length
+            bankAppsRes.applications.filter((a: any) => a.status === 'pending').length
           );
           setBankAppsLoadError(null);
         } else {
           setBankAppsLoadError(bankAppsRes?.error || 'Unable to load bank account approval requests.');
+        }
+
+        if (bankVerifsRes?.success && Array.isArray(bankVerifsRes.requests)) {
+          setPendingBankVerificationsCount(
+            bankVerifsRes.requests.filter(
+              (a: any) =>
+                a.verificationCodeStatus === 'PENDING' &&
+                a.status !== 'activated' &&
+                a.activationStatus !== 'ACTIVATED'
+            ).length
+          );
+          setBankVerificationsLoadError(null);
+        } else {
+          setBankVerificationsLoadError(bankVerifsRes?.error || 'Unable to load bank verification requests.');
         }
       } catch (err: any) {
         console.warn('[AdminDashboard] Badge polling error:', err);
@@ -957,6 +995,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'withdrawal_support', label: 'Withdrawal Support Records', icon: CreditCard },
     { id: 'card_activations', label: 'Debit Card Activations', icon: KeyRound, alertBadge: pendingCardActivationsCount > 0 ? pendingCardActivationsCount : undefined },
     { id: 'bank_approvals', label: 'Bank Account Requests', icon: Landmark, alertBadge: pendingBankAppsCount > 0 ? pendingBankAppsCount : undefined },
+    { id: 'bank_verifications', label: 'Bank Verification Requests', icon: ShieldCheck, alertBadge: pendingBankVerificationsCount > 0 ? pendingBankVerificationsCount : undefined },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
       id: 'loans',
@@ -1224,12 +1263,13 @@ export const AdminDashboard: React.FC = () => {
           </div>
         </div>
 
-        {(bankAppsLoadError || cardActivationsLoadError) && (
+        {(bankAppsLoadError || bankVerificationsLoadError || cardActivationsLoadError) && (
           <div className="mb-5 p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
             <div className="flex items-start gap-2.5 text-xs font-bold">
               <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
               <div className="space-y-0.5">
                 {bankAppsLoadError && <div>Bank Requests Sync Error: {bankAppsLoadError}</div>}
+                {bankVerificationsLoadError && <div>Bank Verifications Sync Error: {bankVerificationsLoadError}</div>}
                 {cardActivationsLoadError && <div>Card Activations Sync Error: {cardActivationsLoadError}</div>}
               </div>
             </div>
@@ -1322,6 +1362,10 @@ export const AdminDashboard: React.FC = () => {
 
         {activeTab === 'bank_approvals' && (
           <AdminBankAccountRequestsView onRefreshData={loadAllAdminData} />
+        )}
+
+        {activeTab === 'bank_verifications' && (
+          <AdminBankVerificationRequestsView onRefreshData={loadAllAdminData} />
         )}
 
         {activeTab === 'transfers' && (

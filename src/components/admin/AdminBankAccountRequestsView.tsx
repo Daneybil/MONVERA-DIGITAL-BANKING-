@@ -36,9 +36,9 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   const [selectedApp, setSelectedApp] = useState<LinkedBankAccountApplication | null>(null);
   const [inspectModalOpen, setInspectModalOpen] = useState<boolean>(false);
 
-  // Approval / Rejection modal state
+  // Approval / Rejection modal state (Stage 1)
   const [actionModal, setActionModal] = useState<{
-    type: 'APPROVE' | 'REJECT' | 'APPROVE_VERIFICATION' | 'REJECT_VERIFICATION';
+    type: 'APPROVE' | 'REJECT';
     app: LinkedBankAccountApplication;
   } | null>(null);
   const [rejectionReason, setRejectionReason] = useState<string>('');
@@ -88,14 +88,11 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   }, []);
 
   const handleApprove = async () => {
-    if (!actionModal || (actionModal.type !== 'APPROVE' && actionModal.type !== 'APPROVE_VERIFICATION')) return;
+    if (!actionModal || actionModal.type !== 'APPROVE') return;
     setIsSubmittingAction(true);
     setActionError(null);
     try {
-      const res =
-        actionModal.type === 'APPROVE_VERIFICATION'
-          ? await api.approveBankVerificationCode(actionModal.app.id)
-          : await api.approveBankAccountApplication(actionModal.app.id);
+      const res = await api.approveBankAccountApplication(actionModal.app.id);
       if (res.success && res.application) {
         setApplications((prev) =>
           prev.map((a) => (a.id === actionModal.app.id ? res.application! : a))
@@ -106,12 +103,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         }
         if (onRefreshData) onRefreshData();
       } else {
-        setActionError(
-          res.error ||
-            (actionModal.type === 'APPROVE_VERIFICATION'
-              ? 'Failed to approve bank verification code.'
-              : 'Failed to approve bank account application.')
-        );
+        setActionError(res.error || 'Failed to approve bank account application.');
       }
     } catch (err: any) {
       setActionError(err?.message || 'Server error during approval.');
@@ -121,20 +113,14 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   };
 
   const handleReject = async () => {
-    if (!actionModal || (actionModal.type !== 'REJECT' && actionModal.type !== 'REJECT_VERIFICATION')) return;
+    if (!actionModal || actionModal.type !== 'REJECT') return;
     setIsSubmittingAction(true);
     setActionError(null);
     try {
-      const res =
-        actionModal.type === 'REJECT_VERIFICATION'
-          ? await api.rejectBankVerificationCode(
-              actionModal.app.id,
-              rejectionReason.trim() || undefined
-            )
-          : await api.rejectBankAccountApplication(
-              actionModal.app.id,
-              rejectionReason.trim() || undefined
-            );
+      const res = await api.rejectBankAccountApplication(
+        actionModal.app.id,
+        rejectionReason.trim() || undefined
+      );
       if (res.success && res.application) {
         setApplications((prev) =>
           prev.map((a) => (a.id === actionModal.app.id ? res.application! : a))
@@ -146,12 +132,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         }
         if (onRefreshData) onRefreshData();
       } else {
-        setActionError(
-          res.error ||
-            (actionModal.type === 'REJECT_VERIFICATION'
-              ? 'Failed to reject bank verification code.'
-              : 'Failed to reject bank account application.')
-        );
+        setActionError(res.error || 'Failed to reject bank account application.');
       }
     } catch (err: any) {
       setActionError(err?.message || 'Server error during rejection.');
@@ -367,8 +348,6 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               <tbody className="divide-y divide-slate-100 font-medium">
                 {filteredApps.map((app) => {
                   const isPending = app.status === 'pending';
-                  const isApproved = app.status === 'approved';
-                  const isRejected = app.status === 'rejected';
 
                   return (
                     <tr key={app.id} className="hover:bg-slate-50/70 transition-colors">
@@ -495,20 +474,20 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                           </span>
                         )}
                         {app.status === 'approved' && app.activationStatus !== 'ACTIVATED' && (
-                          app.verificationCode && app.verificationCodeStatus === 'PENDING' ? (
+                          (app.verificationCode || app.verificationReference) && app.verificationCodeStatus === 'PENDING' ? (
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-100 text-indigo-900 border border-indigo-400 font-mono">
                               <Clock className="w-3 h-3 text-indigo-700" />
-                              Code Pending
+                              Verification Pending Review
                             </span>
                           ) : app.verificationCodeStatus === 'REJECTED' || app.activationStatus === 'REJECTED' ? (
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
                               <XCircle className="w-3 h-3 text-rose-600" />
-                              Code Rejected
+                              Verification Rejected
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
                               <Clock className="w-3 h-3 text-blue-700" />
-                              Approved (Awaiting Code)
+                              Approved (Awaiting Reference)
                             </span>
                           )
                         )}
@@ -568,33 +547,6 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                               >
                                 <X className="w-3.5 h-3.5" />
                                 <span>Reject</span>
-                              </button>
-                            </>
-                          )}
-
-                          {isApproved && app.activationStatus !== 'ACTIVATED' && app.verificationCode && app.verificationCodeStatus !== 'REJECTED' && (
-                            <>
-                              <button
-                                onClick={() => {
-                                  setActionError(null);
-                                  setActionModal({ type: 'APPROVE_VERIFICATION', app });
-                                }}
-                                className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
-                              >
-                                <Check className="w-3.5 h-3.5" />
-                                <span>Approve Code</span>
-                              </button>
-
-                              <button
-                                onClick={() => {
-                                  setActionError(null);
-                                  setRejectionReason('');
-                                  setActionModal({ type: 'REJECT_VERIFICATION', app });
-                                }}
-                                className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                                <span>Reject Code</span>
                               </button>
                             </>
                           )}
@@ -715,11 +667,12 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       ) : selectedApp.status === 'approved' ? (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-300 font-mono">
                           <Clock className="w-4 h-4 text-blue-700" />
-                          {selectedApp.verificationCode && selectedApp.verificationCodeStatus === 'PENDING'
-                            ? 'Verification Code Pending Approval'
+                          {(selectedApp.verificationCode || selectedApp.verificationReference) &&
+                          selectedApp.verificationCodeStatus === 'PENDING'
+                            ? 'Verification Pending Review (See Bank Verification Requests Tab)'
                             : selectedApp.verificationCodeStatus === 'REJECTED'
-                            ? 'Verification Code Rejected'
-                            : 'Approved • Awaiting Bank Verification Code'}
+                            ? 'Verification Rejected'
+                            : 'Approved • Awaiting Verification Reference'}
                         </span>
                       ) : selectedApp.status === 'pending' ? (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300 font-mono">
@@ -735,10 +688,10 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                           Rejected
                         </span>
                       )}
-                      {selectedApp.verificationCode && (
+                      {(selectedApp.verificationReference || selectedApp.verificationCode) && (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-indigo-100 text-indigo-950 border border-indigo-300 font-mono select-all">
                           <Lock className="w-3.5 h-3.5 text-indigo-700" />
-                          Verification Code: {selectedApp.verificationCode}
+                          Submitted Reference: {selectedApp.verificationReference || selectedApp.verificationCode}
                         </span>
                       )}
                     </div>
@@ -834,8 +787,71 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                   )}
                   {selectedApp.rejectionReason && (
                     <div className="pt-1 border-t border-amber-200">
-                      <span className="text-slate-500 block">Rejection Reason:</span>
+                      <span className="text-slate-500 block">Stage 1 Rejection Reason:</span>
                       <span className="font-semibold text-rose-800">{selectedApp.rejectionReason}</span>
+                    </div>
+                  )}
+                  {(selectedApp.verificationReference || selectedApp.verificationCode || selectedApp.verificationCodeStatus) && (
+                    <div className="pt-2 border-t border-amber-200 space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span>Stage 2 Verification Status:</span>
+                        <strong className="font-mono uppercase text-amber-950">
+                          {selectedApp.verificationCodeStatus || selectedApp.activationStatus || 'N/A'}
+                        </strong>
+                      </div>
+                      {(selectedApp.verificationReference || selectedApp.verificationCode) && (
+                        <div className="flex items-center justify-between gap-2">
+                          <span>Submitted Reference:</span>
+                          <span className="font-mono font-bold text-slate-950 break-all select-all">
+                            {selectedApp.verificationReference || selectedApp.verificationCode}
+                          </span>
+                        </div>
+                      )}
+                      {selectedApp.verificationSubmittedAt && (
+                        <div className="flex items-center justify-between">
+                          <span>Verification Submitted At:</span>
+                          <span className="font-mono">{new Date(selectedApp.verificationSubmittedAt).toLocaleString()}</span>
+                        </div>
+                      )}
+                      {selectedApp.verificationApprovedAt && (
+                        <div className="flex items-center justify-between">
+                          <span>Verification Approved At:</span>
+                          <span className="font-mono">{new Date(selectedApp.verificationApprovedAt).toLocaleString()}</span>
+                        </div>
+                      )}
+                      {selectedApp.verificationRejectedAt && (
+                        <div className="flex items-center justify-between">
+                          <span>Verification Rejected At:</span>
+                          <span className="font-mono">{new Date(selectedApp.verificationRejectedAt).toLocaleString()}</span>
+                        </div>
+                      )}
+                      {(selectedApp.verificationRejectionReason || selectedApp.lastVerificationRejectionReason) && (
+                        <div>
+                          <span className="text-slate-500 block">Stage 2 Rejection Reason:</span>
+                          <span className="font-semibold text-rose-800">
+                            {selectedApp.verificationRejectionReason || selectedApp.lastVerificationRejectionReason}
+                          </span>
+                        </div>
+                      )}
+                      {Array.isArray(selectedApp.verificationHistory) && selectedApp.verificationHistory.length > 0 && (
+                        <div className="pt-1 space-y-1">
+                          <span className="text-slate-500 block">Stage 2 Decision History:</span>
+                          {selectedApp.verificationHistory.map((h, i) => (
+                            <div key={`${h.decidedAt}-${i}`} className="p-2 rounded-lg bg-white border border-amber-200 text-[11px]">
+                              <div className="flex justify-between font-mono font-bold">
+                                <span className="break-all">{h.reference}</span>
+                                <span className={h.decision === 'APPROVED' ? 'text-emerald-700' : 'text-rose-700'}>
+                                  {h.decision}
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-slate-500 font-mono">
+                                {new Date(h.decidedAt).toLocaleString()} • {h.decidedBy}
+                              </div>
+                              {h.reason && <div className="text-rose-700 mt-0.5">Reason: {h.reason}</div>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -854,19 +870,19 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         </div>
       )}
 
-      {/* APPROVE / REJECT CONFIRMATION MODAL */}
+      {/* APPROVE / REJECT CONFIRMATION MODAL (STAGE 1) */}
       {actionModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 border border-slate-200 shadow-2xl relative space-y-4">
             <div className="flex items-center gap-3">
               <div
                 className={`w-11 h-11 rounded-2xl flex items-center justify-center ${
-                  actionModal.type === 'APPROVE' || actionModal.type === 'APPROVE_VERIFICATION'
+                  actionModal.type === 'APPROVE'
                     ? 'bg-emerald-100 text-emerald-700'
                     : 'bg-rose-100 text-rose-700'
                 }`}
               >
-                {actionModal.type === 'APPROVE' || actionModal.type === 'APPROVE_VERIFICATION' ? (
+                {actionModal.type === 'APPROVE' ? (
                   <CheckCircle2 className="w-6 h-6" />
                 ) : (
                   <AlertTriangle className="w-6 h-6" />
@@ -874,21 +890,11 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               </div>
               <div>
                 <h3 className="font-black text-slate-950 text-base">
-                  {actionModal.type === 'APPROVE'
-                    ? 'Approve Bank Account'
-                    : actionModal.type === 'APPROVE_VERIFICATION'
-                    ? 'Approve Bank Verification Code'
-                    : actionModal.type === 'REJECT_VERIFICATION'
-                    ? 'Reject Bank Verification Code'
-                    : 'Reject Bank Account'}
+                  {actionModal.type === 'APPROVE' ? 'Approve Bank Account' : 'Reject Bank Account'}
                 </h3>
                 <p className="text-xs text-slate-500">
                   {actionModal.type === 'APPROVE'
-                    ? 'Approve linking so customer can submit their bank verification code'
-                    : actionModal.type === 'APPROVE_VERIFICATION'
-                    ? 'Approve this submitted code and activate the bank account for withdrawals'
-                    : actionModal.type === 'REJECT_VERIFICATION'
-                    ? 'Reject this verification code so the customer must submit a new one'
+                    ? 'Approve bank details so customer can proceed to the activation step'
                     : 'Deny this bank account linking request'}
                 </p>
               </div>
@@ -916,14 +922,6 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                 <span className="text-slate-400">Beneficiary:</span>{' '}
                 <strong className="text-slate-950">{actionModal.app.accountHolderName}</strong>
               </div>
-              {actionModal.app.verificationCode && (
-                <div>
-                  <span className="text-slate-400">Bank Verification Code:</span>{' '}
-                  <strong className="font-mono text-indigo-900 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200 select-all">
-                    {actionModal.app.verificationCode}
-                  </strong>
-                </div>
-              )}
               {actionModal.app.swiftBic && (
                 <div>
                   <span className="text-slate-400">SWIFT / BIC:</span>{' '}
@@ -940,7 +938,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               )}
             </div>
 
-            {(actionModal.type === 'REJECT' || actionModal.type === 'REJECT_VERIFICATION') && (
+            {actionModal.type === 'REJECT' && (
               <div className="space-y-1.5">
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
                   Rejection Reason (Optional)
@@ -949,11 +947,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                   rows={3}
                   value={rejectionReason}
                   onChange={(e) => setRejectionReason(e.target.value)}
-                  placeholder={
-                    actionModal.type === 'REJECT_VERIFICATION'
-                      ? 'e.g. Verification code mismatch or expired. Please enter a valid code.'
-                      : 'e.g. Beneficiary name does not match verified KYC documents, or invalid routing code.'
-                  }
+                  placeholder="e.g. Beneficiary name does not match verified KYC documents, or invalid routing code."
                   className="w-full p-3 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-900 bg-white"
                 />
               </div>
@@ -969,7 +963,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                 Cancel
               </button>
 
-              {actionModal.type === 'APPROVE' || actionModal.type === 'APPROVE_VERIFICATION' ? (
+              {actionModal.type === 'APPROVE' ? (
                 <button
                   type="button"
                   onClick={handleApprove}
