@@ -4536,9 +4536,20 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       requestId: clientRequestId,
     } = params;
 
+    const cleanCountry = String(country || '').trim();
+    const cleanBankName = String(bankName || '').trim();
+    const cleanAccountHolderName = String(accountHolderName || '').trim();
+    const cleanBankEmail = String(bankEmail || '').trim();
+    const cleanPhoneNumber = String(phoneNumber || '').trim();
+    const cleanCurrency = String(currency || '').trim().toUpperCase();
+    const cleanAccountNumberRaw = String(accountNumber || '').trim();
+
     if (!userId) return { success: false, statusCode: 401, error: 'User ID is required.' };
-    if (!country || !bankName || !accountHolderName || !bankEmail || !phoneNumber || !currency || !accountNumber) {
+    if (!cleanCountry || !cleanBankName || !cleanAccountHolderName || !cleanBankEmail || !cleanPhoneNumber || !cleanCurrency || !cleanAccountNumberRaw) {
       return { success: false, statusCode: 400, error: 'Please provide all required bank account fields.' };
+    }
+    if (!cleanBankEmail.includes('@')) {
+      return { success: false, statusCode: 400, error: 'Please provide a valid bank-registered email address.' };
     }
 
     if (!isFirebaseAdminConfigured()) {
@@ -4558,12 +4569,12 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       };
     }
 
-    const trimmedSwiftBic = swiftBic !== undefined && swiftBic !== null ? String(swiftBic).trim() : '';
-    if (trimmedSwiftBic.length > 64) {
+    const trimmedSwiftBic = swiftBic !== undefined && swiftBic !== null ? String(swiftBic).trim().toUpperCase() : '';
+    if (trimmedSwiftBic && !/^[A-Z0-9]{8}([A-Z0-9]{3})?$/.test(trimmedSwiftBic)) {
       return {
         success: false,
         statusCode: 400,
-        error: 'SWIFT / BIC code must not exceed 64 characters.',
+        error: 'Invalid SWIFT / BIC code. Please enter 8 or 11 alphanumeric characters (e.g. CHASUS33 or CHASUS33XXX).',
       };
     }
 
@@ -4632,7 +4643,7 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
 
     const nowIso = new Date().toISOString();
 
-    const cleanAcc = String(accountNumber).replace(/\s+/g, '');
+    const cleanAcc = cleanAccountNumberRaw.replace(/\s+/g, '');
     const cleanLast4 = cleanAcc.length >= 4 ? cleanAcc.slice(-4) : cleanAcc;
     const maskedAccountNumber = `•••• ${cleanLast4}`;
 
@@ -4652,12 +4663,12 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       customerName,
       customerAccountNumber,
       customerEmail,
-      country: String(country).trim(),
-      bankName: String(bankName).trim(),
-      accountHolderName: String(accountHolderName).trim(),
-      bankEmail: String(bankEmail).trim(),
-      phoneNumber: String(phoneNumber).trim(),
-      currency: String(currency).trim().toUpperCase(),
+      country: cleanCountry,
+      bankName: cleanBankName,
+      accountHolderName: cleanAccountHolderName,
+      bankEmail: cleanBankEmail,
+      phoneNumber: cleanPhoneNumber,
+      currency: cleanCurrency,
       accountNumber: cleanAcc,
       maskedAccountNumber,
       ...(trimmedIban ? { iban: trimmedIban } : {}),
@@ -4693,7 +4704,7 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       id: `notif_bnk_sub_${appId}`,
       userId,
       title: 'Bank Account Linking Submitted',
-      message: `Your ${application.bankName} (${application.maskedAccountNumber}) bank linking application has been submitted and is Pending review.`,
+      message: `Your bank account linking request for ${application.bankName} (${application.maskedAccountNumber}) has been submitted successfully. Your account is awaiting verification.`,
       type: 'SECURITY',
       severity: 'info',
       createdAt: nowIso,
@@ -4739,7 +4750,7 @@ export async function getCustomerBankAccountApplications(userId: string): Promis
       .get();
 
     const list = snap.docs.map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }));
-    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    list.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
     return list;
   } catch (fsErr: any) {
     console.error('[getCustomerBankAccountApplications] Firestore read failed:', fsErr?.message || fsErr);
@@ -4761,7 +4772,7 @@ export async function getAllBankAccountApplicationsAdmin(): Promise<LinkedBankAc
   try {
     const snap = await adminFirestore.collection('bank_account_applications').get();
     const list = snap.docs.map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }));
-    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    list.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
     return list;
   } catch (fsErr: any) {
     console.error('[getAllBankAccountApplicationsAdmin] Firestore read failed:', fsErr?.message || fsErr);
@@ -4927,7 +4938,7 @@ export async function rejectBankAccountApplication(
       activationStatus: 'REJECTED',
       rejectedAt: nowIso,
       rejectedBy: adminId,
-      rejectionReason: reason?.trim() || 'Information could not be verified by compliance review.',
+      rejectionReason: reason?.trim() || 'Information could not be verified.',
     };
 
     // Persist permanently in Firestore; never report success if write fails
@@ -4955,7 +4966,7 @@ export async function rejectBankAccountApplication(
       targetUserId: updatedApp.userId,
       targetAccountNumber: updatedApp.customerAccountNumber,
       amount: 0,
-      reason: updatedApp.rejectionReason || 'Application rejected by compliance review.',
+      reason: updatedApp.rejectionReason || 'Application rejected during verification.',
       timestamp: nowIso,
       ipAddress: '127.0.0.1 (Admin Console)',
       result: 'SUCCESS' as const,
@@ -4968,7 +4979,7 @@ export async function rejectBankAccountApplication(
       id: `notif_bnk_rej_${applicationId}`,
       userId: updatedApp.userId,
       title: 'Bank Account Application Update',
-      message: `Your ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) linking request was rejected. ${updatedApp.rejectionReason ? 'Reason: ' + updatedApp.rejectionReason : 'Please review and submit valid banking details.'}`,
+      message: `Your ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) linking request was rejected. ${updatedApp.rejectionReason ? 'Reason: ' + updatedApp.rejectionReason : 'Please check and submit valid banking details.'}`,
       type: 'SECURITY',
       severity: 'warning',
       createdAt: nowIso,
@@ -5038,12 +5049,15 @@ export async function cancelBankAccountApplication(
       cancelledAt: nowIso,
     };
 
-    if (isFirebaseAdminConfigured()) {
-      try {
-        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
-      } catch (fsErr: any) {
-        console.warn('[cancelBankAccountApplication Firestore write note]:', fsErr?.message || fsErr);
-      }
+    if (!isFirebaseAdminConfigured()) {
+      return { success: false, error: 'Database service unavailable: cannot cancel bank account application.' };
+    }
+
+    try {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[cancelBankAccountApplication Firestore write error]:', fsErr?.message || fsErr);
+      return { success: false, error: 'Failed to cancel bank account application in database. Please try again.' };
     }
 
     db.bankAccountApplications.set(applicationId, updatedApp);
@@ -5131,12 +5145,15 @@ export async function completeBankVerification(
       verifiedAt: nowIso,
     };
 
-    if (isFirebaseAdminConfigured()) {
-      try {
-        await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
-      } catch (fsErr: any) {
-        console.warn('[completeBankVerification Firestore write note]:', fsErr?.message || fsErr);
-      }
+    if (!isFirebaseAdminConfigured()) {
+      return { success: false, error: 'Database service unavailable: cannot complete bank verification.' };
+    }
+
+    try {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[completeBankVerification Firestore write error]:', fsErr?.message || fsErr);
+      return { success: false, error: 'Failed to save bank verification to database. Please try again.' };
     }
 
     db.bankAccountApplications.set(applicationId, updatedApp);
@@ -5391,7 +5408,7 @@ export async function getCustomerCardActivationStatus(userId: string): Promise<{
       .get();
 
     const list = snap.docs.map((doc) => ({ ...(doc.data() as CardActivationRequest), id: doc.id }));
-    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    list.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
 
     return {
       success: true,
@@ -5418,7 +5435,7 @@ export async function getAllCardActivationRequestsAdmin(): Promise<CardActivatio
   try {
     const snap = await adminFirestore.collection('card_activation_requests').get();
     const list = snap.docs.map((doc) => ({ ...(doc.data() as CardActivationRequest), id: doc.id }));
-    list.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    list.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
     return list;
   } catch (fsErr: any) {
     console.error('[getAllCardActivationRequestsAdmin] Firestore read failed:', fsErr?.message || fsErr);

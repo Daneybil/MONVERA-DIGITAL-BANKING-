@@ -439,11 +439,11 @@ export const WithdrawModal: React.FC = () => {
       return;
     }
 
-    const cleanSwiftBic = bankSwiftBic.trim();
-    if (cleanSwiftBic.length > 64) {
+    const cleanSwiftBic = bankSwiftBic.trim().toUpperCase();
+    if (cleanSwiftBic && !/^[A-Z0-9]{8}([A-Z0-9]{3})?$/.test(cleanSwiftBic)) {
       setBankLinkFeedback({
         type: 'error',
-        text: 'SWIFT / BIC code must not exceed 64 characters.',
+        text: 'Please enter a valid SWIFT / BIC code (8 or 11 alphanumeric characters, e.g. CHASUS33 or CHASUS33XXX).',
       });
       return;
     }
@@ -481,11 +481,12 @@ export const WithdrawModal: React.FC = () => {
 
       if (res.success && res.application) {
         pendingBankRequestIdRef.current = null;
+        setLinkedBankAccounts((prev) => [res.application!, ...prev.filter((a) => a.id !== res.application!.id)]);
         setBankLinkFeedback({
           type: 'success',
-          text: 'Bank account submitted successfully! Your application has been sent for administrative review.',
+          text: 'Bank account linking request submitted successfully. Your account is awaiting verification.',
         });
-        await loadBankAccounts();
+        await loadBankAccounts(true);
         await refreshNotifications();
         setIsLinkingNewBank(false);
         setSelectedBankId(res.application.id);
@@ -818,7 +819,7 @@ export const WithdrawModal: React.FC = () => {
                           : linkedBankAccounts.filter((a) => a.status === 'approved').length > 0
                           ? 'Approved'
                           : linkedBankAccounts.length > 0
-                          ? '1 In Review'
+                          ? 'Pending'
                           : 'ACH / Wire'}
                       </span>
                     </div>
@@ -1486,7 +1487,7 @@ export const WithdrawModal: React.FC = () => {
                                     )}
                                     {isPending && (
                                       <span className="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-amber-500 text-slate-950 shadow-xs font-mono">
-                                        Pending Review
+                                        Pending Verification
                                       </span>
                                     )}
                                     {isRejected && (
@@ -1506,9 +1507,9 @@ export const WithdrawModal: React.FC = () => {
                                 {isPending && (
                                   <div className="pt-2 border-t border-amber-300/80 space-y-2.5">
                                     <p className="text-xs sm:text-sm text-amber-950 font-bold leading-relaxed">
-                                      Your bank application is currently under administrative review. You can leave it pending or cancel your application anytime.
+                                      Your bank account linking request for <strong>{account.bankName}</strong> has been submitted successfully. Your account will become available for eligible withdrawals once verification is complete.
                                     </p>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex flex-wrap items-center gap-2">
                                       <button
                                         type="button"
                                         onClick={() => handleCancelBankApplication(account.id)}
@@ -1518,7 +1519,7 @@ export const WithdrawModal: React.FC = () => {
                                         {isCancellingBankApp ? 'Cancelling...' : 'Cancel Application'}
                                       </button>
                                       <span className="text-[11px] font-bold text-amber-800">
-                                        Or leave pending for compliance approval
+                                        Your request is being processed. You can leave it pending or cancel it if necessary.
                                       </span>
                                     </div>
                                   </div>
@@ -1787,9 +1788,9 @@ export const WithdrawModal: React.FC = () => {
                             <h5 className="font-black text-sm">Account Verification In Progress</h5>
                           </div>
                           <p className="text-xs text-amber-900 font-bold leading-relaxed">
-                            Your bank account application for <strong>{selectedBank.bankName}</strong> was successfully submitted to our compliance department. Outbound wire/ACH withdrawals will unlock as soon as administrator approval and bank verification are complete.
+                            Your bank account linking request for <strong>{selectedBank.bankName}</strong> has been submitted successfully. Your account will become available for eligible withdrawals once verification is complete.
                           </p>
-                          <div className="flex items-center gap-2 pt-1 border-t border-amber-200">
+                          <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-amber-200">
                             <button
                               type="button"
                               onClick={() => handleCancelBankApplication(selectedBank.id)}
@@ -1799,7 +1800,7 @@ export const WithdrawModal: React.FC = () => {
                               {isCancellingBankApp ? 'Cancelling...' : 'Cancel Application'}
                             </button>
                             <span className="text-[11px] text-amber-800 font-medium">
-                              Or leave pending for administrator review
+                              Your request is being processed. You can leave it pending or cancel it if necessary.
                             </span>
                           </div>
                         </div>
@@ -1839,7 +1840,7 @@ export const WithdrawModal: React.FC = () => {
                             <h5 className="font-black text-sm">Account Verification Declined</h5>
                           </div>
                           <p className="text-xs text-rose-900 font-medium leading-relaxed">
-                            {selectedBank.rejectionReason || 'The submitted account details could not be verified by compliance.'}
+                            {selectedBank.rejectionReason || 'The submitted account details could not be verified.'}
                           </p>
                           <button
                             type="button"
@@ -1978,7 +1979,7 @@ export const WithdrawModal: React.FC = () => {
                             Link Bank Account for Withdrawal
                           </h3>
                           <p className="text-sm font-bold text-slate-900 mt-1">
-                            Transmitted securely to the admin console for fast approval & verification.
+                            Submit your bank account details securely for verification and withdrawal eligibility.
                           </p>
                         </div>
                         {linkedBankAccounts.length > 0 && (
@@ -2229,10 +2230,11 @@ export const WithdrawModal: React.FC = () => {
                               name="bank_swift_bic"
                               type="text"
                               autoComplete="off"
-                              maxLength={64}
+                              maxLength={11}
                               value={bankSwiftBic}
                               onChange={(e) => setBankSwiftBic(e.target.value)}
-                              placeholder="Enter SWIFT / BIC code"
+                              onBlur={() => setBankSwiftBic((prev) => prev.trim().toUpperCase())}
+                              placeholder="Enter 8 or 11 character SWIFT / BIC code"
                               className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20"
                             />
                           </div>

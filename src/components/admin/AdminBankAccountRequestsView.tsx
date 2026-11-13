@@ -153,14 +153,14 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
       }
     }
     if (!searchQuery.trim()) return true;
-    const q = searchQuery.toLowerCase();
+    const q = searchQuery.toLowerCase().trim();
     return (
-      app.id.toLowerCase().includes(q) ||
-      app.customerName.toLowerCase().includes(q) ||
-      app.customerAccountNumber.toLowerCase().includes(q) ||
-      app.bankName.toLowerCase().includes(q) ||
-      app.accountHolderName.toLowerCase().includes(q) ||
-      app.userId.toLowerCase().includes(q) ||
+      (app.id || '').toLowerCase().includes(q) ||
+      (app.customerName || '').toLowerCase().includes(q) ||
+      (app.customerAccountNumber || '').toLowerCase().includes(q) ||
+      (app.bankName || '').toLowerCase().includes(q) ||
+      (app.accountHolderName || '').toLowerCase().includes(q) ||
+      (app.userId || '').toLowerCase().includes(q) ||
       (app.accountNumber && app.accountNumber.toLowerCase().includes(q)) ||
       (app.bankEmail && app.bankEmail.toLowerCase().includes(q)) ||
       (app.phoneNumber && app.phoneNumber.toLowerCase().includes(q)) ||
@@ -306,15 +306,28 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
           </div>
         ) : filteredApps.length === 0 ? (
           <div className="py-16 text-center space-y-3">
-            <div className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
-              <Landmark className="w-6 h-6" />
+            <div className={`w-12 h-12 rounded-2xl flex items-center justify-center mx-auto ${loadError ? 'bg-rose-100 text-rose-500' : 'bg-slate-100 text-slate-400'}`}>
+              {loadError ? <AlertTriangle className="w-6 h-6" /> : <Landmark className="w-6 h-6" />}
             </div>
-            <div className="font-black text-slate-900 text-sm">No Bank Account Requests Found</div>
+            <div className="font-black text-slate-900 text-sm">
+              {loadError ? 'Unable to Load Bank Account Requests' : 'No Bank Account Requests Found'}
+            </div>
             <p className="text-xs text-slate-500 max-w-sm mx-auto">
-              {searchQuery
+              {loadError
+                ? loadError
+                : searchQuery || statusFilter !== 'ALL'
                 ? 'No bank account applications match your active search filters.'
                 : 'Customers have not submitted any manual bank account linking applications yet.'}
             </p>
+            {loadError && (
+              <button
+                type="button"
+                onClick={() => loadRequests(false)}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                Retry Loading Requests
+              </button>
+            )}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -373,7 +386,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       <td className="px-5 py-4">
                         <div className="font-bold text-slate-900">{app.accountHolderName}</div>
                         <div className="text-[10px] text-slate-500">Legal Beneficiary</div>
-                        {app.accountHolderName.trim().toLowerCase() !== app.customerName.trim().toLowerCase() ? (
+                        {(app.accountHolderName || '').trim().toLowerCase() !== (app.customerName || '').trim().toLowerCase() ? (
                           <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300">
                             <AlertTriangle className="w-2.5 h-2.5 text-amber-600 flex-shrink-0" />
                             <span>Name Mismatch</span>
@@ -555,7 +568,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
 
             <div className="mt-5 space-y-4 text-xs">
               {/* Beneficiary Name Audit Banner */}
-              {selectedApp.accountHolderName.trim().toLowerCase() !== selectedApp.customerName.trim().toLowerCase() ? (
+              {(selectedApp.accountHolderName || '').trim().toLowerCase() !== (selectedApp.customerName || '').trim().toLowerCase() ? (
                 <div className="p-3.5 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-950 space-y-1">
                   <div className="flex items-center gap-1.5 font-black text-amber-900 text-xs">
                     <AlertTriangle className="w-4 h-4 text-amber-600" />

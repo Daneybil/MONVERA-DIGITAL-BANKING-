@@ -48,7 +48,7 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
       const res = await api.getAdminCardActivationRequests();
       if (res.success && Array.isArray(res.requests)) {
         const list = [...res.requests].sort(
-          (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
+          (a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0)
         );
         setRequests(list);
         setLoadError(null);
@@ -142,10 +142,10 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
     const query = searchQuery.toLowerCase().trim();
     const matchesSearch =
       !query ||
-      r.id.toLowerCase().includes(query) ||
-      r.customerName.toLowerCase().includes(query) ||
-      r.customerAccountNumber.toLowerCase().includes(query) ||
-      r.activationCode.toLowerCase().includes(query) ||
+      (r.id || '').toLowerCase().includes(query) ||
+      (r.customerName || '').toLowerCase().includes(query) ||
+      (r.customerAccountNumber || '').toLowerCase().includes(query) ||
+      (r.activationCode || '').toLowerCase().includes(query) ||
       (r.customerEmail && r.customerEmail.toLowerCase().includes(query));
     return matchesStatus && matchesSearch;
   });
@@ -290,14 +290,31 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
             <p className="text-xs font-bold font-mono">Loading Card Activation Requests...</p>
           </div>
         ) : filteredRequests.length === 0 ? (
-          <div className="p-12 text-center text-slate-500 space-y-2">
-            <KeyRound className="w-10 h-10 text-slate-300 mx-auto" />
-            <h4 className="font-black text-slate-800 text-sm">No Activation Requests Found</h4>
+          <div className="p-12 text-center text-slate-500 space-y-2.5">
+            {loadError ? (
+              <AlertTriangle className="w-10 h-10 text-rose-400 mx-auto" />
+            ) : (
+              <KeyRound className="w-10 h-10 text-slate-300 mx-auto" />
+            )}
+            <h4 className="font-black text-slate-800 text-sm">
+              {loadError ? 'Unable to Load Activation Requests' : 'No Activation Requests Found'}
+            </h4>
             <p className="text-xs text-slate-500 max-w-md mx-auto">
-              {searchQuery || statusFilter !== 'ALL'
+              {loadError
+                ? loadError
+                : searchQuery || statusFilter !== 'ALL'
                 ? 'No requests match your current search or filter criteria.'
                 : 'Customer activation submissions will appear here for review.'}
             </p>
+            {loadError && (
+              <button
+                type="button"
+                onClick={() => loadRequests(false)}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors cursor-pointer"
+              >
+                Retry Loading Requests
+              </button>
+            )}
           </div>
         ) : (
           <div className="overflow-x-auto">

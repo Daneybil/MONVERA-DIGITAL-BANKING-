@@ -1862,7 +1862,7 @@ app.post('/api/bank-accounts/link', requireFirebaseAuth, async (req: Authenticat
   return res.json({
     success: true,
     application: result.application,
-    message: 'Bank Account Submitted Successfully',
+    message: 'Bank account linking request submitted successfully. Your account is awaiting verification.',
   });
 });
 
@@ -4525,6 +4525,16 @@ app.post('/api/support/messages/read', optionalFirebaseAuth, async (req: Authent
   }
 
   res.json({ success: true });
+});
+
+// --- API 404 CATCH-ALL (JSON) ---
+// Ensures unmatched /api/* endpoints always return JSON 404 rather than HTML SPA fallback
+app.all('/api/*', (req: Request, res: Response) => {
+  return res.status(404).json({
+    success: false,
+    errorCode: 'API_ROUTE_NOT_FOUND',
+    error: `API endpoint not found: ${req.method} ${req.originalUrl}`,
+  });
 });
 
 // --- VITE / STATIC SERVING ---
