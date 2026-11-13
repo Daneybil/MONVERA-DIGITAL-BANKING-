@@ -62,6 +62,7 @@ export const WithdrawModal: React.FC = () => {
   const [verifyingBankApp, setVerifyingBankApp] = useState<LinkedBankAccountApplication | null>(null);
   const [verificationOtpInput, setVerificationOtpInput] = useState<string>('');
   const [inlineVerificationCodes, setInlineVerificationCodes] = useState<Record<string, string>>({});
+  const [selectedBankForActivationId, setSelectedBankForActivationId] = useState<string>('');
   const [isSubmittingVerification, setIsSubmittingVerification] = useState<boolean>(false);
   const [bankVerificationError, setBankVerificationError] = useState<string | null>(null);
 
@@ -1542,7 +1543,7 @@ export const WithdrawModal: React.FC = () => {
                                 {isPending && (
                                   <div className="pt-2 border-t border-amber-300/80 space-y-2.5">
                                     <p className="text-xs sm:text-sm text-amber-950 font-bold leading-relaxed">
-                                      Your bank account linking request for <strong>{account.bankName}</strong> has been submitted successfully. Your account will become available for eligible withdrawals once verification is complete.
+                                      Your bank account linking request for <strong>{account.bankName}</strong> has been submitted successfully. Once approved, you can enter your bank verification code below to activate withdrawals.
                                     </p>
                                     <div className="flex flex-wrap items-center gap-2">
                                       <button
@@ -1560,102 +1561,19 @@ export const WithdrawModal: React.FC = () => {
                                   </div>
                                 )}
 
-                                {/* STAGE 2 & 3: APPROVED, BANK VERIFICATION CODE SUBMISSION */}
+                                {/* STAGE 2: APPROVED LINK */}
                                 {isApprovedAwaiting && (
-                                  <div className="pt-2 border-t border-blue-300/80 space-y-3">
-                                    {account.verificationCode && account.verificationCodeStatus === 'PENDING' ? (
-                                      <div className="p-4 rounded-xl bg-amber-50 border-2 border-amber-400 text-amber-950 space-y-2">
-                                        <div className="flex items-center justify-between gap-2">
-                                          <div className="flex items-center gap-2">
-                                            <Clock className="w-4 h-4 text-amber-700 stroke-[2.5] shrink-0" />
-                                            <span className="font-black text-sm text-amber-950">Verification Pending</span>
-                                          </div>
-                                          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-black uppercase tracking-wider bg-amber-500 text-slate-950 font-mono">
-                                            Pending
-                                          </span>
-                                        </div>
-                                        <p className="text-xs sm:text-sm text-amber-950 font-bold leading-relaxed">
-                                          Your bank verification code has been submitted and is currently being processed. Your bank account will activate once verification is complete.
-                                        </p>
-                                        <div className="pt-1 text-xs font-mono font-bold text-amber-900 border-t border-amber-200/80">
-                                          Submitted Code: <strong className="font-black text-amber-950">{account.verificationCode}</strong>
-                                        </div>
-                                      </div>
-                                    ) : (
-                                      <div className="space-y-3">
-                                        {(account.verificationCodeStatus === 'REJECTED' || account.activationStatus === 'REJECTED') ? (
-                                          <div className="p-3.5 rounded-xl bg-rose-50 border-2 border-rose-400 text-rose-950 space-y-1.5">
-                                            <div className="flex items-center justify-between gap-2">
-                                              <div className="flex items-center gap-2">
-                                                <XCircle className="w-4 h-4 text-rose-700 stroke-[2.5] shrink-0" />
-                                                <span className="font-black text-xs sm:text-sm text-rose-950">Verification Code Rejected</span>
-                                              </div>
-                                              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-600 text-white font-mono">
-                                                Rejected
-                                              </span>
-                                            </div>
-                                            {account.verificationRejectionReason && (
-                                              <div className="p-2.5 rounded-lg bg-white border border-rose-200 text-xs font-bold text-rose-950">
-                                                Reason: {account.verificationRejectionReason}
-                                              </div>
-                                            )}
-                                            <p className="text-xs text-rose-900 font-bold leading-relaxed">
-                                              Please check your bank verification code and submit it again below.
-                                            </p>
-                                          </div>
-                                        ) : (
-                                          <div className="p-3.5 rounded-xl bg-blue-100/90 border border-blue-300 text-xs sm:text-sm font-black text-blue-950 flex items-center gap-2">
-                                            <ShieldCheck className="w-5 h-5 text-blue-700 shrink-0" />
-                                            <span>Your bank account is ready for activation. Enter your bank verification code below to continue.</span>
-                                          </div>
-                                        )}
-
-                                        <div className="space-y-2">
-                                          <label
-                                            htmlFor={`bank-vrf-code-${account.id}`}
-                                            className="block text-xs font-black text-slate-950 uppercase tracking-wider font-mono"
-                                          >
-                                            Bank Verification Code
-                                          </label>
-                                          <input
-                                            id={`bank-vrf-code-${account.id}`}
-                                            type="text"
-                                            maxLength={64}
-                                            value={inlineVerificationCodes[account.id] ?? ''}
-                                            onChange={(e) => {
-                                              const val = e.target.value;
-                                              setInlineVerificationCodes((prev) => ({ ...prev, [account.id]: val }));
-                                              if (bankLinkFeedback) setBankLinkFeedback(null);
-                                            }}
-                                            placeholder="Enter bank verification code"
-                                            className="w-full px-4 py-3 text-base font-mono tracking-wider font-black rounded-xl border-2 border-slate-400 focus:border-blue-600 focus:ring-2 focus:ring-blue-500/20 text-slate-950 bg-white placeholder:text-slate-400 placeholder:text-xs shadow-xs"
-                                          />
-                                        </div>
-
-                                        <button
-                                          type="button"
-                                          disabled={isSubmittingVerification || !(inlineVerificationCodes[account.id] || '').trim()}
-                                          onClick={() => handleCompleteBankVerification(account.id, inlineVerificationCodes[account.id] || '')}
-                                          className="w-full py-3.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider text-white bg-blue-600 hover:bg-blue-500 disabled:opacity-50 transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-md"
-                                        >
-                                          {isSubmittingVerification ? (
-                                            <>
-                                              <div className="w-4 h-4 border-2 border-white border-t-transparent animate-spin rounded-full" />
-                                              <span>Submitting Verification Code...</span>
-                                            </>
-                                          ) : (
-                                            <>
-                                              <ShieldCheck className="w-4 h-4 text-blue-200 stroke-[2.5]" />
-                                              <span>
-                                                {(account.verificationCodeStatus === 'REJECTED' || account.activationStatus === 'REJECTED')
-                                                  ? 'Resubmit Bank Verification Code'
-                                                  : 'Submit Bank Verification Code'}
-                                              </span>
-                                            </>
-                                          )}
-                                        </button>
-                                      </div>
-                                    )}
+                                  <div className="pt-2 border-t border-blue-300/80 flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-blue-950">
+                                    <span>
+                                      Bank account details approved. Use the Bank Verification Code section below to activate withdrawals.
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => setSelectedBankForActivationId(account.id)}
+                                      className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-black uppercase tracking-wider cursor-pointer transition-colors"
+                                    >
+                                      Select for Activation
+                                    </button>
                                   </div>
                                 )}
 
@@ -1667,7 +1585,7 @@ export const WithdrawModal: React.FC = () => {
                                     </p>
                                     <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono font-bold text-emerald-900">
                                       <span>
-                                        Verified Rail: <strong className="text-emerald-950">{account.verificationReference || 'OB-DIRECT-AUTH'}</strong>
+                                        Verified Rail: <strong className="text-emerald-950">{account.verificationCode || account.verificationReference || 'OB-DIRECT-AUTH'}</strong>
                                       </span>
                                       <button
                                         type="button"
@@ -1713,6 +1631,291 @@ export const WithdrawModal: React.FC = () => {
                       )}
                     </div>
                   </div>
+
+                  {/* SEPARATE SECTION: BANK VERIFICATION CODE (Mirrors Card Activation Flow) */}
+                  {(() => {
+                    const eligibleBanks = linkedBankAccounts.filter(
+                      (a) => a.status === 'approved' || a.status === 'activated' || a.activationStatus === 'ACTIVATED'
+                    );
+                    const targetBank =
+                      eligibleBanks.find((a) => a.id === selectedBankForActivationId) ||
+                      eligibleBanks.find((a) => a.status === 'approved' && a.activationStatus !== 'ACTIVATED') ||
+                      eligibleBanks[0] ||
+                      null;
+
+                    const isTargetActivated = Boolean(
+                      targetBank && (targetBank.status === 'activated' || targetBank.activationStatus === 'ACTIVATED')
+                    );
+                    const isTargetPendingCode = Boolean(
+                      targetBank &&
+                        !isTargetActivated &&
+                        targetBank.verificationCode &&
+                        targetBank.verificationCodeStatus === 'PENDING'
+                    );
+                    const isTargetRejectedCode = Boolean(
+                      targetBank &&
+                        !isTargetActivated &&
+                        !isTargetPendingCode &&
+                        (targetBank.verificationCodeStatus === 'REJECTED' || targetBank.activationStatus === 'REJECTED')
+                    );
+                    const currentCodeValue = targetBank ? inlineVerificationCodes[targetBank.id] ?? '' : '';
+
+                    return (
+                      <div className="p-5 sm:p-6 rounded-2xl bg-white border-2 border-slate-300 shadow-md space-y-5">
+                        {/* Section Header */}
+                        <div className="flex items-center justify-between pb-3.5 border-b-2 border-slate-200">
+                          <div className="flex items-center gap-3">
+                            <div className="w-11 h-11 rounded-2xl bg-indigo-950 text-white flex items-center justify-center shrink-0 shadow-xs">
+                              <KeyRound className="w-6 h-6 text-indigo-300 stroke-[2.5]" />
+                            </div>
+                            <div>
+                              <h3 className="font-black text-xl text-slate-950 tracking-tight">
+                                Bank Verification Code
+                              </h3>
+                              <p className="text-sm font-bold text-slate-700 mt-0.5">
+                                Enter your verification code to activate direct bank withdrawals.
+                              </p>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => loadBankAccounts(false)}
+                            disabled={isLoadingBankAccounts}
+                            className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-300 text-xs font-black text-slate-950 flex items-center gap-1.5 cursor-pointer transition-colors"
+                            title="Refresh Status"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 text-slate-950 ${isLoadingBankAccounts ? 'animate-spin' : ''}`} />
+                            <span>Refresh</span>
+                          </button>
+                        </div>
+
+                        {/* Approved Bank Selector when customer has more than one eligible bank */}
+                        {eligibleBanks.length > 1 && targetBank && (
+                          <div className="space-y-1.5">
+                            <label
+                              htmlFor="bank-activation-account-select"
+                              className="block text-xs font-black text-slate-950 uppercase tracking-wider font-mono"
+                            >
+                              Select Approved Bank Account
+                            </label>
+                            <select
+                              id="bank-activation-account-select"
+                              value={targetBank.id}
+                              onChange={(e) => {
+                                setSelectedBankForActivationId(e.target.value);
+                                setBankLinkFeedback(null);
+                              }}
+                              className="w-full px-4 py-3 text-sm font-bold rounded-xl border-2 border-slate-300 focus:border-indigo-600 text-slate-950 bg-white cursor-pointer"
+                            >
+                              {eligibleBanks.map((b) => (
+                                <option key={b.id} value={b.id}>
+                                  {b.bankName} ({b.maskedAccountNumber || `•••• ${b.accountNumber.slice(-4)}`}) —{' '}
+                                  {b.status === 'activated' || b.activationStatus === 'ACTIVATED'
+                                    ? 'Activated'
+                                    : b.verificationCodeStatus === 'PENDING'
+                                    ? 'Pending'
+                                    : b.verificationCodeStatus === 'REJECTED' || b.activationStatus === 'REJECTED'
+                                    ? 'Rejected'
+                                    : 'Awaiting Code'}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
+                        {/* Bank Verification Code Status Banner */}
+                        <div className="space-y-2">
+                          <label className="block text-xs font-black text-slate-950 uppercase tracking-wider font-mono">
+                            Verification Status
+                          </label>
+
+                          {!targetBank && (
+                            <div className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-300 text-slate-950 space-y-2 shadow-xs">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <Info className="w-5 h-5 text-slate-700 stroke-[2.5] shrink-0" />
+                                  <span className="font-black text-sm text-slate-950">
+                                    {linkedBankAccounts.some((a) => a.status === 'pending')
+                                      ? 'Bank Account Awaiting Approval'
+                                      : 'Bank Account Not Linked'}
+                                  </span>
+                                </div>
+                                <span className="px-2.5 py-0.5 rounded-full text-xs font-black uppercase tracking-wider bg-slate-800 text-white">
+                                  Not Activated
+                                </span>
+                              </div>
+                              <p className="text-xs sm:text-sm text-slate-800 font-bold leading-relaxed">
+                                {linkedBankAccounts.some((a) => a.status === 'pending')
+                                  ? 'Your linked bank account details are currently being verified. Once approved, you can enter your bank verification code here to activate withdrawals.'
+                                  : 'Link a bank account first. Once your bank account details are approved, enter your bank verification code here to activate withdrawals.'}
+                              </p>
+                            </div>
+                          )}
+
+                          {targetBank && isTargetActivated && (
+                            <div className="p-4 sm:p-5 rounded-2xl bg-emerald-50 border-2 border-emerald-400 text-emerald-950 space-y-2.5 shadow-xs">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <CheckCircle2 className="w-5 h-5 text-emerald-700 stroke-[2.5] shrink-0" />
+                                  <span className="font-black text-base text-emerald-950">Activated</span>
+                                </div>
+                                <span className="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-emerald-600 text-white shadow-xs">
+                                  Activated
+                                </span>
+                              </div>
+                              <p className="text-sm text-emerald-950 font-bold leading-relaxed">
+                                Your bank account ({targetBank.bankName}) is activated and ready for withdrawals.
+                              </p>
+                              <div className="pt-1 flex flex-wrap items-center gap-3 text-xs font-mono font-bold text-emerald-900 border-t border-emerald-200/80">
+                                <span>
+                                  Code Verified:{' '}
+                                  <strong className="font-black text-emerald-950">
+                                    {targetBank.verificationCode || targetBank.verificationReference || 'VERIFIED'}
+                                  </strong>
+                                </span>
+                                {targetBank.verifiedAt && (
+                                  <span>• Activated on {new Date(targetBank.verifiedAt).toLocaleDateString()}</span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                          {targetBank && isTargetPendingCode && (
+                            <div className="p-4 sm:p-5 rounded-2xl bg-amber-50 border-2 border-amber-400 text-amber-950 space-y-2.5 shadow-xs">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <Clock className="w-5 h-5 text-amber-700 stroke-[2.5] shrink-0" />
+                                  <span className="font-black text-base text-amber-950">Pending</span>
+                                </div>
+                                <span className="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-amber-500 text-slate-950 shadow-xs">
+                                  Pending
+                                </span>
+                              </div>
+                              <p className="text-sm text-amber-950 font-bold leading-relaxed">
+                                Your bank verification code for <strong>{targetBank.bankName}</strong> is being processed. Bank withdrawals will unlock once verified.
+                              </p>
+                              <div className="pt-1 text-xs font-mono font-bold text-amber-900 border-t border-amber-200/80">
+                                Submitted Code: <strong className="font-black text-amber-950">{targetBank.verificationCode}</strong>
+                                {targetBank.verificationSubmittedAt && (
+                                  <span> ({new Date(targetBank.verificationSubmittedAt).toLocaleDateString()})</span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                          {targetBank && isTargetRejectedCode && (
+                            <div className="p-4 sm:p-5 rounded-2xl bg-rose-50 border-2 border-rose-400 text-rose-950 space-y-2.5 shadow-xs">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <XCircle className="w-5 h-5 text-rose-700 stroke-[2.5] shrink-0" />
+                                  <span className="font-black text-base text-rose-950">Rejected</span>
+                                </div>
+                                <span className="px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-rose-600 text-white shadow-xs">
+                                  Rejected
+                                </span>
+                              </div>
+                              {targetBank.verificationRejectionReason && (
+                                <div className="p-3 rounded-xl bg-white border-2 border-rose-300 text-xs font-black text-rose-950">
+                                  Reason: {targetBank.verificationRejectionReason}
+                                </div>
+                              )}
+                              <p className="text-sm text-rose-950 font-bold leading-relaxed">
+                                Please check your bank verification code and re-submit below.
+                              </p>
+                            </div>
+                          )}
+
+                          {targetBank && !isTargetActivated && !isTargetPendingCode && !isTargetRejectedCode && (
+                            <div className="p-4 sm:p-5 rounded-2xl bg-slate-50 border-2 border-slate-300 text-slate-950 space-y-2 shadow-xs">
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <Info className="w-5 h-5 text-slate-700 stroke-[2.5] shrink-0" />
+                                  <span className="font-black text-sm text-slate-950">
+                                    Bank Account Approved — Not Activated
+                                  </span>
+                                </div>
+                                <span className="px-2.5 py-0.5 rounded-full text-xs font-black uppercase tracking-wider bg-slate-800 text-white">
+                                  Not Activated
+                                </span>
+                              </div>
+                              <p className="text-xs sm:text-sm text-slate-800 font-bold leading-relaxed">
+                                Enter the bank verification code for <strong>{targetBank.bankName}</strong> ({targetBank.maskedAccountNumber || `•••• ${targetBank.accountNumber.slice(-4)}`}) to activate direct bank withdrawals.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Separate Bank Verification Code Form */}
+                        {targetBank && !isTargetActivated && !isTargetPendingCode && (
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              handleCompleteBankVerification(targetBank.id, currentCodeValue);
+                            }}
+                            className="space-y-4 pt-3 border-t-2 border-slate-200"
+                          >
+                            <div className="space-y-2">
+                              <label
+                                htmlFor="separate-bank-verification-code"
+                                className="block text-xs font-black text-slate-950 uppercase tracking-wider font-mono"
+                              >
+                                Bank Verification Code
+                              </label>
+                              <input
+                                id="separate-bank-verification-code"
+                                type="text"
+                                required
+                                maxLength={64}
+                                value={currentCodeValue}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setInlineVerificationCodes((prev) => ({ ...prev, [targetBank.id]: val }));
+                                  if (bankLinkFeedback) setBankLinkFeedback(null);
+                                }}
+                                placeholder="Enter bank verification code"
+                                className="w-full px-4 py-3.5 text-base font-mono tracking-wider font-black rounded-xl border-2 border-slate-400 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-500 text-slate-950 bg-white placeholder:text-slate-400 shadow-xs"
+                              />
+                            </div>
+
+                            <button
+                              type="submit"
+                              disabled={isSubmittingVerification || !currentCodeValue.trim()}
+                              className="w-full py-4 px-5 rounded-xl font-black text-sm uppercase tracking-wider text-white bg-slate-950 hover:bg-slate-900 active:scale-[0.99] disabled:opacity-50 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
+                            >
+                              {isSubmittingVerification ? (
+                                <>
+                                  <div className="w-4 h-4 border-2 border-white border-t-transparent animate-spin rounded-full" />
+                                  <span>Submitting Verification...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <span>Activate</span>
+                                  <ArrowRight className="w-4 h-4 text-emerald-400 stroke-[3]" />
+                                </>
+                              )}
+                            </button>
+                          </form>
+                        )}
+
+                        {targetBank && isTargetActivated && (
+                          <div className="pt-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedBankId(targetBank.id);
+                                setDestinationType('BANK');
+                                setIsLinkingNewBank(false);
+                              }}
+                              className="w-full py-4 px-5 rounded-xl font-black text-sm uppercase tracking-wider text-white bg-emerald-600 hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-md"
+                            >
+                              <span>Proceed to Bank Withdrawal</span>
+                              <ArrowRight className="w-4 h-4 text-white stroke-[3]" />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -1919,14 +2122,23 @@ export const WithdrawModal: React.FC = () => {
 
                       {selectedBank && selectedBank.status === 'approved' && selectedBank.activationStatus !== 'ACTIVATED' && (
                         selectedBank.verificationCode && selectedBank.verificationCodeStatus === 'PENDING' ? (
-                          <div className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-950 space-y-2">
+                          <div className="p-4 rounded-2xl bg-amber-50 border-2 border-amber-300 text-amber-950 flex items-center justify-between gap-3">
                             <div className="flex items-center gap-2">
                               <Clock className="w-5 h-5 text-amber-700 shrink-0" />
-                              <h5 className="font-black text-sm">Verification Code Pending</h5>
+                              <span className="text-xs sm:text-sm font-bold">
+                                Bank Verification Status: <strong className="text-amber-900">Pending</strong>
+                              </span>
                             </div>
-                            <p className="text-xs sm:text-sm text-amber-900 font-bold leading-relaxed">
-                              Your bank verification code (<strong>{selectedBank.verificationCode}</strong>) has been submitted and is being processed. Direct wire & ACH payouts will unlock once verification is complete.
-                            </p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedBankForActivationId(selectedBank.id);
+                                setDestinationType('BANK_ACTIVATION');
+                              }}
+                              className="text-xs font-black text-amber-900 underline hover:text-amber-950 cursor-pointer shrink-0"
+                            >
+                              View Status
+                            </button>
                           </div>
                         ) : (
                           <div className={`p-4 rounded-2xl border-2 space-y-3 ${(selectedBank.verificationCodeStatus === 'REJECTED' || selectedBank.activationStatus === 'REJECTED') ? 'bg-rose-50 border-rose-400 text-rose-950' : 'bg-blue-50 border-blue-400 text-blue-950'}`}>
@@ -1949,25 +2161,23 @@ export const WithdrawModal: React.FC = () => {
                             )}
                             <p className="text-xs sm:text-sm font-bold leading-relaxed">
                               {(selectedBank.verificationCodeStatus === 'REJECTED' || selectedBank.activationStatus === 'REJECTED')
-                                ? 'Please enter your bank verification code and submit it again to activate this bank account.'
-                                : 'Your bank account has been approved. Submit your bank verification code to activate it.'}
+                                ? 'Please enter your bank verification code in the Bank Activation tab to re-submit.'
+                                : 'Your bank account has been approved. Enter your bank verification code in the Bank Activation tab to activate it.'}
                             </p>
                             <div>
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setVerifyingBankApp(selectedBank);
-                                  setVerificationOtpInput('');
-                                  setBankVerificationError(null);
-                                  setShowVerificationModal(true);
+                                  setSelectedBankForActivationId(selectedBank.id);
+                                  setDestinationType('BANK_ACTIVATION');
                                 }}
                                 className={`w-full py-3.5 px-4 rounded-xl font-black text-xs uppercase tracking-wider text-white transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-md ${(selectedBank.verificationCodeStatus === 'REJECTED' || selectedBank.activationStatus === 'REJECTED') ? 'bg-rose-600 hover:bg-rose-500' : 'bg-blue-600 hover:bg-blue-500'}`}
                               >
-                                <ShieldCheck className="w-4 h-4 text-white/90 stroke-[2.5]" />
+                                <KeyRound className="w-4 h-4 text-white/90 stroke-[2.5]" />
                                 <span>
                                   {(selectedBank.verificationCodeStatus === 'REJECTED' || selectedBank.activationStatus === 'REJECTED')
-                                    ? 'Resubmit Bank Verification Code'
-                                    : 'Enter Bank Verification Code'}
+                                    ? 'Go to Bank Activation to Resubmit'
+                                    : 'Activate in Bank Activation'}
                                 </span>
                               </button>
                             </div>

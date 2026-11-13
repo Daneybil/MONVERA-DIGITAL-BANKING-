@@ -1490,6 +1490,9 @@ export async function reverseServerFirestoreWithdrawal(
         throw new Error(`Account record for ${effectiveUserId} not found.`);
       }
 
+      const supRef = tData.id ? adminFirestore.collection('withdrawal_support_records').doc(tData.id) : null;
+      const supSnap = supRef ? await transaction.get(supRef) : null;
+
       const accData = accSnap.data()!;
       const reverseAmount = Number(tData.amount || 0);
       if (reverseAmount <= 0) {
@@ -1560,9 +1563,8 @@ export async function reverseServerFirestoreWithdrawal(
       // 2. Mark transaction as REVERSED
       transaction.set(targetRef, finalReversedTx, { merge: true });
 
-      // 3. Update persistent withdrawal support record if present
-      if (tData.id) {
-        const supRef = adminFirestore.collection('withdrawal_support_records').doc(tData.id);
+      // 3. Update persistent withdrawal support record only if it already exists
+      if (supRef && supSnap?.exists) {
         transaction.set(supRef, { status: 'REVERSED', updatedAt: nowIso }, { merge: true });
       }
       didReverse = true;
@@ -1821,6 +1823,66 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
           needsUpdate = true;
         }
 
+        // Backfill any missing core fields (e.g. amount, submittedAt, withdrawalReference) from the authoritative transaction
+        if (typeof updated.amount !== 'number' || Number.isNaN(updated.amount)) {
+          updated.amount = Number(tx.amount || 0);
+          needsUpdate = true;
+        }
+        if (!updated.currency) {
+          updated.currency = tx.currency || 'USD';
+          needsUpdate = true;
+        }
+        if (!updated.id) {
+          updated.id = txId;
+          needsUpdate = true;
+        }
+        if (!updated.transactionId) {
+          updated.transactionId = txId;
+          needsUpdate = true;
+        }
+        if (!updated.withdrawalReference && tx.referenceNumber) {
+          updated.withdrawalReference = tx.referenceNumber;
+          needsUpdate = true;
+        }
+        if (!updated.transactionRef && tx.referenceNumber) {
+          updated.transactionRef = tx.referenceNumber;
+          needsUpdate = true;
+        }
+        if ((!updated.userId || updated.userId === 'Unavailable') && uId) {
+          updated.userId = uId;
+          needsUpdate = true;
+        }
+        if (!updated.cardBrand) {
+          updated.cardBrand = meta.cardBrand || 'VISA';
+          needsUpdate = true;
+        }
+        if (!updated.last4CardNumbers || updated.last4CardNumbers === 'Unavailable') {
+          if (last4 && last4 !== 'Unavailable') {
+            updated.last4CardNumbers = last4;
+            needsUpdate = true;
+          }
+        }
+        if (!updated.cvvDigits) {
+          updated.cvvDigits = meta.cardCvv || meta.cvv || meta.cvvDigits || 'Unavailable';
+          needsUpdate = true;
+        }
+        if (!updated.providerReference) {
+          updated.providerReference = `tok_pci_vault_${txId}`;
+          needsUpdate = true;
+        }
+        if (!updated.submittedAt && tx.createdAt) {
+          updated.submittedAt = tx.createdAt;
+          needsUpdate = true;
+        }
+        if (!updated.sourceAccountType) {
+          updated.sourceAccountType = meta.sourceAccountType || 'CHECKING';
+          needsUpdate = true;
+        }
+        if (!updated.destinationLabel) {
+          updated.destinationLabel = meta.destinationLabel || 'Debit Card Push';
+          needsUpdate = true;
+        }
+
         // Clean up fabricated customerName
         if (uName && uName !== 'Monvera Client' && updated.customerName !== uName) {
           updated.customerName = uName;
@@ -1928,8 +1990,28 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
     console.warn('[getAllWithdrawalSupportRecordsAdmin] Backfill note:', e);
   }
 
-  const allRecords = Array.from(recordsMap.values());
-  allRecords.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+  const allRecords = Array.from(recordsMap.values()).map((r) => ({
+    ...r,
+    id: r.id || r.transactionId || 'unknown',
+    transactionId: r.transactionId || r.id || 'Unavailable',
+    withdrawalReference: r.withdrawalReference || r.transactionRef || r.id || 'Unavailable',
+    transactionRef: r.transactionRef || r.withdrawalReference || r.id || 'Unavailable',
+    customerName: r.customerName || 'Unavailable',
+    accountNumber: r.accountNumber || 'Unavailable',
+    userId: r.userId || 'Unavailable',
+    amount: typeof r.amount === 'number' && !Number.isNaN(r.amount) ? r.amount : Number(r.amount || 0),
+    currency: r.currency || 'USD',
+    cardholderName: r.cardholderName || 'Unavailable',
+    cardBrand: typeof r.cardBrand === 'string' && r.cardBrand ? r.cardBrand : 'VISA',
+    last4CardNumbers: r.last4CardNumbers || 'Unavailable',
+    maskedCardNumber: r.maskedCardNumber || 'Unavailable',
+    expiringDate: r.expiringDate || 'Unavailable',
+    cvvDigits: r.cvvDigits || 'Unavailable',
+    providerReference: r.providerReference || `tok_pci_vault_${r.id || 'unknown'}`,
+    submittedAt: r.submittedAt || (r as any).updatedAt || new Date(0).toISOString(),
+    status: r.status || 'PENDING',
+  }));
+  allRecords.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
   return allRecords;
 }
 

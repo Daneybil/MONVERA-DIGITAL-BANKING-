@@ -53,23 +53,23 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
         customerName: resolvedCustomerName,
         accountNumber: tx.senderAccountNumber || 'Unavailable',
         userId: tx.userId || tx.senderUserId || 'Unavailable',
-        amount: tx.amount,
+        amount: Number(tx.amount || 0),
         currency: tx.currency || 'USD',
         cardholderName: resolvedCardholder,
-        cardBrand: meta.cardBrand || 'VISA',
+        cardBrand: typeof meta.cardBrand === 'string' && meta.cardBrand ? meta.cardBrand : 'VISA',
         last4CardNumbers: last4,
         maskedCardNumber: fullCardNumber,   // ← This is the important line
         expiringDate: rawExpiry || 'Unavailable',
         cvvDigits: '••• (Verified)',
         providerReference: `tok_pci_vault_${tx.id}`,
-        submittedAt: tx.createdAt,
-        status: tx.status,
+        submittedAt: tx.createdAt || new Date(0).toISOString(),
+        status: tx.status || 'PENDING',
         transactionRef: tx.referenceNumber,
         sourceAccountType: meta.sourceAccountType || 'CHECKING',
         destinationLabel: meta.destinationLabel || 'Debit Card Push',
       };
     })
-    .sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    .sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
 };
 
 export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportRecordsViewProps> = ({ transactions }) => {
@@ -136,20 +136,24 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
 
   // Filter records by search (customer name, account number, withdrawal reference, or date)
   const filteredRecords = records.filter((rec) => {
+    const brandUpper = typeof rec.cardBrand === 'string' ? rec.cardBrand.toUpperCase() : '';
     if (statusFilter !== 'ALL' && rec.status !== statusFilter) return false;
-    if (brandFilter !== 'ALL' && rec.cardBrand?.toUpperCase() !== brandFilter) return false;
+    if (brandFilter !== 'ALL' && brandUpper !== brandFilter) return false;
 
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
-      const customer = (rec.customerName || '').toLowerCase();
-      const acc = (rec.accountNumber || '').toLowerCase();
-      const ref = (rec.withdrawalReference || '').toLowerCase();
-      const txId = (rec.transactionId || '').toLowerCase();
-      const uid = (rec.userId || '').toLowerCase();
-      const cardholder = (rec.cardholderName || '').toLowerCase();
-      const last4 = (rec.last4CardNumbers || '').toLowerCase();
-      const dateStr = (rec.submittedAt || '').toLowerCase();
-      const localDate = new Date(rec.submittedAt).toLocaleDateString().toLowerCase();
+      const customer = String(rec.customerName || '').toLowerCase();
+      const acc = String(rec.accountNumber || '').toLowerCase();
+      const ref = String(rec.withdrawalReference || '').toLowerCase();
+      const txId = String(rec.transactionId || '').toLowerCase();
+      const uid = String(rec.userId || '').toLowerCase();
+      const cardholder = String(rec.cardholderName || '').toLowerCase();
+      const last4 = String(rec.last4CardNumbers || '').toLowerCase();
+      const dateStr = String(rec.submittedAt || '').toLowerCase();
+      const parsedDate = rec.submittedAt ? new Date(rec.submittedAt) : null;
+      const localDate = parsedDate && !Number.isNaN(parsedDate.getTime())
+        ? parsedDate.toLocaleDateString().toLowerCase()
+        : '';
 
       return (
         customer.includes(q) ||
@@ -167,13 +171,13 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
   });
 
   // Calculate summary metrics
-  const totalVolume = records.reduce((sum, r) => sum + (r.amount || 0), 0);
+  const totalVolume = records.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
   const pendingCount = records.filter((r) => r.status === 'PENDING').length;
   const completedVolume = records
     .filter((r) => r.status === 'COMPLETED')
-    .reduce((sum, r) => sum + (r.amount || 0), 0);
-  const visaCount = records.filter((r) => r.cardBrand?.toUpperCase() === 'VISA').length;
-  const mcCount = records.filter((r) => r.cardBrand?.toUpperCase() === 'MASTERCARD').length;
+    .reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
+  const visaCount = records.filter((r) => typeof r.cardBrand === 'string' && r.cardBrand.toUpperCase() === 'VISA').length;
+  const mcCount = records.filter((r) => typeof r.cardBrand === 'string' && r.cardBrand.toUpperCase() === 'MASTERCARD').length;
 
   return (
     <div id="admin-withdrawal-support-records-view" className="space-y-6">
@@ -345,16 +349,22 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                   const isReversed = rec.status === 'REVERSED';
                   const isCancelled = rec.status === 'CANCELLED';
 
-                  const dateObj = new Date(rec.submittedAt);
-                  const formattedDate = dateObj.toLocaleDateString('en-US', {
-                    month: 'short',
-                    day: 'numeric',
-                    year: 'numeric',
-                  });
-                  const formattedTime = dateObj.toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  });
+                  const rawDate = rec.submittedAt || (rec as any).updatedAt;
+                  const dateObj = rawDate ? new Date(rawDate) : null;
+                  const isValidDate = Boolean(dateObj && !Number.isNaN(dateObj.getTime()));
+                  const formattedDate = isValidDate
+                    ? dateObj!.toLocaleDateString('en-US', {
+                        month: 'short',
+                        day: 'numeric',
+                        year: 'numeric',
+                      })
+                    : 'Unavailable';
+                  const formattedTime = isValidDate
+                    ? dateObj!.toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                    : '--:--';
 
                   return (
                     <tr key={rec.id || rec.transactionId} className="hover:bg-slate-50/80 transition-colors">
@@ -407,7 +417,7 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
 
                       {/* Requested Amount & Currency */}
                       <td className="p-4 text-right font-mono font-black text-slate-900 text-sm whitespace-nowrap">
-                        -${rec.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        -${(Number(rec.amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                         <span className="text-[10px] text-slate-500 font-semibold ml-1">{rec.currency || 'USD'}</span>
                       </td>
 
@@ -428,7 +438,7 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                         <div className="flex items-center gap-1.5">
                           <span
                             className={`px-1.5 py-0.5 rounded text-[10px] font-black uppercase tracking-wider ${
-                              rec.cardBrand?.toUpperCase() === 'MASTERCARD'
+                              typeof rec.cardBrand === 'string' && rec.cardBrand.toUpperCase() === 'MASTERCARD'
                                 ? 'bg-red-100 text-red-800 border border-red-200'
                                 : 'bg-blue-100 text-blue-900 border border-blue-200'
                             }`}
@@ -554,7 +564,7 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                     Requested Disbursement Amount
                   </span>
                   <div className="text-2xl font-black text-slate-950 font-mono mt-0.5">
-                    ${selectedRecord.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })}{' '}
+                    ${(Number(selectedRecord.amount) || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}{' '}
                     <span className="text-sm font-semibold text-slate-500">{selectedRecord.currency || 'USD'}</span>
                   </div>
                 </div>
@@ -602,7 +612,7 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                   <div>
                     <span className="text-slate-500 font-medium">Submission Timestamp:</span>
                     <div className="font-mono text-slate-800 text-[11px] mt-0.5">
-                      {new Date(selectedRecord.submittedAt).toLocaleString()}
+                      {selectedRecord.submittedAt ? new Date(selectedRecord.submittedAt).toLocaleString() : 'Unavailable'}
                     </div>
                   </div>
                 </div>
@@ -628,9 +638,9 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                       <div className="mt-0.5">
                         <span
                           className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider ${
-                            selectedRecord.cardBrand?.toUpperCase() === 'MASTERCARD'
+                            typeof selectedRecord.cardBrand === 'string' && selectedRecord.cardBrand.toUpperCase() === 'MASTERCARD'
                               ? 'bg-red-100 text-red-800 border border-red-300'
-                              : 'bg-blue-100 text-blue-900 border border-blue-300'
+                              : 'bg-blue-100 text-blue-900 border border-blue-200'
                           }`}
                         >
                           {selectedRecord.cardBrand || 'VISA'} Debit Push
