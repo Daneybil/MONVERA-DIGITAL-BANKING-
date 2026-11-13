@@ -447,7 +447,9 @@ export const AdminDashboard: React.FC = () => {
       }
 
       if (bankAppsRes?.success && Array.isArray(bankAppsRes.applications)) {
-        const pendingBankApps = bankAppsRes.applications.filter((a: any) => a.status === 'pending').length;
+        const pendingBankApps = bankAppsRes.applications.filter(
+          (a: any) => a.status === 'pending' || (a.status === 'approved' && a.verificationCodeStatus === 'PENDING')
+        ).length;
         setPendingBankAppsCount(pendingBankApps);
         setBankAppsLoadError(null);
       } else {
@@ -577,7 +579,11 @@ export const AdminDashboard: React.FC = () => {
         }
 
         if (bankAppsRes?.success && Array.isArray(bankAppsRes.applications)) {
-          setPendingBankAppsCount(bankAppsRes.applications.filter((a: any) => a.status === 'pending').length);
+          setPendingBankAppsCount(
+            bankAppsRes.applications.filter(
+              (a: any) => a.status === 'pending' || (a.status === 'approved' && a.verificationCodeStatus === 'PENDING')
+            ).length
+          );
           setBankAppsLoadError(null);
         } else {
           setBankAppsLoadError(bankAppsRes?.error || 'Unable to load bank account approval requests.');

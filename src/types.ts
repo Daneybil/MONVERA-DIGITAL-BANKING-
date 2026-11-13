@@ -202,6 +202,10 @@ export interface LinkedBankAccountApplication {
   activationStatus?: BankActivationStatus;
   verificationProvider?: string;
   verificationReference?: string;
+  verificationCode?: string;
+  verificationCodeStatus?: 'PENDING' | 'APPROVED' | 'REJECTED';
+  verificationSubmittedAt?: string;
+  verificationRejectionReason?: string;
   verifiedAt?: string;
   submittedAt: string;
   approvedAt?: string;

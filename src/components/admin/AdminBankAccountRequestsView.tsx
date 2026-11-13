@@ -38,7 +38,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
 
   // Approval / Rejection modal state
   const [actionModal, setActionModal] = useState<{
-    type: 'APPROVE' | 'REJECT';
+    type: 'APPROVE' | 'REJECT' | 'APPROVE_VERIFICATION' | 'REJECT_VERIFICATION';
     app: LinkedBankAccountApplication;
   } | null>(null);
   const [rejectionReason, setRejectionReason] = useState<string>('');
@@ -88,11 +88,14 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   }, []);
 
   const handleApprove = async () => {
-    if (!actionModal || actionModal.type !== 'APPROVE') return;
+    if (!actionModal || (actionModal.type !== 'APPROVE' && actionModal.type !== 'APPROVE_VERIFICATION')) return;
     setIsSubmittingAction(true);
     setActionError(null);
     try {
-      const res = await api.approveBankAccountApplication(actionModal.app.id);
+      const res =
+        actionModal.type === 'APPROVE_VERIFICATION'
+          ? await api.approveBankVerificationCode(actionModal.app.id)
+          : await api.approveBankAccountApplication(actionModal.app.id);
       if (res.success && res.application) {
         setApplications((prev) =>
           prev.map((a) => (a.id === actionModal.app.id ? res.application! : a))
@@ -103,7 +106,12 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         }
         if (onRefreshData) onRefreshData();
       } else {
-        setActionError(res.error || 'Failed to approve bank account application.');
+        setActionError(
+          res.error ||
+            (actionModal.type === 'APPROVE_VERIFICATION'
+              ? 'Failed to approve bank verification code.'
+              : 'Failed to approve bank account application.')
+        );
       }
     } catch (err: any) {
       setActionError(err?.message || 'Server error during approval.');
@@ -113,14 +121,20 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   };
 
   const handleReject = async () => {
-    if (!actionModal || actionModal.type !== 'REJECT') return;
+    if (!actionModal || (actionModal.type !== 'REJECT' && actionModal.type !== 'REJECT_VERIFICATION')) return;
     setIsSubmittingAction(true);
     setActionError(null);
     try {
-      const res = await api.rejectBankAccountApplication(
-        actionModal.app.id,
-        rejectionReason.trim() || undefined
-      );
+      const res =
+        actionModal.type === 'REJECT_VERIFICATION'
+          ? await api.rejectBankVerificationCode(
+              actionModal.app.id,
+              rejectionReason.trim() || undefined
+            )
+          : await api.rejectBankAccountApplication(
+              actionModal.app.id,
+              rejectionReason.trim() || undefined
+            );
       if (res.success && res.application) {
         setApplications((prev) =>
           prev.map((a) => (a.id === actionModal.app.id ? res.application! : a))
@@ -132,7 +146,12 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         }
         if (onRefreshData) onRefreshData();
       } else {
-        setActionError(res.error || 'Failed to reject bank account application.');
+        setActionError(
+          res.error ||
+            (actionModal.type === 'REJECT_VERIFICATION'
+              ? 'Failed to reject bank verification code.'
+              : 'Failed to reject bank account application.')
+        );
       }
     } catch (err: any) {
       setActionError(err?.message || 'Server error during rejection.');
@@ -165,6 +184,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
       (app.bankEmail && app.bankEmail.toLowerCase().includes(q)) ||
       (app.phoneNumber && app.phoneNumber.toLowerCase().includes(q)) ||
       (app.verificationReference && app.verificationReference.toLowerCase().includes(q)) ||
+      (app.verificationCode && app.verificationCode.toLowerCase().includes(q)) ||
       (app.maskedAccountNumber && app.maskedAccountNumber.toLowerCase().includes(q)) ||
       (app.swiftBic && app.swiftBic.toLowerCase().includes(q)) ||
       (app.iban && app.iban.toLowerCase().includes(q)) ||
@@ -429,6 +449,12 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                             BSB: {app.bsb}
                           </div>
                         )}
+                        {app.verificationCode && (
+                          <div className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-50 border border-indigo-200 font-mono text-[11px] font-black text-indigo-900 select-all">
+                            <Lock className="w-3 h-3 text-indigo-600 shrink-0" />
+                            <span>Code: {app.verificationCode}</span>
+                          </div>
+                        )}
                         {app.verificationReference && (
                           <div className="font-mono text-[10px] text-emerald-700 font-bold flex items-center gap-1 mt-0.5">
                             <ShieldCheck className="w-3 h-3 text-emerald-600" />
@@ -469,10 +495,22 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                           </span>
                         )}
                         {app.status === 'approved' && app.activationStatus !== 'ACTIVATED' && (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
-                            <Clock className="w-3 h-3 text-blue-700" />
-                            Approved (Verifying)
-                          </span>
+                          app.verificationCode && app.verificationCodeStatus === 'PENDING' ? (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-100 text-indigo-900 border border-indigo-400 font-mono">
+                              <Clock className="w-3 h-3 text-indigo-700" />
+                              Code Pending
+                            </span>
+                          ) : app.verificationCodeStatus === 'REJECTED' || app.activationStatus === 'REJECTED' ? (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
+                              <XCircle className="w-3 h-3 text-rose-600" />
+                              Code Rejected
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
+                              <Clock className="w-3 h-3 text-blue-700" />
+                              Approved (Awaiting Code)
+                            </span>
+                          )
                         )}
                         {app.status === 'pending' && (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-400 font-mono">
@@ -530,6 +568,33 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                               >
                                 <X className="w-3.5 h-3.5" />
                                 <span>Reject</span>
+                              </button>
+                            </>
+                          )}
+
+                          {isApproved && app.activationStatus !== 'ACTIVATED' && app.verificationCode && app.verificationCodeStatus !== 'REJECTED' && (
+                            <>
+                              <button
+                                onClick={() => {
+                                  setActionError(null);
+                                  setActionModal({ type: 'APPROVE_VERIFICATION', app });
+                                }}
+                                className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                                <span>Approve Code</span>
+                              </button>
+
+                              <button
+                                onClick={() => {
+                                  setActionError(null);
+                                  setRejectionReason('');
+                                  setActionModal({ type: 'REJECT_VERIFICATION', app });
+                                }}
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                                <span>Reject Code</span>
                               </button>
                             </>
                           )}
@@ -641,7 +706,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                   </div>
                   <div className="col-span-2 pt-2 border-t border-slate-200/80">
                     <span className="text-slate-400 block text-[10px]">Bank Activation & Rail Verification</span>
-                    <div className="flex items-center gap-2 mt-1">
+                    <div className="flex items-center gap-2 mt-1 flex-wrap">
                       {selectedApp.status === 'activated' || selectedApp.activationStatus === 'ACTIVATED' ? (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-emerald-100 text-emerald-900 border border-emerald-300 font-mono">
                           <ShieldCheck className="w-4 h-4 text-emerald-700" />
@@ -650,7 +715,11 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       ) : selectedApp.status === 'approved' ? (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-300 font-mono">
                           <Clock className="w-4 h-4 text-blue-700" />
-                          Approved • Awaiting Bank Verification
+                          {selectedApp.verificationCode && selectedApp.verificationCodeStatus === 'PENDING'
+                            ? 'Verification Code Pending Approval'
+                            : selectedApp.verificationCodeStatus === 'REJECTED'
+                            ? 'Verification Code Rejected'
+                            : 'Approved • Awaiting Bank Verification Code'}
                         </span>
                       ) : selectedApp.status === 'pending' ? (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300 font-mono">
@@ -664,6 +733,12 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       ) : (
                         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-300 font-mono">
                           Rejected
+                        </span>
+                      )}
+                      {selectedApp.verificationCode && (
+                        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-indigo-100 text-indigo-950 border border-indigo-300 font-mono select-all">
+                          <Lock className="w-3.5 h-3.5 text-indigo-700" />
+                          Verification Code: {selectedApp.verificationCode}
                         </span>
                       )}
                     </div>
@@ -786,12 +861,12 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
             <div className="flex items-center gap-3">
               <div
                 className={`w-11 h-11 rounded-2xl flex items-center justify-center ${
-                  actionModal.type === 'APPROVE'
+                  actionModal.type === 'APPROVE' || actionModal.type === 'APPROVE_VERIFICATION'
                     ? 'bg-emerald-100 text-emerald-700'
                     : 'bg-rose-100 text-rose-700'
                 }`}
               >
-                {actionModal.type === 'APPROVE' ? (
+                {actionModal.type === 'APPROVE' || actionModal.type === 'APPROVE_VERIFICATION' ? (
                   <CheckCircle2 className="w-6 h-6" />
                 ) : (
                   <AlertTriangle className="w-6 h-6" />
@@ -799,11 +874,21 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               </div>
               <div>
                 <h3 className="font-black text-slate-950 text-base">
-                  {actionModal.type === 'APPROVE' ? 'Approve Bank Account' : 'Reject Bank Account'}
+                  {actionModal.type === 'APPROVE'
+                    ? 'Approve Bank Account'
+                    : actionModal.type === 'APPROVE_VERIFICATION'
+                    ? 'Approve Bank Verification Code'
+                    : actionModal.type === 'REJECT_VERIFICATION'
+                    ? 'Reject Bank Verification Code'
+                    : 'Reject Bank Account'}
                 </h3>
                 <p className="text-xs text-slate-500">
                   {actionModal.type === 'APPROVE'
-                    ? 'Verify and activate this bank account for withdrawals'
+                    ? 'Approve linking so customer can submit their bank verification code'
+                    : actionModal.type === 'APPROVE_VERIFICATION'
+                    ? 'Approve this submitted code and activate the bank account for withdrawals'
+                    : actionModal.type === 'REJECT_VERIFICATION'
+                    ? 'Reject this verification code so the customer must submit a new one'
                     : 'Deny this bank account linking request'}
                 </p>
               </div>
@@ -831,6 +916,14 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                 <span className="text-slate-400">Beneficiary:</span>{' '}
                 <strong className="text-slate-950">{actionModal.app.accountHolderName}</strong>
               </div>
+              {actionModal.app.verificationCode && (
+                <div>
+                  <span className="text-slate-400">Bank Verification Code:</span>{' '}
+                  <strong className="font-mono text-indigo-900 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200 select-all">
+                    {actionModal.app.verificationCode}
+                  </strong>
+                </div>
+              )}
               {actionModal.app.swiftBic && (
                 <div>
                   <span className="text-slate-400">SWIFT / BIC:</span>{' '}
@@ -847,7 +940,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               )}
             </div>
 
-            {actionModal.type === 'REJECT' && (
+            {(actionModal.type === 'REJECT' || actionModal.type === 'REJECT_VERIFICATION') && (
               <div className="space-y-1.5">
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
                   Rejection Reason (Optional)
@@ -856,7 +949,11 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                   rows={3}
                   value={rejectionReason}
                   onChange={(e) => setRejectionReason(e.target.value)}
-                  placeholder="e.g. Beneficiary name does not match verified KYC documents, or invalid routing code."
+                  placeholder={
+                    actionModal.type === 'REJECT_VERIFICATION'
+                      ? 'e.g. Verification code mismatch or expired. Please enter a valid code.'
+                      : 'e.g. Beneficiary name does not match verified KYC documents, or invalid routing code.'
+                  }
                   className="w-full p-3 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-900 bg-white"
                 />
               </div>
@@ -872,7 +969,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                 Cancel
               </button>
 
-              {actionModal.type === 'APPROVE' ? (
+              {actionModal.type === 'APPROVE' || actionModal.type === 'APPROVE_VERIFICATION' ? (
                 <button
                   type="button"
                   onClick={handleApprove}

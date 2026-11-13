@@ -5097,10 +5097,11 @@ export async function completeBankVerification(
   userId: string,
   applicationId: string,
   params: {
+    verificationCode?: string;
     verificationReference?: string;
     verificationProvider?: string;
   }
-): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string }> {
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string; statusCode?: number }> {
   try {
     let existingApp: LinkedBankAccountApplication | null = null;
     const nowIso = new Date().toISOString();
@@ -5122,48 +5123,183 @@ export async function completeBankVerification(
     }
 
     if (!existingApp) {
-      return { success: false, error: 'Bank account application not found.' };
+      return { success: false, statusCode: 404, error: 'Bank account application not found.' };
     }
 
     if (existingApp.userId !== userId) {
-      return { success: false, error: 'Unauthorized to verify this bank account.' };
+      return { success: false, statusCode: 403, error: 'Unauthorized to verify this bank account.' };
     }
 
-    if (existingApp.status !== 'approved' && existingApp.status !== 'activated') {
-      return { success: false, error: 'Bank account must be approved before bank verification can be completed.' };
+    if (existingApp.status === 'activated' || existingApp.activationStatus === 'ACTIVATED') {
+      return { success: false, statusCode: 400, error: 'This bank account is already activated.' };
     }
 
-    const verificationRef = params.verificationReference || `OB-VRF-${Date.now().toString(36).toUpperCase()}`;
-    const verificationProvider = params.verificationProvider || 'Authorized Open Banking Rail';
+    if (existingApp.status !== 'approved') {
+      return { success: false, statusCode: 400, error: 'Bank account must be approved before a bank verification code can be submitted.' };
+    }
+
+    const cleanCode = String(params.verificationCode || '').trim();
+    if (!cleanCode) {
+      return { success: false, statusCode: 400, error: 'Please enter your bank verification code.' };
+    }
+    if (cleanCode.length > 64) {
+      return { success: false, statusCode: 400, error: 'Bank verification code must not exceed 64 characters.' };
+    }
+
+    if (existingApp.verificationCodeStatus === 'PENDING' && existingApp.verificationCode) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'A bank verification code has already been submitted and is currently awaiting verification.',
+      };
+    }
+
+    const verificationRef = params.verificationReference || existingApp.verificationReference || `OB-VRF-${Date.now().toString(36).toUpperCase()}`;
+    const verificationProvider = params.verificationProvider || existingApp.verificationProvider || 'Bank Verification Rail';
 
     const updatedApp: LinkedBankAccountApplication = {
       ...existingApp,
-      status: 'activated',
-      activationStatus: 'ACTIVATED',
+      status: 'approved',
+      activationStatus: 'PENDING_VERIFICATION',
       verificationProvider,
       verificationReference: verificationRef,
-      verifiedAt: nowIso,
+      verificationCode: cleanCode,
+      verificationCodeStatus: 'PENDING',
+      verificationSubmittedAt: nowIso,
+      verificationRejectionReason: '',
     };
 
     if (!isFirebaseAdminConfigured()) {
-      return { success: false, error: 'Database service unavailable: cannot complete bank verification.' };
+      return { success: false, statusCode: 503, error: 'Database service unavailable: cannot save bank verification code.' };
     }
 
     try {
       await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
     } catch (fsErr: any) {
       console.error('[completeBankVerification Firestore write error]:', fsErr?.message || fsErr);
-      return { success: false, error: 'Failed to save bank verification to database. Please try again.' };
+      return { success: false, statusCode: 503, error: 'Failed to save bank verification code to database. Please try again.' };
     }
 
     db.bankAccountApplications.set(applicationId, updatedApp);
 
-    // Record deterministic Notification for customer
+    // Record deterministic Notification for customer (no administrative terminology)
+    await persistCustomerNotification({
+      id: `notif_bnk_vrf_sub_${applicationId}_${Date.now()}`,
+      userId: updatedApp.userId,
+      title: 'Bank Verification Submitted',
+      message: `Your bank verification code for ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) has been submitted and is awaiting verification.`,
+      type: 'SECURITY',
+      severity: 'info',
+      createdAt: nowIso,
+      referenceId: applicationId,
+      actionModal: 'withdraw',
+      actionSection: 'BANK_ACTIVATION',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_VERIFICATION_SUBMITTED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Bank Verification',
+        status: 'pending',
+        bankName: updatedApp.bankName,
+        bankAccountMasked: updatedApp.maskedAccountNumber,
+        date: nowIso,
+      },
+    });
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[completeBankVerification Error]:', err);
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to submit bank verification code.' };
+  }
+}
+
+export async function approveBankVerificationCode(
+  adminId: string,
+  applicationId: string
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string; statusCode?: number }> {
+  try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: bank verification approval could not be saved.',
+      };
+    }
+
+    let existingApp: LinkedBankAccountApplication | null = null;
+    const nowIso = new Date().toISOString();
+
+    try {
+      const snap = await adminFirestore.collection('bank_account_applications').doc(applicationId).get();
+      if (snap.exists) {
+        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+      }
+    } catch (fsErr: any) {
+      console.error('[approveBankVerificationCode Firestore read error]:', fsErr?.message || fsErr);
+      return { success: false, statusCode: 503, error: 'Failed to load bank account application from database.' };
+    }
+
+    if (!existingApp) {
+      return { success: false, statusCode: 404, error: 'Bank account application not found.' };
+    }
+
+    if (existingApp.status === 'activated' || existingApp.activationStatus === 'ACTIVATED') {
+      return { success: false, statusCode: 400, error: 'This bank account is already activated.' };
+    }
+
+    if (existingApp.status !== 'approved') {
+      return { success: false, statusCode: 400, error: 'Bank account linking must be approved before approving its verification code.' };
+    }
+
+    if (!existingApp.verificationCode) {
+      return { success: false, statusCode: 400, error: 'No bank verification code has been submitted by the customer yet.' };
+    }
+
+    const verificationRef = existingApp.verificationReference || `OB-VRF-${Date.now().toString(36).toUpperCase()}`;
+
+    const updatedApp: LinkedBankAccountApplication = {
+      ...existingApp,
+      status: 'activated',
+      activationStatus: 'ACTIVATED',
+      verificationCodeStatus: 'APPROVED',
+      verificationReference: verificationRef,
+      verifiedAt: nowIso,
+      verificationRejectionReason: '',
+    };
+
+    try {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[approveBankVerificationCode Firestore write error]:', fsErr?.message || fsErr);
+      return { success: false, statusCode: 503, error: 'Failed to persist bank verification approval to database.' };
+    }
+
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    const auditId = `aud_${Date.now()}_approve_bank_vrf_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_APPROVE_BANK_VERIFICATION',
+      targetUserId: updatedApp.userId,
+      targetAccountNumber: updatedApp.customerAccountNumber,
+      amount: 0,
+      reason: `Approved bank verification code for ${updatedApp.bankName} (${updatedApp.maskedAccountNumber})`,
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+
     await persistCustomerNotification({
       id: `notif_bnk_act_${applicationId}`,
       userId: updatedApp.userId,
       title: 'Bank Account Activated',
-      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has completed bank verification and is now Activated for payouts and withdrawals.`,
+      message: `Your ${updatedApp.bankName} account (${updatedApp.maskedAccountNumber}) has been verified and is now Activated for payouts and withdrawals.`,
       type: 'SECURITY',
       severity: 'success',
       createdAt: nowIso,
@@ -5187,8 +5323,116 @@ export async function completeBankVerification(
 
     return { success: true, application: updatedApp };
   } catch (err: any) {
-    console.error('[completeBankVerification Error]:', err);
-    return { success: false, error: err?.message || 'Failed to complete bank verification.' };
+    console.error('[approveBankVerificationCode Error]:', err);
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to approve bank verification code.' };
+  }
+}
+
+export async function rejectBankVerificationCode(
+  adminId: string,
+  applicationId: string,
+  reason?: string
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string; statusCode?: number }> {
+  try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: bank verification rejection could not be saved.',
+      };
+    }
+
+    let existingApp: LinkedBankAccountApplication | null = null;
+    const nowIso = new Date().toISOString();
+
+    try {
+      const snap = await adminFirestore.collection('bank_account_applications').doc(applicationId).get();
+      if (snap.exists) {
+        existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+      }
+    } catch (fsErr: any) {
+      console.error('[rejectBankVerificationCode Firestore read error]:', fsErr?.message || fsErr);
+      return { success: false, statusCode: 503, error: 'Failed to load bank account application from database.' };
+    }
+
+    if (!existingApp) {
+      return { success: false, statusCode: 404, error: 'Bank account application not found.' };
+    }
+
+    if (existingApp.status === 'activated' || existingApp.activationStatus === 'ACTIVATED') {
+      return { success: false, statusCode: 400, error: 'Cannot reject verification on an already activated bank account.' };
+    }
+
+    if (existingApp.status !== 'approved') {
+      return { success: false, statusCode: 400, error: 'Bank account must be in approved state to reject its verification code.' };
+    }
+
+    const rejectionText =
+      reason?.trim() || 'The submitted bank verification code could not be verified. Please enter a valid code and try again.';
+
+    const updatedApp: LinkedBankAccountApplication = {
+      ...existingApp,
+      status: 'approved',
+      activationStatus: 'REJECTED',
+      verificationCodeStatus: 'REJECTED',
+      verificationRejectionReason: rejectionText,
+    };
+
+    try {
+      await adminFirestore.collection('bank_account_applications').doc(applicationId).set(updatedApp, { merge: true });
+    } catch (fsErr: any) {
+      console.error('[rejectBankVerificationCode Firestore write error]:', fsErr?.message || fsErr);
+      return { success: false, statusCode: 503, error: 'Failed to persist bank verification rejection to database.' };
+    }
+
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    const auditId = `aud_${Date.now()}_reject_bank_vrf_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_REJECT_BANK_VERIFICATION',
+      targetUserId: updatedApp.userId,
+      targetAccountNumber: updatedApp.customerAccountNumber,
+      amount: 0,
+      reason: rejectionText,
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+
+    await persistCustomerNotification({
+      id: `notif_bnk_vrf_rej_${applicationId}_${Date.now()}`,
+      userId: updatedApp.userId,
+      title: 'Bank Verification Code Rejected',
+      message: `Your bank verification code for ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}) was rejected. ${rejectionText}`,
+      type: 'SECURITY',
+      severity: 'warning',
+      createdAt: nowIso,
+      referenceId: applicationId,
+      actionModal: 'withdraw',
+      actionSection: 'BANK_ACTIVATION',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'BANK_VERIFICATION_REJECTED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Bank Verification',
+        status: 'rejected',
+        bankName: updatedApp.bankName,
+        reason: rejectionText,
+        date: nowIso,
+      },
+    });
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[rejectBankVerificationCode Error]:', err);
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to reject bank verification code.' };
   }
 }
 

@@ -3267,12 +3267,13 @@ export const api = {
   },
 
   /**
-   * Completes bank verification and activates the bank account (Customer Stage 3 & 4)
+   * Submits a customer's bank verification code for backend verification (Customer Stage 3)
    */
   async completeBankVerification(
     applicationId: string,
     data: {
       userId?: string;
+      verificationCode?: string;
       verificationReference?: string;
       verificationProvider?: string;
     }
@@ -3296,19 +3297,97 @@ export const api = {
         error?: string;
       }>(res, {
         success: false,
-        error: 'Failed to complete bank verification',
+        error: 'Failed to submit bank verification code',
       });
 
       if (!res.ok || !parsed.success) {
         return {
           success: false,
-          error: parsed.error || `Failed to complete bank verification (HTTP ${res.status})`,
+          error: parsed.error || `Failed to submit bank verification code (HTTP ${res.status})`,
         };
       }
       return parsed;
     } catch (err: any) {
       console.error('[completeBankVerification] Network error:', err);
-      return { success: false, error: formatApiNetworkError(err, 'complete bank verification') };
+      return { success: false, error: formatApiNetworkError(err, 'submit bank verification code') };
+    }
+  },
+
+  /**
+   * Approves a submitted bank verification code and activates the bank account (Admin Console)
+   */
+  async approveBankVerificationCode(applicationId: string): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        `/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/verify-approve`,
+        getAuthHeaders,
+        { method: 'POST' }
+      );
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
+        success: false,
+        error: 'Failed to approve bank verification code',
+      });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to approve bank verification code (HTTP ${res.status})`,
+        };
+      }
+      return parsed;
+    } catch (err: any) {
+      console.error('[approveBankVerificationCode] Network error:', err);
+      return { success: false, error: formatApiNetworkError(err, 'approve bank verification code') };
+    }
+  },
+
+  /**
+   * Rejects a submitted bank verification code so customer can resubmit (Admin Console)
+   */
+  async rejectBankVerificationCode(
+    applicationId: string,
+    reason?: string
+  ): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        `/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/verify-reject`,
+        getAuthHeaders,
+        {
+          method: 'POST',
+          body: JSON.stringify({ reason }),
+        }
+      );
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        error?: string;
+      }>(res, {
+        success: false,
+        error: 'Failed to reject bank verification code',
+      });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to reject bank verification code (HTTP ${res.status})`,
+        };
+      }
+      return parsed;
+    } catch (err: any) {
+      console.error('[rejectBankVerificationCode] Network error:', err);
+      return { success: false, error: formatApiNetworkError(err, 'reject bank verification code') };
     }
   },
 

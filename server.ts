@@ -33,6 +33,8 @@ import {
   rejectBankAccountApplication,
   cancelBankAccountApplication,
   completeBankVerification,
+  approveBankVerificationCode,
+  rejectBankVerificationCode,
   submitCardActivationRequest,
   getCustomerCardActivationStatus,
   getAllCardActivationRequestsAdmin,
@@ -1915,21 +1917,22 @@ app.post('/api/bank-accounts/:id/verify-activate', requireFirebaseAuth, async (r
   }
 
   const { id } = req.params;
-  const { verificationReference, verificationProvider } = req.body;
+  const { verificationCode, verificationReference, verificationProvider } = req.body;
 
   const result = await completeBankVerification(targetUserId, id, {
+    verificationCode,
     verificationReference,
     verificationProvider,
   });
 
   if (!result.success) {
-    return res.status(400).json({ error: result.error });
+    return res.status(result.statusCode || 400).json({ error: result.error });
   }
 
   return res.json({
     success: true,
     application: result.application,
-    message: 'Bank verification completed successfully. Bank account is now Activated.',
+    message: 'Bank verification code submitted successfully. Status: Pending verification.',
   });
 });
 
@@ -1964,6 +1967,33 @@ app.post('/api/admin/bank-accounts/:id/reject', requireAdminAuth, async (req: Au
   const adminId = req.auth?.uid || 'usr_admin';
 
   const result = await rejectBankAccountApplication(adminId, id, reason);
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, application: result.application });
+});
+
+// Administrator endpoint: approve submitted bank verification code (activates account)
+app.post('/api/admin/bank-accounts/:id/verify-approve', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const adminId = req.auth?.uid || 'usr_admin';
+
+  const result = await approveBankVerificationCode(adminId, id);
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({ error: result.error });
+  }
+
+  return res.json({ success: true, application: result.application });
+});
+
+// Administrator endpoint: reject submitted bank verification code (customer can resubmit)
+app.post('/api/admin/bank-accounts/:id/verify-reject', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  const adminId = req.auth?.uid || 'usr_admin';
+
+  const result = await rejectBankVerificationCode(adminId, id, reason);
   if (!result.success) {
     return res.status(result.statusCode || 400).json({ error: result.error });
   }
