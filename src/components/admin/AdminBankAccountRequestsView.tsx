@@ -26,9 +26,13 @@ import {
 
 interface AdminBankAccountRequestsViewProps {
   onRefreshData?: () => void;
+  onOpenBankVerifications?: () => void;
 }
 
-export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsViewProps> = ({ onRefreshData }) => {
+export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsViewProps> = ({
+  onRefreshData,
+  onOpenBankVerifications,
+}) => {
   const [applications, setApplications] = useState<LinkedBankAccountApplication[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -36,12 +40,13 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   const [selectedApp, setSelectedApp] = useState<LinkedBankAccountApplication | null>(null);
   const [inspectModalOpen, setInspectModalOpen] = useState<boolean>(false);
 
-  // Approval / Rejection modal state (Stage 1)
+  // Approval / Rejection / Cancellation modal state
   const [actionModal, setActionModal] = useState<{
-    type: 'APPROVE' | 'REJECT';
+    type: 'APPROVE' | 'REJECT' | 'CANCEL';
     app: LinkedBankAccountApplication;
   } | null>(null);
   const [rejectionReason, setRejectionReason] = useState<string>('');
+  const [cancellationReason, setCancellationReason] = useState<string>('');
   const [isSubmittingAction, setIsSubmittingAction] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -141,14 +146,48 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
     }
   };
 
+  const handleCancelBankAccount = async () => {
+    if (!actionModal || actionModal.type !== 'CANCEL' || isSubmittingAction) return;
+    setIsSubmittingAction(true);
+    setActionError(null);
+    try {
+      const res = await api.adminCancelBankAccount(
+        actionModal.app.id,
+        cancellationReason.trim() || undefined,
+        actionModal.app.userId
+      );
+      if (res.success && res.application) {
+        setApplications((prev) =>
+          prev.map((a) => (a.id === actionModal.app.id ? res.application! : a))
+        );
+        setActionModal(null);
+        setCancellationReason('');
+        if (selectedApp?.id === actionModal.app.id) {
+          setSelectedApp(res.application);
+        }
+        if (onRefreshData) onRefreshData();
+      } else {
+        setActionError(res.error || 'Failed to cancel linked bank account.');
+      }
+    } catch (err: any) {
+      setActionError(err?.message || 'Server error during bank account cancellation.');
+    } finally {
+      setIsSubmittingAction(false);
+    }
+  };
+
   // Filtering
   const filteredApps = applications.filter((app) => {
+    const isCancelled = app.status === 'cancelled' || app.activationStatus === 'CANCELLED';
+    const isActivated = !isCancelled && (app.status === 'activated' || app.activationStatus === 'ACTIVATED');
     if (statusFilter !== 'ALL') {
-      if (statusFilter === 'activated') {
-        if (app.status !== 'activated' && app.activationStatus !== 'ACTIVATED') return false;
+      if (statusFilter === 'cancelled') {
+        if (!isCancelled) return false;
+      } else if (statusFilter === 'activated') {
+        if (!isActivated) return false;
       } else if (statusFilter === 'approved') {
-        if (app.status !== 'approved' || app.activationStatus === 'ACTIVATED') return false;
-      } else if (app.status !== statusFilter) {
+        if (app.status !== 'approved' || isActivated || isCancelled) return false;
+      } else if (app.status !== statusFilter || isCancelled) {
         return false;
       }
     }
@@ -174,8 +213,8 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
   });
 
   const pendingCount = applications.filter((a) => a.status === 'pending').length;
-  const approvedCount = applications.filter((a) => a.status === 'approved' && a.activationStatus !== 'ACTIVATED').length;
-  const activatedCount = applications.filter((a) => a.status === 'activated' || a.activationStatus === 'ACTIVATED').length;
+  const approvedCount = applications.filter((a) => a.status === 'approved' && a.activationStatus !== 'ACTIVATED' && a.activationStatus !== 'CANCELLED').length;
+  const activatedCount = applications.filter((a) => a.status !== 'cancelled' && a.activationStatus !== 'CANCELLED' && (a.status === 'activated' || a.activationStatus === 'ACTIVATED')).length;
   const rejectedCount = applications.filter((a) => a.status === 'rejected').length;
 
   return (
@@ -331,233 +370,414 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
             )}
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px]">
-                <tr>
-                  <th className="px-5 py-4">Customer</th>
-                  <th className="px-5 py-4">Bank & Country</th>
-                  <th className="px-5 py-4">Account Holder</th>
-                  <th className="px-5 py-4">Account / SWIFT / IBAN</th>
-                  <th className="px-5 py-4">Contact Info</th>
-                  <th className="px-5 py-4">Submitted</th>
-                  <th className="px-5 py-4 text-center">Status</th>
-                  <th className="px-5 py-4 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 font-medium">
-                {filteredApps.map((app) => {
-                  const isPending = app.status === 'pending';
+          <>
+            {/* Mobile Cards View */}
+            <div className="md:hidden divide-y divide-slate-200">
+              {filteredApps.map((app) => {
+                const isPending = app.status === 'pending';
+                const isCancelled = app.status === 'cancelled' || app.activationStatus === 'CANCELLED';
+                const isActivated = !isCancelled && (app.status === 'activated' || app.activationStatus === 'ACTIVATED');
+                const isApproved = !isCancelled && !isActivated && app.status === 'approved';
+                const isStage2Pending =
+                  isApproved &&
+                  Boolean(app.verificationCode || app.verificationReference) &&
+                  (String(app.verificationCodeStatus || '').toUpperCase() === 'PENDING' ||
+                    !app.verificationCodeStatus);
+                const canAdminCancel = isApproved || isActivated;
 
-                  return (
-                    <tr key={app.id} className="hover:bg-slate-50/70 transition-colors">
-                      {/* Customer Info */}
-                      <td className="px-5 py-4">
-                        <div className="font-black text-slate-950 text-sm">{app.customerName}</div>
-                        <div className="font-mono text-[11px] text-slate-500 flex items-center gap-1 mt-0.5">
-                          <Hash className="w-3 h-3 text-slate-400" />
-                          <span>MVB: {app.customerAccountNumber}</span>
-                        </div>
-                        <div className="text-[10px] text-slate-400 font-mono truncate max-w-[160px]" title={app.userId}>
-                          UID: {app.userId.slice(0, 10)}...
-                        </div>
-                        <div className="text-[10px] text-slate-400 font-mono truncate max-w-[160px]" title={app.id}>
-                          App: {app.id}
-                        </div>
-                      </td>
-
-                      {/* Bank & Country */}
-                      <td className="px-5 py-4">
-                        <div className="font-black text-slate-900 flex items-center gap-1.5">
-                          <Building className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
-                          <span>{app.bankName}</span>
-                        </div>
-                        <div className="text-[11px] text-slate-600 font-semibold mt-0.5 flex items-center gap-1">
-                          <Globe className="w-3 h-3 text-slate-400" />
-                          <span>{app.country}</span>
-                          <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-700 font-mono text-[10px] font-bold">
-                            {app.currency}
-                          </span>
-                        </div>
-                      </td>
-
-                      {/* Account Holder Name */}
-                      <td className="px-5 py-4">
-                        <div className="font-bold text-slate-900">{app.accountHolderName}</div>
-                        <div className="text-[10px] text-slate-500">Legal Beneficiary</div>
-                        {(app.accountHolderName || '').trim().toLowerCase() !== (app.customerName || '').trim().toLowerCase() ? (
-                          <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300">
-                            <AlertTriangle className="w-2.5 h-2.5 text-amber-600 flex-shrink-0" />
-                            <span>Name Mismatch</span>
-                          </div>
-                        ) : (
-                          <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold tracking-wider bg-emerald-50 text-emerald-800 border border-emerald-200">
-                            <Check className="w-2.5 h-2.5 text-emerald-600 flex-shrink-0" />
-                            <span>Matched</span>
-                          </div>
-                        )}
-                      </td>
-
-                      {/* Account / SWIFT / IBAN */}
-                      <td className="px-5 py-4">
-                        <div className="font-mono font-bold text-slate-900 select-all">
-                          {app.accountNumber || app.maskedAccountNumber}
-                        </div>
-                        {app.swiftBic && (
-                          <div className="font-mono text-[11px] text-slate-700 font-semibold mt-0.5 select-all">
-                            SWIFT/BIC: {app.swiftBic}
-                          </div>
-                        )}
-                        {(app.iban || app.maskedIban) && (
-                          <div className="font-mono text-[11px] text-slate-600 mt-0.5 break-all select-all">
-                            IBAN: {app.iban || app.maskedIban}
-                          </div>
-                        )}
-                        {app.routingNumber && (
-                          <div className="font-mono text-[10px] text-slate-400">
-                            Routing: {app.routingNumber}
-                          </div>
-                        )}
-                        {app.sortCode && (
-                          <div className="font-mono text-[10px] text-slate-400">
-                            Sort Code: {app.sortCode}
-                          </div>
-                        )}
-                        {app.bsb && (
-                          <div className="font-mono text-[10px] text-slate-400">
-                            BSB: {app.bsb}
-                          </div>
-                        )}
-                        {app.verificationCode && (
-                          <div className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-50 border border-indigo-200 font-mono text-[11px] font-black text-indigo-900 select-all">
-                            <Lock className="w-3 h-3 text-indigo-600 shrink-0" />
-                            <span>Code: {app.verificationCode}</span>
-                          </div>
-                        )}
-                        {app.verificationReference && (
-                          <div className="font-mono text-[10px] text-emerald-700 font-bold flex items-center gap-1 mt-0.5">
-                            <ShieldCheck className="w-3 h-3 text-emerald-600" />
-                            <span>Ref: {app.verificationReference}</span>
-                          </div>
-                        )}
-                      </td>
-
-                      {/* Contact Info */}
-                      <td className="px-5 py-4">
-                        <div className="text-slate-700 text-[11px] flex items-center gap-1 truncate max-w-[160px]" title={app.bankEmail}>
-                          <Mail className="w-3 h-3 text-slate-400 flex-shrink-0" />
-                          <span>{app.bankEmail}</span>
-                        </div>
-                        <div className="text-slate-600 text-[11px] flex items-center gap-1 mt-0.5">
-                          <Phone className="w-3 h-3 text-slate-400 flex-shrink-0" />
-                          <span>{app.phoneNumber}</span>
-                        </div>
-                      </td>
-
-                      {/* Submission Date */}
-                      <td className="px-5 py-4 text-slate-600 text-[11px]">
-                        <div className="flex items-center gap-1 text-slate-800 font-semibold">
-                          <Calendar className="w-3 h-3 text-slate-400" />
-                          <span>{new Date(app.submittedAt).toLocaleDateString()}</span>
-                        </div>
-                        <div className="font-mono text-[10px] text-slate-400">
-                          {new Date(app.submittedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </div>
-                      </td>
-
-                      {/* Status */}
-                      <td className="px-5 py-4 text-center">
-                        {(app.status === 'activated' || app.activationStatus === 'ACTIVATED') && (
+                return (
+                  <div key={`mob-req-${app.id}`} className="p-4 space-y-3 bg-white">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="font-black text-slate-950 text-sm truncate">{app.customerName}</div>
+                        <div className="font-mono text-[11px] text-slate-500">MVB: {app.customerAccountNumber}</div>
+                        <div className="text-[11px] font-bold text-slate-800 mt-0.5">{app.bankName} ({app.country})</div>
+                      </div>
+                      <div className="shrink-0">
+                        {isActivated && (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-900 border border-emerald-400 font-mono">
-                            <ShieldCheck className="w-3 h-3 text-emerald-700" />
                             Activated
                           </span>
                         )}
-                        {app.status === 'approved' && app.activationStatus !== 'ACTIVATED' && (
-                          (app.verificationCode || app.verificationReference) && app.verificationCodeStatus === 'PENDING' ? (
-                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-100 text-indigo-900 border border-indigo-400 font-mono">
-                              <Clock className="w-3 h-3 text-indigo-700" />
-                              Verification Pending Review
-                            </span>
-                          ) : app.verificationCodeStatus === 'REJECTED' || app.activationStatus === 'REJECTED' ? (
-                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
-                              <XCircle className="w-3 h-3 text-rose-600" />
-                              Verification Rejected
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
-                              <Clock className="w-3 h-3 text-blue-700" />
-                              Approved (Awaiting Reference)
-                            </span>
-                          )
+                        {isStage2Pending && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-100 text-indigo-900 border border-indigo-400 font-mono">
+                            Verifying
+                          </span>
                         )}
-                        {app.status === 'pending' && (
+                        {isApproved && !isStage2Pending && (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
+                            Approved
+                          </span>
+                        )}
+                        {isPending && (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-400 font-mono">
-                            <Clock className="w-3 h-3 text-amber-600" />
                             Pending
                           </span>
                         )}
                         {app.status === 'rejected' && (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
-                            <XCircle className="w-3.5 h-3.5 text-rose-600" />
                             Rejected
                           </span>
                         )}
-                        {app.status === 'cancelled' && (
+                        {isCancelled && (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-200 text-slate-700 border border-slate-300 font-mono">
                             Cancelled
                           </span>
                         )}
-                      </td>
+                      </div>
+                    </div>
 
-                      {/* Actions */}
-                      <td className="px-5 py-4 text-right whitespace-nowrap">
-                        <div className="flex items-center justify-end gap-1.5">
+                    <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200 text-xs space-y-1">
+                      <div className="flex justify-between gap-2">
+                        <span className="text-slate-500">Account #:</span>
+                        <span className="font-mono font-bold text-slate-900">{app.accountNumber || app.maskedAccountNumber}</span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span className="text-slate-500">Holder:</span>
+                        <span className="font-bold text-slate-900">{app.accountHolderName}</span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span className="text-slate-500">App ID:</span>
+                        <span className="font-mono text-[11px] text-slate-700 break-all text-right">{app.id}</span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedApp(app);
+                          setInspectModalOpen(true);
+                        }}
+                        className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                        <span>Inspect</span>
+                      </button>
+
+                      {isPending && (
+                        <>
                           <button
+                            type="button"
                             onClick={() => {
-                              setSelectedApp(app);
-                              setInspectModalOpen(true);
+                              setActionError(null);
+                              setActionModal({ type: 'APPROVE', app });
                             }}
-                            className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer"
-                            title="Inspect Details"
+                            className="flex-1 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center justify-center gap-1 cursor-pointer"
                           >
-                            <Eye className="w-4 h-4" />
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Approve</span>
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActionError(null);
+                              setRejectionReason('');
+                              setActionModal({ type: 'REJECT', app });
+                            }}
+                            className="flex-1 px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs flex items-center justify-center gap-1 cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>Reject</span>
+                          </button>
+                        </>
+                      )}
 
-                          {isPending && (
-                            <>
-                              <button
-                                onClick={() => {
-                                  setActionError(null);
-                                  setActionModal({ type: 'APPROVE', app });
-                                }}
-                                className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
-                              >
-                                <Check className="w-3.5 h-3.5" />
-                                <span>Approve</span>
-                              </button>
+                      {isStage2Pending && onOpenBankVerifications && (
+                        <button
+                          type="button"
+                          onClick={onOpenBankVerifications}
+                          className="flex-1 px-3 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-black text-[11px] uppercase tracking-wider flex items-center justify-center gap-1 cursor-pointer"
+                        >
+                          <ShieldCheck className="w-3.5 h-3.5" />
+                          <span>Review Verification</span>
+                        </button>
+                      )}
 
-                              <button
-                                onClick={() => {
-                                  setActionError(null);
-                                  setRejectionReason('');
-                                  setActionModal({ type: 'REJECT', app });
-                                }}
-                                className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                                <span>Reject</span>
-                              </button>
-                            </>
+                      {canAdminCancel && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setActionError(null);
+                            setCancellationReason('');
+                            setActionModal({ type: 'CANCEL', app });
+                          }}
+                          className="w-full px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-black text-xs uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                        >
+                          <XCircle className="w-4 h-4" />
+                          <span>CANCEL BANK ACCOUNT</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Desktop Table */}
+            <div className="hidden md:block overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider text-[11px]">
+                  <tr>
+                    <th className="px-5 py-4">Customer</th>
+                    <th className="px-5 py-4">Bank & Country</th>
+                    <th className="px-5 py-4">Account Holder</th>
+                    <th className="px-5 py-4">Account / SWIFT / IBAN</th>
+                    <th className="px-5 py-4">Contact Info</th>
+                    <th className="px-5 py-4">Submitted</th>
+                    <th className="px-5 py-4 text-center">Status</th>
+                    <th className="px-5 py-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-medium">
+                  {filteredApps.map((app) => {
+                    const isPending = app.status === 'pending';
+                    const isCancelled = app.status === 'cancelled' || app.activationStatus === 'CANCELLED';
+                    const isActivated = !isCancelled && (app.status === 'activated' || app.activationStatus === 'ACTIVATED');
+                    const isApproved = !isCancelled && !isActivated && app.status === 'approved';
+                    const isStage2Pending =
+                      isApproved &&
+                      Boolean(app.verificationCode || app.verificationReference) &&
+                      (String(app.verificationCodeStatus || '').toUpperCase() === 'PENDING' ||
+                        !app.verificationCodeStatus);
+                    const canAdminCancel = isApproved || isActivated;
+
+                    return (
+                      <tr key={app.id} className="hover:bg-slate-50/70 transition-colors">
+                        {/* Customer Info */}
+                        <td className="px-5 py-4">
+                          <div className="font-black text-slate-950 text-sm">{app.customerName}</div>
+                          <div className="font-mono text-[11px] text-slate-500 flex items-center gap-1 mt-0.5">
+                            <Hash className="w-3 h-3 text-slate-400" />
+                            <span>MVB: {app.customerAccountNumber}</span>
+                          </div>
+                          <div className="text-[10px] text-slate-400 font-mono truncate max-w-[160px]" title={app.userId}>
+                            UID: {(app.userId || '').slice(0, 10)}...
+                          </div>
+                          <div className="text-[10px] text-slate-400 font-mono truncate max-w-[160px]" title={app.id}>
+                            App: {app.id}
+                          </div>
+                        </td>
+
+                        {/* Bank & Country */}
+                        <td className="px-5 py-4">
+                          <div className="font-black text-slate-900 flex items-center gap-1.5">
+                            <Building className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+                            <span>{app.bankName}</span>
+                          </div>
+                          <div className="text-[11px] text-slate-600 font-semibold mt-0.5 flex items-center gap-1">
+                            <Globe className="w-3 h-3 text-slate-400" />
+                            <span>{app.country}</span>
+                            <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-700 font-mono text-[10px] font-bold">
+                              {app.currency}
+                            </span>
+                          </div>
+                        </td>
+
+                        {/* Account Holder Name */}
+                        <td className="px-5 py-4">
+                          <div className="font-bold text-slate-900">{app.accountHolderName}</div>
+                          <div className="text-[10px] text-slate-500">Legal Beneficiary</div>
+                          {(app.accountHolderName || '').trim().toLowerCase() !== (app.customerName || '').trim().toLowerCase() ? (
+                            <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-300">
+                              <AlertTriangle className="w-2.5 h-2.5 text-amber-600 flex-shrink-0" />
+                              <span>Name Mismatch</span>
+                            </div>
+                          ) : (
+                            <div className="inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold tracking-wider bg-emerald-50 text-emerald-800 border border-emerald-200">
+                              <Check className="w-2.5 h-2.5 text-emerald-600 flex-shrink-0" />
+                              <span>Matched</span>
+                            </div>
                           )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                        </td>
+
+                        {/* Account / SWIFT / IBAN */}
+                        <td className="px-5 py-4">
+                          <div className="font-mono font-bold text-slate-900 select-all">
+                            {app.accountNumber || app.maskedAccountNumber}
+                          </div>
+                          {app.swiftBic && (
+                            <div className="font-mono text-[11px] text-slate-700 font-semibold mt-0.5 select-all">
+                              SWIFT/BIC: {app.swiftBic}
+                            </div>
+                          )}
+                          {(app.iban || app.maskedIban) && (
+                            <div className="font-mono text-[11px] text-slate-600 mt-0.5 break-all select-all">
+                              IBAN: {app.iban || app.maskedIban}
+                            </div>
+                          )}
+                          {app.routingNumber && (
+                            <div className="font-mono text-[10px] text-slate-400">
+                              Routing: {app.routingNumber}
+                            </div>
+                          )}
+                          {app.sortCode && (
+                            <div className="font-mono text-[10px] text-slate-400">
+                              Sort Code: {app.sortCode}
+                            </div>
+                          )}
+                          {app.bsb && (
+                            <div className="font-mono text-[10px] text-slate-400">
+                              BSB: {app.bsb}
+                            </div>
+                          )}
+                          {app.verificationCode && (
+                            <div className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-50 border border-indigo-200 font-mono text-[11px] font-black text-indigo-900 select-all">
+                              <Lock className="w-3 h-3 text-indigo-600 shrink-0" />
+                              <span>Code: {app.verificationCode}</span>
+                            </div>
+                          )}
+                          {app.verificationReference && (
+                            <div className="font-mono text-[10px] text-emerald-700 font-bold flex items-center gap-1 mt-0.5">
+                              <ShieldCheck className="w-3 h-3 text-emerald-600" />
+                              <span>Ref: {app.verificationReference}</span>
+                            </div>
+                          )}
+                        </td>
+
+                        {/* Contact Info */}
+                        <td className="px-5 py-4">
+                          <div className="text-slate-700 text-[11px] flex items-center gap-1 truncate max-w-[160px]" title={app.bankEmail}>
+                            <Mail className="w-3 h-3 text-slate-400 flex-shrink-0" />
+                            <span>{app.bankEmail}</span>
+                          </div>
+                          <div className="text-slate-600 text-[11px] flex items-center gap-1 mt-0.5">
+                            <Phone className="w-3 h-3 text-slate-400 flex-shrink-0" />
+                            <span>{app.phoneNumber}</span>
+                          </div>
+                        </td>
+
+                        {/* Submission Date */}
+                        <td className="px-5 py-4 text-slate-600 text-[11px]">
+                          <div className="flex items-center gap-1 text-slate-800 font-semibold">
+                            <Calendar className="w-3 h-3 text-slate-400" />
+                            <span>{new Date(app.submittedAt).toLocaleDateString()}</span>
+                          </div>
+                          <div className="font-mono text-[10px] text-slate-400">
+                            {new Date(app.submittedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </div>
+                        </td>
+
+                        {/* Status */}
+                        <td className="px-5 py-4 text-center">
+                          {isActivated && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-900 border border-emerald-400 font-mono">
+                              <ShieldCheck className="w-3 h-3 text-emerald-700" />
+                              Activated
+                            </span>
+                          )}
+                          {isApproved && (
+                            isStage2Pending ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-100 text-indigo-900 border border-indigo-400 font-mono">
+                                <Clock className="w-3 h-3 text-indigo-700" />
+                                Verification Pending Review
+                              </span>
+                            ) : app.verificationCodeStatus === 'REJECTED' || app.activationStatus === 'REJECTED' ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
+                                <XCircle className="w-3 h-3 text-rose-600" />
+                                Verification Rejected
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-blue-100 text-blue-900 border border-blue-400 font-mono">
+                                <Clock className="w-3 h-3 text-blue-700" />
+                                Approved (Awaiting Reference)
+                              </span>
+                            )
+                          )}
+                          {isPending && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-100 text-amber-900 border border-amber-400 font-mono">
+                              <Clock className="w-3 h-3 text-amber-600" />
+                              Pending
+                            </span>
+                          )}
+                          {app.status === 'rejected' && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-rose-100 text-rose-900 border border-rose-400 font-mono">
+                              <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                              Rejected
+                            </span>
+                          )}
+                          {isCancelled && (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-slate-200 text-slate-700 border border-slate-300 font-mono">
+                              Cancelled
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Actions */}
+                        <td className="px-5 py-4 text-right whitespace-nowrap">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <button
+                              onClick={() => {
+                                setSelectedApp(app);
+                                setInspectModalOpen(true);
+                              }}
+                              className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors cursor-pointer"
+                              title="Inspect Details"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+
+                            {isPending && (
+                              <>
+                                <button
+                                  onClick={() => {
+                                    setActionError(null);
+                                    setActionModal({ type: 'APPROVE', app });
+                                  }}
+                                  className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
+                                >
+                                  <Check className="w-3.5 h-3.5" />
+                                  <span>Approve</span>
+                                </button>
+
+                                <button
+                                  onClick={() => {
+                                    setActionError(null);
+                                    setRejectionReason('');
+                                    setActionModal({ type: 'REJECT', app });
+                                  }}
+                                  className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-bold text-[11px] transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                  <span>Reject</span>
+                                </button>
+                              </>
+                            )}
+
+                            {isStage2Pending && onOpenBankVerifications && (
+                              <button
+                                type="button"
+                                onClick={onOpenBankVerifications}
+                                className="px-2.5 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 text-white font-black text-[11px] uppercase tracking-wider transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
+                              >
+                                <ShieldCheck className="w-3.5 h-3.5" />
+                                <span>Review Verification</span>
+                              </button>
+                            )}
+
+                            {canAdminCancel && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActionError(null);
+                                  setCancellationReason('');
+                                  setActionModal({ type: 'CANCEL', app });
+                                }}
+                                className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-black text-[11px] uppercase tracking-wider transition-colors cursor-pointer flex items-center gap-1 shadow-xs"
+                              >
+                                <XCircle className="w-3.5 h-3.5" />
+                                <span>CANCEL BANK ACCOUNT</span>
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </div>
 
@@ -854,11 +1074,69 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                       )}
                     </div>
                   )}
+                  {selectedApp.cancelledAt && (
+                    <div className="pt-2 border-t border-amber-200 space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span>Cancelled At:</span>
+                        <span className="font-mono">{new Date(selectedApp.cancelledAt).toLocaleString()}</span>
+                      </div>
+                      {selectedApp.cancelledBy && (
+                        <div className="flex items-center justify-between">
+                          <span>Cancelled By:</span>
+                          <span className="font-mono">{selectedApp.cancelledBy}</span>
+                        </div>
+                      )}
+                      {selectedApp.cancellationReason && (
+                        <div>
+                          <span className="text-slate-500 block">Cancellation Reason:</span>
+                          <span className="font-semibold text-rose-800">{selectedApp.cancellationReason}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
 
-            <div className="mt-6 flex justify-end">
+            <div className="mt-6 flex flex-wrap items-center justify-end gap-2">
+              {selectedApp.status === 'approved' &&
+                selectedApp.activationStatus !== 'ACTIVATED' &&
+                selectedApp.activationStatus !== 'CANCELLED' &&
+                Boolean(selectedApp.verificationCode || selectedApp.verificationReference) &&
+                (String(selectedApp.verificationCodeStatus || '').toUpperCase() === 'PENDING' ||
+                  !selectedApp.verificationCodeStatus) &&
+                onOpenBankVerifications && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInspectModalOpen(false);
+                      onOpenBankVerifications();
+                    }}
+                    className="px-4 py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-black text-xs uppercase tracking-wider transition-colors cursor-pointer flex items-center gap-1.5"
+                  >
+                    <ShieldCheck className="w-4 h-4" />
+                    <span>Review Verification</span>
+                  </button>
+                )}
+              {(selectedApp.status === 'approved' ||
+                selectedApp.status === 'activated' ||
+                selectedApp.activationStatus === 'ACTIVATED') &&
+                selectedApp.status !== 'cancelled' &&
+                selectedApp.activationStatus !== 'CANCELLED' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInspectModalOpen(false);
+                      setActionError(null);
+                      setCancellationReason('');
+                      setActionModal({ type: 'CANCEL', app: selectedApp });
+                    }}
+                    className="px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-black text-xs uppercase tracking-wider transition-colors cursor-pointer flex items-center gap-1.5"
+                  >
+                    <XCircle className="w-4 h-4" />
+                    <span>CANCEL BANK ACCOUNT</span>
+                  </button>
+                )}
               <button
                 onClick={() => setInspectModalOpen(false)}
                 className="px-5 py-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 text-white font-bold text-xs transition-colors cursor-pointer"
@@ -870,7 +1148,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
         </div>
       )}
 
-      {/* APPROVE / REJECT CONFIRMATION MODAL (STAGE 1) */}
+      {/* APPROVE / REJECT / CANCEL CONFIRMATION MODAL */}
       {actionModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 border border-slate-200 shadow-2xl relative space-y-4">
@@ -890,12 +1168,18 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               </div>
               <div>
                 <h3 className="font-black text-slate-950 text-base">
-                  {actionModal.type === 'APPROVE' ? 'Approve Bank Account' : 'Reject Bank Account'}
+                  {actionModal.type === 'APPROVE'
+                    ? 'Approve Bank Account'
+                    : actionModal.type === 'REJECT'
+                    ? 'Reject Bank Account'
+                    : 'Cancel Linked Bank Account'}
                 </h3>
                 <p className="text-xs text-slate-500">
                   {actionModal.type === 'APPROVE'
                     ? 'Approve bank details so customer can proceed to the activation step'
-                    : 'Deny this bank account linking request'}
+                    : actionModal.type === 'REJECT'
+                    ? 'Deny this bank account linking request'
+                    : 'Deactivate this linked bank account and remove it from active customer withdrawal options'}
                 </p>
               </div>
             </div>
@@ -921,6 +1205,10 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               <div>
                 <span className="text-slate-400">Beneficiary:</span>{' '}
                 <strong className="text-slate-950">{actionModal.app.accountHolderName}</strong>
+              </div>
+              <div>
+                <span className="text-slate-400">Application ID:</span>{' '}
+                <strong className="font-mono text-slate-950">{actionModal.app.id}</strong>
               </div>
               {actionModal.app.swiftBic && (
                 <div>
@@ -953,6 +1241,24 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
               </div>
             )}
 
+            {actionModal.type === 'CANCEL' && (
+              <div className="space-y-1.5">
+                <p className="text-xs text-slate-700 font-semibold leading-relaxed">
+                  Cancelling this linked bank account permanently disables it for future withdrawals while preserving all historical audit records. The customer will be notified and can submit a new bank linking application.
+                </p>
+                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                  Cancellation Reason (Optional)
+                </label>
+                <textarea
+                  rows={3}
+                  value={cancellationReason}
+                  onChange={(e) => setCancellationReason(e.target.value)}
+                  placeholder="Optional reason for cancelling this linked bank account..."
+                  className="w-full p-3 text-xs rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-white"
+                />
+              </div>
+            )}
+
             <div className="flex items-center justify-end gap-2 pt-2">
               <button
                 type="button"
@@ -960,7 +1266,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                 disabled={isSubmittingAction}
                 className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition-colors cursor-pointer"
               >
-                Cancel
+                {actionModal.type === 'CANCEL' ? 'Keep Linked Account' : 'Cancel'}
               </button>
 
               {actionModal.type === 'APPROVE' ? (
@@ -982,7 +1288,7 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                     </>
                   )}
                 </button>
-              ) : (
+              ) : actionModal.type === 'REJECT' ? (
                 <button
                   type="button"
                   onClick={handleReject}
@@ -998,6 +1304,25 @@ export const AdminBankAccountRequestsView: React.FC<AdminBankAccountRequestsView
                     <>
                       <X className="w-4 h-4" />
                       <span>Confirm Rejection</span>
+                    </>
+                  )}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleCancelBankAccount}
+                  disabled={isSubmittingAction}
+                  className="px-5 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-black text-xs uppercase tracking-wider transition-colors flex items-center gap-1.5 cursor-pointer shadow-md disabled:opacity-50"
+                >
+                  {isSubmittingAction ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent animate-spin rounded-full" />
+                      <span>Cancelling...</span>
+                    </>
+                  ) : (
+                    <>
+                      <XCircle className="w-4 h-4" />
+                      <span>Confirm Bank Account Cancellation</span>
                     </>
                   )}
                 </button>

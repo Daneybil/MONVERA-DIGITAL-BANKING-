@@ -3228,6 +3228,54 @@ export const api = {
   },
 
   /**
+   * Cancels an already-linked / activated bank account (Administrator only)
+   */
+  async adminCancelBankAccount(
+    applicationId: string,
+    reason?: string,
+    expectedUserId?: string
+  ): Promise<{
+    success: boolean;
+    application?: LinkedBankAccountApplication;
+    message?: string;
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        `/api/admin/bank-accounts/${encodeURIComponent(applicationId)}/cancel`,
+        getAuthHeaders,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ...(reason !== undefined ? { reason } : {}),
+            ...(expectedUserId ? { expectedUserId } : {}),
+          }),
+        }
+      );
+      const parsed = await parseJsonResponse<{
+        success: boolean;
+        application?: LinkedBankAccountApplication;
+        message?: string;
+        error?: string;
+      }>(res, {
+        success: false,
+        error: 'Failed to cancel linked bank account',
+      });
+
+      if (!res.ok || !parsed.success) {
+        return {
+          success: false,
+          error: parsed.error || `Failed to cancel linked bank account (HTTP ${res.status})`,
+        };
+      }
+      return parsed;
+    } catch (err: any) {
+      console.error('[adminCancelBankAccount] Network error:', err);
+      return { success: false, error: formatApiNetworkError(err, 'cancel linked bank account') };
+    }
+  },
+
+  /**
    * Cancels a pending bank account application (Customer)
    */
   async cancelBankAccountApplication(applicationId: string, userId?: string): Promise<{

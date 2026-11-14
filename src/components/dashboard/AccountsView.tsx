@@ -434,19 +434,29 @@ export const AccountsView: React.FC = () => {
           </button>
         </div>
 
-        {isLoadingBanks ? (
-          <div className="py-8 text-center text-xs font-bold text-slate-400">Loading linked bank accounts...</div>
-        ) : bankAccounts.length === 0 ? (
-          <div className="py-8 text-center space-y-2 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
-            <Building2 className="w-8 h-8 text-slate-400 mx-auto" />
-            <div className="font-bold text-xs text-slate-700">No External Bank Accounts Linked</div>
-            <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
-              Link your domestic or international checking or savings bank account to enable direct wire and ACH withdrawals.
-            </p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-            {bankAccounts.map((app) => {
+        {(() => {
+          const visibleBankAccounts = bankAccounts.filter(
+            (a) => a.status !== 'cancelled' && a.activationStatus !== 'CANCELLED'
+          );
+          if (isLoadingBanks) {
+            return (
+              <div className="py-8 text-center text-xs font-bold text-slate-400">Loading linked bank accounts...</div>
+            );
+          }
+          if (visibleBankAccounts.length === 0) {
+            return (
+              <div className="py-8 text-center space-y-2 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+                <Building2 className="w-8 h-8 text-slate-400 mx-auto" />
+                <div className="font-bold text-xs text-slate-700">No External Bank Accounts Linked</div>
+                <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
+                  Link your domestic or international checking or savings bank account to enable direct wire and ACH withdrawals.
+                </p>
+              </div>
+            );
+          }
+          return (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+              {visibleBankAccounts.map((app) => {
               const isActivated = app.status === 'activated' || app.activationStatus === 'ACTIVATED';
               const isApprovedNotActivated = app.status === 'approved' && !isActivated;
               return (
@@ -546,9 +556,10 @@ export const AccountsView: React.FC = () => {
                   )}
                 </div>
               );
-            })}
-          </div>
-        )}
+              })}
+            </div>
+          );
+        })()}
       </div>
 
     </div>

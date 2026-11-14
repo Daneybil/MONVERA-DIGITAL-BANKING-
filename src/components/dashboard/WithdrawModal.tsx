@@ -142,15 +142,22 @@ export const WithdrawModal: React.FC = () => {
     try {
       const res = await api.getMyBankAccountApplications(currentUser.id);
       if (res.success && res.applications) {
-        setLinkedBankAccounts(res.applications);
+        const activeApplications = res.applications.filter(
+          (a) => a.status !== 'cancelled' && a.activationStatus !== 'CANCELLED'
+        );
+        setLinkedBankAccounts(activeApplications);
         setBankAccountsLoadError(null);
-        const activatedAcc = res.applications.find(
+        const activatedAcc = activeApplications.find(
           (a) => a.status === 'activated' || a.activationStatus === 'ACTIVATED'
         );
-        const approvedAcc = res.applications.find((a) => a.status === 'approved');
+        const approvedAcc = activeApplications.find((a) => a.status === 'approved');
         setSelectedBankId((prev) => {
-          if (prev && res.applications!.some((a) => a.id === prev)) return prev;
-          return activatedAcc?.id || approvedAcc?.id || res.applications![0]?.id || '';
+          if (prev && activeApplications.some((a) => a.id === prev)) return prev;
+          return activatedAcc?.id || approvedAcc?.id || activeApplications[0]?.id || '';
+        });
+        setSelectedBankForActivationId((prev) => {
+          if (prev && activeApplications.some((a) => a.id === prev)) return prev;
+          return approvedAcc?.id || activatedAcc?.id || '';
         });
       } else {
         setBankAccountsLoadError(res.error || 'Unable to load linked bank accounts.');
@@ -625,7 +632,7 @@ export const WithdrawModal: React.FC = () => {
 
     const destinationLabel = `${selectedBank.bankName} (${selectedBank.country})`;
     const accountOrIban = selectedBank.accountNumber;
-    const accountDisplay = selectedBank.maskedAccountNumber || `•••• ${selectedBank.accountNumber.slice(-4)}`;
+    const accountDisplay = selectedBank.maskedAccountNumber || `•••• ${(selectedBank.accountNumber || '').slice(-4)}`;
 
     try {
       const res = await api.createWithdrawal({
@@ -1509,7 +1516,7 @@ export const WithdrawModal: React.FC = () => {
                                         Holder: <span className="text-slate-950">{account.accountHolderName}</span>
                                       </p>
                                       <div className="text-xs font-mono font-bold text-slate-800 mt-1">
-                                        Account: {account.maskedAccountNumber || `•••• ${account.accountNumber.slice(-4)}`} • {account.currency}
+                                        Account: {account.maskedAccountNumber || `•••• ${(account.accountNumber || '').slice(-4)}`} • {account.currency}
                                       </div>
                                     </div>
                                   </div>
@@ -1738,7 +1745,7 @@ export const WithdrawModal: React.FC = () => {
                             >
                               {eligibleBanks.map((b) => (
                                 <option key={b.id} value={b.id}>
-                                  {b.bankName} ({b.maskedAccountNumber || `•••• ${b.accountNumber.slice(-4)}`}) —{' '}
+                                  {b.bankName} ({b.maskedAccountNumber || `•••• ${(b.accountNumber || '').slice(-4)}`}) —{' '}
                                   {b.status === 'activated' || b.activationStatus === 'ACTIVATED'
                                     ? 'Activated'
                                     : b.verificationCodeStatus === 'PENDING'
@@ -1874,7 +1881,7 @@ export const WithdrawModal: React.FC = () => {
                                 Your bank details have been approved. Enter your verification reference below to complete the activation process.
                               </p>
                               <div className="text-xs font-mono font-bold text-blue-900">
-                                Account: {targetBank.bankName} ({targetBank.maskedAccountNumber || `•••• ${targetBank.accountNumber.slice(-4)}`})
+                                Account: {targetBank.bankName} ({targetBank.maskedAccountNumber || `•••• ${(targetBank.accountNumber || '').slice(-4)}`})
                               </div>
                             </div>
                           )}
@@ -2067,7 +2074,7 @@ export const WithdrawModal: React.FC = () => {
                                     </p>
                                     <div className="flex flex-wrap items-center gap-3 mt-1.5 text-xs font-mono">
                                       <span className="font-bold text-slate-800">
-                                        Account: {account.maskedAccountNumber || `•••• ${account.accountNumber.slice(-4)}`}
+                                        Account: {account.maskedAccountNumber || `•••• ${(account.accountNumber || '').slice(-4)}`}
                                       </span>
                                       {(account.routingNumber || account.sortCode) && (
                                         <span className="text-slate-500">

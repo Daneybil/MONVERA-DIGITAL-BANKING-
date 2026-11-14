@@ -1126,20 +1126,35 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
             const bankAppSnap = await transaction.get(adminFirestore.collection('bank_account_applications').doc(params.bankAccountId));
             if (bankAppSnap.exists) {
               const bData = bankAppSnap.data();
-              if (bData?.userId === userId && (bData?.status === 'activated' || bData?.activationStatus === 'ACTIVATED')) {
+              if (
+                bData?.userId === userId &&
+                bData?.status !== 'cancelled' &&
+                bData?.activationStatus !== 'CANCELLED' &&
+                (bData?.status === 'activated' || bData?.activationStatus === 'ACTIVATED')
+              ) {
                 isActivated = true;
               }
             }
           } catch {}
           if (!isActivated) {
             const memApp = db.bankAccountApplications.get(params.bankAccountId);
-            if (memApp && memApp.userId === userId && (memApp.status === 'activated' || memApp.activationStatus === 'ACTIVATED')) {
+            if (
+              memApp &&
+              memApp.userId === userId &&
+              memApp.status !== 'cancelled' &&
+              memApp.activationStatus !== 'CANCELLED' &&
+              (memApp.status === 'activated' || memApp.activationStatus === 'ACTIVATED')
+            ) {
               isActivated = true;
             }
           }
         } else {
           const memApps = Array.from(db.bankAccountApplications.values()).filter(
-            (a) => a.userId === userId && (a.status === 'activated' || a.activationStatus === 'ACTIVATED')
+            (a) =>
+              a.userId === userId &&
+              a.status !== 'cancelled' &&
+              a.activationStatus !== 'CANCELLED' &&
+              (a.status === 'activated' || a.activationStatus === 'ACTIVATED')
           );
           if (memApps.length > 0) {
             isActivated = true;
@@ -1149,9 +1164,10 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
                 .collection('bank_account_applications')
                 .where('userId', '==', userId)
                 .where('status', '==', 'activated')
-                .limit(1)
                 .get();
-              if (!snap.empty) isActivated = true;
+              if (snap.docs.some((doc) => doc.data()?.activationStatus !== 'CANCELLED')) {
+                isActivated = true;
+              }
             } catch {}
           }
         }
@@ -4707,7 +4723,10 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
       const duplicateApp = userAppsSnap.docs.find((doc) => {
         const d = doc.data() as LinkedBankAccountApplication;
         const activeStatuses = ['pending', 'approved', 'activated'];
-        if (!activeStatuses.includes(String(d.status || '').toLowerCase())) {
+        if (
+          d.activationStatus === 'CANCELLED' ||
+          !activeStatuses.includes(String(d.status || '').toLowerCase())
+        ) {
           return false;
         }
         const existingAcc = String(d.accountNumber || '').replace(/\s+/g, '').toLowerCase();
@@ -5235,6 +5254,127 @@ export async function cancelBankAccountApplication(
   }
 }
 
+export async function adminCancelBankAccount(
+  adminId: string,
+  applicationId: string,
+  reason?: string,
+  expectedUserId?: string
+): Promise<{ success: boolean; application?: LinkedBankAccountApplication; error?: string; statusCode?: number }> {
+  try {
+    if (!isFirebaseAdminConfigured()) {
+      return {
+        success: false,
+        statusCode: 503,
+        error: 'Database service unavailable: linked bank account cancellation could not be saved.',
+      };
+    }
+
+    const nowIso = new Date().toISOString();
+    const cleanReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'Cancelled by administrator';
+    const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
+
+    const txResult = await adminFirestore.runTransaction(async (tx) => {
+      const snap = await tx.get(docRef);
+      if (!snap.exists) {
+        return { ok: false as const, statusCode: 404, error: 'Bank account record not found.' };
+      }
+
+      const existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+
+      if (expectedUserId && existingApp.userId !== expectedUserId) {
+        return { ok: false as const, statusCode: 400, error: 'Customer mismatch on bank account cancellation request.' };
+      }
+
+      if (existingApp.status === 'cancelled' || existingApp.activationStatus === 'CANCELLED') {
+        return { ok: false as const, statusCode: 400, error: 'This linked bank account is already cancelled.' };
+      }
+
+      if (existingApp.status === 'rejected') {
+        return { ok: false as const, statusCode: 400, error: 'Rejected bank account applications cannot be cancelled.' };
+      }
+
+      if (
+        existingApp.status !== 'approved' &&
+        existingApp.status !== 'activated' &&
+        existingApp.activationStatus !== 'ACTIVATED'
+      ) {
+        return {
+          ok: false as const,
+          statusCode: 400,
+          error: 'Only approved or activated linked bank accounts can be cancelled from this control.',
+        };
+      }
+
+      const updatedApp: LinkedBankAccountApplication = {
+        ...existingApp,
+        status: 'cancelled',
+        activationStatus: 'CANCELLED',
+        cancelledAt: nowIso,
+        cancelledBy: adminId,
+        cancellationReason: cleanReason,
+      };
+
+      tx.set(docRef, updatedApp, { merge: true });
+      return { ok: true as const, application: updatedApp };
+    });
+
+    if (!txResult.ok) {
+      return { success: false, statusCode: txResult.statusCode, error: txResult.error };
+    }
+
+    const updatedApp = txResult.application;
+    db.bankAccountApplications.set(applicationId, updatedApp);
+
+    const auditId = `aud_${Date.now()}_cancel_bank_${Math.random().toString(36).substring(2, 6)}`;
+    const auditEntry = {
+      id: auditId,
+      adminId,
+      adminName: 'Bennett Johnson',
+      action: 'ADMIN_CANCEL_BANK_ACCOUNT',
+      targetUserId: updatedApp.userId,
+      targetAccountNumber: updatedApp.customerAccountNumber,
+      amount: 0,
+      reason: `Cancelled linked bank account ${updatedApp.bankName} (${updatedApp.maskedAccountNumber}). Reason: ${cleanReason}`,
+      timestamp: nowIso,
+      ipAddress: '127.0.0.1 (Admin Console)',
+      result: 'SUCCESS' as const,
+    };
+    db.auditLogs.unshift(auditEntry);
+    adminFirestore.collection('audit_logs').doc(auditId).set(auditEntry).catch(() => {});
+
+    await persistCustomerNotification({
+      id: `notif_bnk_adm_can_${applicationId}_${Date.now()}`,
+      userId: updatedApp.userId,
+      title: 'Linked Bank Account Cancelled',
+      message:
+        'Your linked bank account has been cancelled and is no longer available for withdrawals. You can submit a new bank account linking request if you wish to link an account again.',
+      type: 'SECURITY',
+      severity: 'warning',
+      createdAt: nowIso,
+      referenceId: applicationId,
+      actionModal: 'withdraw',
+      actionSection: 'BANK',
+      actionRecordId: applicationId,
+      metadata: {
+        category: 'SECURITY',
+        eventType: 'LINKED_BANK_CANCELLED',
+        customerName: updatedApp.customerName,
+        accountNumberMasked: maskAccountNumber(updatedApp.customerAccountNumber),
+        requestType: 'Linked Bank Account',
+        status: 'cancelled',
+        bankName: updatedApp.bankName,
+        bankAccountMasked: updatedApp.maskedAccountNumber,
+        date: nowIso,
+      },
+    });
+
+    return { success: true, application: updatedApp };
+  } catch (err: any) {
+    console.error('[adminCancelBankAccount Error]:', err);
+    return { success: false, statusCode: 500, error: err?.message || 'Failed to cancel linked bank account.' };
+  }
+}
+
 export async function getBankVerificationRequestsAdmin(): Promise<LinkedBankAccountApplication[]> {
   if (!isFirebaseAdminConfigured()) {
     throw Object.assign(
@@ -5248,7 +5388,11 @@ export async function getBankVerificationRequestsAdmin(): Promise<LinkedBankAcco
     const list = snap.docs
       .map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }))
       .filter((app) => {
-        const hasSubmittedRef = Boolean((app.verificationCode && String(app.verificationCode).trim()) || app.verificationCodeStatus);
+        if (app.status === 'cancelled' || app.activationStatus === 'CANCELLED') {
+          return false;
+        }
+        const submittedRef = String(app.verificationReference || app.verificationCode || '').trim();
+        const hasSubmittedRef = Boolean(submittedRef || app.verificationCodeStatus);
         const hasValidStage1 = app.status === 'approved' || app.status === 'activated' || app.activationStatus === 'ACTIVATED';
         return hasValidStage1 && hasSubmittedRef;
       });
@@ -5309,6 +5453,14 @@ export async function completeBankVerification(
       const existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
       if (existingApp.userId !== userId) {
         return { ok: false as const, statusCode: 403, error: 'Unauthorized to verify this bank account.' };
+      }
+
+      if (existingApp.status === 'cancelled' || existingApp.activationStatus === 'CANCELLED') {
+        return {
+          ok: false as const,
+          statusCode: 400,
+          error: 'This bank account has been cancelled and can no longer be activated. Please submit a new bank account linking request.',
+        };
       }
 
       if (existingApp.status === 'activated' || existingApp.activationStatus === 'ACTIVATED') {
@@ -5438,6 +5590,10 @@ export async function approveBankVerificationCode(
         return { ok: false as const, statusCode: 400, error: 'Customer mismatch on bank verification request.' };
       }
 
+      if (existingApp.status === 'cancelled' || existingApp.activationStatus === 'CANCELLED') {
+        return { ok: false as const, statusCode: 400, error: 'Cannot approve verification on a cancelled bank account.' };
+      }
+
       if (
         existingApp.status === 'activated' ||
         existingApp.activationStatus === 'ACTIVATED' ||
@@ -5459,7 +5615,8 @@ export async function approveBankVerificationCode(
         return { ok: false as const, statusCode: 400, error: 'No verification reference has been submitted by the customer yet.' };
       }
 
-      if (existingApp.verificationCodeStatus === 'REJECTED') {
+      const normalizedCodeStatus = String(existingApp.verificationCodeStatus || '').trim().toUpperCase();
+      if (normalizedCodeStatus === 'REJECTED' || existingApp.activationStatus === 'REJECTED') {
         return {
           ok: false as const,
           statusCode: 400,
@@ -5467,7 +5624,7 @@ export async function approveBankVerificationCode(
         };
       }
 
-      if (existingApp.verificationCodeStatus !== 'PENDING') {
+      if (normalizedCodeStatus && normalizedCodeStatus !== 'PENDING') {
         return {
           ok: false as const,
           statusCode: 400,
@@ -5574,8 +5731,15 @@ export async function rejectBankVerificationCode(
     }
 
     const nowIso = new Date().toISOString();
-    const rejectionText =
-      reason?.trim() || 'The submitted verification reference could not be verified. Please enter a new verification reference and submit again.';
+    const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+    if (!trimmedReason) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'Please enter a rejection reason visible to the customer.',
+      };
+    }
+    const rejectionText = trimmedReason;
     const docRef = adminFirestore.collection('bank_account_applications').doc(applicationId);
 
     const txResult = await adminFirestore.runTransaction(async (tx) => {
@@ -5585,6 +5749,10 @@ export async function rejectBankVerificationCode(
       }
 
       const existingApp = { ...(snap.data() as LinkedBankAccountApplication), id: snap.id };
+
+      if (existingApp.status === 'cancelled' || existingApp.activationStatus === 'CANCELLED') {
+        return { ok: false as const, statusCode: 400, error: 'Cannot reject verification on a cancelled bank account.' };
+      }
 
       if (existingApp.status === 'activated' || existingApp.activationStatus === 'ACTIVATED') {
         return { ok: false as const, statusCode: 400, error: 'Cannot reject verification on an already activated bank account.' };
@@ -5599,7 +5767,16 @@ export async function rejectBankVerificationCode(
         return { ok: false as const, statusCode: 400, error: 'No verification reference has been submitted for review.' };
       }
 
-      if (existingApp.verificationCodeStatus !== 'PENDING') {
+      const normalizedCodeStatus = String(existingApp.verificationCodeStatus || '').trim().toUpperCase();
+      if (normalizedCodeStatus === 'REJECTED' || existingApp.activationStatus === 'REJECTED') {
+        return {
+          ok: false as const,
+          statusCode: 400,
+          error: 'This verification reference has already been rejected. Wait for customer resubmission.',
+        };
+      }
+
+      if (normalizedCodeStatus && normalizedCodeStatus !== 'PENDING') {
         return {
           ok: false as const,
           statusCode: 400,

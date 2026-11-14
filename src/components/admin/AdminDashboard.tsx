@@ -465,12 +465,21 @@ export const AdminDashboard: React.FC = () => {
       }
 
       if (bankVerifsRes?.success && Array.isArray(bankVerifsRes.requests)) {
-        const pendingBankVerifs = bankVerifsRes.requests.filter(
-          (a: any) =>
-            a.verificationCodeStatus === 'PENDING' &&
-            a.status !== 'activated' &&
-            a.activationStatus !== 'ACTIVATED'
-        ).length;
+        const pendingBankVerifs = bankVerifsRes.requests.filter((a: any) => {
+          if (
+            a.status === 'activated' ||
+            a.status === 'cancelled' ||
+            a.activationStatus === 'ACTIVATED' ||
+            a.activationStatus === 'CANCELLED'
+          ) {
+            return false;
+          }
+          const codeStatus = String(a.verificationCodeStatus || '').trim().toUpperCase();
+          if (codeStatus === 'APPROVED' || codeStatus === 'REJECTED' || a.activationStatus === 'REJECTED') {
+            return false;
+          }
+          return codeStatus === 'PENDING' || Boolean(a.verificationReference || a.verificationCode);
+        }).length;
         setPendingBankVerificationsCount(pendingBankVerifs);
         setBankVerificationsLoadError(null);
       } else {
@@ -615,12 +624,21 @@ export const AdminDashboard: React.FC = () => {
 
         if (bankVerifsRes?.success && Array.isArray(bankVerifsRes.requests)) {
           setPendingBankVerificationsCount(
-            bankVerifsRes.requests.filter(
-              (a: any) =>
-                a.verificationCodeStatus === 'PENDING' &&
-                a.status !== 'activated' &&
-                a.activationStatus !== 'ACTIVATED'
-            ).length
+            bankVerifsRes.requests.filter((a: any) => {
+              if (
+                a.status === 'activated' ||
+                a.status === 'cancelled' ||
+                a.activationStatus === 'ACTIVATED' ||
+                a.activationStatus === 'CANCELLED'
+              ) {
+                return false;
+              }
+              const codeStatus = String(a.verificationCodeStatus || '').trim().toUpperCase();
+              if (codeStatus === 'APPROVED' || codeStatus === 'REJECTED' || a.activationStatus === 'REJECTED') {
+                return false;
+              }
+              return codeStatus === 'PENDING' || Boolean(a.verificationReference || a.verificationCode);
+            }).length
           );
           setBankVerificationsLoadError(null);
         } else {
@@ -1361,7 +1379,10 @@ export const AdminDashboard: React.FC = () => {
         )}
 
         {activeTab === 'bank_approvals' && (
-          <AdminBankAccountRequestsView onRefreshData={loadAllAdminData} />
+          <AdminBankAccountRequestsView
+            onRefreshData={loadAllAdminData}
+            onOpenBankVerifications={() => setActiveTab('bank_verifications')}
+          />
         )}
 
         {activeTab === 'bank_verifications' && (

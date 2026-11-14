@@ -33,6 +33,7 @@ import {
   approveBankAccountApplication,
   rejectBankAccountApplication,
   cancelBankAccountApplication,
+  adminCancelBankAccount,
   completeBankVerification,
   approveBankVerificationCode,
   rejectBankVerificationCode,
@@ -1985,6 +1986,29 @@ app.post('/api/admin/bank-accounts/:id/reject', requireAdminAuth, async (req: Au
   }
 
   return res.json({ success: true, application: result.application });
+});
+
+// Administrator endpoint: cancel an already-linked / activated bank account (preserves historical record)
+app.post('/api/admin/bank-accounts/:id/cancel', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const { reason, expectedUserId } = req.body || {};
+  const adminId = req.auth?.uid || 'usr_admin';
+
+  const result = await adminCancelBankAccount(
+    adminId,
+    id,
+    typeof reason === 'string' ? reason : undefined,
+    expectedUserId ? String(expectedUserId).trim() : undefined
+  );
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({ error: result.error });
+  }
+
+  return res.json({
+    success: true,
+    application: result.application,
+    message: 'Linked bank account cancelled successfully.',
+  });
 });
 
 // Administrator endpoint: approve submitted bank verification reference (activates account)
