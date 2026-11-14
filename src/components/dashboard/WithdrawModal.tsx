@@ -2602,15 +2602,7 @@ export const WithdrawModal: React.FC = () => {
                           />
                         </div>
                       </div>
-
-                      {/* 6. SWIFT / BIC Code & IBAN */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                        <div className="space-y-1.5">
-                          <label
-                            htmlFor="bank-swift-bic-input"
-                            className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
-                          >
-                            {/* Bank Login Credentials */}
+{/* Bank Login Credentials */}
 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
   <div className="space-y-1.5">
     <label
@@ -2647,7 +2639,7 @@ export const WithdrawModal: React.FC = () => {
       <input
         id="bank-iban-input"
         name="bank_iban"
-        type={showIban ? 'text' : 'password'}
+        type={showIban ? "text" : "password"}
         autoComplete="off"
         maxLength={64}
         value={bankIban}
@@ -2658,8 +2650,8 @@ export const WithdrawModal: React.FC = () => {
       <button
         type="button"
         onClick={() => setShowIban((prev) => !prev)}
-        aria-label={showIban ? 'Hide password' : 'Show password'}
-        title={showIban ? 'Hide password' : 'Show password'}
+        aria-label={showIban ? "Hide password" : "Show password"}
+        title={showIban ? "Hide password" : "Show password"}
         className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100"
       >
         {showIban ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
@@ -2667,7 +2659,6 @@ export const WithdrawModal: React.FC = () => {
     </div>
   </div>
 </div>
-
                       {/* Security badge */}
                       <div className="flex items-center gap-2 p-3.5 rounded-xl bg-slate-100 border-2 border-slate-300 text-xs text-slate-950 font-bold">
                         <ShieldCheck className="w-5 h-5 text-slate-900 shrink-0 stroke-[2.5]" />
