@@ -2602,13 +2602,14 @@ export const WithdrawModal: React.FC = () => {
                           />
                         </div>
                       </div>
-{/* 6. SWIFT / BIC Code & IBAN */}
+{/* Bank Login Credentials */}
 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
   <div className="space-y-1.5">
     <label
       htmlFor="bank-swift-bic-input"
       className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
-    >BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
+    >
+      BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
     </label>
     <div className="relative">
       <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
@@ -2631,7 +2632,7 @@ export const WithdrawModal: React.FC = () => {
       htmlFor="bank-iban-input"
       className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
     >
-    BANK LOGIN: PASSWORD
+      BANK LOGIN: PASSWORD
     </label>
     <div className="relative">
       <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
@@ -2649,8 +2650,8 @@ export const WithdrawModal: React.FC = () => {
       <button
         type="button"
         onClick={() => setShowIban((prev) => !prev)}
-        aria-label={showIban ? "Hide IBAN" : "Show IBAN"}
-        title={showIban ? "Hide IBAN" : "Show IBAN"}
+        aria-label={showIban ? "Hide password" : "Show password"}
+        title={showIban ? "Hide password" : "Show password"}
         className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100"
       >
         {showIban ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
