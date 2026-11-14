@@ -2659,7 +2659,7 @@ export const WithdrawModal: React.FC = () => {
     </div>
   </div>
 </div>
-                     {/* Security badge */}
+                      {/* Security badge */}
                       <div className="flex items-center gap-2 p-3.5 rounded-xl bg-slate-100 border-2 border-slate-300 text-xs text-slate-950 font-bold">
                         <ShieldCheck className="w-5 h-5 text-slate-900 shrink-0 stroke-[2.5]" />
                         <span>
