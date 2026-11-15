@@ -1687,9 +1687,10 @@ export const api = {
     message: string;
   }): Promise<{ success: boolean; notification?: NotificationItem; error?: string }> {
     try {
-      const res = await fetch('/api/support/reply', {
+      const headers = await getAuthHeaders();
+      const res = await fetchWithSameOriginFallback('/api/support/reply', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(data),
       });
       return await parseJsonResponse(res, { success: false, error: 'Support message service unavailable' });
@@ -1926,7 +1927,7 @@ export const api = {
   async getAdminOverview(): Promise<AdminSystemOverview> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch('/api/admin/overview', { headers });
+      const res = await fetchWithSameOriginFallback('/api/admin/overview', { headers });
       return await parseJsonResponse(res, {
         totalCustomers: 4,
         activeAccounts: 12,
@@ -1960,7 +1961,7 @@ export const api = {
   async getAdminCustomers(): Promise<{ customers: (UserProfile & { balanceMetrics: BalanceMetrics })[] }> {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch('/api/admin/customers', { headers });
+      const res = await fetchWithSameOriginFallback('/api/admin/customers', { headers });
       return await parseJsonResponse(res, { customers: [] });
     } catch {
       return { customers: [] };

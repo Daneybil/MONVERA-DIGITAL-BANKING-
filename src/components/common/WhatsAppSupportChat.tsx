@@ -31,6 +31,8 @@ import {
   Sparkles,
   Mail,
   ArrowUpRight,
+  AlertCircle,
+  RotateCcw,
 } from 'lucide-react';
 
 const QUICK_PROMPTS = [
@@ -54,6 +56,9 @@ export const WhatsAppSupportChat: React.FC = () => {
   const [callNotice, setCallNotice] = useState<string | null>(null);
   const [zoomedImage, setZoomedImage] = useState<{ src: string; name: string } | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [failedMessageIds, setFailedMessageIds] = useState<Record<string, boolean>>({});
+  const [retryingMessageId, setRetryingMessageId] = useState<string | null>(null);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [phoneViewMode, setPhoneViewMode] = useState<'iphone' | 'wide'>('iphone');
   const [isExpanded, setIsExpanded] = useState<boolean>(false);
   const [showScrollBottomBtn, setShowScrollBottomBtn] = useState<boolean>(false);
@@ -347,6 +352,7 @@ export const WhatsAppSupportChat: React.FC = () => {
 
     setInputValue('');
     setShowAttachMenu(false);
+    setDeliveryError(null);
 
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     firestoreSync.setTypingStatus(currentUser.id, false, 'user').catch(() => {});
@@ -367,8 +373,33 @@ export const WhatsAppSupportChat: React.FC = () => {
     setMessages((prev) => [...prev, userMsg]);
     scrollToBottom();
 
-    // Persist to Firestore: Admin dashboard receives this instantly!
-    await firestoreSync.saveChatMessage(userMsg);
+    // Persist to backend API & Firestore: surface delivery failure if both fail
+    const delivered = await firestoreSync.saveChatMessage(userMsg);
+    if (!delivered) {
+      setFailedMessageIds((prev) => ({ ...prev, [userMsg.id]: true }));
+      setDeliveryError('Message could not be delivered. Check your connection and tap Retry.');
+    }
+  };
+
+  const handleRetryMessage = async (msg: ChatMessage) => {
+    if (!currentUser?.id || retryingMessageId === msg.id) return;
+    setRetryingMessageId(msg.id);
+    setDeliveryError(null);
+    try {
+      const delivered = await firestoreSync.saveChatMessage(msg);
+      if (delivered) {
+        setFailedMessageIds((prev) => {
+          const next = { ...prev };
+          delete next[msg.id];
+          return next;
+        });
+      } else {
+        setFailedMessageIds((prev) => ({ ...prev, [msg.id]: true }));
+        setDeliveryError('Delivery failed again. Please verify your connection and retry.');
+      }
+    } finally {
+      setRetryingMessageId(null);
+    }
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -376,6 +407,7 @@ export const WhatsAppSupportChat: React.FC = () => {
     if (!file || !currentUser?.id) return;
 
     setIsUploading(true);
+    setDeliveryError(null);
     const reader = new FileReader();
 
     reader.onload = async () => {
@@ -403,10 +435,15 @@ export const WhatsAppSupportChat: React.FC = () => {
         setMessages((prev) => [...prev, fileMsg]);
         scrollToBottom();
 
-        // Persist file attachment to Firestore for Admin to inspect and download
-        await firestoreSync.saveChatMessage(fileMsg);
+        // Persist file attachment to backend API & Firestore for Admin to inspect and download
+        const delivered = await firestoreSync.saveChatMessage(fileMsg);
+        if (!delivered) {
+          setFailedMessageIds((prev) => ({ ...prev, [fileMsg.id]: true }));
+          setDeliveryError('Attachment could not be delivered. Check your connection and tap Retry.');
+        }
       } catch (err) {
         console.error('Failed to upload chat file:', err);
+        setDeliveryError('Unable to send attachment. Please try again.');
       } finally {
         setIsUploading(false);
         setShowAttachMenu(false);
@@ -417,6 +454,7 @@ export const WhatsAppSupportChat: React.FC = () => {
     reader.onerror = () => {
       setIsUploading(false);
       setShowAttachMenu(false);
+      setDeliveryError('Unable to read the selected file.');
     };
 
     reader.readAsDataURL(file);
@@ -1038,9 +1076,25 @@ export const WhatsAppSupportChat: React.FC = () => {
                           )}
 
                           {/* Timestamp & Status */}
-                          <div className="mt-1 flex items-center justify-end gap-1 text-[9px] text-slate-500">
+                          <div className="mt-1 flex items-center justify-end gap-1.5 text-[9px] text-slate-500">
                             <span>{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                            {!isSupport && <CheckCheck className="w-3 h-3 text-[#53bdeb]" />}
+                            {!isSupport && (
+                              failedMessageIds[msg.id] ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRetryMessage(msg)}
+                                  disabled={retryingMessageId === msg.id}
+                                  className="inline-flex items-center gap-1 text-rose-700 hover:text-rose-900 font-black cursor-pointer disabled:opacity-60"
+                                  title="Tap to retry sending this message"
+                                >
+                                  <AlertCircle className="w-3 h-3" />
+                                  <span>{retryingMessageId === msg.id ? 'Retrying...' : 'Not delivered • Retry'}</span>
+                                  <RotateCcw className="w-2.5 h-2.5" />
+                                </button>
+                              ) : (
+                                <CheckCheck className="w-3 h-3 text-[#53bdeb]" />
+                              )
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1094,6 +1148,24 @@ export const WhatsAppSupportChat: React.FC = () => {
                         <ImageIcon className="w-4 h-4 stroke-[2.5]" />
                       </div>
                       <span className="text-[10px] font-black">Photo / ID</span>
+                    </button>
+                  </div>
+                )}
+
+                {/* Delivery Failure Banner */}
+                {deliveryError && (
+                  <div className="bg-rose-50 border-t border-rose-200 px-3 py-1.5 flex items-center justify-between gap-2 text-[11px] font-bold text-rose-800 shrink-0">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <AlertCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span className="truncate">{deliveryError}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setDeliveryError(null)}
+                      className="text-rose-700 hover:text-rose-950 font-black px-1 cursor-pointer shrink-0"
+                      aria-label="Dismiss delivery error"
+                    >
+                      ✕
                     </button>
                   </div>
                 )}
@@ -1384,7 +1456,23 @@ export const WhatsAppSupportChat: React.FC = () => {
 
                         <div className="mt-1.5 flex items-center justify-end gap-1.5 text-[10px] text-slate-500">
                           <span>{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                          {!isSupport && <CheckCheck className="w-4 h-4 text-[#53bdeb]" />}
+                          {!isSupport && (
+                            failedMessageIds[msg.id] ? (
+                              <button
+                                type="button"
+                                onClick={() => handleRetryMessage(msg)}
+                                disabled={retryingMessageId === msg.id}
+                                className="inline-flex items-center gap-1 text-rose-700 hover:text-rose-900 font-black cursor-pointer disabled:opacity-60"
+                                title="Tap to retry sending this message"
+                              >
+                                <AlertCircle className="w-3.5 h-3.5" />
+                                <span>{retryingMessageId === msg.id ? 'Retrying...' : 'Not delivered • Retry'}</span>
+                                <RotateCcw className="w-3 h-3" />
+                              </button>
+                            ) : (
+                              <CheckCheck className="w-4 h-4 text-[#53bdeb]" />
+                            )
+                          )}
                         </div>
                       </div>
                     </div>
@@ -1438,6 +1526,24 @@ export const WhatsAppSupportChat: React.FC = () => {
                       <ImageIcon className="w-5 h-5 stroke-[2.5]" />
                     </div>
                     <span className="text-xs font-black">Proof Photo / ID</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Delivery Failure Banner */}
+              {deliveryError && (
+                <div className="bg-rose-50 border-t border-rose-200 px-4 py-2 flex items-center justify-between gap-2 text-xs font-bold text-rose-800 shrink-0">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span className="truncate">{deliveryError}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryError(null)}
+                    className="text-rose-700 hover:text-rose-950 font-black px-1.5 cursor-pointer shrink-0"
+                    aria-label="Dismiss delivery error"
+                  >
+                    ✕
                   </button>
                 </div>
               )}

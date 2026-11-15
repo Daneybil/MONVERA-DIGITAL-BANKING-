@@ -445,6 +445,15 @@ export const firestoreSync = {
     return headers;
   },
 
+  async _resolveApiEndpoint(endpoint: string): Promise<string> {
+    try {
+      const { getApiEndpoint } = await import('./api');
+      return getApiEndpoint(endpoint);
+    } catch {
+      return endpoint;
+    }
+  },
+
   /**
    * Fetch all notifications for a specific user from Firestore and Local Cache
    */
@@ -1848,6 +1857,7 @@ export const firestoreSync = {
 
       const existingData = snap.data() as NotificationItem;
       const currentReplies = existingData.replies || [];
+      const nowIso = new Date().toISOString();
       const newReply = {
         id: `reply_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         senderId: reply.senderId,
@@ -1855,7 +1865,8 @@ export const firestoreSync = {
         senderRole: reply.senderRole,
         senderAvatar: reply.senderAvatar,
         message: reply.message.trim(),
-        timestamp: new Date().toISOString(),
+        createdAt: nowIso,
+        timestamp: nowIso,
       };
 
       const updatedReplies = [...currentReplies, newReply];
@@ -1959,32 +1970,45 @@ export const firestoreSync = {
       }
     } catch {}
 
-    // 2. Server API persistence with auth headers
+    // 2. Server API persistence with auth headers & configured endpoint
+    let apiPersisted = false;
     try {
       if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
         const headers = await this._getSyncHeaders();
-        fetch('/api/support/messages', {
+        const targetUrl = await this._resolveApiEndpoint('/api/support/messages');
+        const res = await fetch(targetUrl, {
           method: 'POST',
           headers,
           body: JSON.stringify(msg),
-        }).catch(() => {});
+        });
+        if (res.ok) {
+          apiPersisted = true;
+        } else {
+          const errData = await res.json().catch(() => ({}));
+          console.warn('[FirestoreSync.saveChatMessage] API delivery failed:', res.status, errData?.error || '');
+        }
       }
-    } catch {}
+    } catch (apiErr: any) {
+      console.warn('[FirestoreSync.saveChatMessage] API request error:', apiErr?.message || apiErr);
+    }
 
     // 3. Firestore Cloud Persistence
-    if (!db) return true;
-    const path = `support_messages/${msg.id}`;
-    try {
-      const docRef = doc(db, 'support_messages', msg.id);
-      await setDoc(docRef, {
-        ...msg,
-        syncedAt: new Date().toISOString(),
-      }, { merge: true });
-      return true;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, path);
-      return true;
+    let firestorePersisted = false;
+    if (db) {
+      const path = `support_messages/${msg.id}`;
+      try {
+        const docRef = doc(db, 'support_messages', msg.id);
+        await setDoc(docRef, {
+          ...msg,
+          syncedAt: new Date().toISOString(),
+        }, { merge: true });
+        firestorePersisted = true;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, path);
+      }
     }
+
+    return apiPersisted || firestorePersisted;
   },
 
   /**
@@ -2066,20 +2090,25 @@ export const firestoreSync = {
       }
     } catch {}
 
-    // 2. Fetch from backend API with auth headers
+    // 2. Fetch from backend API with auth headers & configured endpoint
     try {
       if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
         const headers = await this._getSyncHeaders();
         delete headers['Content-Type'];
-        const res = await fetch(`/api/support/messages?userId=${encodeURIComponent(userId)}`, { headers });
+        const targetUrl = await this._resolveApiEndpoint(`/api/support/messages?userId=${encodeURIComponent(userId)}`);
+        const res = await fetch(targetUrl, { headers });
         if (res.ok) {
           const data = await res.json();
           if (Array.isArray(data.messages)) {
             data.messages.forEach(mergeMsg);
           }
+        } else {
+          console.warn('[FirestoreSync.getChatMessagesForUser] API fetch status:', res.status);
         }
       }
-    } catch {}
+    } catch (err: any) {
+      console.warn('[FirestoreSync.getChatMessagesForUser] API fetch error:', err?.message || err);
+    }
 
     // 3. Fetch from Firestore if available (strictly owned by userId)
     if (db) {
@@ -2241,8 +2270,16 @@ export const firestoreSync = {
 
   /**
    * Subscribe to ALL WhatsApp Live Chat messages across all customers (For Admin Dashboard)
+   * Combines real-time Firestore listener, initial authenticated backend fetch, and periodic polling fallback.
    */
-  subscribeToAllChatMessages(onUpdate: (messages: ChatMessage[]) => void): () => void {
+  subscribeToAllChatMessages(
+    onUpdate: (messages: ChatMessage[]) => void,
+    onError?: (errorMessage: string) => void
+  ): () => void {
+    let isDisposed = false;
+    const apiMsgMap = new Map<string, ChatMessage>();
+    const firestoreMsgMap = new Map<string, ChatMessage>();
+
     const getLocalAll = (): ChatMessage[] => {
       try {
         const map = new Map<string, ChatMessage>();
@@ -2266,8 +2303,67 @@ export const firestoreSync = {
       }
     };
 
+    const mergeAndEmit = () => {
+      if (isDisposed) return;
+      const merged = new Map<string, ChatMessage>();
+      const applyMessage = (incoming: ChatMessage) => {
+        if (!incoming || !incoming.id || !incoming.userId) return;
+        const existing = merged.get(incoming.id);
+        if (!existing) {
+          merged.set(incoming.id, incoming);
+        } else {
+          const resolvedStatus =
+            existing.status === 'read' || incoming.status === 'read'
+              ? ('read' as const)
+              : incoming.status || existing.status;
+          merged.set(incoming.id, { ...existing, ...incoming, status: resolvedStatus });
+        }
+      };
+
+      getLocalAll().forEach(applyMessage);
+      apiMsgMap.forEach(applyMessage);
+      firestoreMsgMap.forEach(applyMessage);
+
+      const sorted = Array.from(merged.values()).sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+      onUpdate(sorted);
+    };
+
+    const fetchFromBackendApi = async () => {
+      if (isDisposed || typeof window === 'undefined' || typeof fetch === 'undefined') return;
+      try {
+        const headers = await this._getSyncHeaders();
+        delete headers['Content-Type'];
+        const targetUrl = await this._resolveApiEndpoint('/api/support/messages');
+        const res = await fetch(targetUrl, { headers });
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          const msg = errBody?.error || `HTTP ${res.status}`;
+          console.warn('[FirestoreSync.subscribeToAllChatMessages] Backend API retrieval warning:', msg);
+          if (firestoreMsgMap.size === 0) {
+            onError?.(`Unable to sync support messages from server (${msg}).`);
+          }
+          return;
+        }
+        const data = await res.json();
+        if (Array.isArray(data.messages) && !isDisposed) {
+          apiMsgMap.clear();
+          data.messages.forEach((m: ChatMessage) => {
+            if (m && m.id) apiMsgMap.set(m.id, m);
+          });
+          mergeAndEmit();
+        }
+      } catch (err: any) {
+        console.warn('[FirestoreSync.subscribeToAllChatMessages] Backend polling error:', err?.message || err);
+        if (firestoreMsgMap.size === 0) {
+          onError?.('Network issue syncing customer support messages.');
+        }
+      }
+    };
+
     const handleLocalBroadcast = () => {
-      onUpdate(getLocalAll());
+      mergeAndEmit();
     };
 
     if (typeof window !== 'undefined') {
@@ -2275,57 +2371,56 @@ export const firestoreSync = {
       window.addEventListener('storage', handleLocalBroadcast);
     }
 
-    if (!db) {
-      onUpdate(getLocalAll());
-      return () => {
-        if (typeof window !== 'undefined') {
-          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
-          window.removeEventListener('storage', handleLocalBroadcast);
-        }
-      };
+    // Immediate emission from local cache, initial authenticated backend retrieval, and 12s polling fallback
+    mergeAndEmit();
+    fetchFromBackendApi();
+    const pollInterval =
+      typeof window !== 'undefined'
+        ? window.setInterval(() => {
+            fetchFromBackendApi();
+          }, 12000)
+        : undefined;
+
+    let unsubscribeFirestore: (() => void) | undefined;
+    if (db) {
+      try {
+        const msgCol = collection(db, 'support_messages');
+        unsubscribeFirestore = onSnapshot(
+          msgCol,
+          (snap) => {
+            firestoreMsgMap.clear();
+            snap.forEach((d) => {
+              const m = d.data() as ChatMessage;
+              const id = m?.id || d.id;
+              if (id && m) {
+                firestoreMsgMap.set(id, { ...m, id });
+              }
+            });
+            mergeAndEmit();
+          },
+          (error) => {
+            console.warn('[Firestore all chat messages subscription note]:', error);
+            onError?.('Real-time chat listener paused; using server polling fallback.');
+            fetchFromBackendApi();
+          }
+        );
+      } catch (err) {
+        console.warn('[Firestore] Error subscribing to all chat messages:', err);
+        onError?.('Real-time chat listener unavailable; using server polling fallback.');
+      }
     }
 
-    try {
-      const msgCol = collection(db, 'support_messages');
-      const unsubscribe = onSnapshot(
-        msgCol,
-        (snap) => {
-          const map = new Map<string, ChatMessage>();
-          // 1. Add local fallback messages
-          getLocalAll().forEach((m) => map.set(m.id, m));
-          // 2. Add live Firestore docs
-          snap.forEach((d) => {
-            const m = d.data() as ChatMessage;
-            if (m && m.id) map.set(m.id, m);
-          });
-
-          const list = Array.from(map.values()).sort(
-            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-          );
-          onUpdate(list);
-        },
-        (error) => {
-          console.warn('[Firestore all chat messages subscription note]:', error);
-          onUpdate(getLocalAll());
-        }
-      );
-      return () => {
-        if (typeof window !== 'undefined') {
-          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
-          window.removeEventListener('storage', handleLocalBroadcast);
-        }
-        if (typeof unsubscribe === 'function') unsubscribe();
-      };
-    } catch (err) {
-      console.warn('[Firestore] Error subscribing to all chat messages:', err);
-      onUpdate(getLocalAll());
-      return () => {
-        if (typeof window !== 'undefined') {
-          window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
-          window.removeEventListener('storage', handleLocalBroadcast);
-        }
-      };
-    }
+    return () => {
+      isDisposed = true;
+      if (pollInterval !== undefined && typeof window !== 'undefined') {
+        window.clearInterval(pollInterval);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_chat_update', handleLocalBroadcast);
+        window.removeEventListener('storage', handleLocalBroadcast);
+      }
+      if (typeof unsubscribeFirestore === 'function') unsubscribeFirestore();
+    };
   },
 
   /**
@@ -2457,13 +2552,19 @@ export const firestoreSync = {
     try {
       if (typeof window !== 'undefined' && typeof fetch !== 'undefined') {
         const headers = await this._getSyncHeaders();
-        await fetch('/api/support/messages/read', {
+        const targetUrl = await this._resolveApiEndpoint('/api/support/messages/read');
+        const res = await fetch(targetUrl, {
           method: 'POST',
           headers,
           body: JSON.stringify({ userId, role: reader }),
-        }).catch(() => {});
+        });
+        if (!res.ok) {
+          console.warn('[FirestoreSync.markChatMessagesAsRead] API status:', res.status);
+        }
       }
-    } catch {}
+    } catch (err: any) {
+      console.warn('[FirestoreSync.markChatMessagesAsRead] API error:', err?.message || err);
+    }
 
     if (!db) return;
     try {

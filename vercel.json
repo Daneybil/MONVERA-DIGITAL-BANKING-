@@ -3,11 +3,11 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "https://monvera-digital-banking-production.up.railway.app/api/$1"
+      "destination": "https://monvera-digital-banking-production-6b9a206d.up.railway.app/api/$1"
     },
     {
       "source": "/api",
-      "destination": "https://monvera-digital-banking-production.up.railway.app/api"
+      "destination": "https://monvera-digital-banking-production-6b9a206d.up.railway.app/api"
     },
     {
       "source": "/(.*)",

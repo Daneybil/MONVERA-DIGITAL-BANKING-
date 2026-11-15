@@ -45,9 +45,14 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
   const [selectedNotification, setSelectedNotification] = useState<NotificationItem | null>(null);
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [isSubmittingReply, setIsSubmittingReply] = useState<Record<string, boolean>>({});
+  const [replyErrors, setReplyErrors] = useState<Record<string, string>>({});
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
   if (!isOpen) return null;
+
+  const activeNotification = selectedNotification
+    ? notifications.find((n) => n.id === selectedNotification.id) || selectedNotification
+    : null;
 
   const filteredNotifications = notifications.filter((n) => {
     if (selectedFilter === 'ALL') return true;
@@ -163,12 +168,24 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
     const text = replyDrafts[notificationId]?.trim();
     if (!text) return;
 
+    setReplyErrors((prev) => ({ ...prev, [notificationId]: '' }));
     setIsSubmittingReply((prev) => ({ ...prev, [notificationId]: true }));
     try {
-      await replyToSupport(notificationId, text);
-      setReplyDrafts((prev) => ({ ...prev, [notificationId]: '' }));
-    } catch (err) {
+      const res = await replyToSupport(notificationId, text);
+      if (res?.success) {
+        setReplyDrafts((prev) => ({ ...prev, [notificationId]: '' }));
+      } else {
+        setReplyErrors((prev) => ({
+          ...prev,
+          [notificationId]: res?.error || 'Unable to send reply right now. Please try again.',
+        }));
+      }
+    } catch (err: any) {
       console.error('Failed to send support reply:', err);
+      setReplyErrors((prev) => ({
+        ...prev,
+        [notificationId]: err?.message || 'Network error while sending reply.',
+      }));
     } finally {
       setIsSubmittingReply((prev) => ({ ...prev, [notificationId]: false }));
     }
@@ -199,8 +216,8 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
     return `$${Math.abs(amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
   };
 
-  const detailTarget = selectedNotification ? resolveNavigationTarget(selectedNotification) : null;
-  const meta = selectedNotification?.metadata;
+  const detailTarget = activeNotification ? resolveNavigationTarget(activeNotification) : null;
+  const meta = activeNotification?.metadata;
 
   return (
     <div
@@ -220,7 +237,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
         {/* Header */}
         <div className="p-5 sm:p-6 border-b-2 border-slate-200 bg-slate-50 flex flex-col gap-4">
           <div className="flex items-center justify-between">
-            {selectedNotification ? (
+            {activeNotification ? (
               <div className="flex items-center gap-3">
                 <button
                   onClick={() => setSelectedNotification(null)}
@@ -232,7 +249,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                 <div>
                   <h3 className="font-extrabold text-slate-950 text-xl tracking-tight">Notification Details</h3>
                   <p className="text-xs font-extrabold text-slate-700 font-mono">
-                    ID: {selectedNotification.id.slice(0, 18)}
+                    ID: {activeNotification.id.slice(0, 18)}
                   </p>
                 </div>
               </div>
@@ -310,7 +327,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
 
         {/* Body Content */}
         <div className="flex-1 overflow-y-auto p-5 sm:p-6 space-y-4">
-          {selectedNotification ? (
+          {activeNotification ? (
             /* --- DETAIL VIEW OF SPECIFIC NOTIFICATION --- */
             <div className="space-y-5 animate-fadeIn">
               {/* Top Banner Card */}
@@ -319,25 +336,25 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                   <div className="flex items-center gap-3.5">
                     <div
                       className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 ${
-                        selectedNotification.type === 'SECURITY'
+                        activeNotification.type === 'SECURITY'
                           ? 'bg-sky-500/30 text-sky-300 border-2 border-sky-400'
-                          : selectedNotification.type === 'INVESTMENT'
+                          : activeNotification.type === 'INVESTMENT'
                           ? 'bg-emerald-500/30 text-emerald-300 border-2 border-emerald-400'
-                          : selectedNotification.severity === 'warning'
+                          : activeNotification.severity === 'warning'
                           ? 'bg-amber-500/30 text-amber-300 border-2 border-amber-400'
-                          : selectedNotification.severity === 'error'
+                          : activeNotification.severity === 'error'
                           ? 'bg-rose-500/30 text-rose-300 border-2 border-rose-400'
                           : 'bg-white/20 text-white border-2 border-white/30'
                       }`}
                     >
-                      {React.createElement(getIcon(selectedNotification.type, selectedNotification), { className: 'w-6 h-6 stroke-[2.5]' })}
+                      {React.createElement(getIcon(activeNotification.type, activeNotification), { className: 'w-6 h-6 stroke-[2.5]' })}
                     </div>
                     <div>
                       <span className="text-xs font-mono font-black uppercase tracking-wider text-sky-400 block">
-                        {selectedNotification.type} NOTIFICATION
+                        {activeNotification.type} NOTIFICATION
                       </span>
                       <h4 className="text-lg sm:text-xl font-extrabold text-white leading-tight">
-                        {selectedNotification.title}
+                        {activeNotification.title}
                       </h4>
                     </div>
                   </div>
@@ -347,15 +364,15 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                   <span className="flex items-center gap-2">
                     <Clock className="w-4 h-4 text-sky-300 stroke-[2.5]" />
                     <span>
-                      {new Date(selectedNotification.createdAt).toLocaleString(undefined, {
+                      {new Date(activeNotification.createdAt).toLocaleString(undefined, {
                         dateStyle: 'medium',
                         timeStyle: 'short',
                       })}
                     </span>
                   </span>
-                  {(meta?.referenceNumber || selectedNotification.referenceId) && (
+                  {(meta?.referenceNumber || activeNotification.referenceId) && (
                     <span className="font-mono text-xs font-black bg-sky-900/80 border border-sky-400 px-3 py-1 rounded-lg text-sky-100">
-                      Ref: {meta?.referenceNumber || selectedNotification.referenceId}
+                      Ref: {meta?.referenceNumber || activeNotification.referenceId}
                     </span>
                   )}
                 </div>
@@ -367,7 +384,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                   Message Details & Notice
                 </h5>
                 <p className="text-base sm:text-lg font-bold text-slate-950 leading-relaxed">
-                  {selectedNotification.message}
+                  {activeNotification.message}
                 </p>
               </div>
 
@@ -455,14 +472,14 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
               </div>
 
               {/* Support Thread if applicable */}
-              {selectedNotification.type === 'SUPPORT' && (
+              {activeNotification.type === 'SUPPORT' && (
                 <div className="p-5 sm:p-6 rounded-3xl bg-purple-50 border-2 border-purple-300 space-y-4 shadow-sm">
                   <h5 className="text-xs font-black uppercase tracking-wider text-purple-950">
                     Concierge Dialogue
                   </h5>
-                  {selectedNotification.replies && selectedNotification.replies.length > 0 && (
+                  {activeNotification.replies && activeNotification.replies.length > 0 && (
                     <div className="space-y-3">
-                      {selectedNotification.replies.map((reply) => (
+                      {activeNotification.replies.map((reply) => (
                         <div
                           key={reply.id}
                           className="p-4 rounded-2xl text-sm space-y-1.5 bg-white border-2 border-purple-200 shadow-xs"
@@ -470,7 +487,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                           <div className="flex items-center justify-between font-black text-xs">
                             <span className="text-purple-950">{reply.senderName}</span>
                             <span className="text-xs text-slate-600 font-mono font-bold">
-                              {new Date(reply.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              {new Date(reply.createdAt || reply.timestamp || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                             </span>
                           </div>
                           <p className="text-slate-950 font-bold leading-relaxed">{reply.message}</p>
@@ -484,20 +501,29 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                     <textarea
                       rows={3}
                       placeholder="Type your reply to Monvera Concierge..."
-                      value={replyDrafts[selectedNotification.id] || ''}
-                      onChange={(e) =>
-                        setReplyDrafts((prev) => ({ ...prev, [selectedNotification.id]: e.target.value }))
-                      }
+                      value={replyDrafts[activeNotification.id] || ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setReplyDrafts((prev) => ({ ...prev, [activeNotification.id]: val }));
+                        if (replyErrors[activeNotification.id]) {
+                          setReplyErrors((prev) => ({ ...prev, [activeNotification.id]: '' }));
+                        }
+                      }}
                       className="w-full text-sm font-bold text-slate-950 placeholder:text-slate-500 p-4 rounded-2xl border-2 border-purple-300 focus:outline-hidden focus:ring-2 focus:ring-purple-600 bg-white"
                     />
+                    {replyErrors[activeNotification.id] && (
+                      <div className="text-xs font-bold text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2">
+                        {replyErrors[activeNotification.id]}
+                      </div>
+                    )}
                     <div className="flex justify-end">
                       <button
-                        onClick={() => handleSendReply(selectedNotification.id)}
-                        disabled={!replyDrafts[selectedNotification.id]?.trim() || isSubmittingReply[selectedNotification.id]}
+                        onClick={() => handleSendReply(activeNotification.id)}
+                        disabled={!replyDrafts[activeNotification.id]?.trim() || isSubmittingReply[activeNotification.id]}
                         className="px-6 py-3 rounded-2xl text-sm font-extrabold text-white bg-purple-800 hover:bg-purple-900 disabled:opacity-50 flex items-center space-x-2 transition-all shadow-md cursor-pointer"
                       >
                         <Send className="w-4 h-4 stroke-[2.5]" />
-                        <span>{isSubmittingReply[selectedNotification.id] ? 'Sending...' : 'Send Reply'}</span>
+                        <span>{isSubmittingReply[activeNotification.id] ? 'Sending...' : 'Send Reply'}</span>
                       </button>
                     </div>
                   </div>
@@ -509,7 +535,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                 {detailTarget && (
                   <button
                     id="notification-navigate-action-btn"
-                    onClick={() => handleNavigateNotification(selectedNotification)}
+                    onClick={() => handleNavigateNotification(activeNotification)}
                     className="w-full py-4 px-6 rounded-2xl text-sm font-extrabold text-white bg-emerald-600 hover:bg-emerald-700 border-2 border-emerald-500 transition-colors flex items-center justify-center gap-2 shadow-md cursor-pointer"
                   >
                     <span>{detailTarget.label}</span>

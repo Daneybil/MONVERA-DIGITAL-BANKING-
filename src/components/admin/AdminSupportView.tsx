@@ -76,6 +76,8 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
   const [isProofModalOpen, setIsProofModalOpen] = useState(false);
   const [phoneViewMode, setPhoneViewMode] = useState<'iphone' | 'wide'>('iphone');
   const [mobileShowPhoneChat, setMobileShowPhoneChat] = useState(false);
+  const [chatSyncError, setChatSyncError] = useState<string | null>(null);
+  const [replyDeliveryError, setReplyDeliveryError] = useState<string | null>(null);
 
   // Dedicated refs & state for smooth scrolling without scroll hijacking
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
@@ -170,16 +172,23 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
   useEffect(() => {
     if (sharedChatMessages !== undefined) {
       setAllChatMessages(sharedChatMessages);
+      setChatSyncError(null);
     }
   }, [sharedChatMessages]);
 
   useEffect(() => {
     if (sharedChatMessages !== undefined) return;
-    const unsubscribeChat = firestoreSync.subscribeToAllChatMessages((liveList) => {
-      if (liveList) {
-        setAllChatMessages(liveList);
+    const unsubscribeChat = firestoreSync.subscribeToAllChatMessages(
+      (liveList) => {
+        setChatSyncError(null);
+        if (liveList) {
+          setAllChatMessages(liveList);
+        }
+      },
+      (errMsg) => {
+        setChatSyncError(errMsg);
       }
-    });
+    );
 
     return () => {
       if (typeof unsubscribeChat === 'function') unsubscribeChat();
@@ -217,6 +226,11 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
       {
         userId: string;
         customer?: UserProfile & { balanceMetrics?: any };
+        metadata?: {
+          name?: string;
+          email?: string;
+          accountNumber?: string;
+        };
         lastMessage: ChatMessage;
         unreadCount: number;
         totalMessages: number;
@@ -226,22 +240,36 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     for (const msg of allChatMessages) {
       if (!msg.userId) continue;
       const current = threadsMap.get(msg.userId);
-
       const isUnreadUserMsg = msg.sender === 'user' && msg.status !== 'read';
+      const msgName = msg.sender === 'user' && msg.senderName ? msg.senderName.trim() : undefined;
+      const msgEmail = msg.userEmail ? msg.userEmail.trim() : undefined;
+      const msgAcc = msg.userAccountNumber ? msg.userAccountNumber.trim() : undefined;
 
       if (!current) {
         const foundCustomer = customers.find((c) => c.id === msg.userId);
         threadsMap.set(msg.userId, {
           userId: msg.userId,
           customer: foundCustomer,
+          metadata: {
+            name: msgName,
+            email: msgEmail,
+            accountNumber: msgAcc,
+          },
           lastMessage: msg,
           unreadCount: isUnreadUserMsg ? 1 : 0,
           totalMessages: 1,
         });
       } else {
         const isNewer = new Date(msg.timestamp).getTime() > new Date(current.lastMessage.timestamp).getTime();
+        const foundCustomer = current.customer || customers.find((c) => c.id === msg.userId);
         threadsMap.set(msg.userId, {
           ...current,
+          customer: foundCustomer,
+          metadata: {
+            name: msgName || current.metadata?.name,
+            email: msgEmail || current.metadata?.email,
+            accountNumber: msgAcc || current.metadata?.accountNumber,
+          },
           lastMessage: isNewer ? msg : current.lastMessage,
           unreadCount: isUnreadUserMsg ? current.unreadCount + 1 : current.unreadCount,
           totalMessages: current.totalMessages + 1,
@@ -256,6 +284,11 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
         threadsMap.set(cust.id, {
           userId: cust.id,
           customer: cust,
+          metadata: {
+            name: `${cust.firstName} ${cust.lastName}`.trim(),
+            email: cust.email,
+            accountNumber: cust.permanentAccountNumber,
+          },
           lastMessage: {
             id: `init_${cust.id}`,
             userId: cust.id,
@@ -281,14 +314,14 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     });
   }, [allChatMessages, customers]);
 
-  // Set default selected customer if none selected
+  // Set default selected customer if none selected (does NOT auto-mark messages read)
   useEffect(() => {
     if (!selectedCustomerId && chatThreads.length > 0) {
       setSelectedCustomerId(chatThreads[0].userId);
     }
   }, [selectedCustomerId, chatThreads]);
 
-  // 4. Subscribe to typing status of the selected customer
+  // 4. Subscribe to typing status of the selected customer (no premature auto-read on mount/auto-select)
   useEffect(() => {
     if (!selectedCustomerId) return;
 
@@ -296,21 +329,25 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
       setCustomerIsTyping(!!userTyping);
     });
 
-    // Mark messages as read by admin
-    firestoreSync.markChatMessagesAsRead(selectedCustomerId, 'admin').catch(() => {});
-
     return () => {
       if (typeof unsubscribe === 'function') unsubscribe();
     };
   }, [selectedCustomerId]);
 
+  const markThreadAsRead = (customerId: string) => {
+    if (!customerId) return;
+    firestoreSync.markChatMessagesAsRead(customerId, 'admin').catch(() => {});
+  };
+
   // Filter threads by search term and filter pill
   const filteredChatThreads = chatThreads.filter((t) => {
     const term = chatSearchQuery.toLowerCase();
     const cust = t.customer;
-    const name = cust ? `${cust.firstName} ${cust.lastName}`.toLowerCase() : t.userId.toLowerCase();
-    const email = (cust?.email || '').toLowerCase();
-    const acc = (cust?.permanentAccountNumber || '').toLowerCase();
+    const name = cust
+      ? `${cust.firstName} ${cust.lastName}`.toLowerCase()
+      : (t.metadata?.name || t.userId).toLowerCase();
+    const email = (cust?.email || t.metadata?.email || '').toLowerCase();
+    const acc = (cust?.permanentAccountNumber || t.metadata?.accountNumber || '').toLowerCase();
     const msg = (t.lastMessage.message || '').toLowerCase();
 
     const matchesSearch = name.includes(term) || email.includes(term) || acc.includes(term) || msg.includes(term);
@@ -326,9 +363,40 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     return true;
   });
 
-  // Selected customer object & their messages
+  // Selected customer object (with resilient metadata fallback when customer directory is incomplete/unavailable)
   const selectedCustomerThread = chatThreads.find((t) => t.userId === selectedCustomerId);
-  const selectedCustomer = selectedCustomerThread?.customer || customers.find((c) => c.id === selectedCustomerId);
+  const resolvedDirectoryCustomer =
+    selectedCustomerThread?.customer || customers.find((c) => c.id === selectedCustomerId);
+  const isSelectedCustomerFallback = !resolvedDirectoryCustomer && !!selectedCustomerId;
+
+  const selectedCustomer: (UserProfile & { balanceMetrics?: any }) | undefined = useMemo(() => {
+    if (resolvedDirectoryCustomer) return resolvedDirectoryCustomer;
+    if (!selectedCustomerId) return undefined;
+
+    const fullName = (selectedCustomerThread?.metadata?.name || '').trim();
+    const nameParts = fullName ? fullName.split(/\s+/) : [];
+    const firstName = nameParts[0] || 'Client';
+    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : `#${selectedCustomerId.slice(-6)}`;
+    const email = selectedCustomerThread?.metadata?.email || '';
+    const accountNumber = selectedCustomerThread?.metadata?.accountNumber || '';
+
+    return {
+      id: selectedCustomerId,
+      username: email ? email.split('@')[0] : selectedCustomerId.slice(0, 12),
+      email,
+      firstName,
+      lastName,
+      phone: '',
+      permanentAccountNumber: accountNumber,
+      country: '',
+      role: 'customer',
+      status: 'active',
+      membershipTier: 'Standard',
+      twoFactorEnabled: false,
+      kycStatus: 'pending',
+      createdAt: selectedCustomerThread?.lastMessage.timestamp || new Date().toISOString(),
+    };
+  }, [resolvedDirectoryCustomer, selectedCustomerId, selectedCustomerThread]);
 
   // Memoize active customer messages so reference remains stable across renders unless messages change
   const activeCustomerMessages = useMemo(() => {
@@ -417,6 +485,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     if (!text) return;
 
     setChatReplyInput('');
+    setReplyDeliveryError(null);
     if (adminTypingTimeoutRef.current) clearTimeout(adminTypingTimeoutRef.current);
     firestoreSync.setTypingStatus(selectedCustomerId, false, 'admin').catch(() => {});
 
@@ -432,8 +501,11 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
       status: 'sent',
     };
 
-    // Save to Firestore
-    await firestoreSync.saveChatMessage(supportMsg);
+    // Save to backend API & Firestore
+    const delivered = await firestoreSync.saveChatMessage(supportMsg);
+    if (!delivered) {
+      setReplyDeliveryError('Reply saved locally, but cloud/server delivery failed. Check connection.');
+    }
     // Mark customer's prior messages as read
     await firestoreSync.markChatMessagesAsRead(selectedCustomerId, 'admin');
     setTimeout(() => scrollToBottom('smooth'), 50);
@@ -445,6 +517,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
     if (!file || !selectedCustomerId) return;
 
     setIsUploadingProof(true);
+    setReplyDeliveryError(null);
     const reader = new FileReader();
 
     reader.onload = async () => {
@@ -468,11 +541,15 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
           attachmentSize: file.size,
         };
 
-        await firestoreSync.saveChatMessage(fileMsg);
+        const delivered = await firestoreSync.saveChatMessage(fileMsg);
+        if (!delivered) {
+          setReplyDeliveryError('Attachment saved locally, but cloud/server delivery failed.');
+        }
         await firestoreSync.markChatMessagesAsRead(selectedCustomerId, 'admin');
         setTimeout(() => scrollToBottom('smooth'), 50);
       } catch (err) {
         console.error('Failed to send admin attachment:', err);
+        setReplyDeliveryError('Failed to send attachment. Please try again.');
       } finally {
         setIsUploadingProof(false);
         if (fileUploadInputRef.current) fileUploadInputRef.current.value = '';
@@ -664,6 +741,26 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
         </div>
       </div>
 
+      {/* Sync or Delivery Warning Banner */}
+      {(chatSyncError || replyDeliveryError) && (
+        <div className="bg-amber-50 border border-amber-300 text-amber-950 px-4 py-2.5 rounded-xl flex items-center justify-between gap-3 text-xs font-bold shadow-2xs">
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+            <span className="truncate">{replyDeliveryError || chatSyncError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setChatSyncError(null);
+              setReplyDeliveryError(null);
+            }}
+            className="text-amber-800 hover:text-amber-950 font-black px-1.5 cursor-pointer shrink-0"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* ========================================================================= */}
       {/* 1. LIVE WHATSAPP CHAT DESK */}
       {/* ========================================================================= */}
@@ -774,10 +871,13 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                 filteredChatThreads.map((thread) => {
                   const cust = thread.customer;
                   const isSelected = selectedCustomerId === thread.userId;
-                  const fullName = cust ? `${cust.firstName} ${cust.lastName}`.trim() : thread.userId;
-                  const accMask = cust?.permanentAccountNumber
-                    ? `•••• ${cust.permanentAccountNumber.slice(-4)}`
-                    : '•••• 1000';
+                  const fullName = cust
+                    ? `${cust.firstName} ${cust.lastName}`.trim()
+                    : thread.metadata?.name || thread.userId;
+                  const resolvedAcc = cust?.permanentAccountNumber || thread.metadata?.accountNumber;
+                  const accMask = resolvedAcc
+                    ? `•••• ${resolvedAcc.slice(-4)}`
+                    : '•••• N/A';
                   const isPending = thread.unreadCount > 0;
 
                   return (
@@ -786,6 +886,9 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                       onClick={() => {
                         setSelectedCustomerId(thread.userId);
                         setMobileShowPhoneChat(true);
+                        if (thread.unreadCount > 0) {
+                          markThreadAsRead(thread.userId);
+                        }
                       }}
                       className={`p-3.5 flex items-start gap-3 transition-colors cursor-pointer ${
                         isSelected
@@ -877,17 +980,17 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                       <ChevronLeft className="w-5 h-5" />
                     </button>
                     <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                    <div className="min-w-0">
+                      <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="text-xs sm:text-sm font-black text-white truncate">
                           {selectedCustomer.firstName} {selectedCustomer.lastName}
                         </span>
                         <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-800 hidden sm:inline">
-                          MVB •••• {selectedCustomer.permanentAccountNumber?.slice(-4) || '1000'}
+                          MVB •••• {selectedCustomer.permanentAccountNumber ? selectedCustomer.permanentAccountNumber.slice(-4) : 'N/A'}
                         </span>
                       </div>
                       <div className="text-[11px] text-slate-400 truncate font-mono">
-                        Acc: {selectedCustomer.permanentAccountNumber || '1000000000'} • @{selectedCustomer.username || 'client'}
+                        Acc: {selectedCustomer.permanentAccountNumber || 'N/A'} • @{selectedCustomer.username || 'client'}
                       </div>
                     </div>
                   </div>
@@ -922,6 +1025,17 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                       </button>
                     </div>
 
+                    {(selectedCustomerThread?.unreadCount || 0) > 0 && selectedCustomerId && (
+                      <button
+                        onClick={() => markThreadAsRead(selectedCustomerId)}
+                        className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black flex items-center gap-1 transition-colors cursor-pointer shadow-xs shrink-0"
+                        title="Mark unread customer messages in this conversation as read"
+                      >
+                        <CheckCheck className="w-3.5 h-3.5" />
+                        <span className="hidden md:inline">Mark Read</span>
+                      </button>
+                    )}
+
                     <button
                       onClick={() => setIsProofModalOpen(true)}
                       className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs shrink-0"
@@ -931,7 +1045,7 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                       <span className="hidden md:inline">Request Proof</span>
                     </button>
 
-                    {onSelectCustomer && (
+                    {onSelectCustomer && !isSelectedCustomerFallback && (
                       <button
                         onClick={() => onSelectCustomer(selectedCustomer)}
                         className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold border border-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0"
@@ -1275,6 +1389,11 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                             type="text"
                             placeholder="Type a message..."
                             value={chatReplyInput}
+                            onFocus={() => {
+                              if (selectedCustomerId && (selectedCustomerThread?.unreadCount || 0) > 0) {
+                                markThreadAsRead(selectedCustomerId);
+                              }
+                            }}
                             onChange={handleAdminInputChange}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {
@@ -1632,6 +1751,11 @@ export const AdminSupportView: React.FC<AdminSupportViewProps> = ({
                         type="text"
                         placeholder={`Reply directly to ${selectedCustomer.firstName}...`}
                         value={chatReplyInput}
+                        onFocus={() => {
+                          if (selectedCustomerId && (selectedCustomerThread?.unreadCount || 0) > 0) {
+                            markThreadAsRead(selectedCustomerId);
+                          }
+                        }}
                         onChange={handleAdminInputChange}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') {

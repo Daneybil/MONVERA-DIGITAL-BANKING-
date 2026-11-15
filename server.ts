@@ -2920,13 +2920,99 @@ app.post('/api/notifications/read-all', optionalFirebaseAuth, async (req: Authen
   res.json({ success: true });
 });
 
-app.post('/api/support/reply', (req: Request, res: Response) => {
-  const { notificationId, userId, message } = req.body;
-  if (!notificationId || !userId || !message) {
+app.post('/api/support/reply', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const { notificationId, userId, message } = req.body || {};
+  const cleanMessage = typeof message === 'string' ? message.trim() : '';
+  if (!notificationId || !userId || !cleanMessage) {
     return res.status(400).json({ error: 'Missing required parameters' });
   }
 
-  const result = db.replyToSupportMessage({ notificationId, userId, message });
+  const callerUid = req.auth?.uid;
+  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
+  const isCallerAdmin =
+    adminSess.valid ||
+    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+
+  if (!callerUid && !isCallerAdmin) {
+    return res.status(401).json({ error: 'UNAUTHORIZED: Authentication required to reply to support tickets.' });
+  }
+
+  if (callerUid && !isCallerAdmin && userId !== callerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: You can only reply to your own support notices.' });
+  }
+
+  const effectiveUserId = callerUid && !isCallerAdmin ? callerUid : userId;
+  const nowIso = new Date().toISOString();
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const notifRef = adminFirestore.collection('notifications').doc(notificationId);
+      const snap = await notifRef.get();
+      if (snap.exists) {
+        const existing = snap.data() as any;
+        if (!isCallerAdmin && existing.userId && existing.userId !== effectiveUserId) {
+          return res.status(403).json({ error: 'FORBIDDEN: You are not authorized to reply to this notice.' });
+        }
+
+        let senderName = isCallerAdmin ? 'Specialist' : 'Valued Customer';
+        let senderAvatar: string | undefined;
+        try {
+          const uSnap = await adminFirestore.collection('users').doc(effectiveUserId).get();
+          if (uSnap.exists) {
+            const u = uSnap.data() as any;
+            const fullName = `${u.firstName || ''} ${u.lastName || ''}`.trim();
+            if (fullName) senderName = fullName;
+            senderAvatar = u.avatarUrl;
+          } else {
+            const memUser = db.users.get(effectiveUserId);
+            if (memUser) {
+              senderName = `${memUser.firstName} ${memUser.lastName}`.trim() || senderName;
+              senderAvatar = memUser.avatarUrl;
+            }
+          }
+        } catch {}
+
+        const newReply = {
+          id: `rep_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          sender: isCallerAdmin ? ('support' as const) : ('user' as const),
+          senderRole: isCallerAdmin ? ('ADMIN' as const) : ('CUSTOMER' as const),
+          senderId: effectiveUserId,
+          senderName,
+          ...(senderAvatar ? { senderAvatar } : {}),
+          message: cleanMessage,
+          createdAt: nowIso,
+          timestamp: nowIso,
+        };
+
+        const updatedReplies = [...(Array.isArray(existing.replies) ? existing.replies : []), newReply];
+        const updatedSupportStatus = isCallerAdmin ? 'IN_PROGRESS' : 'OPEN';
+        const updatedDoc = {
+          ...existing,
+          id: existing.id || notificationId,
+          supportTicketId: existing.supportTicketId || notificationId,
+          replies: updatedReplies,
+          supportStatus: updatedSupportStatus,
+          read: isCallerAdmin ? false : true,
+          updatedAt: nowIso,
+        };
+
+        await notifRef.set(updatedDoc, { merge: true });
+
+        // Sync in-memory record if present
+        const memIdx = db.notifications.findIndex((n) => n.id === notificationId);
+        if (memIdx >= 0) {
+          db.notifications[memIdx] = updatedDoc;
+        }
+
+        return res.json({ success: true, notification: updatedDoc });
+      }
+    } catch (fsErr: any) {
+      console.error('[/api/support/reply] Firestore persistence error:', fsErr?.message || fsErr);
+      return res.status(500).json({ error: 'Failed to persist support reply to database. Please try again.' });
+    }
+  }
+
+  const result = db.replyToSupportMessage({ notificationId, userId: effectiveUserId, message: cleanMessage });
   if (!result.success) {
     return res.status(400).json({ error: result.error });
   }
@@ -4501,9 +4587,13 @@ app.get('/api/support/messages', optionalFirebaseAuth, async (req: Authenticated
     adminSess.valid ||
     (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
 
+  if (!callerUid && !isCallerAdmin) {
+    return res.status(401).json({ error: 'UNAUTHORIZED: Authentication is required to access support messages.' });
+  }
+
   const requestedUserId = (req.query.userId as string | undefined)?.trim();
 
-  if (callerUid && !isCallerAdmin && requestedUserId && requestedUserId !== callerUid) {
+  if (!isCallerAdmin && requestedUserId && requestedUserId !== callerUid) {
     return res.status(403).json({ error: 'FORBIDDEN: You are not authorized to access another customer\'s support chat.' });
   }
 
@@ -4511,7 +4601,7 @@ app.get('/api/support/messages', optionalFirebaseAuth, async (req: Authenticated
     return res.status(403).json({ error: 'FORBIDDEN: userId is required for customer support chat access.' });
   }
 
-  const targetUserId = isCallerAdmin ? requestedUserId : (callerUid || requestedUserId);
+  const targetUserId = isCallerAdmin ? requestedUserId : callerUid;
   const msgMap = new Map<string, any>();
 
   // 1. Authoritative messages from Firestore
@@ -4557,12 +4647,16 @@ app.post('/api/support/messages', optionalFirebaseAuth, async (req: Authenticate
     adminSess.valid ||
     (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
 
+  if (!callerUid && !isCallerAdmin) {
+    return res.status(401).json({ error: 'UNAUTHORIZED: Authentication is required to send support messages.' });
+  }
+
   const msg = req.body;
   if (!msg || !msg.id || !msg.userId) {
     return res.status(400).json({ error: 'Valid message with id and userId required.' });
   }
 
-  if (callerUid && !isCallerAdmin && msg.userId !== callerUid) {
+  if (!isCallerAdmin && msg.userId !== callerUid) {
     return res.status(403).json({ error: 'FORBIDDEN: You can only send support messages in your own conversation.' });
   }
 
@@ -4572,15 +4666,19 @@ app.post('/api/support/messages', optionalFirebaseAuth, async (req: Authenticate
     syncedAt: new Date().toISOString(),
   };
 
-  db.supportMessages.set(cleanMsg.id, cleanMsg);
-
   if (isFirebaseAdminConfigured()) {
     try {
       await adminFirestore.collection('support_messages').doc(cleanMsg.id).set(cleanMsg, { merge: true });
     } catch (err: any) {
-      console.warn('[/api/support/messages POST] Firestore note:', err?.message || err);
+      console.error('[/api/support/messages POST] Firestore persistence failure:', err?.message || err);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to persist support message to database. Please retry.',
+      });
     }
   }
+
+  db.supportMessages.set(cleanMsg.id, cleanMsg);
 
   res.json({ success: true, message: cleanMsg });
 });
@@ -4592,12 +4690,16 @@ app.post('/api/support/messages/read', optionalFirebaseAuth, async (req: Authent
     adminSess.valid ||
     (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
 
+  if (!callerUid && !isCallerAdmin) {
+    return res.status(401).json({ error: 'UNAUTHORIZED: Authentication is required to update support message read status.' });
+  }
+
   const { userId, role } = req.body || {};
   if (!userId) {
     return res.status(400).json({ error: 'userId is required' });
   }
 
-  if (callerUid && !isCallerAdmin && userId !== callerUid) {
+  if (!isCallerAdmin && userId !== callerUid) {
     return res.status(403).json({ error: 'FORBIDDEN: You cannot modify another customer\'s support chat.' });
   }
 
