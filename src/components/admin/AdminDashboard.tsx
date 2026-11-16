@@ -61,6 +61,7 @@ import { AdminBankAccountRequestsView } from './AdminBankAccountRequestsView';
 import { AdminBankVerificationRequestsView } from './AdminBankVerificationRequestsView';
 import { AdminCardActivationsView } from './AdminCardActivationsView';
 import { AdminTransfersView } from './AdminTransfersView';
+import { AdminIssuedChecksView } from './AdminIssuedChecksView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
 import { AdminNotificationsView } from './AdminNotificationsView';
 import { AdminAuditLogView } from './AdminAuditLogView';
@@ -68,6 +69,277 @@ import { AdminLoansView } from './AdminLoansView';
 import { AdminWebhooksView } from './AdminWebhooksView';
 import { AdminCustomerDetailsModal } from './AdminCustomerDetailsModal';
 import { AdminLoginForm } from './AdminLoginForm';
+
+const isBalanceFieldPresent = (val: unknown): boolean =>
+  val !== undefined && val !== null && !(typeof val === 'string' && val.trim() === '');
+
+const parseValidatedBalanceCents = (
+  raw: unknown,
+  label: string
+): { cents: number; error?: undefined } | { cents?: undefined; error: string } => {
+  if (typeof raw === 'boolean' || typeof raw === 'object') {
+    return { error: `Customer ${label} balance data is invalid.` };
+  }
+  const num = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(num) || num < 0) {
+    return { error: `Customer ${label} balance is invalid or negative.` };
+  }
+  const cents = Math.round(num * 100);
+  if (cents < 0 || Math.abs(num * 100 - cents) > 1e-4) {
+    return { error: `Customer ${label} balance has invalid monetary precision.` };
+  }
+  return { cents };
+};
+
+const resolveSubAccountEntryCents = (
+  accountsList: any[],
+  targetType: 'CHECKING' | 'SAVINGS' | 'INVESTMENT',
+  label: string
+): { found: boolean; cents: number; code?: undefined; error?: undefined } | { found?: undefined; cents?: undefined; code: string; error: string } => {
+  const matches = accountsList.filter(
+    (a) => String(a?.type || '').trim().toUpperCase() === targetType
+  );
+  if (matches.length === 0) return { found: false, cents: 0 };
+  if (matches.length > 1) {
+    return {
+      code: 'AMBIGUOUS_ACCOUNT_BALANCE',
+      error: `Multiple ${label} entries exist in accounts[] without an authoritative top-level balance.`,
+    };
+  }
+  const entry = matches[0];
+  const hasBal = isBalanceFieldPresent(entry?.balance);
+  const hasAvail = isBalanceFieldPresent(entry?.availableBalance);
+  if (!hasBal && !hasAvail) {
+    return {
+      code: 'INVALID_ACCOUNT_BALANCE',
+      error: `${label} sub-account entry is missing a valid balance value.`,
+    };
+  }
+  const balParsed = hasBal ? parseValidatedBalanceCents(entry.balance, `${label} sub-account`) : null;
+  if (balParsed && balParsed.error) {
+    return { code: 'INVALID_ACCOUNT_BALANCE', error: balParsed.error };
+  }
+  const availParsed = hasAvail
+    ? parseValidatedBalanceCents(entry.availableBalance, `${label} sub-account availableBalance`)
+    : null;
+  if (availParsed && availParsed.error) {
+    return { code: 'INVALID_ACCOUNT_BALANCE', error: availParsed.error };
+  }
+  if (balParsed && availParsed && balParsed.cents !== availParsed.cents) {
+    return {
+      code: 'AMBIGUOUS_ACCOUNT_BALANCE',
+      error: `${label} sub-account balance and availableBalance disagree without an authoritative top-level balance.`,
+    };
+  }
+  return {
+    found: true,
+    cents: balParsed ? (balParsed.cents as number) : availParsed ? (availParsed.cents as number) : 0,
+  };
+};
+
+export function resolveAdminCustomerBalancePreview(incomingMetrics?: any): any {
+  if (!incomingMetrics) {
+    return {
+      checkingBalance: 0,
+      savingsBalance: 0,
+      authoritativeCheckingBalance: 0,
+      authoritativeSavingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 0,
+      availableBalance: 0,
+      pendingBalance: 0,
+      loanBalance: 0,
+      accounts: [],
+      balanceResolutionError: null,
+      balanceResolutionErrorCode: null,
+    };
+  }
+
+  if (incomingMetrics.balanceResolutionError) {
+    return {
+      ...incomingMetrics,
+      checkingBalance: null,
+      savingsBalance: null,
+      authoritativeCheckingBalance: null,
+      authoritativeSavingsBalance: null,
+      investedBalance: null,
+      accruedEarnings: null,
+      totalBalance: null,
+      availableBalance: null,
+      pendingBalance: null,
+      loanBalance: null,
+      accounts: Array.isArray(incomingMetrics.accounts) ? incomingMetrics.accounts : [],
+      balanceResolutionError: incomingMetrics.balanceResolutionError,
+      balanceResolutionErrorCode: incomingMetrics.balanceResolutionErrorCode || 'INVALID_ACCOUNT_BALANCE',
+    };
+  }
+
+  if (incomingMetrics.accounts !== undefined && !Array.isArray(incomingMetrics.accounts)) {
+    return {
+      ...incomingMetrics,
+      checkingBalance: null,
+      savingsBalance: null,
+      authoritativeCheckingBalance: null,
+      authoritativeSavingsBalance: null,
+      investedBalance: null,
+      accruedEarnings: null,
+      totalBalance: null,
+      availableBalance: null,
+      pendingBalance: null,
+      loanBalance: null,
+      accounts: [],
+      balanceResolutionError: 'Customer accounts[] record is malformed.',
+      balanceResolutionErrorCode: 'INVALID_ACCOUNT_BALANCE',
+    };
+  }
+
+  const accountsList = Array.isArray(incomingMetrics.accounts) ? incomingMetrics.accounts : [];
+  const failSafe = (error: string, code: string) => ({
+    ...incomingMetrics,
+    checkingBalance: null,
+    savingsBalance: null,
+    authoritativeCheckingBalance: null,
+    authoritativeSavingsBalance: null,
+    investedBalance: null,
+    accruedEarnings: null,
+    totalBalance: null,
+    availableBalance: null,
+    pendingBalance: null,
+    loanBalance: null,
+    accounts: accountsList,
+    balanceResolutionError: error,
+    balanceResolutionErrorCode: code,
+  });
+
+  // 1. Checking resolution: authoritativeCheckingBalance -> checkingBalance -> accounts[] CHECKING -> availableBalance (only if accounts[] empty)
+  let checkingCents = 0;
+  let hasChecking = false;
+  const rawChecking = isBalanceFieldPresent(incomingMetrics.authoritativeCheckingBalance)
+    ? incomingMetrics.authoritativeCheckingBalance
+    : incomingMetrics.checkingBalance;
+  if (isBalanceFieldPresent(rawChecking)) {
+    const parsed = parseValidatedBalanceCents(rawChecking, 'Checking');
+    if (parsed.error) return failSafe(parsed.error, 'INVALID_ACCOUNT_BALANCE');
+    checkingCents = parsed.cents as number;
+    hasChecking = true;
+  } else {
+    const subChk = resolveSubAccountEntryCents(accountsList, 'CHECKING', 'Checking');
+    if (subChk.error) return failSafe(subChk.error, subChk.code || 'INVALID_ACCOUNT_BALANCE');
+    if (subChk.found) {
+      checkingCents = subChk.cents as number;
+      hasChecking = true;
+    } else if (accountsList.length === 0 && isBalanceFieldPresent(incomingMetrics.availableBalance)) {
+      const parsedAvail = parseValidatedBalanceCents(incomingMetrics.availableBalance, 'Checking available');
+      if (parsedAvail.error) return failSafe(parsedAvail.error, 'INVALID_ACCOUNT_BALANCE');
+      checkingCents = parsedAvail.cents as number;
+      hasChecking = true;
+    }
+  }
+
+  // 2. Savings resolution: authoritativeSavingsBalance -> savingsBalance -> savings -> accounts[] SAVINGS
+  let savingsCents = 0;
+  let hasSavings = false;
+  const rawSavings = isBalanceFieldPresent(incomingMetrics.authoritativeSavingsBalance)
+    ? incomingMetrics.authoritativeSavingsBalance
+    : isBalanceFieldPresent(incomingMetrics.savingsBalance)
+      ? incomingMetrics.savingsBalance
+      : incomingMetrics.savings;
+  if (isBalanceFieldPresent(rawSavings)) {
+    const parsed = parseValidatedBalanceCents(rawSavings, 'Savings');
+    if (parsed.error) return failSafe(parsed.error, 'INVALID_ACCOUNT_BALANCE');
+    savingsCents = parsed.cents as number;
+    hasSavings = true;
+  } else {
+    const subSav = resolveSubAccountEntryCents(accountsList, 'SAVINGS', 'Savings');
+    if (subSav.error) return failSafe(subSav.error, subSav.code || 'INVALID_ACCOUNT_BALANCE');
+    if (subSav.found) {
+      savingsCents = subSav.cents as number;
+      hasSavings = true;
+    }
+  }
+
+  // 3. Invested & Accrued
+  let investedCents = 0;
+  const rawInvested = isBalanceFieldPresent(incomingMetrics.investedBalance)
+    ? incomingMetrics.investedBalance
+    : incomingMetrics.investmentBalance;
+  if (isBalanceFieldPresent(rawInvested)) {
+    const parsed = parseValidatedBalanceCents(rawInvested, 'Invested');
+    if (parsed.error) return failSafe(parsed.error, 'INVALID_ACCOUNT_BALANCE');
+    investedCents = parsed.cents as number;
+  } else {
+    const subInv = resolveSubAccountEntryCents(accountsList, 'INVESTMENT', 'Investment');
+    if (subInv.error) return failSafe(subInv.error, subInv.code || 'INVALID_ACCOUNT_BALANCE');
+    if (subInv.found) investedCents = subInv.cents as number;
+  }
+
+  let accruedCents = 0;
+  if (isBalanceFieldPresent(incomingMetrics.accruedEarnings)) {
+    const parsed = parseValidatedBalanceCents(incomingMetrics.accruedEarnings, 'Accrued earnings');
+    if (parsed.error) return failSafe(parsed.error, 'INVALID_ACCOUNT_BALANCE');
+    accruedCents = parsed.cents as number;
+  }
+
+  const fromCentsLocal = (c: number) => Number((c / 100).toFixed(2));
+  const checking = fromCentsLocal(checkingCents);
+  const savings = fromCentsLocal(savingsCents);
+  const invested = fromCentsLocal(investedCents);
+  const accrued = fromCentsLocal(accruedCents);
+
+  let total = fromCentsLocal(checkingCents + savingsCents + investedCents + accruedCents);
+  if (isBalanceFieldPresent(incomingMetrics.totalBalance)) {
+    const parsedTotal = parseValidatedBalanceCents(incomingMetrics.totalBalance, 'Total');
+    if (parsedTotal.error) return failSafe(parsedTotal.error, 'INVALID_ACCOUNT_BALANCE');
+    total = fromCentsLocal(parsedTotal.cents as number);
+  }
+
+  let available = checking;
+  if (isBalanceFieldPresent(incomingMetrics.availableBalance)) {
+    const parsedAvail = parseValidatedBalanceCents(incomingMetrics.availableBalance, 'Available');
+    if (parsedAvail.error) return failSafe(parsedAvail.error, 'INVALID_ACCOUNT_BALANCE');
+    available = fromCentsLocal(parsedAvail.cents as number);
+  }
+
+  let pending = 0;
+  if (isBalanceFieldPresent(incomingMetrics.pendingBalance)) {
+    const parsedPending = parseValidatedBalanceCents(incomingMetrics.pendingBalance, 'Pending');
+    if (parsedPending.error) return failSafe(parsedPending.error, 'INVALID_ACCOUNT_BALANCE');
+    pending = fromCentsLocal(parsedPending.cents as number);
+  }
+
+  let loanBal = 0;
+  if (isBalanceFieldPresent(incomingMetrics.loanBalance)) {
+    const parsedLoan = parseValidatedBalanceCents(incomingMetrics.loanBalance, 'Loan');
+    if (parsedLoan.error) return failSafe(parsedLoan.error, 'INVALID_ACCOUNT_BALANCE');
+    loanBal = fromCentsLocal(parsedLoan.cents as number);
+  }
+
+  return {
+    ...incomingMetrics,
+    checkingBalance: checking,
+    savingsBalance: savings,
+    authoritativeCheckingBalance: checking,
+    authoritativeSavingsBalance: savings,
+    hasAuthoritativeChecking:
+      typeof incomingMetrics.hasAuthoritativeChecking === 'boolean'
+        ? incomingMetrics.hasAuthoritativeChecking
+        : hasChecking,
+    hasAuthoritativeSavings:
+      typeof incomingMetrics.hasAuthoritativeSavings === 'boolean'
+        ? incomingMetrics.hasAuthoritativeSavings
+        : hasSavings,
+    investedBalance: invested,
+    accruedEarnings: accrued,
+    totalBalance: total,
+    availableBalance: available,
+    pendingBalance: pending,
+    loanBalance: loanBal,
+    accounts: accountsList,
+    balanceResolutionError: null,
+    balanceResolutionErrorCode: null,
+  };
+}
 
 export const AdminDashboard: React.FC = () => {
   const { currentUser, isLoading: isAuthLoading, balanceMetrics: currentAuthBalanceMetrics, refreshBalance, refreshNotifications, setCurrentView, openModal, updateUser } = useAuth();
@@ -95,6 +367,7 @@ export const AdminDashboard: React.FC = () => {
   const [isServerAdminVerified, setIsServerAdminVerified] = useState<boolean | null>(null);
   const [verificationStatus, setVerificationStatus] = useState<'checking' | 'verified' | 'denied' | 'error'>('checking');
   const [verificationError, setVerificationError] = useState<string | null>(null);
+  const [sessionReauthNotice, setSessionReauthNotice] = useState<string | null>(null);
   const [verifyAttempt, setVerifyAttempt] = useState<number>(0);
   const verifiedUidRef = useRef<string | null>(null);
   const lastCheckedKeyRef = useRef<string | null>(null);
@@ -185,6 +458,7 @@ export const AdminDashboard: React.FC = () => {
         setIsServerAdminVerified(true);
         setVerificationStatus('verified');
         setVerificationError(null);
+        setSessionReauthNotice(null);
         if (currentUser && currentUser.role !== 'admin') {
           updateUser({ ...currentUser, role: 'admin' }, { skipFirestoreSync: true });
         }
@@ -204,6 +478,15 @@ export const AdminDashboard: React.FC = () => {
         setIsServerAdminVerified(false);
         setVerificationStatus('denied');
         setVerificationError(null);
+        if (check.errorCode === 'ADMIN_SESSION_INVALID') {
+          setSessionReauthNotice(
+            check.sessionExpired
+              ? 'Your 8-hour executive administrator session has expired. Please re-authenticate with your administrator password to continue.'
+              : 'Your Firebase identity is recognized, but an active executive administrator session is required. Please sign in to continue.'
+          );
+        } else {
+          setSessionReauthNotice(null);
+        }
       }
     }
     verifyAdminSession();
@@ -224,28 +507,13 @@ export const AdminDashboard: React.FC = () => {
     const frozenRaw = typeof window !== 'undefined' ? localStorage.getItem('monvera_frozen_accounts') : null;
     const frozenIds = new Set<string>(frozenRaw ? JSON.parse(frozenRaw) : []);
 
-    // Ensure customer balances are 100% authoritative from Firestore metrics
+    // Ensure customer balances mirror the exact authoritative Stage 7 checking/savings resolution
     const resolveCustomerBalances = (
       _userId: string,
       _accNum?: string,
       incomingMetrics?: any
     ): any => {
-      const checking = Number(incomingMetrics?.checkingBalance || 0);
-      const savings = Number(incomingMetrics?.savingsBalance || 0);
-      const invested = Number(incomingMetrics?.investedBalance || 0);
-      const accrued = Number(incomingMetrics?.accruedEarnings || 0);
-      const total = Number(incomingMetrics?.totalBalance || (checking + savings + invested + accrued));
-
-      return {
-        checkingBalance: checking,
-        savingsBalance: savings,
-        investedBalance: invested,
-        accruedEarnings: accrued,
-        totalBalance: total || (checking + savings + invested + accrued),
-        availableBalance: Number(incomingMetrics?.availableBalance ?? checking),
-        pendingBalance: Number(incomingMetrics?.pendingBalance || 0),
-        accounts: incomingMetrics?.accounts || [],
-      };
+      return resolveAdminCustomerBalancePreview(incomingMetrics);
     };
 
     const firestoreCustomerIds = new Set<string>();
@@ -1014,6 +1282,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'card_activations', label: 'Debit Card Activations', icon: KeyRound, alertBadge: pendingCardActivationsCount > 0 ? pendingCardActivationsCount : undefined },
     { id: 'bank_approvals', label: 'Bank Account Requests', icon: Landmark, alertBadge: pendingBankAppsCount > 0 ? pendingBankAppsCount : undefined },
     { id: 'bank_verifications', label: 'Bank Verification Requests', icon: ShieldCheck, alertBadge: pendingBankVerificationsCount > 0 ? pendingBankVerificationsCount : undefined },
+    { id: 'issued_checks', label: 'Issued Checks', icon: FileText },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
       id: 'loans',
@@ -1096,6 +1365,8 @@ export const AdminDashboard: React.FC = () => {
   if (!isAdmin) {
     return (
       <AdminLoginForm
+        sessionNotice={sessionReauthNotice}
+        onSuccess={() => setVerifyAttempt((n) => n + 1)}
         onCancel={() => setCurrentView('home')}
       />
     );
@@ -1387,6 +1658,13 @@ export const AdminDashboard: React.FC = () => {
 
         {activeTab === 'bank_verifications' && (
           <AdminBankVerificationRequestsView onRefreshData={loadAllAdminData} />
+        )}
+
+        {activeTab === 'issued_checks' && (
+          <AdminIssuedChecksView
+            customers={customers}
+            onRefreshData={loadAllAdminData}
+          />
         )}
 
         {activeTab === 'transfers' && (

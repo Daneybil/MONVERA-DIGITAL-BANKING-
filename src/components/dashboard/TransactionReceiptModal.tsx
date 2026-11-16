@@ -178,13 +178,16 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
      transaction.senderName?.includes('Bennett Johnson')) &&
     (isRecipient || transaction.userId === currentUser?.id || transaction.recipientUserId === currentUser?.id);
 
-  const isCredit =
-    (isRecipient && !isSender) ||
-    isAdminTransferCredit ||
-    transaction.type === 'DEPOSIT' ||
-    transaction.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-    transaction.type === 'INVESTMENT_EARNING' ||
-    transaction.type === 'INVESTMENT_MATURITY';
+  const isCheckWithdrawalDebit = transaction.type === 'CHECK_WITHDRAWAL';
+
+  const isCredit = isCheckWithdrawalDebit
+    ? false
+    : (isRecipient && !isSender) ||
+      isAdminTransferCredit ||
+      transaction.type === 'DEPOSIT' ||
+      transaction.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+      transaction.type === 'INVESTMENT_EARNING' ||
+      transaction.type === 'INVESTMENT_MATURITY';
 
   const cleanSenderName = (transaction.senderName || '').replace(/\s*\(Admin\)/i, '').trim();
   const displayDescription = (transaction.description && transaction.description.toLowerCase().includes('administrative direct transfer'))
@@ -212,6 +215,8 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
         return 'Electronic Funds Deposit';
       case 'WITHDRAWAL':
         return 'External Wire / Account Withdrawal';
+      case 'CHECK_WITHDRAWAL':
+        return 'Check Withdrawal';
       case 'INVESTMENT':
         return 'High-Yield Treasury Allocation';
       case 'INVESTMENT_EARNING':
@@ -236,7 +241,8 @@ Flow: ${isCredit ? 'CREDIT (+)' : 'DEBIT (-)'}
 Amount: $${transaction.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
 Fee: $${(transaction.fee || 0).toFixed(2)} USD
 Sender: ${transaction.senderName || 'Monvera Authorized Account'} (${transaction.senderAccountNumber || 'MVB •••• 9921'})
-Recipient: ${transaction.recipientName || 'Monvera Authorized Account'} (${transaction.recipientAccountNumber || 'MVB •••• 7391'})
+${isCheckWithdrawalDebit ? `Payee: ${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Payee'} (${transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'Check'})
+Source Account: ${transaction.metadata?.sourceAccountType || 'CHECKING'}` : `Recipient: ${transaction.recipientName || 'Monvera Authorized Account'} (${transaction.recipientAccountNumber || 'MVB •••• 7391'})`}
 Date & Time: ${formattedDate} at ${formattedTime}
 Reference: ${transaction.referenceNumber}
 Ledger Hash: ${transaction.id}
@@ -482,9 +488,10 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
       <div class="item-val">${transaction.senderName || 'Authorized Sender'} (${transaction.senderAccountNumber || 'MVB •••• 9921'})</div>
     </div>
     <div class="item">
-      <div class="item-label">Recipient</div>
-      <div class="item-val">${transaction.recipientName || 'Authorized Recipient'} (${transaction.recipientAccountNumber || 'MVB •••• 7391'})</div>
+      <div class="item-label">${isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient'}</div>
+      <div class="item-val">${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Recipient'} (${isCheckWithdrawalDebit && transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'MVB •••• 7391'})</div>
     </div>
+    ${isCheckWithdrawalDebit ? `<div class="item" style="grid-column: span 2;"><div class="item-label">Source Account</div><div class="item-val">${transaction.metadata?.sourceAccountType || 'CHECKING'}</div></div>` : ''}
     <div class="item">
       <div class="item-label">Date & Time</div>
       <div class="item-val">${formattedDate} • ${formattedTime}</div>
@@ -628,13 +635,15 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
 
               <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
                 <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                  Recipient Information
+                  {isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient Information'}
                 </span>
                 <div className="text-sm font-black text-slate-950">
-                  {transaction.recipientName || 'Monvera Authorized Account'}
+                  {transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
                 </div>
                 <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                  {transaction.recipientAccountNumber || 'MVB •••• 7391'}
+                  {isCheckWithdrawalDebit && transaction.metadata?.checkNumber
+                    ? `Check #${transaction.metadata.checkNumber}${transaction.metadata?.sourceAccountType ? ` • ${transaction.metadata.sourceAccountType}` : ''}`
+                    : transaction.recipientAccountNumber || 'MVB •••• 7391'}
                 </div>
               </div>
 
@@ -784,16 +793,18 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
               </div>
             </div>
 
-            {/* Recipient Details */}
+            {/* Recipient / Check Payee Details */}
             <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
               <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                Recipient Information
+                {isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient Information'}
               </span>
               <div className="text-sm font-black text-slate-950">
-                {transaction.recipientName || 'Monvera Authorized Account'}
+                {transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
               </div>
               <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                {transaction.recipientAccountNumber || 'MVB •••• 7391'}
+                {isCheckWithdrawalDebit && transaction.metadata?.checkNumber
+                  ? `Check #${transaction.metadata.checkNumber}${transaction.metadata?.sourceAccountType ? ` • ${transaction.metadata.sourceAccountType}` : ''}`
+                  : transaction.recipientAccountNumber || 'MVB •••• 7391'}
               </div>
             </div>
 

@@ -17,9 +17,10 @@ import {
 interface AdminLoginFormProps {
   onCancel?: () => void;
   onSuccess?: () => void;
+  sessionNotice?: string | null;
 }
 
-export const AdminLoginForm: React.FC<AdminLoginFormProps> = ({ onCancel, onSuccess }) => {
+export const AdminLoginForm: React.FC<AdminLoginFormProps> = ({ onCancel, onSuccess, sessionNotice }) => {
   const { adminLogin, setCurrentView } = useAuth();
 
   const [email, setEmail] = useState('');
@@ -164,6 +165,17 @@ export const AdminLoginForm: React.FC<AdminLoginFormProps> = ({ onCancel, onSucc
           </span>
           <span className="text-amber-400/90 font-medium">Server Session Enforced</span>
         </div>
+
+        {/* Session Expiration / Re-authentication Notice */}
+        {sessionNotice && !errorInfo && (
+          <div className="mt-5 p-3.5 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-amber-200 text-xs space-y-1 relative z-10">
+            <div className="flex items-center gap-2 font-bold text-amber-300">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>Administrator Session Re-Authentication Required</span>
+            </div>
+            <p className="text-[12px] text-amber-100 leading-relaxed pl-6">{sessionNotice}</p>
+          </div>
+        )}
 
         {/* Error Notification Alert */}
         {errorInfo && (

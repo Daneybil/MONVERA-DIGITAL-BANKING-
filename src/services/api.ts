@@ -19,6 +19,7 @@ import {
   LinkedBankAccountApplication,
   CardActivationRequest,
   CardActivationStatus,
+  IssuedCheckRecord,
 } from '../types';
 import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc, setDoc, deleteField } from 'firebase/firestore';
@@ -48,14 +49,33 @@ async function fetchWithSameOriginFallback(endpoint: string, init?: RequestInit)
 async function fetchWithFreshAuthRetry(
   endpoint: string,
   buildHeaders: (forceRefresh?: boolean) => Promise<Record<string, string>>,
-  init?: Omit<RequestInit, 'headers'>
+  init?: Omit<RequestInit, 'headers'>,
+  options?: {
+    hasAuthenticatedUser?: () => boolean;
+    fetchFn?: (endpoint: string, init?: RequestInit) => Promise<Response>;
+    shouldRetryOn401?: (res: Response) => Promise<boolean> | boolean;
+    onRefreshAttempted?: (succeeded: boolean) => void;
+  }
 ): Promise<Response> {
+  const fetchFn = options?.fetchFn || fetchWithSameOriginFallback;
+  const hasUser = options?.hasAuthenticatedUser ? options.hasAuthenticatedUser() : Boolean(auth?.currentUser);
   const headers = await buildHeaders(false);
-  const res = await fetchWithSameOriginFallback(endpoint, { ...init, headers });
-  if (res.status === 401 && auth?.currentUser) {
-    const refreshedHeaders = await buildHeaders(true);
-    if (refreshedHeaders['Authorization']) {
-      return await fetchWithSameOriginFallback(endpoint, { ...init, headers: refreshedHeaders });
+  const res = await fetchFn(endpoint, { ...init, headers });
+  if (res.status === 401 && hasUser) {
+    const eligible = options?.shouldRetryOn401 ? await options.shouldRetryOn401(res) : true;
+    if (!eligible) {
+      return res;
+    }
+    let refreshedHeaders: Record<string, string> | null = null;
+    try {
+      refreshedHeaders = await buildHeaders(true);
+    } catch {
+      refreshedHeaders = null;
+    }
+    const hasFreshToken = Boolean(refreshedHeaders && refreshedHeaders['Authorization']);
+    options?.onRefreshAttempted?.(hasFreshToken);
+    if (hasFreshToken && refreshedHeaders) {
+      return await fetchFn(endpoint, { ...init, headers: refreshedHeaders });
     }
   }
   return res;
@@ -84,8 +104,18 @@ export interface AdminSessionVerificationResult {
   isAdmin: boolean;
   uid?: string;
   email?: string;
+  expiresAt?: number;
+  hasAdminIdentity?: boolean;
+  sessionExpired?: boolean;
   error?: string;
-  errorCode?: 'NO_TOKEN' | 'UNAUTHORIZED' | 'FORBIDDEN' | 'CONFIG_UNAVAILABLE' | 'SERVER_ERROR' | 'NETWORK_FAILURE';
+  errorCode?:
+    | 'NO_TOKEN'
+    | 'UNAUTHORIZED'
+    | 'FORBIDDEN'
+    | 'ADMIN_SESSION_INVALID'
+    | 'CONFIG_UNAVAILABLE'
+    | 'SERVER_ERROR'
+    | 'NETWORK_FAILURE';
   recoverable?: boolean;
 }
 
@@ -357,6 +387,189 @@ export interface RecipientLookupResult {
   membershipTier?: string;
   verified?: boolean;
   error?: string;
+}
+
+export interface IssueAdminCheckDeps {
+  hasAuthenticatedUser?: () => boolean;
+  buildHeaders?: (forceRefresh?: boolean) => Promise<Record<string, string>>;
+  fetchFn?: (endpoint: string, init?: RequestInit) => Promise<Response>;
+}
+
+export async function issueAdminCheckWithAuthRetry(
+  data: {
+    customerIdentifier: string;
+    sourceAccountType: 'CHECKING' | 'SAVINGS';
+    checkNumber: string;
+    payeeName: string;
+    amount: number;
+    memo?: string;
+    idempotencyKey: string;
+  },
+  deps?: IssueAdminCheckDeps
+): Promise<{
+  success: boolean;
+  check?: IssuedCheckRecord;
+  transaction?: Transaction;
+  balanceMetrics?: BalanceMetrics;
+  isDuplicate?: boolean;
+  warnings?: string[];
+  isRetryableTimeout?: boolean;
+  errorCode?: string;
+  error?: string;
+}> {
+  const hasUser = deps?.hasAuthenticatedUser ? deps.hasAuthenticatedUser() : Boolean(auth?.currentUser);
+  const buildHeaders = deps?.buildHeaders || ((forceRefresh = false) => getAuthHeaders(forceRefresh));
+  const fetchFn = deps?.fetchFn || fetchWithSameOriginFallback;
+
+  if (!hasUser) {
+    return {
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'Administrator authentication required. Please sign into an authorized administrator account.',
+    };
+  }
+
+  const serializedBody = JSON.stringify({
+    customerIdentifier: data.customerIdentifier,
+    sourceAccountType: data.sourceAccountType,
+    checkNumber: data.checkNumber,
+    payeeName: data.payeeName,
+    amount: data.amount,
+    memo: data.memo || '',
+    idempotencyKey: data.idempotencyKey,
+  });
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 30000) : null;
+
+  let refreshAttempted = false;
+  let refreshSucceeded = false;
+  let initialTokenValidated = false;
+
+  const safeBuildHeaders = async (forceRefresh = false): Promise<Record<string, string>> => {
+    const hdrs = await buildHeaders(forceRefresh);
+    if (!forceRefresh && !hdrs['Authorization']) {
+      const freshHdrs = await buildHeaders(true);
+      initialTokenValidated = Boolean(freshHdrs['Authorization']);
+      return freshHdrs;
+    }
+    if (!forceRefresh) {
+      initialTokenValidated = Boolean(hdrs['Authorization']);
+    }
+    return hdrs;
+  };
+
+  try {
+    const preHeaders = await safeBuildHeaders(false);
+    if (!preHeaders['Authorization']) {
+      if (timeoutId) clearTimeout(timeoutId);
+      return {
+        success: false,
+        errorCode: 'TOKEN_REFRESH_FAILED',
+        error:
+          'Unable to obtain a valid administrator authentication token. Please re-authenticate and safely retry.',
+      };
+    }
+
+    let firstAttempt = true;
+    const res = await fetchWithFreshAuthRetry(
+      '/api/admin/checks/issue',
+      async (forceRefresh = false) => {
+        if (firstAttempt && !forceRefresh && initialTokenValidated) {
+          firstAttempt = false;
+          return preHeaders;
+        }
+        firstAttempt = false;
+        return await buildHeaders(forceRefresh);
+      },
+      {
+        method: 'POST',
+        body: serializedBody,
+        ...(controller ? { signal: controller.signal } : {}),
+      },
+      {
+        hasAuthenticatedUser: () => hasUser,
+        fetchFn,
+        shouldRetryOn401: async (failedRes: Response) => {
+          const peek = await failedRes
+            .clone()
+            .json()
+            .catch(() => null);
+          // Only refresh Firebase ID token when rejection is not specifically an expired/missing separate X-Admin-Session
+          return peek?.errorCode !== 'ADMIN_SESSION_INVALID';
+        },
+        onRefreshAttempted: (succeeded: boolean) => {
+          refreshAttempted = true;
+          refreshSucceeded = succeeded;
+        },
+      }
+    );
+
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const parsed = await parseJsonResponse<{
+      success?: boolean;
+      check?: IssuedCheckRecord;
+      transaction?: Transaction;
+      balanceMetrics?: BalanceMetrics;
+      isDuplicate?: boolean;
+      warnings?: string[];
+      errorCode?: string;
+      error?: string;
+    }>(res, { success: false });
+
+    if (!res.ok || !parsed.success || !parsed.check || !parsed.transaction) {
+      const isTransient = res.status >= 500;
+      const derivedErrorCode =
+        refreshAttempted && !refreshSucceeded
+          ? 'TOKEN_REFRESH_FAILED'
+          : parsed.errorCode || (res.status === 401 ? 'UNAUTHORIZED' : undefined);
+      return {
+        success: false,
+        errorCode: derivedErrorCode,
+        isRetryableTimeout: isTransient,
+        error:
+          refreshAttempted && !refreshSucceeded
+            ? 'Firebase authentication token renewal failed. Please re-authenticate and safely retry with your preserved check details.'
+            : parsed.error || `Failed to issue check (HTTP ${res.status}).`,
+      };
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('monvera_balance_updated', {
+            detail: { userId: parsed.check.userId, balanceMetrics: parsed.balanceMetrics },
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('monvera_transaction_created', {
+            detail: { userId: parsed.check.userId, transaction: parsed.transaction },
+          })
+        );
+      } catch {}
+    }
+
+    return {
+      success: true,
+      check: parsed.check,
+      transaction: parsed.transaction,
+      balanceMetrics: parsed.balanceMetrics,
+      isDuplicate: parsed.isDuplicate || false,
+      warnings: parsed.warnings,
+    };
+  } catch (err: any) {
+    if (timeoutId) clearTimeout(timeoutId);
+    const isAbort = err?.name === 'AbortError';
+    return {
+      success: false,
+      isRetryableTimeout: true,
+      errorCode: isAbort ? 'REQUEST_TIMEOUT' : 'NETWORK_FAILURE',
+      error: isAbort
+        ? 'The check issuance request timed out waiting for server confirmation. Your idempotency key is preserved so retrying will safely confirm or complete without double-debiting.'
+        : formatApiNetworkError(err, 'issue check'),
+    };
+  }
 }
 
 export const api = {
@@ -1799,8 +2012,13 @@ export const api = {
     const adminToken = getAdminSessionToken() || '';
     const cacheKey = `${fbUser.uid}:${adminToken}`;
 
+    const isCacheExpired = Boolean(
+      lastVerifiedAdminCache?.result?.expiresAt && Date.now() >= lastVerifiedAdminCache.result.expiresAt
+    );
+
     if (
       !options?.forceRefresh &&
+      !isCacheExpired &&
       lastVerifiedAdminCache &&
       lastVerifiedAdminCache.key === cacheKey &&
       lastVerifiedAdminCache.result.isAdmin &&
@@ -1858,8 +2076,14 @@ export const api = {
 
       let attempt = await attemptVerify(!!options?.forceRefresh);
 
-      // Recover from stale cached Firebase ID token on initial 401 right after token minting/refresh
-      if (!attempt.ok && attempt.status === 401 && !options?.forceRefresh) {
+      // Recover from stale cached Firebase ID token on initial 401 right after token minting/refresh,
+      // unless the server explicitly reported ADMIN_SESSION_INVALID (missing/expired X-Admin-Session)
+      if (
+        !attempt.ok &&
+        attempt.status === 401 &&
+        attempt.data?.errorCode !== 'ADMIN_SESSION_INVALID' &&
+        !options?.forceRefresh
+      ) {
         attempt = await attemptVerify(true);
       }
 
@@ -1874,6 +2098,7 @@ export const api = {
           isAdmin: true,
           uid: attempt.data.uid || fbUser.uid,
           email: attempt.data.email || fbUser.email || undefined,
+          expiresAt: typeof attempt.data.expiresAt === 'number' ? attempt.data.expiresAt : undefined,
           recoverable: false,
         };
         lastVerifiedAdminCache = {
@@ -1886,10 +2111,17 @@ export const api = {
 
       if (attempt.status === 401 || attempt.status === 403) {
         clearAdminSessionToken();
+        const isSessionInvalid = attempt.data?.errorCode === 'ADMIN_SESSION_INVALID';
         return {
           isAdmin: false,
           recoverable: false,
-          errorCode: attempt.status === 401 ? 'UNAUTHORIZED' : 'FORBIDDEN',
+          hasAdminIdentity: Boolean(attempt.data?.hasAdminIdentity),
+          sessionExpired: Boolean(attempt.data?.sessionExpired),
+          errorCode: isSessionInvalid
+            ? 'ADMIN_SESSION_INVALID'
+            : attempt.status === 401
+            ? 'UNAUTHORIZED'
+            : 'FORBIDDEN',
           error: attempt.data?.error || 'Administrator session authorization rejected by server.',
         };
       }
@@ -2333,6 +2565,68 @@ export const api = {
         error: `Network failure connecting to Monvera Banking Core: ${err?.message || 'Unable to reach server'}`,
       };
     }
+  },
+
+  async getAdminIssuedChecks(): Promise<{
+    success: boolean;
+    checks: IssuedCheckRecord[];
+    error?: string;
+    errorCode?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        '/api/admin/checks',
+        (forceRefresh) => getAuthHeaders(forceRefresh)
+      );
+      const parsed = await parseJsonResponse<{
+        success?: boolean;
+        checks?: IssuedCheckRecord[];
+        error?: string;
+        errorCode?: string;
+      }>(res, { success: false, checks: [] });
+
+      if (!res.ok || parsed.success === false) {
+        return {
+          success: false,
+          checks: [],
+          errorCode: parsed.errorCode,
+          error: parsed.error || `Unable to load issued checks (HTTP ${res.status}).`,
+        };
+      }
+
+      return {
+        success: true,
+        checks: Array.isArray(parsed.checks) ? parsed.checks : [],
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        checks: [],
+        error: formatApiNetworkError(err, 'load issued checks'),
+      };
+    }
+  },
+
+  async issueAdminCheck(data: {
+    customerIdentifier: string;
+    sourceAccountType: 'CHECKING' | 'SAVINGS';
+    checkNumber: string;
+    payeeName: string;
+    amount: number;
+    memo?: string;
+    idempotencyKey: string;
+  }): Promise<{
+    success: boolean;
+    check?: IssuedCheckRecord;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    isDuplicate?: boolean;
+    warnings?: string[];
+    isRetryableTimeout?: boolean;
+    errorCode?: string;
+    error?: string;
+  }> {
+    return issueAdminCheckWithAuthRetry(data);
   },
 
   async issueAdminDevFunding(data: {

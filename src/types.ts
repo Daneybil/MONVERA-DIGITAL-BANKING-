@@ -90,6 +90,7 @@ export interface BankAccount {
 export type TransactionType =
   | 'DEPOSIT'
   | 'WITHDRAWAL'
+  | 'CHECK_WITHDRAWAL'
   | 'TRANSFER'
   | 'INVESTMENT'
   | 'INVESTMENT_EARNING'
@@ -120,7 +121,7 @@ export interface Transaction {
   recipientAccountNumber?: string;
   fee: number;
   description: string;
-  category: 'Transfers' | 'Deposits' | 'Withdrawals' | 'Investments' | 'Shopping' | 'Earnings' | 'System' | 'Bills' | 'Rewards';
+  category: 'Transfers' | 'Deposits' | 'Withdrawals' | 'Checks' | 'Investments' | 'Shopping' | 'Earnings' | 'System' | 'Bills' | 'Rewards';
   paymentProviderRef?: string;
   createdAt: string;
   completedAt?: string;
@@ -170,6 +171,31 @@ export interface WithdrawalSupportRecord {
   sourceAccountType?: 'CHECKING' | 'SAVINGS';
   destinationLabel?: string;
   notes?: string;
+}
+
+export interface IssuedCheckRecord {
+  checkId: string;
+  checkNumber: string;
+  normalizedCheckNumber?: string;
+  userId: string;
+  customerName: string;
+  customerAccountNumber: string;
+  customerEmail?: string;
+  payeeName: string;
+  amount: number;
+  currency: string;
+  sourceAccountType: 'CHECKING' | 'SAVINGS';
+  sourceAccountId?: string;
+  sourceAccountNumber?: string;
+  memo?: string;
+  referenceNumber: string;
+  transactionId: string;
+  status: 'ISSUED';
+  debitStatus: 'COMPLETED';
+  issuedByUid: string;
+  issuedByEmail: string;
+  issuedAt: string;
+  idempotencyKey: string;
 }
 
 export type BankAccountApplicationStatus = 'pending' | 'approved' | 'rejected' | 'activated' | 'cancelled';

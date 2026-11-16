@@ -10,6 +10,7 @@ import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview }
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest, createAdminSessionToken, verifyAdminSessionToken } from './server/authMiddleware';
 import { adminAuth, adminFirestore, isFirebaseAdminConfigured, getFirebaseAdminDiagnostics } from './server/firebaseAdmin';
+import { executeServerAdminCheckWithdrawal, getAllIssuedChecksAdmin, resolveCustomerPreviewBalanceMetrics } from './server/adminCheckService';
 import {
   executeServerTransfer,
   executeServerWithdrawal,
@@ -2342,6 +2343,7 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
   if (flow && flow !== 'ALL' && userId) {
     if (flow === 'CREDIT') {
       txs = txs.filter((t) => {
+        if (t.type === 'CHECK_WITHDRAWAL') return false;
         const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
         const txRecipClean = (t.recipientAccountNumber || '').replace(/[-\s]/g, '');
         const isRecipient = t.recipientUserId === userId || (!t.recipientUserId && t.userId === userId) || (userAccClean && txRecipClean && txRecipClean === userAccClean);
@@ -2361,6 +2363,7 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
       });
     } else if (flow === 'DEBIT') {
       txs = txs.filter((t) => {
+        if (t.type === 'CHECK_WITHDRAWAL') return true;
         const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
         const txSenderClean = (t.senderAccountNumber || '').replace(/[-\s]/g, '');
         const isOutgoing = (t.senderUserId === userId && t.recipientUserId !== userId) || (userAccClean && txSenderClean && txSenderClean === userAccClean);
@@ -3087,11 +3090,27 @@ app.post('/api/security/sessions/:id/terminate', (req: Request, res: Response) =
 
 // --- ADMIN SYSTEM & GOVERNANCE ---
 app.get('/api/admin/verify-session', requireAdminAuth, (req: AuthenticatedRequest, res: Response) => {
+  const headerSessionToken = req.headers['x-admin-session'] as string | undefined;
+  const effectiveSessionToken = headerSessionToken || req.auth?.adminSessionToken;
+  const sessionCheck = verifyAdminSessionToken(effectiveSessionToken, req.auth!.uid, req.auth!.email);
+  if (!sessionCheck.valid) {
+    const isExpired = sessionCheck.reason === 'Admin session expired';
+    return res.status(401).json({
+      success: false,
+      isAdmin: false,
+      hasAdminIdentity: true,
+      sessionExpired: isExpired,
+      errorCode: 'ADMIN_SESSION_INVALID',
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Valid non-expired administrator session is required. Please sign in to the Executive Console again.'}`,
+    });
+  }
+
   res.json({
     success: true,
     isAdmin: true,
     uid: req.auth!.uid,
     email: req.auth!.email,
+    expiresAt: sessionCheck.payload?.exp,
   });
 });
 
@@ -3444,56 +3463,10 @@ app.get('/api/admin/customers', requireAdminAuth, async (req: AuthenticatedReque
       const ad = accountsMap.get(fu.id) || (cleanAcc ? accountsMap.get(cleanAcc) : null);
       let balanceMetrics: any;
       if (ad) {
-        const chk = Number(ad.checkingBalance ?? 0);
-        const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
-        const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
-        const accrued = Number(ad.accruedEarnings ?? 0);
-        const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
-        const avail = Number(ad.availableBalance ?? chk);
-        const loanBal = Number(ad.loanBalance ?? 0);
-        const pending = Number(ad.pendingBalance ?? 0);
-        const accountsList = ad.accounts || [
-          {
-            id: `acc_chk_${fu.id}`,
-            userId: fu.id,
-            type: 'CHECKING',
-            accountNumber: cleanAcc || '1000000000',
-            routingNumber: '021000021',
-            currency: 'USD',
-            balance: chk,
-            availableBalance: avail,
-            investedBalance: inv,
-            pendingBalance: pending,
-            status: 'ACTIVE',
-            nickname: 'Monvera Premier Checking',
-          },
-          {
-            id: `acc_sav_${fu.id}`,
-            userId: fu.id,
-            type: 'SAVINGS',
-            accountNumber: cleanAcc ? `10${cleanAcc.slice(2, -3)}991` : '1000000991',
-            routingNumber: '021000021',
-            currency: 'USD',
-            balance: sav,
-            availableBalance: sav,
-            investedBalance: 0,
-            pendingBalance: 0,
-            interestRateAPY: 4.85,
-            status: 'ACTIVE',
-            nickname: 'Monvera High-Yield Treasury',
-          },
-        ];
-        balanceMetrics = {
-          checkingBalance: chk,
-          savingsBalance: sav,
-          investedBalance: inv,
-          accruedEarnings: accrued,
-          totalBalance: total,
-          availableBalance: avail,
-          pendingBalance: pending,
-          loanBalance: loanBal,
-          accounts: accountsList,
-        };
+        balanceMetrics = resolveCustomerPreviewBalanceMetrics(ad, {
+          userId: fu.id,
+          accountNumber: cleanAcc,
+        });
       } else if (db.users.has(fu.id)) {
         balanceMetrics = db.getUserBalanceMetrics(fu.id);
       } else {
@@ -3992,6 +3965,50 @@ app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, async (r
   const { status, reason } = req.body;
   if (!status) return res.status(400).json({ error: 'status is required' });
 
+  // Protect permanent CHECK_WITHDRAWAL debits from status-only reversal/override
+  const normalizedTargetStatus = String(status).trim().toUpperCase();
+  const memTxMatch = db.transactions.find((t) => t.id === id || t.referenceNumber === id);
+  if (
+    memTxMatch &&
+    (memTxMatch.type === 'CHECK_WITHDRAWAL' || memTxMatch.metadata?.permanentDebit === true) &&
+    (normalizedTargetStatus === 'REVERSED' || normalizedTargetStatus !== 'COMPLETED')
+  ) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'CHECK_WITHDRAWAL_PERMANENT',
+      error: 'Admin-issued CHECK_WITHDRAWAL debits are permanent and cannot be reversed or altered through status-only updates.',
+    });
+  }
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      let guardRef = adminFirestore.collection('transactions').doc(id);
+      let guardSnap = await guardRef.get();
+      if (!guardSnap.exists) {
+        const qGuard = await adminFirestore.collection('transactions').where('referenceNumber', '==', id).limit(1).get();
+        if (!qGuard.empty) {
+          guardRef = qGuard.docs[0].ref;
+          guardSnap = qGuard.docs[0];
+        }
+      }
+      if (guardSnap.exists) {
+        const fsTxGuard = guardSnap.data() as any;
+        if (
+          (fsTxGuard?.type === 'CHECK_WITHDRAWAL' || fsTxGuard?.metadata?.permanentDebit === true) &&
+          (normalizedTargetStatus === 'REVERSED' || normalizedTargetStatus !== 'COMPLETED')
+        ) {
+          return res.status(400).json({
+            success: false,
+            errorCode: 'CHECK_WITHDRAWAL_PERMANENT',
+            error: 'Admin-issued CHECK_WITHDRAWAL debits are permanent and cannot be reversed or altered through status-only updates.',
+          });
+        }
+      }
+    } catch (guardErr) {
+      console.warn('[/api/admin/transactions/:id/update-status] Pre-check warning:', guardErr);
+    }
+  }
+
   const adminId = req.auth!.uid;
   let result = db.updateTransactionStatus({ txId: id, status, adminId, reason });
   let updatedTx = result.transaction;
@@ -4226,6 +4243,106 @@ app.post('/api/admin/dev-topup', requireAdminAuth, (req: AuthenticatedRequest, r
 
 app.get('/api/admin/audit-logs', requireAdminAuth, (req: AuthenticatedRequest, res: Response) => {
   res.json({ auditLogs: db.auditLogs });
+});
+
+// --- ADMIN ISSUED CHECKS WITH PERMANENT CUSTOMER DEBIT ---
+app.get('/api/admin/checks', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const headerSessionToken = req.headers['x-admin-session'] as string | undefined;
+  const effectiveSessionToken = headerSessionToken || req.auth?.adminSessionToken;
+  const sessionCheck = verifyAdminSessionToken(effectiveSessionToken, req.auth!.uid, req.auth!.email);
+  if (!sessionCheck.valid) {
+    return res.status(401).json({
+      success: false,
+      checks: [],
+      errorCode: 'ADMIN_SESSION_INVALID',
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Administrator session is invalid or expired.'}`,
+    });
+  }
+
+  try {
+    const result = await getAllIssuedChecksAdmin();
+    if (!result.success) {
+      return res.status(503).json({
+        success: false,
+        checks: [],
+        error: result.error || 'Unable to retrieve issued checks.',
+      });
+    }
+    return res.json({ success: true, checks: result.checks });
+  } catch (err: any) {
+    console.error('[GET /api/admin/checks] Error:', err);
+    return res.status(500).json({
+      success: false,
+      checks: [],
+      error: err?.message || 'Failed to list issued checks.',
+    });
+  }
+});
+
+app.post('/api/admin/checks/issue', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  // Enforce valid non-expired admin session token (either x-admin-session header or signed claim from /api/admin/login)
+  const headerSessionToken = req.headers['x-admin-session'] as string | undefined;
+  const effectiveSessionToken = headerSessionToken || req.auth?.adminSessionToken;
+  const sessionCheck = verifyAdminSessionToken(effectiveSessionToken, req.auth!.uid, req.auth!.email);
+  if (!sessionCheck.valid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'ADMIN_SESSION_INVALID',
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Valid non-expired administrator session is required.'}`,
+    });
+  }
+
+  // Derive admin identity strictly from server-verified authentication context (never req.body)
+  const verifiedAdminUid = req.auth!.uid;
+  const verifiedAdminEmail = (req.auth!.email || sessionCheck.payload?.email || '').toLowerCase().trim();
+
+  const body = req.body || {};
+  const customerIdentifier =
+    body.customerIdentifier || body.targetUserId || body.userId || body.customerAccountNumber || '';
+  const sourceAccountType = body.sourceAccountType || 'CHECKING';
+  const checkNumber = body.checkNumber || '';
+  const payeeName = body.payeeName || '';
+  const amount = body.amount;
+  const memo = body.memo || body.description || '';
+  const idempotencyKey = body.idempotencyKey || body.clientRequestId || '';
+
+  try {
+    const result = await executeServerAdminCheckWithdrawal({
+      customerIdentifier,
+      sourceAccountType,
+      checkNumber,
+      payeeName,
+      amount: Number(amount),
+      memo,
+      idempotencyKey,
+      adminUid: verifiedAdminUid,
+      adminEmail: verifiedAdminEmail,
+    });
+
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        success: false,
+        errorCode: result.errorCode,
+        error: result.error || 'Failed to issue check.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      check: result.check,
+      transaction: result.transaction,
+      balanceMetrics: result.balanceMetrics,
+      isDuplicate: result.isDuplicate || false,
+      ...(result.warnings ? { warnings: result.warnings } : {}),
+    });
+  } catch (err: any) {
+    console.error('[POST /api/admin/checks/issue] Error:', err);
+    return res.status(500).json({
+      success: false,
+      errorCode: 'INTERNAL_ERROR',
+      error: err?.message || 'Unexpected server error issuing check.',
+    });
+  }
 });
 
 // --- LOANS & CREDIT FACILITY API ---

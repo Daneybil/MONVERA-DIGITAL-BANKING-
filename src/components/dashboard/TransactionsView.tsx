@@ -125,7 +125,7 @@ export const TransactionsView: React.FC = () => {
 
   if (!currentUser) return null;
 
-  const categories = ['ALL', 'Transfers', 'Deposits', 'Withdrawals', 'Investments', 'Shopping', 'Payroll'];
+  const categories = ['ALL', 'Transfers', 'Deposits', 'Withdrawals', 'Checks', 'Investments', 'Shopping', 'Payroll'];
 
   // Helper for date filtering calculation
   const filteredTransactions = useMemo(() => {
@@ -192,14 +192,16 @@ export const TransactionsView: React.FC = () => {
          (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
          tx.userId === currentUser.id || tx.recipientUserId === currentUser.id);
 
-      const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
+      const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+      const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
       const isDeposit =
-        tx.type === 'DEPOSIT' ||
-        tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-        tx.type === 'INVESTMENT_EARNING' ||
-        tx.type === 'INVESTMENT_MATURITY' ||
-        isAdminTransferCredit;
-      const isCredit = isIncoming || isDeposit;
+        !isCheckWithdrawalDebit &&
+        (tx.type === 'DEPOSIT' ||
+          tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+          tx.type === 'INVESTMENT_EARNING' ||
+          tx.type === 'INVESTMENT_MATURITY' ||
+          isAdminTransferCredit);
+      const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
 
       if (flowFilter === 'CREDIT' && !isCredit) return false;
       if (flowFilter === 'DEBIT' && isCredit) return false;
@@ -255,14 +257,16 @@ export const TransactionsView: React.FC = () => {
          tx.senderName?.includes('Bennett Johnson')) &&
         (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
 
-      const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
+      const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+      const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
       const isDeposit =
-        tx.type === 'DEPOSIT' ||
-        tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-        tx.type === 'INVESTMENT_EARNING' ||
-        tx.type === 'INVESTMENT_MATURITY' ||
-        isAdminTransferCredit;
-      const isCredit = isIncoming || isDeposit;
+        !isCheckWithdrawalDebit &&
+        (tx.type === 'DEPOSIT' ||
+          tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+          tx.type === 'INVESTMENT_EARNING' ||
+          tx.type === 'INVESTMENT_MATURITY' ||
+          isAdminTransferCredit);
+      const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
 
       if (isCredit) {
         totalInflow += tx.amount;
@@ -287,6 +291,8 @@ export const TransactionsView: React.FC = () => {
         return 'Direct Deposit';
       case 'WITHDRAWAL':
         return 'Wire Withdrawal';
+      case 'CHECK_WITHDRAWAL':
+        return 'Check Withdrawal';
       case 'INVESTMENT':
         return 'Treasury Plan';
       case 'INVESTMENT_EARNING':
@@ -318,13 +324,15 @@ export const TransactionsView: React.FC = () => {
     ];
 
     const rows = filteredTransactions.map((t) => {
-      const isIncoming = t.recipientUserId === currentUser.id && t.senderUserId !== currentUser.id;
+      const isCheckWithdrawalDebit = t.type === 'CHECK_WITHDRAWAL';
+      const isIncoming = !isCheckWithdrawalDebit && t.recipientUserId === currentUser.id && t.senderUserId !== currentUser.id;
       const isDeposit =
-        t.type === 'DEPOSIT' ||
-        t.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-        t.type === 'INVESTMENT_EARNING' ||
-        t.type === 'INVESTMENT_MATURITY';
-      const isCredit = isIncoming || isDeposit;
+        !isCheckWithdrawalDebit &&
+        (t.type === 'DEPOSIT' ||
+          t.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+          t.type === 'INVESTMENT_EARNING' ||
+          t.type === 'INVESTMENT_MATURITY');
+      const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
 
       const dateObj = new Date(t.createdAt);
       const party = isCredit ? t.senderName || 'Authorized Sender' : t.recipientName || 'Authorized Recipient';
@@ -644,14 +652,16 @@ export const TransactionsView: React.FC = () => {
                  tx.senderName?.includes('Bennett Johnson')) &&
                 (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
 
-              const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
+              const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+              const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
               const isDeposit =
-                tx.type === 'DEPOSIT' ||
-                tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-                tx.type === 'INVESTMENT_EARNING' ||
-                tx.type === 'INVESTMENT_MATURITY' ||
-                isAdminTransferCredit;
-              const isCredit = isIncoming || isDeposit;
+                !isCheckWithdrawalDebit &&
+                (tx.type === 'DEPOSIT' ||
+                  tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+                  tx.type === 'INVESTMENT_EARNING' ||
+                  tx.type === 'INVESTMENT_MATURITY' ||
+                  isAdminTransferCredit);
+              const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
 
               const dateObj = new Date(tx.createdAt);
               const formattedDate = dateObj.toLocaleDateString('en-US', {
@@ -713,10 +723,23 @@ export const TransactionsView: React.FC = () => {
                       {/* Party & Type info */}
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
                         <span className="font-semibold text-slate-800">
-                          {isCredit ? `From: ${partyName}` : `To: ${partyName}`}
+                          {tx.type === 'CHECK_WITHDRAWAL'
+                            ? `Payee: ${partyName}`
+                            : isCredit
+                            ? `From: ${partyName}`
+                            : `To: ${partyName}`}
                         </span>
                         <span className="text-slate-300">•</span>
                         <span className="text-slate-500">{getCleanTypeLabel(tx.type)}</span>
+                        {tx.type === 'CHECK_WITHDRAWAL' && tx.metadata?.checkNumber && (
+                          <>
+                            <span className="text-slate-300">•</span>
+                            <span className="text-slate-700 font-mono font-semibold">
+                              Check #{tx.metadata.checkNumber}
+                              {tx.metadata?.sourceAccountType ? ` (${tx.metadata.sourceAccountType})` : ''}
+                            </span>
+                          </>
+                        )}
                         <span className="text-slate-300">•</span>
                         <span className="text-slate-500 font-mono text-[11px]">{tx.referenceNumber}</span>
                       </div>

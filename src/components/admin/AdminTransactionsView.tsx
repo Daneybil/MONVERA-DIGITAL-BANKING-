@@ -162,6 +162,7 @@ export const AdminTransactionsView: React.FC<AdminTransactionsViewProps> = ({
             <option value="ALL">All Types</option>
             <option value="DEPOSIT">Deposits</option>
             <option value="WITHDRAWAL">Withdrawals</option>
+            <option value="CHECK_WITHDRAWAL">Issued Check Withdrawals</option>
             <option value="TRANSFER">Transfers</option>
             <option value="INVESTMENT">Investments</option>
             <option value="CARD_PURCHASE">Card Purchases</option>
@@ -245,7 +246,7 @@ export const AdminTransactionsView: React.FC<AdminTransactionsViewProps> = ({
               ) : (
                 filteredTransactions.map((tx) => {
                   const isDeposit = tx.type === 'DEPOSIT' || tx.type === 'ADMIN_DEVELOPMENT_FUNDING';
-                  const isWithdrawal = tx.type === 'WITHDRAWAL';
+                  const isWithdrawal = tx.type === 'WITHDRAWAL' || tx.type === 'CHECK_WITHDRAWAL';
                   const isTransfer = tx.type === 'TRANSFER';
 
                   return (
@@ -352,7 +353,9 @@ export const AdminTransactionsView: React.FC<AdminTransactionsViewProps> = ({
                             </button>
                           )}
 
-                          {tx.status === 'COMPLETED' && (
+                          {tx.status === 'COMPLETED' &&
+                            tx.type !== 'CHECK_WITHDRAWAL' &&
+                            tx.metadata?.permanentDebit !== true && (
                             <button
                               onClick={() => {
                                 setConfirmConfig({
@@ -372,6 +375,16 @@ export const AdminTransactionsView: React.FC<AdminTransactionsViewProps> = ({
                             >
                               Reverse
                             </button>
+                          )}
+
+                          {tx.status === 'COMPLETED' &&
+                            (tx.type === 'CHECK_WITHDRAWAL' || tx.metadata?.permanentDebit === true) && (
+                            <span
+                              className="px-2 py-1 text-[10px] font-bold text-slate-500 bg-slate-100 rounded-lg border border-slate-200"
+                              title="Permanent check debits cannot be status-reversed"
+                            >
+                              Permanent Debit
+                            </span>
                           )}
                         </div>
                       </td>

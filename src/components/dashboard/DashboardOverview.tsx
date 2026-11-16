@@ -784,14 +784,16 @@ export const DashboardOverview: React.FC = () => {
                    (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
                    (currentUser?.id && (tx.userId === currentUser.id || tx.recipientUserId === currentUser.id)));
 
-                const isIncoming = (isRecipient && !isSender) || isAdminTransferCredit;
+                const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+                const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
                 const isDeposit =
-                  tx.type === 'DEPOSIT' ||
-                  tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-                  tx.type === 'INVESTMENT_EARNING' ||
-                  tx.type === 'INVESTMENT_MATURITY' ||
-                  isAdminTransferCredit;
-                const isCredit = isIncoming || isDeposit;
+                  !isCheckWithdrawalDebit &&
+                  (tx.type === 'DEPOSIT' ||
+                    tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+                    tx.type === 'INVESTMENT_EARNING' ||
+                    tx.type === 'INVESTMENT_MATURITY' ||
+                    isAdminTransferCredit);
+                const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
 
                 const dateObj = new Date(tx.createdAt);
                 const formattedDate = dateObj.toLocaleDateString('en-US', {
@@ -856,8 +858,20 @@ export const DashboardOverview: React.FC = () => {
 
                         <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-700 font-bold">
                           <span className="text-slate-900">
-                            {isCredit ? `From: ${partyName}` : `To: ${partyName}`}
+                            {tx.type === 'CHECK_WITHDRAWAL'
+                              ? `Payee: ${partyName}`
+                              : isCredit
+                              ? `From: ${partyName}`
+                              : `To: ${partyName}`}
                           </span>
+                          {tx.type === 'CHECK_WITHDRAWAL' && tx.metadata?.checkNumber && (
+                            <>
+                              <span>•</span>
+                              <span className="text-slate-700 font-mono">
+                                Check Withdrawal (#{tx.metadata.checkNumber})
+                              </span>
+                            </>
+                          )}
                           <span>•</span>
                           <span className="text-slate-600 font-mono">{tx.referenceNumber}</span>
                         </div>
