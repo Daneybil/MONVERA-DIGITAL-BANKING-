@@ -179,8 +179,25 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
     (isRecipient || transaction.userId === currentUser?.id || transaction.recipientUserId === currentUser?.id);
 
   const isCheckWithdrawalDebit = transaction.type === 'CHECK_WITHDRAWAL';
+  const isWireCheckWithdrawalDebit = transaction.type === 'WIRE_CHECK_WITHDRAWAL';
+  const isPermanentCheckDebit = isCheckWithdrawalDebit || isWireCheckWithdrawalDebit;
+  const wireCheckBankName = String(transaction.metadata?.bankName || 'United States Financial Institution');
+  const wireCheckDestAccMasked = transaction.metadata?.destinationBankAccountNumberMasked
+    ? String(transaction.metadata.destinationBankAccountNumberMasked)
+    : '';
+  const wireCheckSourceAccMasked = transaction.metadata?.sourceAccountNumberMasked
+    ? String(transaction.metadata.sourceAccountNumberMasked)
+    : 'MVB ••••';
+  const wireCheckSourceAccount = String(transaction.metadata?.sourceAccountType || 'CHECKING');
+  const wireCheckDeliveryStatus =
+    transaction.metadata?.checkProcessingStatus === 'DELIVERED' ? 'DELIVERED' : 'REQUESTED';
+  const wireCheckEstBusinessDays = Number(transaction.metadata?.estimatedDeliveryBusinessDays) || 5;
+  const wireCheckNoticeMessage =
+    wireCheckDeliveryStatus === 'DELIVERED'
+      ? 'Your Wire Check has been delivered.'
+      : `Estimated delivery is ${wireCheckEstBusinessDays} business days. You will receive a notification when your Wire Check has been delivered.`;
 
-  const isCredit = isCheckWithdrawalDebit
+  const isCredit = isPermanentCheckDebit
     ? false
     : (isRecipient && !isSender) ||
       isAdminTransferCredit ||
@@ -217,6 +234,8 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
         return 'External Wire / Account Withdrawal';
       case 'CHECK_WITHDRAWAL':
         return 'Check Withdrawal';
+      case 'WIRE_CHECK_WITHDRAWAL':
+        return 'Wire Check Withdrawal';
       case 'INVESTMENT':
         return 'High-Yield Treasury Allocation';
       case 'INVESTMENT_EARNING':
@@ -235,13 +254,17 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
   const buildSummaryText = () => `═══════════════════════════════════
    MONVERA PRIVATE BANK RECEIPT
 ═══════════════════════════════════
-Status: VERIFIED & SETTLED
+Status: ${isWireCheckWithdrawalDebit ? `COMPLETED • ${wireCheckDeliveryStatus}` : 'VERIFIED & SETTLED'}
 Type: ${getCleanTypeLabel(transaction.type)}
 Flow: ${isCredit ? 'CREDIT (+)' : 'DEBIT (-)'}
 Amount: $${transaction.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
 Fee: $${(transaction.fee || 0).toFixed(2)} USD
-Sender: ${transaction.senderName || 'Monvera Authorized Account'} (${transaction.senderAccountNumber || 'MVB •••• 9921'})
-${isCheckWithdrawalDebit ? `Payee: ${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Payee'} (${transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'Check'})
+Sender: ${transaction.senderName || 'Monvera Authorized Account'} (${isWireCheckWithdrawalDebit ? wireCheckSourceAccMasked : transaction.senderAccountNumber || 'MVB •••• 9921'})
+${isWireCheckWithdrawalDebit ? `Destination Bank: ${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}
+Source Account: ${wireCheckSourceAccount}
+Delivery Status: ${wireCheckDeliveryStatus}
+Estimated Delivery: ${wireCheckEstBusinessDays} business days
+Notice: ${wireCheckNoticeMessage}` : isCheckWithdrawalDebit ? `Payee: ${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Payee'} (${transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'Check'})
 Source Account: ${transaction.metadata?.sourceAccountType || 'CHECKING'}` : `Recipient: ${transaction.recipientName || 'Monvera Authorized Account'} (${transaction.recipientAccountNumber || 'MVB •••• 7391'})`}
 Date & Time: ${formattedDate} at ${formattedTime}
 Reference: ${transaction.referenceNumber}
@@ -465,7 +488,7 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
       <div class="logo">MONVERA</div>
       <div style="font-size: 12px; color: #64748b; margin-top: 4px;">Official Sovereign Transaction Record</div>
     </div>
-    <div class="status">✓ Verified & Settled</div>
+    <div class="status">${isWireCheckWithdrawalDebit ? `Wire Check • ${wireCheckDeliveryStatus}` : '✓ Verified & Settled'}</div>
   </div>
 
   <div class="amount-box">
@@ -481,17 +504,18 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
     </div>
     <div class="item">
       <div class="item-label">Status</div>
-      <div class="item-val" style="color: #059669;">Completed & Settled</div>
+      <div class="item-val" style="color: #059669;">${isWireCheckWithdrawalDebit ? `Completed • ${wireCheckDeliveryStatus}` : 'Completed & Settled'}</div>
     </div>
     <div class="item">
       <div class="item-label">Sender</div>
-      <div class="item-val">${transaction.senderName || 'Authorized Sender'} (${transaction.senderAccountNumber || 'MVB •••• 9921'})</div>
+      <div class="item-val">${transaction.senderName || 'Authorized Sender'} (${isWireCheckWithdrawalDebit ? wireCheckSourceAccMasked : transaction.senderAccountNumber || 'MVB •••• 9921'})</div>
     </div>
     <div class="item">
-      <div class="item-label">${isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient'}</div>
-      <div class="item-val">${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Recipient'} (${isCheckWithdrawalDebit && transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'MVB •••• 7391'})</div>
+      <div class="item-label">${isWireCheckWithdrawalDebit ? 'Destination Bank' : isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient'}</div>
+      <div class="item-val">${isWireCheckWithdrawalDebit ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}` : `${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Recipient'} (${isCheckWithdrawalDebit && transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'MVB •••• 7391'})`}</div>
     </div>
     ${isCheckWithdrawalDebit ? `<div class="item" style="grid-column: span 2;"><div class="item-label">Source Account</div><div class="item-val">${transaction.metadata?.sourceAccountType || 'CHECKING'}</div></div>` : ''}
+    ${isWireCheckWithdrawalDebit ? `<div class="item"><div class="item-label">Source Account</div><div class="item-val">${wireCheckSourceAccount}</div></div><div class="item"><div class="item-label">Delivery Estimate & Notification</div><div class="item-val">${wireCheckDeliveryStatus} • ${wireCheckNoticeMessage}</div></div>` : ''}
     <div class="item">
       <div class="item-label">Date & Time</div>
       <div class="item-val">${formattedDate} • ${formattedTime}</div>
@@ -575,7 +599,11 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
             <div className="rounded-2xl p-6 bg-slate-50 border-2 border-slate-200 text-center relative overflow-hidden">
               <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-900 border border-emerald-300 mb-3">
                 <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                <span>TRANSACTION SETTLED & VERIFIED</span>
+                <span>
+                  {isWireCheckWithdrawalDebit
+                    ? `WIRE CHECK • ${wireCheckDeliveryStatus}`
+                    : 'TRANSACTION SETTLED & VERIFIED'}
+                </span>
               </div>
 
               <div className="text-xs uppercase font-bold text-slate-500 tracking-wider mb-1 font-mono">
@@ -617,7 +645,11 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                 </span>
                 <div className="flex items-center space-x-2">
                   <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  <span className="text-sm font-bold text-emerald-700">Completed (Instant Settlement)</span>
+                  <span className="text-sm font-bold text-emerald-700">
+                    {isWireCheckWithdrawalDebit
+                      ? `Completed (${wireCheckDeliveryStatus})`
+                      : 'Completed (Instant Settlement)'}
+                  </span>
                 </div>
               </div>
 
@@ -629,23 +661,49 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                   {transaction.senderName || 'Monvera Authorized Account'}
                 </div>
                 <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                  {transaction.senderAccountNumber || 'MVB •••• 9921'}
+                  {isWireCheckWithdrawalDebit
+                    ? wireCheckSourceAccMasked
+                    : transaction.senderAccountNumber || 'MVB •••• 9921'}
                 </div>
               </div>
 
               <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
                 <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                  {isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient Information'}
+                  {isWireCheckWithdrawalDebit
+                    ? 'Destination Bank & Source'
+                    : isCheckWithdrawalDebit
+                    ? 'Check Payee & Check #'
+                    : 'Recipient Information'}
                 </span>
                 <div className="text-sm font-black text-slate-950">
-                  {transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
+                  {isWireCheckWithdrawalDebit
+                    ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}`
+                    : transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
                 </div>
                 <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                  {isCheckWithdrawalDebit && transaction.metadata?.checkNumber
+                  {isWireCheckWithdrawalDebit
+                    ? `${wireCheckSourceAccount} • ${wireCheckDeliveryStatus}`
+                    : isCheckWithdrawalDebit && transaction.metadata?.checkNumber
                     ? `Check #${transaction.metadata.checkNumber}${transaction.metadata?.sourceAccountType ? ` • ${transaction.metadata.sourceAccountType}` : ''}`
                     : transaction.recipientAccountNumber || 'MVB •••• 7391'}
                 </div>
               </div>
+
+              {isWireCheckWithdrawalDebit && (
+                <div className="p-4 rounded-2xl bg-sky-50 border-2 border-sky-200 col-span-2 space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-black text-sky-900 uppercase tracking-wide font-mono">
+                      Delivery Estimate &amp; Notification
+                    </span>
+                    <span className="px-2 py-0.5 rounded-md font-mono font-black text-xs uppercase bg-white text-slate-900 border border-sky-200">
+                      {wireCheckDeliveryStatus}
+                    </span>
+                  </div>
+                  <p className="text-xs text-sky-900 font-medium leading-relaxed">
+                    {wireCheckNoticeMessage}
+                  </p>
+                </div>
+              )}
 
               <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 col-span-2">
                 <div className="grid grid-cols-2 gap-2">
@@ -733,7 +791,11 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
 
             <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-900 border border-emerald-300 mb-3">
               <ShieldCheck className="w-4 h-4 text-emerald-600" />
-              <span>TRANSACTION SETTLED & VERIFIED</span>
+              <span>
+                {isWireCheckWithdrawalDebit
+                  ? `WIRE CHECK • ${wireCheckDeliveryStatus}`
+                  : 'TRANSACTION SETTLED & VERIFIED'}
+              </span>
             </div>
 
             <div className="text-xs uppercase font-bold text-slate-500 tracking-wider mb-1 font-mono">
@@ -776,7 +838,11 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
               </span>
               <div className="flex items-center space-x-2">
                 <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span className="text-sm font-bold text-emerald-700">Completed (Instant Settlement)</span>
+                <span className="text-sm font-bold text-emerald-700">
+                  {isWireCheckWithdrawalDebit
+                    ? `Completed (${wireCheckDeliveryStatus})`
+                    : 'Completed (Instant Settlement)'}
+                </span>
               </div>
             </div>
 
@@ -789,24 +855,56 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                 {transaction.senderName || 'Monvera Authorized Account'}
               </div>
               <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                {transaction.senderAccountNumber || 'MVB •••• 9921'}
+                {isWireCheckWithdrawalDebit
+                  ? wireCheckSourceAccMasked
+                  : transaction.senderAccountNumber || 'MVB •••• 9921'}
               </div>
             </div>
 
-            {/* Recipient / Check Payee Details */}
+            {/* Recipient / Check Payee / Wire Check Details */}
             <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
               <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                {isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient Information'}
+                {isWireCheckWithdrawalDebit
+                  ? 'Destination Bank & Source'
+                  : isCheckWithdrawalDebit
+                  ? 'Check Payee & Check #'
+                  : 'Recipient Information'}
               </span>
               <div className="text-sm font-black text-slate-950">
-                {transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
+                {isWireCheckWithdrawalDebit
+                  ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}`
+                  : transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
               </div>
               <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                {isCheckWithdrawalDebit && transaction.metadata?.checkNumber
+                {isWireCheckWithdrawalDebit
+                  ? `${wireCheckSourceAccount} • ${wireCheckDeliveryStatus}`
+                  : isCheckWithdrawalDebit && transaction.metadata?.checkNumber
                   ? `Check #${transaction.metadata.checkNumber}${transaction.metadata?.sourceAccountType ? ` • ${transaction.metadata.sourceAccountType}` : ''}`
                   : transaction.recipientAccountNumber || 'MVB •••• 7391'}
               </div>
             </div>
+
+            {isWireCheckWithdrawalDebit && (
+              <div className="p-4 rounded-2xl bg-sky-50 border-2 border-sky-200 sm:col-span-2 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-black text-sky-900 uppercase tracking-wide font-mono">
+                    Delivery Estimate &amp; Notification
+                  </span>
+                  <span
+                    className={`px-2.5 py-0.5 rounded-md font-mono font-black text-xs uppercase ${
+                      wireCheckDeliveryStatus === 'DELIVERED'
+                        ? 'bg-emerald-100 text-emerald-900'
+                        : 'bg-amber-100 text-amber-900'
+                    }`}
+                  >
+                    {wireCheckDeliveryStatus}
+                  </span>
+                </div>
+                <p className="text-xs text-sky-900 font-medium leading-relaxed">
+                  {wireCheckNoticeMessage}
+                </p>
+              </div>
+            )}
 
             {/* Date and Time */}
             <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 sm:col-span-2">

@@ -125,7 +125,7 @@ export const TransactionsView: React.FC = () => {
 
   if (!currentUser) return null;
 
-  const categories = ['ALL', 'Transfers', 'Deposits', 'Withdrawals', 'Checks', 'Investments', 'Shopping', 'Payroll'];
+  const categories = ['ALL', 'Transfers', 'Deposits', 'Withdrawals', 'Checks', 'Wire Check', 'Investments', 'Shopping', 'Payroll'];
 
   // Helper for date filtering calculation
   const filteredTransactions = useMemo(() => {
@@ -192,7 +192,8 @@ export const TransactionsView: React.FC = () => {
          (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
          tx.userId === currentUser.id || tx.recipientUserId === currentUser.id);
 
-      const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+      const isCheckWithdrawalDebit =
+        tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
       const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
       const isDeposit =
         !isCheckWithdrawalDebit &&
@@ -257,7 +258,8 @@ export const TransactionsView: React.FC = () => {
          tx.senderName?.includes('Bennett Johnson')) &&
         (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
 
-      const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+      const isCheckWithdrawalDebit =
+        tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
       const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
       const isDeposit =
         !isCheckWithdrawalDebit &&
@@ -293,6 +295,8 @@ export const TransactionsView: React.FC = () => {
         return 'Wire Withdrawal';
       case 'CHECK_WITHDRAWAL':
         return 'Check Withdrawal';
+      case 'WIRE_CHECK_WITHDRAWAL':
+        return 'Wire Check Withdrawal';
       case 'INVESTMENT':
         return 'Treasury Plan';
       case 'INVESTMENT_EARNING':
@@ -324,7 +328,8 @@ export const TransactionsView: React.FC = () => {
     ];
 
     const rows = filteredTransactions.map((t) => {
-      const isCheckWithdrawalDebit = t.type === 'CHECK_WITHDRAWAL';
+      const isCheckWithdrawalDebit =
+        t.type === 'CHECK_WITHDRAWAL' || t.type === 'WIRE_CHECK_WITHDRAWAL';
       const isIncoming = !isCheckWithdrawalDebit && t.recipientUserId === currentUser.id && t.senderUserId !== currentUser.id;
       const isDeposit =
         !isCheckWithdrawalDebit &&
@@ -652,7 +657,8 @@ export const TransactionsView: React.FC = () => {
                  tx.senderName?.includes('Bennett Johnson')) &&
                 (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
 
-              const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+              const isCheckWithdrawalDebit =
+                tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
               const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
               const isDeposit =
                 !isCheckWithdrawalDebit &&
@@ -723,7 +729,9 @@ export const TransactionsView: React.FC = () => {
                       {/* Party & Type info */}
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
                         <span className="font-semibold text-slate-800">
-                          {tx.type === 'CHECK_WITHDRAWAL'
+                          {tx.type === 'WIRE_CHECK_WITHDRAWAL'
+                            ? `Bank: ${tx.metadata?.bankName || cleanRecipName || 'Destination Bank'}${tx.metadata?.destinationBankAccountNumberMasked ? ` (${tx.metadata.destinationBankAccountNumberMasked})` : ''}`
+                            : tx.type === 'CHECK_WITHDRAWAL'
                             ? `Payee: ${partyName}`
                             : isCredit
                             ? `From: ${partyName}`
@@ -737,6 +745,30 @@ export const TransactionsView: React.FC = () => {
                             <span className="text-slate-700 font-mono font-semibold">
                               Check #{tx.metadata.checkNumber}
                               {tx.metadata?.sourceAccountType ? ` (${tx.metadata.sourceAccountType})` : ''}
+                            </span>
+                          </>
+                        )}
+                        {tx.type === 'WIRE_CHECK_WITHDRAWAL' && (
+                          <>
+                            {tx.metadata?.sourceAccountType && (
+                              <>
+                                <span className="text-slate-300">•</span>
+                                <span className="text-slate-700 font-mono font-semibold">
+                                  {tx.metadata.sourceAccountType}
+                                </span>
+                              </>
+                            )}
+                            <span className="text-slate-300">•</span>
+                            <span
+                              className={`px-2 py-0.5 rounded-md font-mono font-bold text-[10px] uppercase ${
+                                tx.metadata?.checkProcessingStatus === 'DELIVERED'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : 'bg-amber-100 text-amber-900'
+                              }`}
+                            >
+                              {tx.metadata?.checkProcessingStatus === 'DELIVERED'
+                                ? 'DELIVERED'
+                                : 'REQUESTED • 5 business days'}
                             </span>
                           </>
                         )}

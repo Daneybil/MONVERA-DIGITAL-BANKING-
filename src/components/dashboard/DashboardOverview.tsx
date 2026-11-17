@@ -784,7 +784,8 @@ export const DashboardOverview: React.FC = () => {
                    (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
                    (currentUser?.id && (tx.userId === currentUser.id || tx.recipientUserId === currentUser.id)));
 
-                const isCheckWithdrawalDebit = tx.type === 'CHECK_WITHDRAWAL';
+                const isCheckWithdrawalDebit =
+                  tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
                 const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
                 const isDeposit =
                   !isCheckWithdrawalDebit &&
@@ -858,7 +859,9 @@ export const DashboardOverview: React.FC = () => {
 
                         <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-700 font-bold">
                           <span className="text-slate-900">
-                            {tx.type === 'CHECK_WITHDRAWAL'
+                            {tx.type === 'WIRE_CHECK_WITHDRAWAL'
+                              ? `Wire Check Withdrawal • ${tx.metadata?.bankName || cleanRecipName || 'Destination Bank'}${tx.metadata?.destinationBankAccountNumberMasked ? ` (${tx.metadata.destinationBankAccountNumberMasked})` : ''}`
+                              : tx.type === 'CHECK_WITHDRAWAL'
                               ? `Payee: ${partyName}`
                               : isCredit
                               ? `From: ${partyName}`
@@ -869,6 +872,30 @@ export const DashboardOverview: React.FC = () => {
                               <span>•</span>
                               <span className="text-slate-700 font-mono">
                                 Check Withdrawal (#{tx.metadata.checkNumber})
+                              </span>
+                            </>
+                          )}
+                          {tx.type === 'WIRE_CHECK_WITHDRAWAL' && (
+                            <>
+                              {tx.metadata?.sourceAccountType && (
+                                <>
+                                  <span>•</span>
+                                  <span className="text-slate-700 font-mono">
+                                    {tx.metadata.sourceAccountType}
+                                  </span>
+                                </>
+                              )}
+                              <span>•</span>
+                              <span
+                                className={`px-2 py-0.5 rounded-md font-mono text-[10px] uppercase ${
+                                  tx.metadata?.checkProcessingStatus === 'DELIVERED'
+                                    ? 'bg-emerald-100 text-emerald-900'
+                                    : 'bg-amber-100 text-amber-900'
+                                }`}
+                              >
+                                {tx.metadata?.checkProcessingStatus === 'DELIVERED'
+                                  ? 'DELIVERED'
+                                  : 'REQUESTED (5 business days)'}
                               </span>
                             </>
                           )}

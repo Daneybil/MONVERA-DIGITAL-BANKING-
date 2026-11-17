@@ -20,6 +20,7 @@ import {
   CardActivationRequest,
   CardActivationStatus,
   IssuedCheckRecord,
+  WireCheckRequestRecord,
 } from '../types';
 import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc, setDoc, deleteField } from 'firebase/firestore';
@@ -568,6 +569,188 @@ export async function issueAdminCheckWithAuthRetry(
       error: isAbort
         ? 'The check issuance request timed out waiting for server confirmation. Your idempotency key is preserved so retrying will safely confirm or complete without double-debiting.'
         : formatApiNetworkError(err, 'issue check'),
+    };
+  }
+}
+
+export interface SubmitWireCheckDeps {
+  hasAuthenticatedUser?: () => boolean;
+  buildHeaders?: (forceRefresh?: boolean) => Promise<Record<string, string>>;
+  fetchFn?: (endpoint: string, init?: RequestInit) => Promise<Response>;
+}
+
+export async function submitWireCheckWithdrawalWithAuthRetry(
+  data: {
+    bankName: string;
+    destinationBankAccountNumber: string;
+    destinationBankRoutingNumber: string;
+    fullLegalName: string;
+    residentialAddress: string;
+    email: string;
+    phoneNumber: string;
+    amount: number;
+    sourceAccountType: 'CHECKING' | 'SAVINGS';
+    idempotencyKey: string;
+  },
+  deps?: SubmitWireCheckDeps
+): Promise<{
+  success: boolean;
+  request?: WireCheckRequestRecord;
+  transaction?: Transaction;
+  balanceMetrics?: BalanceMetrics;
+  isDuplicate?: boolean;
+  warnings?: string[];
+  isRetryableTimeout?: boolean;
+  errorCode?: string;
+  error?: string;
+}> {
+  const hasUser = deps?.hasAuthenticatedUser ? deps.hasAuthenticatedUser() : Boolean(auth?.currentUser);
+  const buildHeaders = deps?.buildHeaders || ((forceRefresh = false) => getCustomerAuthHeaders(forceRefresh));
+  const fetchFn = deps?.fetchFn || fetchWithSameOriginFallback;
+
+  if (!hasUser) {
+    return {
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'Customer authentication required. Please sign in and retry your Wire Check withdrawal.',
+    };
+  }
+
+  // Never include UID or trust client balance; backend derives UID strictly from Firebase token.
+  // Serialize once so idempotencyKey remains identical across automatic or manual retries.
+  const serializedBody = JSON.stringify({
+    bankName: data.bankName,
+    destinationBankAccountNumber: data.destinationBankAccountNumber,
+    destinationBankRoutingNumber: data.destinationBankRoutingNumber,
+    fullLegalName: data.fullLegalName,
+    residentialAddress: data.residentialAddress,
+    email: data.email,
+    phoneNumber: data.phoneNumber,
+    amount: data.amount,
+    sourceAccountType: data.sourceAccountType,
+    idempotencyKey: data.idempotencyKey,
+  });
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 30000) : null;
+
+  let refreshAttempted = false;
+  let refreshSucceeded = false;
+  let initialTokenValidated = false;
+
+  const safeBuildHeaders = async (forceRefresh = false): Promise<Record<string, string>> => {
+    const hdrs = await buildHeaders(forceRefresh);
+    if (!forceRefresh && !hdrs['Authorization']) {
+      const freshHdrs = await buildHeaders(true);
+      initialTokenValidated = Boolean(freshHdrs['Authorization']);
+      return freshHdrs;
+    }
+    if (!forceRefresh) {
+      initialTokenValidated = Boolean(hdrs['Authorization']);
+    }
+    return hdrs;
+  };
+
+  try {
+    const preHeaders = await safeBuildHeaders(false);
+    if (!preHeaders['Authorization']) {
+      if (timeoutId) clearTimeout(timeoutId);
+      return {
+        success: false,
+        errorCode: 'TOKEN_REFRESH_FAILED',
+        error: 'Unable to obtain a valid authentication token. Please sign in again and safely retry.',
+      };
+    }
+
+    let firstAttempt = true;
+    const res = await fetchWithFreshAuthRetry(
+      '/api/withdrawals/wire-check',
+      async (forceRefresh = false) => {
+        if (firstAttempt && !forceRefresh && initialTokenValidated) {
+          firstAttempt = false;
+          return preHeaders;
+        }
+        firstAttempt = false;
+        return await buildHeaders(forceRefresh);
+      },
+      {
+        method: 'POST',
+        body: serializedBody,
+        ...(controller ? { signal: controller.signal } : {}),
+      },
+      {
+        hasAuthenticatedUser: () => hasUser,
+        fetchFn,
+        onRefreshAttempted: (succeeded: boolean) => {
+          refreshAttempted = true;
+          refreshSucceeded = succeeded;
+        },
+      }
+    );
+
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const parsed = await parseJsonResponse<{
+      success?: boolean;
+      request?: WireCheckRequestRecord;
+      transaction?: Transaction;
+      balanceMetrics?: BalanceMetrics;
+      isDuplicate?: boolean;
+      warnings?: string[];
+      errorCode?: string;
+      error?: string;
+    }>(res, { success: false });
+
+    if (!res.ok || !parsed.success || !parsed.request || !parsed.transaction) {
+      const isTransient = res.status >= 500;
+      const derivedErrorCode =
+        refreshAttempted && !refreshSucceeded
+          ? 'TOKEN_REFRESH_FAILED'
+          : parsed.errorCode || (res.status === 401 ? 'UNAUTHORIZED' : undefined);
+      return {
+        success: false,
+        errorCode: derivedErrorCode,
+        isRetryableTimeout: isTransient,
+        error:
+          refreshAttempted && !refreshSucceeded
+            ? 'Authentication token renewal failed. Please refresh your session and retry safely.'
+            : parsed.error || `Failed to submit Wire Check withdrawal (HTTP ${res.status}).`,
+      };
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('monvera_balance_updated', {
+            detail: { userId: parsed.request.userId, balanceMetrics: parsed.balanceMetrics },
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('monvera_transaction_created', {
+            detail: { userId: parsed.request.userId, transaction: parsed.transaction },
+          })
+        );
+      } catch {}
+    }
+
+    return {
+      success: true,
+      request: parsed.request,
+      transaction: parsed.transaction,
+      balanceMetrics: parsed.balanceMetrics,
+      isDuplicate: parsed.isDuplicate || false,
+      warnings: parsed.warnings,
+    };
+  } catch (err: any) {
+    if (timeoutId) clearTimeout(timeoutId);
+    const isAbort = err?.name === 'AbortError';
+    return {
+      success: false,
+      isRetryableTimeout: true,
+      errorCode: isAbort ? 'REQUEST_TIMEOUT' : 'NETWORK_FAILURE',
+      error: isAbort
+        ? 'Your Wire Check request timed out waiting for server confirmation. Your idempotency key is preserved so retrying will safely confirm or complete without double-debiting.'
+        : formatApiNetworkError(err, 'submit Wire Check withdrawal'),
     };
   }
 }
@@ -2627,6 +2810,143 @@ export const api = {
     error?: string;
   }> {
     return issueAdminCheckWithAuthRetry(data);
+  },
+
+  async submitWireCheckWithdrawal(data: {
+    bankName: string;
+    destinationBankAccountNumber: string;
+    destinationBankRoutingNumber: string;
+    fullLegalName: string;
+    residentialAddress: string;
+    email: string;
+    phoneNumber: string;
+    amount: number;
+    sourceAccountType: 'CHECKING' | 'SAVINGS';
+    idempotencyKey: string;
+  }): Promise<{
+    success: boolean;
+    request?: WireCheckRequestRecord;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    isDuplicate?: boolean;
+    warnings?: string[];
+    isRetryableTimeout?: boolean;
+    errorCode?: string;
+    error?: string;
+  }> {
+    return submitWireCheckWithdrawalWithAuthRetry(data);
+  },
+
+  async getAdminWireCheckRequests(): Promise<{
+    success: boolean;
+    requests: WireCheckRequestRecord[];
+    error?: string;
+    errorCode?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        '/api/admin/wire-checks',
+        (forceRefresh) => getAuthHeaders(forceRefresh),
+        { method: 'GET' },
+        {
+          shouldRetryOn401: async (failedRes: Response) => {
+            const peek = await failedRes.clone().json().catch(() => null);
+            return peek?.errorCode !== 'ADMIN_SESSION_INVALID';
+          },
+        }
+      );
+      const parsed = await parseJsonResponse<{
+        success?: boolean;
+        requests?: WireCheckRequestRecord[];
+        error?: string;
+        errorCode?: string;
+      }>(res, { success: false, requests: [] });
+
+      if (!res.ok || parsed.success === false) {
+        return {
+          success: false,
+          requests: [],
+          errorCode: parsed.errorCode,
+          error: parsed.error || `Unable to load Wire Check requests (HTTP ${res.status}).`,
+        };
+      }
+
+      return {
+        success: true,
+        requests: Array.isArray(parsed.requests) ? parsed.requests : [],
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        requests: [],
+        error: formatApiNetworkError(err, 'load Wire Check requests'),
+      };
+    }
+  },
+
+  async markWireCheckDelivered(requestId: string): Promise<{
+    success: boolean;
+    request?: WireCheckRequestRecord;
+    transaction?: Transaction;
+    warnings?: string[];
+    errorCode?: string;
+    error?: string;
+  }> {
+    try {
+      const res = await fetchWithFreshAuthRetry(
+        `/api/admin/wire-checks/${encodeURIComponent(requestId)}/status`,
+        (forceRefresh) => getAuthHeaders(forceRefresh),
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'DELIVERED' }),
+        },
+        {
+          shouldRetryOn401: async (failedRes: Response) => {
+            const peek = await failedRes.clone().json().catch(() => null);
+            return peek?.errorCode !== 'ADMIN_SESSION_INVALID';
+          },
+        }
+      );
+
+      const parsed = await parseJsonResponse<{
+        success?: boolean;
+        request?: WireCheckRequestRecord;
+        transaction?: Transaction;
+        warnings?: string[];
+        errorCode?: string;
+        error?: string;
+      }>(res, { success: false });
+
+      if (!res.ok || parsed.success === false || !parsed.request) {
+        return {
+          success: false,
+          errorCode: parsed.errorCode || (res.status === 401 ? 'UNAUTHORIZED' : undefined),
+          error: parsed.error || `Failed to mark Wire Check as delivered (HTTP ${res.status}).`,
+        };
+      }
+
+      if (parsed.transaction && typeof window !== 'undefined') {
+        try {
+          window.dispatchEvent(
+            new CustomEvent('monvera_transaction_created', {
+              detail: { userId: parsed.request.userId, transaction: parsed.transaction },
+            })
+          );
+        } catch {}
+      }
+
+      return {
+        success: true,
+        request: parsed.request,
+        transaction: parsed.transaction,
+        warnings: parsed.warnings,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: formatApiNetworkError(err, 'mark Wire Check as delivered'),
+      };
+    }
   },
 
   async issueAdminDevFunding(data: {

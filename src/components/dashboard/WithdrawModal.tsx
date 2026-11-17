@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { CardActivationRequest, LinkedBankAccountApplication } from '../../types';
 import { WORLD_COUNTRIES, MAJOR_BANKS, WORLD_CURRENCIES } from '../../constants/bankingData';
+import { WireCheckWithdrawPanel } from './WireCheckWithdrawPanel';
 import {
   X,
   ArrowRight,
@@ -33,12 +34,13 @@ import {
   Hash,
   Eye,
   EyeOff,
+  FileText,
 } from 'lucide-react';
 
 export const WithdrawModal: React.FC = () => {
   const { activeModal, closeModal, currentUser, balanceMetrics, refreshBalance, refreshNotifications } = useAuth();
   const [sourceAccount, setSourceAccount] = useState<'CHECKING' | 'SAVINGS'>('CHECKING');
-  const [destinationType, setDestinationType] = useState<'CARD' | 'BANK' | 'ACTIVATION' | 'BANK_ACTIVATION' | 'CRYPTO'>('CARD');
+  const [destinationType, setDestinationType] = useState<'CARD' | 'BANK' | 'WIRE_CHECK' | 'ACTIVATION' | 'BANK_ACTIVATION' | 'CRYPTO'>('CARD');
 
   // Debit Card fields
   const [cardBrand, setCardBrand] = useState<'VISA' | 'MASTERCARD'>('VISA');
@@ -182,7 +184,7 @@ export const WithdrawModal: React.FC = () => {
         }
         if (target && target.actionModal === 'withdraw' && target.actionSection) {
           const sec = target.actionSection;
-          if (sec === 'BANK' || sec === 'BANK_ACTIVATION' || sec === 'ACTIVATION' || sec === 'CARD') {
+          if (sec === 'BANK' || sec === 'BANK_ACTIVATION' || sec === 'ACTIVATION' || sec === 'CARD' || sec === 'WIRE_CHECK') {
             setDestinationType(sec);
             setErrorMessage(null);
             if (target.openBankLinkForm) {
@@ -798,7 +800,7 @@ export const WithdrawModal: React.FC = () => {
                 <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
                   2. Select Withdrawal Method
                 </label>
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 sm:gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 sm:gap-3">
                   {/* Debit Card Push */}
                   <button
                     type="button"
@@ -947,6 +949,33 @@ export const WithdrawModal: React.FC = () => {
                     </div>
                   </button>
 
+                  {/* Wire Check Withdrawal (Isolated Permanent Debit) */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDestinationType('WIRE_CHECK');
+                      setErrorMessage(null);
+                    }}
+                    className={`p-3.5 sm:p-4 rounded-2xl border-2 text-left transition-all cursor-pointer flex flex-col justify-between ${
+                      destinationType === 'WIRE_CHECK'
+                        ? 'bg-sky-50/90 border-sky-700 text-slate-950 ring-2 ring-sky-600/20 shadow-sm'
+                        : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-1.5">
+                      <div className="w-8 h-8 rounded-xl bg-slate-900 text-white flex items-center justify-center">
+                        <FileText className="w-4 h-4 text-sky-300" />
+                      </div>
+                      <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-md bg-sky-100 text-sky-900 font-mono">
+                        US Check
+                      </span>
+                    </div>
+                    <div className="font-black text-sm text-slate-950">Wire Check</div>
+                    <div className="text-[11px] text-slate-500 font-medium mt-0.5">
+                      Est. 5 business days delivery
+                    </div>
+                  </button>
+
                   {/* Crypto Payouts (Coming Soon) */}
                   <div className="p-3.5 sm:p-4 rounded-2xl border-2 border-slate-200 bg-slate-50/80 text-left flex flex-col justify-between opacity-85 select-none relative overflow-hidden">
                     <div className="flex items-center justify-between mb-1.5">
@@ -964,6 +993,20 @@ export const WithdrawModal: React.FC = () => {
                   </div>
                 </div>
               </div>
+
+              {/* 3W. WIRE CHECK WITHDRAWAL FORM (ISOLATED) */}
+              {destinationType === 'WIRE_CHECK' && currentUser && (
+                <WireCheckWithdrawPanel
+                  currentUser={currentUser}
+                  sourceAccount={sourceAccount}
+                  onSourceAccountChange={setSourceAccount}
+                  availableChecking={checkingBal}
+                  availableSavings={savingsBal}
+                  refreshBalance={refreshBalance}
+                  refreshNotifications={refreshNotifications}
+                  onDone={handleReset}
+                />
+              )}
 
               {/* 3A. DEBIT CARD FORM FIELDS */}
               {destinationType === 'CARD' && (

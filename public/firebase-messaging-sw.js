@@ -19,16 +19,22 @@ const messaging = firebase.messaging();
 // Background push notification receiver
 messaging.onBackgroundMessage((payload) => {
   console.log('[Monvera SW] Received background FCM message:', payload);
-  const notificationTitle = payload.notification?.title || payload.data?.title || 'Monvera Digital Bank';
+
+  // Firebase SDK automatically renders notifications containing a top-level `notification` object.
+  if (payload && payload.notification) {
+    return;
+  }
+
+  const notificationTitle = (payload && payload.data && payload.data.title) || 'Monvera Digital Bank';
   const notificationOptions = {
-    body: payload.notification?.body || payload.data?.body || 'New account activity alert received.',
+    body: (payload && payload.data && payload.data.body) || 'New account activity alert received.',
     icon: '/favicon.svg',
     badge: '/favicon.svg',
-    tag: payload.data?.referenceId || `monvera-${Date.now()}`,
+    tag: (payload && payload.data && payload.data.referenceId) || `monvera-${Date.now()}`,
     renotify: true,
     data: {
-      url: payload.data?.url || '/dashboard',
-      referenceId: payload.data?.referenceId,
+      url: (payload && payload.data && payload.data.url) || '/dashboard',
+      referenceId: payload && payload.data && payload.data.referenceId,
       timestamp: Date.now()
     }
   };

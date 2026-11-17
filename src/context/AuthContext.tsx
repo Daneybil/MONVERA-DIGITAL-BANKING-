@@ -136,6 +136,40 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+/**
+ * Synchronize the browser's FCM token for an authenticated customer session.
+ * Marks syncedPushUidRef ONLY after syncFn confirms backend /api/push/register success,
+ * deduplicates concurrent calls, and permits safe retries on transient failures.
+ */
+export async function synchronizeSessionPushToken(params: {
+  targetUid: string;
+  syncedPushUidRef: { current: string | null };
+  inFlightSyncUidRef: { current: string | null };
+  syncFn: (uid: string) => Promise<string | null>;
+  isStillActive?: () => boolean;
+}): Promise<boolean> {
+  const { targetUid, syncedPushUidRef, inFlightSyncUidRef, syncFn, isStillActive } = params;
+  if (!targetUid) return false;
+  if (syncedPushUidRef.current === targetUid) return true;
+  if (inFlightSyncUidRef.current === targetUid) return false;
+
+  inFlightSyncUidRef.current = targetUid;
+  try {
+    const registeredToken = await syncFn(targetUid);
+    if (registeredToken && (!isStillActive || isStillActive())) {
+      syncedPushUidRef.current = targetUid;
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (inFlightSyncUidRef.current === targetUid) {
+      inFlightSyncUidRef.current = null;
+    }
+  }
+}
+
 function getFirebaseErrorMessage(err: any): string {
   const code = err?.code || '';
   const message = err?.message || '';
@@ -280,6 +314,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const isHydratingSessionRef = React.useRef<string | null>(null);
   const checkedReversalsUidRef = React.useRef<string | null>(null);
   const syncedPushUidRef = React.useRef<string | null>(null);
+  const inFlightPushSyncUidRef = React.useRef<string | null>(null);
   const currentUserRef = React.useRef<UserProfile | null>(currentUser);
   currentUserRef.current = currentUser;
 
@@ -563,11 +598,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       api.checkAndExecutePendingWithdrawalReversals(targetNotifUid).catch(() => {});
     }
 
-    // 6. Silently sync FCM registration token once per session if browser permission is already granted
-    if (targetNotifUid && syncedPushUidRef.current !== targetNotifUid) {
-      syncedPushUidRef.current = targetNotifUid;
-      pushNotificationService.syncTokenForUser(targetNotifUid).catch(() => {});
-    }
+    // 6. Silently sync FCM registration token for the session ONLY if browser permission is already granted;
+    // mark syncedPushUidRef exclusively after /api/push/register succeeds so transient failures can retry safely.
+    let isSessionPushActive = true;
+    const triggerSessionPushSync = () => {
+      if (!isSessionPushActive || !targetNotifUid) return;
+      if (syncedPushUidRef.current === targetNotifUid) return;
+      if (typeof window === 'undefined' || !('Notification' in window) || Notification.permission !== 'granted') return;
+
+      synchronizeSessionPushToken({
+        targetUid: targetNotifUid,
+        syncedPushUidRef,
+        inFlightSyncUidRef: inFlightPushSyncUidRef,
+        syncFn: (uid) => pushNotificationService.syncTokenForUser(uid),
+        isStillActive: () =>
+          isSessionPushActive &&
+          (currentUserRef.current?.id === targetNotifUid || auth.currentUser?.uid === targetNotifUid),
+      }).catch(() => {});
+    };
+
+    triggerSessionPushSync();
+
+    const handlePushRetryTrigger = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      triggerSessionPushSync();
+    };
 
     // 7. Listen to foreground push notifications while tab is open
     const unsubPush = pushNotificationService.listenToForegroundMessages(() => {
@@ -701,8 +756,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     window.addEventListener('monvera_balance_updated', handleBalanceUpdated);
     window.addEventListener('monvera_notification_created', handleNotificationCreated);
     window.addEventListener('storage', handleStorageEvent);
+    window.addEventListener('online', handlePushRetryTrigger);
+    document.addEventListener('visibilitychange', handlePushRetryTrigger);
 
     return () => {
+      isSessionPushActive = false;
       unsubBalance();
       unsubProfile();
       unsubLoans();
@@ -717,6 +775,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.removeEventListener('monvera_balance_updated', handleBalanceUpdated);
       window.removeEventListener('monvera_notification_created', handleNotificationCreated);
       window.removeEventListener('storage', handleStorageEvent);
+      window.removeEventListener('online', handlePushRetryTrigger);
+      document.removeEventListener('visibilitychange', handlePushRetryTrigger);
     };
   }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email]);
 
@@ -962,6 +1022,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // No authenticated session
         checkedReversalsUidRef.current = null;
         syncedPushUidRef.current = null;
+        inFlightPushSyncUidRef.current = null;
         if (isMounted) {
           setCurrentUser(null);
           setBalanceMetrics(null);
@@ -1696,6 +1757,13 @@ const unenrollTotpMfa = async (): Promise<{
    */
   const logout = async () => {
     isHydratingSessionRef.current = null;
+    syncedPushUidRef.current = null;
+    inFlightPushSyncUidRef.current = null;
+    try {
+      await pushNotificationService.unregisterCurrentDeviceToken();
+    } catch {
+      // Non-blocking best-effort device token unlink
+    }
     try {
       await signOut(auth);
     } catch (err) {

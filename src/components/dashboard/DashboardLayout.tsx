@@ -4,6 +4,7 @@ import { MonveraLogo } from '../common/MonveraLogo';
 import { NotificationsDrawer } from './NotificationsDrawer';
 import { KycStatusAlertModal } from '../kyc/KycStatusAlertModal';
 import { LanguageSelector } from '../common/LanguageSelector';
+import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import {
   LayoutDashboard,
   Wallet,
@@ -59,6 +60,7 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
     switchUser,
     unreadNotifsCount,
     balanceMetrics,
+    activeModal,
   } = useAuth();
 
   const [notifsOpen, setNotifsOpen] = useState(false);
@@ -816,7 +818,11 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
                   <span>256-Bit TLS • FDIC FinCEN Tier-1</span>
                 </div>
 
-                <div className="flex items-center gap-2 w-full sm:w-auto">
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                  <PWAInstallButton
+                    variant="dashboard"
+                    suppressModal={Boolean(activeModal)}
+                  />
                   <button
                     onClick={() => {
                       setMobileMenuOpen(false);

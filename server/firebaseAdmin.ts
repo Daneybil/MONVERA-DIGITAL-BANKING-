@@ -2,6 +2,7 @@ import { initializeApp, getApps, getApp, cert } from 'firebase-admin/app';
 import type { App } from 'firebase-admin/app';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
 import { getAuth, Auth } from 'firebase-admin/auth';
+import { getMessaging, Messaging } from 'firebase-admin/messaging';
 
 const EXPECTED_FIREBASE_PROJECT_ID = 'monvera-digital-banking';
 const ENV_FIREBASE_PROJECT_ID = (process.env.FIREBASE_PROJECT_ID || '').trim();
@@ -11,6 +12,7 @@ const isProduction = process.env.NODE_ENV === 'production' || !!process.env.RAIL
 let rawApp: App | undefined;
 let rawFirestore: Firestore | undefined;
 let rawAuth: Auth | undefined;
+let rawMessaging: Messaging | undefined;
 let isConfigured = false;
 let resolvedProjectId = FIREBASE_PROJECT_ID;
 let configDiagnosticError: string | undefined;
@@ -51,6 +53,7 @@ try {
       rawFirestore = getFirestore(rawApp);
       rawFirestore.settings({ ignoreUndefinedProperties: true });
       rawAuth = getAuth(rawApp);
+      rawMessaging = getMessaging(rawApp);
       isConfigured = true;
     }
   } else {
@@ -77,6 +80,7 @@ try {
           rawFirestore = getFirestore(rawApp);
           rawFirestore.settings({ ignoreUndefinedProperties: true });
           rawAuth = getAuth(rawApp);
+          rawMessaging = getMessaging(rawApp);
           isConfigured = true;
           console.log(`[FirebaseAdmin] Successfully initialized for project "${effectiveProjectId}" via service account JSON.`);
         }
@@ -108,6 +112,7 @@ try {
           rawFirestore = getFirestore(rawApp);
           rawFirestore.settings({ ignoreUndefinedProperties: true });
           rawAuth = getAuth(rawApp);
+          rawMessaging = getMessaging(rawApp);
           isConfigured = true;
           console.log(`[FirebaseAdmin] Successfully initialized for project "${FIREBASE_PROJECT_ID}" via FIREBASE_CLIENT_EMAIL/KEY.`);
         }
@@ -138,6 +143,7 @@ try {
           rawFirestore = getFirestore(rawApp);
           rawFirestore.settings({ ignoreUndefinedProperties: true });
           rawAuth = getAuth(rawApp);
+          rawMessaging = getMessaging(rawApp);
           isConfigured = true;
           console.log(`[FirebaseAdmin] Initialized for development project "${FIREBASE_PROJECT_ID}" via Application Default Credentials.`);
         }
@@ -158,14 +164,20 @@ export function isFirebaseAdminConfigured(): boolean {
   return isConfigured && !!rawFirestore && !!rawAuth;
 }
 
+export function isFirebaseMessagingConfigured(): boolean {
+  return isConfigured && !!rawApp && !!rawMessaging;
+}
+
 export function getFirebaseAdminDiagnostics(): {
   configured: boolean;
+  messagingConfigured: boolean;
   projectId: string;
   expectedProjectId: string;
   error?: string;
 } {
   return {
     configured: isFirebaseAdminConfigured(),
+    messagingConfigured: isFirebaseMessagingConfigured(),
     projectId: resolvedProjectId,
     expectedProjectId: EXPECTED_FIREBASE_PROJECT_ID,
     error: configDiagnosticError,
@@ -189,6 +201,16 @@ export const adminAuth = new Proxy({} as Auth, {
     }
     const val = (rawAuth as any)[prop];
     return typeof val === 'function' ? val.bind(rawAuth) : val;
+  },
+});
+
+export const adminMessaging = new Proxy({} as Messaging, {
+  get(_target, prop) {
+    if (!rawMessaging) {
+      throw new Error('[FirebaseAdmin] Firebase Messaging is unavailable: Firebase Admin SDK is not configured with valid service account credentials.');
+    }
+    const val = (rawMessaging as any)[prop];
+    return typeof val === 'function' ? val.bind(rawMessaging) : val;
   },
 });
 

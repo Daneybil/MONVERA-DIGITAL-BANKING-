@@ -4,13 +4,23 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
-import { serverNotificationDispatcher } from './server/services/notificationDispatcher';
+import {
+  serverNotificationDispatcher,
+  registerCustomerPushToken,
+  unregisterCustomerPushToken,
+  validatePushToken,
+} from './server/services/notificationDispatcher';
 import { persistCustomerNotification, maskAccountNumber, resolveCustomerNotificationContext } from './server/services/notificationStore';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest, createAdminSessionToken, verifyAdminSessionToken } from './server/authMiddleware';
 import { adminAuth, adminFirestore, isFirebaseAdminConfigured, getFirebaseAdminDiagnostics } from './server/firebaseAdmin';
 import { executeServerAdminCheckWithdrawal, getAllIssuedChecksAdmin, resolveCustomerPreviewBalanceMetrics } from './server/adminCheckService';
+import {
+  executeServerWireCheckWithdrawal,
+  getAllWireCheckRequestsAdmin,
+  markWireCheckRequestDeliveredAdmin,
+} from './server/wireCheckService';
 import {
   executeServerTransfer,
   executeServerWithdrawal,
@@ -1795,6 +1805,53 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
   }
 });
 
+// Isolated Customer Wire Check Withdrawal Endpoint (Permanent Debit, No 30-Min Reversal)
+app.post('/api/withdrawals/wire-check', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  // Derive customer UID strictly from verified Firebase Auth token (never req.body)
+  const authUid = req.auth!.uid;
+  const body = req.body || {};
+
+  try {
+    const result = await executeServerWireCheckWithdrawal({
+      userId: authUid,
+      bankName: body.bankName,
+      destinationBankAccountNumber: body.destinationBankAccountNumber,
+      destinationBankRoutingNumber: body.destinationBankRoutingNumber,
+      fullLegalName: body.fullLegalName,
+      residentialAddress: body.residentialAddress,
+      email: body.email,
+      phoneNumber: body.phoneNumber,
+      amount: body.amount,
+      sourceAccountType: body.sourceAccountType,
+      idempotencyKey: body.idempotencyKey,
+    });
+
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        success: false,
+        errorCode: result.errorCode,
+        error: result.error || 'Failed to process Wire Check withdrawal.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      request: result.request,
+      transaction: result.transaction,
+      balanceMetrics: result.balanceMetrics,
+      isDuplicate: result.isDuplicate || false,
+      ...(result.warnings ? { warnings: result.warnings } : {}),
+    });
+  } catch (err: any) {
+    console.error('[POST /api/withdrawals/wire-check] Error:', err);
+    return res.status(500).json({
+      success: false,
+      errorCode: 'INTERNAL_ERROR',
+      error: err?.message || 'Unexpected server error processing Wire Check withdrawal.',
+    });
+  }
+});
+
 // Administrator endpoint: retrieves all customer withdrawal support records
 app.get('/api/admin/withdrawal-support-records', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
@@ -2242,20 +2299,37 @@ if (!process.env.VERCEL) {
 }
 
 // --- TRANSACTIONS EXPLORER ---
-app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+app.get('/api/transactions', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+  if (!callerUid) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
 
-  let targetUserId = req.query.userId as string | undefined;
+  const adminSessionToken =
+    (req.headers['x-admin-session'] as string | undefined) || req.auth?.adminSessionToken;
+  const isCallerAdmin = await isCallerAdministrator(
+    callerUid,
+    req.auth?.email,
+    req.auth,
+    adminSessionToken
+  );
 
-  // Security check: non-administrators can only query their own transactions
+  const requestedUserId =
+    typeof req.query.userId === 'string' && req.query.userId.trim()
+      ? req.query.userId.trim()
+      : undefined;
+
+  // Security check: non-administrators can only query their own transactions derived from verified token
+  let targetUserId: string | undefined;
   if (!isCallerAdmin) {
-    if (!callerUid && !targetUserId) {
-      return res.status(401).json({ error: 'Authentication required' });
+    if (requestedUserId && requestedUserId !== callerUid) {
+      return res.status(403).json({
+        error: 'FORBIDDEN: You are not authorized to view another customer\'s transactions.',
+      });
     }
-    if (callerUid) {
-      targetUserId = callerUid;
-    }
+    targetUserId = callerUid;
+  } else {
+    targetUserId = requestedUserId;
   }
 
   const userId = targetUserId;
@@ -2343,7 +2417,7 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
   if (flow && flow !== 'ALL' && userId) {
     if (flow === 'CREDIT') {
       txs = txs.filter((t) => {
-        if (t.type === 'CHECK_WITHDRAWAL') return false;
+        if (t.type === 'CHECK_WITHDRAWAL' || t.type === 'WIRE_CHECK_WITHDRAWAL') return false;
         const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
         const txRecipClean = (t.recipientAccountNumber || '').replace(/[-\s]/g, '');
         const isRecipient = t.recipientUserId === userId || (!t.recipientUserId && t.userId === userId) || (userAccClean && txRecipClean && txRecipClean === userAccClean);
@@ -2363,11 +2437,16 @@ app.get('/api/transactions', optionalFirebaseAuth, async (req: AuthenticatedRequ
       });
     } else if (flow === 'DEBIT') {
       txs = txs.filter((t) => {
-        if (t.type === 'CHECK_WITHDRAWAL') return true;
+        if (t.type === 'CHECK_WITHDRAWAL' || t.type === 'WIRE_CHECK_WITHDRAWAL') return true;
         const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
         const txSenderClean = (t.senderAccountNumber || '').replace(/[-\s]/g, '');
         const isOutgoing = (t.senderUserId === userId && t.recipientUserId !== userId) || (userAccClean && txSenderClean && txSenderClean === userAccClean);
-        const isWithdrawal = t.type === 'WITHDRAWAL' || t.type === 'CARD_PURCHASE' || t.type === 'FEE';
+        const isWithdrawal =
+          t.type === 'WITHDRAWAL' ||
+          t.type === 'CHECK_WITHDRAWAL' ||
+          t.type === 'WIRE_CHECK_WITHDRAWAL' ||
+          t.type === 'CARD_PURCHASE' ||
+          t.type === 'FEE';
         const isAdminTransferCredit =
           (t.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
            t.senderAccountNumber === '1000000001' ||
@@ -3023,53 +3102,75 @@ app.post('/api/support/reply', optionalFirebaseAuth, async (req: AuthenticatedRe
   res.json({ success: true, notification: result.notification });
 });
 
-// Multi-Channel Notification Dispatcher Endpoint (SMS, Email, Push)
-app.post('/api/notifications/dispatch', async (req: Request, res: Response) => {
+// Multi-Channel Notification Dispatcher Endpoint (Disabled for external HTTP calls)
+// Financial and compliance notifications are generated strictly in-process by verified backend ledger operations.
+app.post('/api/notifications/dispatch', requireFirebaseAuth, async (_req: AuthenticatedRequest, res: Response) => {
+  return res.status(403).json({
+    success: false,
+    errorCode: 'NOTIFICATION_DISPATCH_DISABLED',
+    error: 'FORBIDDEN: External HTTP notification dispatch is disabled. Transaction and security notifications are generated exclusively by verified backend operations.',
+  });
+});
+
+// Authenticated Push Device Registration (derives UID exclusively from verified Firebase ID token)
+app.post('/api/push/register', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const uid = req.auth!.uid;
+  const { token, platform, userAgent } = req.body || {};
+
+  const validation = validatePushToken(token);
+  if (!validation.valid || !validation.token) {
+    return res.status(400).json({ success: false, error: validation.error || 'Invalid FCM registration token.' });
+  }
+
   try {
-    const {
-      transactionId,
-      referenceNumber,
-      type,
-      userId,
-      recipientName,
-      recipientEmail,
-      recipientPhone,
-      amount,
-      currency,
-      senderName,
-      accountMasked,
-      preferences,
-    } = req.body;
-
-    if (!userId || !type) {
-      return res.status(400).json({ error: 'userId and notification type are required' });
-    }
-
-    // Try to resolve user contact details from database if not explicitly provided
-    const user = db.users.get(userId);
-    const finalPhone = recipientPhone || user?.phone;
-    const finalEmail = recipientEmail || user?.email;
-    const finalName = recipientName || (user ? `${user.firstName} ${user.lastName}` : undefined);
-
-    const result = await serverNotificationDispatcher.dispatch({
-      transactionId: transactionId || referenceNumber || `tx_${Date.now()}`,
-      referenceNumber: referenceNumber || `MV-${Date.now().toString().slice(-6)}`,
-      type,
-      userId,
-      recipientName: finalName,
-      recipientEmail: finalEmail,
-      recipientPhone: finalPhone,
-      amount: amount !== undefined ? Number(amount) : undefined,
-      currency: currency || 'USD',
-      senderName,
-      accountMasked,
-      preferences,
+    const result = await registerCustomerPushToken({
+      uid,
+      token: validation.token,
+      platform: typeof platform === 'string' ? platform : 'web',
+      userAgent: typeof userAgent === 'string' ? userAgent : (req.headers['user-agent'] || 'unknown'),
     });
 
-    res.json({ success: true, dispatchResult: result });
+    if (!result.success) {
+      return res.status(503).json({ success: false, error: result.error || 'Failed to register push token.' });
+    }
+
+    return res.json({
+      success: true,
+      tokenId: result.tokenId,
+    });
   } catch (err: any) {
-    console.error('[API] /api/notifications/dispatch error:', err?.message || err);
-    res.status(500).json({ success: false, error: err?.message || 'Dispatch failed' });
+    console.error('[POST /api/push/register] Error:', err?.message || err);
+    return res.status(500).json({ success: false, error: 'Failed to register push device.' });
+  }
+});
+
+// Authenticated Push Device Unregistration (unlinks ONLY the caller's current device token)
+app.post('/api/push/unregister', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const uid = req.auth!.uid;
+  const { token } = req.body || {};
+
+  const validation = validatePushToken(token);
+  if (!validation.valid || !validation.token) {
+    return res.status(400).json({ success: false, error: validation.error || 'Invalid FCM registration token.' });
+  }
+
+  try {
+    const result = await unregisterCustomerPushToken({
+      uid,
+      token: validation.token,
+    });
+
+    if (!result.success) {
+      return res.status(503).json({ success: false, error: result.error || 'Failed to unregister push token.' });
+    }
+
+    return res.json({
+      success: true,
+      unregistered: result.unregistered,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/push/unregister] Error:', err?.message || err);
+    return res.status(500).json({ success: false, error: 'Failed to unregister push device.' });
   }
 });
 
@@ -3965,9 +4066,20 @@ app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, async (r
   const { status, reason } = req.body;
   if (!status) return res.status(400).json({ error: 'status is required' });
 
-  // Protect permanent CHECK_WITHDRAWAL debits from status-only reversal/override
+  // Protect permanent CHECK_WITHDRAWAL and WIRE_CHECK_WITHDRAWAL debits from status-only reversal/override
   const normalizedTargetStatus = String(status).trim().toUpperCase();
   const memTxMatch = db.transactions.find((t) => t.id === id || t.referenceNumber === id);
+  if (
+    memTxMatch &&
+    memTxMatch.type === 'WIRE_CHECK_WITHDRAWAL' &&
+    (normalizedTargetStatus === 'REVERSED' || normalizedTargetStatus !== 'COMPLETED')
+  ) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'WIRE_CHECK_WITHDRAWAL_PERMANENT',
+      error: 'WIRE_CHECK_WITHDRAWAL debits are permanent and cannot be reversed or altered through status-only updates.',
+    });
+  }
   if (
     memTxMatch &&
     (memTxMatch.type === 'CHECK_WITHDRAWAL' || memTxMatch.metadata?.permanentDebit === true) &&
@@ -3993,6 +4105,16 @@ app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, async (r
       }
       if (guardSnap.exists) {
         const fsTxGuard = guardSnap.data() as any;
+        if (
+          fsTxGuard?.type === 'WIRE_CHECK_WITHDRAWAL' &&
+          (normalizedTargetStatus === 'REVERSED' || normalizedTargetStatus !== 'COMPLETED')
+        ) {
+          return res.status(400).json({
+            success: false,
+            errorCode: 'WIRE_CHECK_WITHDRAWAL_PERMANENT',
+            error: 'WIRE_CHECK_WITHDRAWAL debits are permanent and cannot be reversed or altered through status-only updates.',
+          });
+        }
         if (
           (fsTxGuard?.type === 'CHECK_WITHDRAWAL' || fsTxGuard?.metadata?.permanentDebit === true) &&
           (normalizedTargetStatus === 'REVERSED' || normalizedTargetStatus !== 'COMPLETED')
@@ -4341,6 +4463,89 @@ app.post('/api/admin/checks/issue', requireAdminAuth, async (req: AuthenticatedR
       success: false,
       errorCode: 'INTERNAL_ERROR',
       error: err?.message || 'Unexpected server error issuing check.',
+    });
+  }
+});
+
+// --- ADMIN WIRE CHECK WITHDRAWAL QUEUE & DELIVERY STATUS ---
+app.get('/api/admin/wire-checks', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const headerSessionToken = req.headers['x-admin-session'] as string | undefined;
+  const effectiveSessionToken = headerSessionToken || req.auth?.adminSessionToken;
+  const sessionCheck = verifyAdminSessionToken(effectiveSessionToken, req.auth!.uid, req.auth!.email);
+  if (!sessionCheck.valid) {
+    return res.status(401).json({
+      success: false,
+      requests: [],
+      errorCode: 'ADMIN_SESSION_INVALID',
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Administrator session is invalid or expired.'}`,
+    });
+  }
+
+  try {
+    const result = await getAllWireCheckRequestsAdmin();
+    if (!result.success) {
+      return res.status(503).json({
+        success: false,
+        requests: [],
+        error: result.error || 'Unable to retrieve Wire Check requests.',
+      });
+    }
+    return res.json({ success: true, requests: result.requests });
+  } catch (err: any) {
+    console.error('[GET /api/admin/wire-checks] Error:', err);
+    return res.status(500).json({
+      success: false,
+      requests: [],
+      error: err?.message || 'Failed to list Wire Check requests.',
+    });
+  }
+});
+
+app.patch('/api/admin/wire-checks/:id/status', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const headerSessionToken = req.headers['x-admin-session'] as string | undefined;
+  const effectiveSessionToken = headerSessionToken || req.auth?.adminSessionToken;
+  const sessionCheck = verifyAdminSessionToken(effectiveSessionToken, req.auth!.uid, req.auth!.email);
+  if (!sessionCheck.valid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'ADMIN_SESSION_INVALID',
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Valid non-expired administrator session is required.'}`,
+    });
+  }
+
+  const verifiedAdminUid = req.auth!.uid;
+  const verifiedAdminEmail = (req.auth!.email || sessionCheck.payload?.email || '').toLowerCase().trim();
+  const requestId = req.params.id;
+  const targetStatus = req.body?.status ?? req.body?.checkProcessingStatus ?? '';
+
+  try {
+    const result = await markWireCheckRequestDeliveredAdmin({
+      requestId,
+      targetStatus,
+      adminUid: verifiedAdminUid,
+      adminEmail: verifiedAdminEmail,
+    });
+
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        success: false,
+        errorCode: result.errorCode,
+        error: result.error || 'Failed to update Wire Check delivery status.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      request: result.request,
+      transaction: result.transaction,
+      ...(result.warnings ? { warnings: result.warnings } : {}),
+    });
+  } catch (err: any) {
+    console.error('[PATCH /api/admin/wire-checks/:id/status] Error:', err);
+    return res.status(500).json({
+      success: false,
+      errorCode: 'INTERNAL_ERROR',
+      error: err?.message || 'Unexpected server error updating Wire Check delivery status.',
     });
   }
 });

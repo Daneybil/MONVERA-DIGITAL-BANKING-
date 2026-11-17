@@ -62,6 +62,7 @@ import { AdminBankVerificationRequestsView } from './AdminBankVerificationReques
 import { AdminCardActivationsView } from './AdminCardActivationsView';
 import { AdminTransfersView } from './AdminTransfersView';
 import { AdminIssuedChecksView } from './AdminIssuedChecksView';
+import { AdminWireChecksView } from './AdminWireChecksView';
 import { AdminDemoFundsView } from './AdminDemoFundsView';
 import { AdminNotificationsView } from './AdminNotificationsView';
 import { AdminAuditLogView } from './AdminAuditLogView';
@@ -1283,6 +1284,7 @@ export const AdminDashboard: React.FC = () => {
     { id: 'bank_approvals', label: 'Bank Account Requests', icon: Landmark, alertBadge: pendingBankAppsCount > 0 ? pendingBankAppsCount : undefined },
     { id: 'bank_verifications', label: 'Bank Verification Requests', icon: ShieldCheck, alertBadge: pendingBankVerificationsCount > 0 ? pendingBankVerificationsCount : undefined },
     { id: 'issued_checks', label: 'Issued Checks', icon: FileText },
+    { id: 'wire_checks', label: 'Wire Check Withdrawals', icon: FileText },
     { id: 'transfers', label: 'Transfers', icon: Zap },
     {
       id: 'loans',
@@ -1663,6 +1665,12 @@ export const AdminDashboard: React.FC = () => {
         {activeTab === 'issued_checks' && (
           <AdminIssuedChecksView
             customers={customers}
+            onRefreshData={loadAllAdminData}
+          />
+        )}
+
+        {activeTab === 'wire_checks' && (
+          <AdminWireChecksView
             onRefreshData={loadAllAdminData}
           />
         )}

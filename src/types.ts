@@ -91,6 +91,7 @@ export type TransactionType =
   | 'DEPOSIT'
   | 'WITHDRAWAL'
   | 'CHECK_WITHDRAWAL'
+  | 'WIRE_CHECK_WITHDRAWAL'
   | 'TRANSFER'
   | 'INVESTMENT'
   | 'INVESTMENT_EARNING'
@@ -121,7 +122,7 @@ export interface Transaction {
   recipientAccountNumber?: string;
   fee: number;
   description: string;
-  category: 'Transfers' | 'Deposits' | 'Withdrawals' | 'Checks' | 'Investments' | 'Shopping' | 'Earnings' | 'System' | 'Bills' | 'Rewards';
+  category: 'Transfers' | 'Deposits' | 'Withdrawals' | 'Checks' | 'Wire Check' | 'Investments' | 'Shopping' | 'Earnings' | 'System' | 'Bills' | 'Rewards';
   paymentProviderRef?: string;
   createdAt: string;
   completedAt?: string;
@@ -196,6 +197,48 @@ export interface IssuedCheckRecord {
   issuedByEmail: string;
   issuedAt: string;
   idempotencyKey: string;
+}
+
+export type WireCheckProcessingStatus = 'REQUESTED' | 'DELIVERED';
+
+export interface WireCheckDeliveryAudit {
+  previousStatus: WireCheckProcessingStatus;
+  nextStatus: WireCheckProcessingStatus;
+  adminUid: string;
+  adminEmail: string;
+  deliveredAt: string;
+}
+
+export interface WireCheckRequestRecord {
+  requestId: string;
+  userId: string;
+  customerAccountNumber: string;
+  customerName: string;
+  customerEmail?: string;
+  customerUsername?: string;
+  bankName: string;
+  destinationBankAccountNumber?: string;
+  destinationBankAccountNumberMasked?: string;
+  destinationBankRoutingNumber?: string;
+  fullLegalName: string;
+  residentialAddress: string;
+  email: string;
+  phoneNumber: string;
+  sourceAccountType: 'CHECKING' | 'SAVINGS';
+  amount: number;
+  currency: string;
+  referenceNumber: string;
+  transactionId: string;
+  transactionStatus: 'COMPLETED';
+  permanentDebit: true;
+  checkProcessingStatus: WireCheckProcessingStatus;
+  estimatedDeliveryBusinessDays: number;
+  submittedAt: string;
+  updatedAt: string;
+  deliveredAt?: string;
+  deliveredByUid?: string;
+  deliveredByEmail?: string;
+  deliveryAudit?: WireCheckDeliveryAudit;
 }
 
 export type BankAccountApplicationStatus = 'pending' | 'approved' | 'rejected' | 'activated' | 'cancelled';

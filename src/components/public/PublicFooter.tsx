@@ -3,6 +3,7 @@ import { MonveraLogo } from '../common/MonveraLogo';
 import { ShieldCheck, HeartHandshake, Lock, ArrowUpRight, CheckCircle2, Building2, Headphones, Mail } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { LanguageSelector } from '../common/LanguageSelector';
+import { PWAInstallButton } from '../pwa/PWAInstallButton';
 
 export const PublicFooter: React.FC = () => {
   const { setCurrentView, openModal, currentUser } = useAuth();
@@ -31,6 +32,9 @@ export const PublicFooter: React.FC = () => {
             <div className="flex items-center gap-2 text-emerald-400 font-bold text-xs pt-1">
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
               <span>Protected • Member FDIC Partner Security</span>
+            </div>
+            <div className="pt-1">
+              <PWAInstallButton variant="footer" />
             </div>
           </div>
 

@@ -4,6 +4,7 @@ import { useAuth } from '../../context/AuthContext';
 import { ArrowRight, ShieldCheck, ChevronDown, Menu, X, Lock, LayoutDashboard, Globe } from 'lucide-react';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { LanguageSelector } from '../common/LanguageSelector';
+import { PWAInstallButton } from '../pwa/PWAInstallButton';
 
 export const PublicNavbar: React.FC = () => {
   const { currentUser, setCurrentView, openModal } = useAuth();
@@ -107,6 +108,7 @@ export const PublicNavbar: React.FC = () => {
 
         {/* Right CTA Actions & Menu Trigger (Both Mobile and Desktop) */}
         <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
+          <PWAInstallButton variant="navbar" />
           {currentUser ? (
             <button
               id="navbar-dashboard-btn"
@@ -188,7 +190,8 @@ export const PublicNavbar: React.FC = () => {
               <div className="text-xs text-slate-500 font-medium">
                 Monvera Institutional Digital Asset & Treasury Banking
               </div>
-              <div className="flex items-center gap-2 w-full sm:w-auto">
+              <div className="flex flex-col sm:flex-row items-center gap-2 w-full sm:w-auto">
+                <PWAInstallButton variant="drawer" />
                 <button
                   id="drawer-get-started-btn"
                   onClick={() => {
