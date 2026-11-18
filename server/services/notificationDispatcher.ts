@@ -13,10 +13,156 @@ import {
 } from '../firebaseAdmin';
 import { smsService, SmsDispatchResult } from './smsService';
 import { emailService, EmailDispatchResult } from './emailService';
-import { persistCustomerNotification } from './notificationStore';
+import { persistCustomerNotification, maskAccountNumber } from './notificationStore';
+import type { BalanceMetrics, Transaction } from '../../src/types';
 
 export type NotificationCategory = 'TRANSACTION' | 'SECURITY' | 'INVESTMENT' | 'SYSTEM' | 'SUPPORT';
 export type DispatchEventType = 'MONEY_RECEIVED' | 'MONEY_SENT' | 'SECURITY' | 'TRANSACTION' | 'INVESTMENT' | 'SYSTEM' | 'SUPPORT';
+export type TransactionNotificationLifecycleStage = 'INITIATED' | 'REVERSED' | 'SUBMITTED' | 'DELIVERED';
+
+/**
+ * Deterministic lifecycle event-key contract for future multi-stage transaction notification integration.
+ * Preserves underlying ledger transaction IDs while separating distinct notification milestones
+ * (e.g., `${transactionId}:INITIATED`, `${transactionId}:REVERSED`, `${transactionId}:SUBMITTED`, `${transactionId}:DELIVERED`).
+ * Per-user dispatch isolation remains enforced by `computeDispatchLogId(userId, eventKey)`.
+ */
+export function buildTransactionLifecycleEventKey(
+  transactionId: string,
+  stage: TransactionNotificationLifecycleStage
+): string {
+  const cleanTxId = String(transactionId || '').trim();
+  if (!cleanTxId) {
+    throw new Error('transactionId is required to build a transaction lifecycle event key.');
+  }
+  return `${cleanTxId}:${stage}`;
+}
+
+function resolveAuthoritativeAccountMasked(
+  metrics: BalanceMetrics | undefined,
+  preferredType: string | undefined,
+  fallbackAccountNumber: string | undefined,
+  fallbackLabel?: string
+): string {
+  const normalizedPreferred = String(preferredType || '').trim().toUpperCase();
+  const accountsList = Array.isArray(metrics?.accounts) ? metrics.accounts : [];
+  const matchedAccount =
+    accountsList.find((a) => normalizedPreferred && String(a?.type || '').trim().toUpperCase() === normalizedPreferred) ||
+    accountsList.find((a) => fallbackAccountNumber && a?.accountNumber === fallbackAccountNumber);
+
+  const accountNumber = String(fallbackAccountNumber || matchedAccount?.accountNumber || '').trim();
+  const maskedNumber = accountNumber ? maskAccountNumber(accountNumber) : '';
+  const accountLabel =
+    String(matchedAccount?.nickname || fallbackLabel || '').trim() ||
+    (matchedAccount?.type === 'SAVINGS'
+      ? 'Monvera High-Yield Treasury'
+      : matchedAccount?.type === 'CHECKING'
+        ? 'Monvera Premier Checking'
+        : '');
+
+  if (accountLabel && maskedNumber) {
+    return `${accountLabel} (${maskedNumber})`;
+  }
+  if (maskedNumber) {
+    return maskedNumber;
+  }
+  if (accountLabel) {
+    return accountLabel;
+  }
+  return 'Monvera Account';
+}
+
+export interface BuildTransferDispatchOptions {
+  mode: 'MONVERA_C2C' | 'ADMIN_TRANSFER';
+  authenticatedSenderUid?: string;
+  senderMetrics?: BalanceMetrics;
+  recipientMetrics?: BalanceMetrics;
+  senderContact?: { email?: string; phone?: string };
+  recipientContact?: { email?: string; phone?: string };
+}
+
+/**
+ * Constructs notification dispatch events strictly from a committed authoritative transaction.
+ * Rejects duplicate replays, non-COMPLETED transactions, and invalid/missing amounts.
+ */
+export function buildTrustedTransferDispatchEvents(
+  tx: Transaction | null | undefined,
+  isDuplicate: boolean | undefined,
+  options: BuildTransferDispatchOptions
+): DispatchNotificationEvent[] {
+  if (isDuplicate === true) return [];
+  if (!tx || tx.status !== 'COMPLETED') return [];
+
+  const committedAmount = Number(tx.amount);
+  if (!Number.isFinite(committedAmount) || committedAmount <= 0) return [];
+
+  const transactionId = String(tx.id || '').trim();
+  if (!transactionId) return [];
+  const referenceNumber = String(tx.referenceNumber || transactionId).trim();
+  const currency = String(tx.currency || 'USD').trim() || 'USD';
+
+  const events: DispatchNotificationEvent[] = [];
+
+  const recipientUid = String(tx.recipientUserId || '').trim();
+  const recipientName = String(tx.recipientName || '').trim() || 'Monvera Member';
+  const defaultSenderName =
+    options.mode === 'ADMIN_TRANSFER'
+      ? String(tx.metadata?.adminSenderName || 'Bennett Johnson').trim()
+      : 'Monvera Member';
+  const senderName = String(tx.senderName || '').trim() || defaultSenderName;
+
+  if (recipientUid) {
+    const recipientAccountLabel = resolveAuthoritativeAccountMasked(
+      options.recipientMetrics,
+      tx.metadata?.recipientAccountType || 'CHECKING',
+      tx.recipientAccountNumber || tx.metadata?.recipientAccountNumber,
+      tx.metadata?.destinationAccount
+    );
+
+    events.push({
+      transactionId,
+      referenceNumber,
+      type: 'MONEY_RECEIVED',
+      userId: recipientUid,
+      recipientName,
+      recipientEmail: options.recipientContact?.email,
+      recipientPhone: options.recipientContact?.phone,
+      amount: committedAmount,
+      currency,
+      senderName,
+      accountMasked: recipientAccountLabel,
+    });
+  }
+
+  if (options.mode === 'MONVERA_C2C') {
+    const committedSenderUid = String(tx.senderUserId || '').trim();
+    if (
+      committedSenderUid &&
+      (!options.authenticatedSenderUid || committedSenderUid === options.authenticatedSenderUid)
+    ) {
+      const senderAccountLabel = resolveAuthoritativeAccountMasked(
+        options.senderMetrics,
+        tx.metadata?.sourceAccountType || 'CHECKING',
+        tx.senderAccountNumber
+      );
+
+      events.push({
+        transactionId,
+        referenceNumber,
+        type: 'MONEY_SENT',
+        userId: committedSenderUid,
+        recipientName,
+        recipientEmail: options.senderContact?.email,
+        recipientPhone: options.senderContact?.phone,
+        amount: committedAmount,
+        currency,
+        senderName,
+        accountMasked: senderAccountLabel,
+      });
+    }
+  }
+
+  return events;
+}
 
 export interface DispatchNotificationPreferences {
   pushEnabled?: boolean;
@@ -29,6 +175,8 @@ export interface DispatchNotificationPreferences {
 export interface DispatchNotificationEvent {
   transactionId: string;
   referenceNumber: string;
+  eventKey?: string;
+  lifecycleStage?: TransactionNotificationLifecycleStage;
   type: DispatchEventType;
   category?: NotificationCategory;
   userId: string;
@@ -62,6 +210,39 @@ export interface DispatchResultSummary {
   push: PushDispatchSummary;
   sms: SmsDispatchResult;
   email: EmailDispatchResult;
+}
+
+export interface OutboxDispatchOwnershipContext {
+  outboxId: string;
+  leaseToken: string;
+  outboxCollection?: string;
+  channels?: {
+    push?: boolean;
+    sms?: boolean;
+    email?: boolean;
+  };
+  knownChannelStatuses?: {
+    pushStatus?: string;
+    smsStatus?: string;
+    emailStatus?: string;
+  };
+  requirePersistentTracking?: boolean;
+  nowMs?: number;
+}
+
+export interface DispatchExecutionOptions {
+  outboxContext?: OutboxDispatchOwnershipContext;
+  channels?: {
+    push?: boolean;
+    sms?: boolean;
+    email?: boolean;
+  };
+  knownChannelStatuses?: {
+    pushStatus?: string;
+    smsStatus?: string;
+    emailStatus?: string;
+  };
+  requirePersistentTracking?: boolean;
 }
 
 export interface StoredDeviceToken {
@@ -147,8 +328,19 @@ export function computeLegacyPushTokenId(token: string): string {
   return Buffer.from(token.slice(-32), 'utf8').toString('base64').replace(/[/+=]/g, '_');
 }
 
-function computeDispatchLogId(userId: string, eventKey: string): string {
+export function computeDispatchLogId(userId: string, eventKey: string): string {
   return crypto.createHash('sha256').update(`${userId}::${eventKey}`).digest('base64url');
+}
+
+/**
+ * Derives the dispatch dedupe/log key for an event.
+ * Uses explicit `event.eventKey` when supplied while preserving existing
+ * `${transactionId || referenceNumber}_${type}` keys for backward compatibility.
+ */
+export function resolveDispatchKey(event: Pick<DispatchNotificationEvent, 'transactionId' | 'referenceNumber' | 'eventKey' | 'type'>): string {
+  const explicit = typeof event.eventKey === 'string' ? event.eventKey.trim() : '';
+  const base = explicit || String(event.transactionId || event.referenceNumber || '').trim();
+  return `${base}_${event.type}`;
 }
 
 function sanitizeActionUrl(url?: string): string {
@@ -506,11 +698,214 @@ export class ServerNotificationDispatcher {
   }
 
   /**
-   * Dispatch multi-channel notifications in background
+   * Read the authoritative outbox record and verify active lease ownership.
+   * Returns { leaseValid: true } for non-outbox legacy callers.
    */
-  public async dispatch(event: DispatchNotificationEvent): Promise<DispatchResultSummary> {
+  private async readOutboxRecordSnapshot(
+    fs: Firestore | null,
+    outboxCtx?: OutboxDispatchOwnershipContext
+  ): Promise<{ leaseValid: boolean; outboxData?: Record<string, any> }> {
+    if (!outboxCtx) {
+      return { leaseValid: true };
+    }
+    if (!fs || !outboxCtx.outboxId || !outboxCtx.leaseToken) {
+      return { leaseValid: false };
+    }
+
+    const colName = outboxCtx.outboxCollection || 'notification_outbox';
+    const snap = await fs.collection(colName).doc(outboxCtx.outboxId).get();
+    if (!snap.exists) {
+      return { leaseValid: false };
+    }
+
+    const data = snap.data() || {};
+    if (
+      data.status !== 'PROCESSING' ||
+      !data.leaseToken ||
+      data.leaseToken !== outboxCtx.leaseToken
+    ) {
+      return { leaseValid: false, outboxData: data };
+    }
+
+    const effectiveNowMs = outboxCtx.nowMs ?? Date.now();
+    if (data.leaseExpiresAt) {
+      const expMs = Date.parse(String(data.leaseExpiresAt));
+      if (Number.isFinite(expMs) && expMs <= effectiveNowMs) {
+        return { leaseValid: false, outboxData: data };
+      }
+    }
+
+    return { leaseValid: true, outboxData: data };
+  }
+
+  /**
+   * Persist independent per-channel completion state in `notification_dispatch_logs/{docId}`
+   * without downgrading any channel already confirmed SENT or NO_ACTIVE_TOKENS.
+   * When an outboxContext is supplied, atomically verifies active outbox lease ownership
+   * inside the transaction before writing.
+   */
+  private async persistChannelOutcomes(
+    fs: Firestore | null,
+    event: DispatchNotificationEvent,
+    category: NotificationCategory,
+    dispatchKey: string,
+    updates: {
+      pushStatus?: string;
+      smsStatus?: string;
+      emailStatus?: string;
+      smsError?: string;
+      emailError?: string;
+    },
+    options?: {
+      outboxContext?: OutboxDispatchOwnershipContext;
+      requirePersistentTracking?: boolean;
+    }
+  ): Promise<{ persisted: boolean; leaseLost: boolean }> {
+    const requireTracking = Boolean(options?.requirePersistentTracking ?? options?.outboxContext);
+    if (!fs) {
+      if (requireTracking) {
+        throw new Error('PERSISTENCE_ERROR: Firestore unavailable for required channel completion tracking.');
+      }
+      return { persisted: false, leaseLost: false };
+    }
+
+    const docId = computeDispatchLogId(event.userId, dispatchKey);
+    const logRef = fs.collection('notification_dispatch_logs').doc(docId);
+    const outboxCtx = options?.outboxContext;
+    const outboxRef = outboxCtx
+      ? fs.collection(outboxCtx.outboxCollection || 'notification_outbox').doc(outboxCtx.outboxId)
+      : null;
+    const nowIso = new Date().toISOString();
+
+    try {
+      const outcome = await fs.runTransaction(async (tx) => {
+        // ALL READS MUST PRECEDE ALL WRITES
+        const [snap, outboxSnap] = await Promise.all([
+          tx.get(logRef),
+          outboxRef ? tx.get(outboxRef) : Promise.resolve(null),
+        ]);
+
+        if (outboxCtx) {
+          if (!outboxSnap?.exists) {
+            return { persisted: false, leaseLost: true };
+          }
+          const outboxData = outboxSnap.data() || {};
+          if (
+            outboxData.status !== 'PROCESSING' ||
+            !outboxData.leaseToken ||
+            outboxData.leaseToken !== outboxCtx.leaseToken
+          ) {
+            return { persisted: false, leaseLost: true };
+          }
+          const effectiveNowMs = outboxCtx.nowMs ?? Date.now();
+          if (outboxData.leaseExpiresAt) {
+            const expMs = Date.parse(String(outboxData.leaseExpiresAt));
+            if (Number.isFinite(expMs) && expMs <= effectiveNowMs) {
+              return { persisted: false, leaseLost: true };
+            }
+          }
+        }
+
+        const existing = snap.exists ? snap.data() || {} : {};
+        const patch: Record<string, any> = {
+          dispatchKey,
+          userId: event.userId,
+          transactionId: event.transactionId || event.referenceNumber,
+          referenceNumber: event.referenceNumber,
+          category,
+          updatedAt: nowIso,
+        };
+        if (event.eventKey) {
+          patch.eventKey = event.eventKey;
+        }
+        if (event.lifecycleStage) {
+          patch.lifecycleStage = event.lifecycleStage;
+        }
+        if (!snap.exists) {
+          patch.createdAt = nowIso;
+        }
+
+        if (updates.pushStatus && existing.pushStatus !== 'SENT' && existing.pushStatus !== 'NO_ACTIVE_TOKENS') {
+          patch.pushStatus = updates.pushStatus;
+        }
+
+        if (updates.smsStatus && existing.smsStatus !== 'SENT') {
+          patch.smsStatus = updates.smsStatus;
+          if (updates.smsStatus === 'SENT') {
+            patch.smsSentAt = nowIso;
+          }
+          if (updates.smsError) {
+            patch.smsLastError = updates.smsError;
+          }
+        }
+
+        if (updates.emailStatus && existing.emailStatus !== 'SENT') {
+          patch.emailStatus = updates.emailStatus;
+          if (updates.emailStatus === 'SENT') {
+            patch.emailSentAt = nowIso;
+          }
+          if (updates.emailError) {
+            patch.emailLastError = updates.emailError;
+          }
+        }
+
+        tx.set(logRef, patch, { merge: true });
+        return { persisted: true, leaseLost: false };
+      });
+      return outcome;
+    } catch (err) {
+      if (requireTracking) {
+        throw err;
+      }
+      // Non-blocking audit/channel persistence for legacy callers
+      return { persisted: false, leaseLost: false };
+    }
+  }
+
+  private buildLeaseLostSummary(
+    event: DispatchNotificationEvent,
+    pushOverride?: PushDispatchSummary
+  ): DispatchResultSummary {
+    return {
+      transactionId: event.transactionId,
+      referenceNumber: event.referenceNumber,
+      push: pushOverride || { attempted: false, delivered: false, status: 'LEASE_LOST' },
+      sms: { success: false, delivered: false, status: 'LEASE_LOST', error: 'ABORTED_LEASE_LOST' },
+      email: { success: false, delivered: false, status: 'LEASE_LOST', error: 'ABORTED_LEASE_LOST' },
+    };
+  }
+
+  /**
+   * Dispatch multi-channel notifications in background or under durable outbox ownership.
+   */
+  public async dispatch(
+    event: DispatchNotificationEvent,
+    options?: DispatchExecutionOptions
+  ): Promise<DispatchResultSummary> {
     const category = resolveNotificationCategory(event);
-    const eventKey = `${event.userId}_${event.transactionId || event.referenceNumber}_${event.type}`;
+    const dispatchKey = resolveDispatchKey(event);
+    const inMemEventKey = `${event.userId}_${dispatchKey}`;
+    const smsMemKey = `${inMemEventKey}::SMS`;
+    const emailMemKey = `${inMemEventKey}::EMAIL`;
+    const fs = this.getFirestore();
+
+    const outboxCtx = options?.outboxContext;
+    const isOutboxOwned = Boolean(outboxCtx);
+    const requirePersistentTracking = Boolean(
+      options?.requirePersistentTracking ?? outboxCtx?.requirePersistentTracking ?? isOutboxOwned
+    );
+    const channelSelection = options?.channels ?? outboxCtx?.channels;
+    const callerKnownStatuses = options?.knownChannelStatuses ?? outboxCtx?.knownChannelStatuses;
+
+    // 0. For outbox-owned dispatch, verify active lease ownership BEFORE touching any channel
+    let liveOutboxData: Record<string, any> | undefined;
+    if (outboxCtx) {
+      const initialLease = await this.readOutboxRecordSnapshot(fs, outboxCtx);
+      if (!initialLease.leaseValid) {
+        return this.buildLeaseLostSummary(event);
+      }
+      liveOutboxData = initialLease.outboxData;
+    }
 
     // Load authoritative customer preferences from Firestore (allowing explicit internal overrides if supplied)
     const firestorePrefs = await this.loadCustomerPreferences(event.userId);
@@ -520,9 +915,59 @@ export class ServerNotificationDispatcher {
       securityAlerts: true,
     };
 
+    // Read persistent channel completion state before sending so retries only run unfinished channels
+    let persistedLog: Record<string, any> | null = null;
+    if (fs) {
+      try {
+        const logId = computeDispatchLogId(event.userId, dispatchKey);
+        const logSnap = await fs.collection('notification_dispatch_logs').doc(logId).get();
+        if (logSnap.exists) {
+          persistedLog = logSnap.data() || null;
+        }
+      } catch (readErr) {
+        if (requirePersistentTracking) {
+          throw readErr;
+        }
+        persistedLog = null;
+      }
+    }
+
+    const persistentSmsSent =
+      persistedLog?.smsStatus === 'SENT' ||
+      liveOutboxData?.smsStatus === 'SENT' ||
+      callerKnownStatuses?.smsStatus === 'SENT';
+    const persistentEmailSent =
+      persistedLog?.emailStatus === 'SENT' ||
+      liveOutboxData?.emailStatus === 'SENT' ||
+      callerKnownStatuses?.emailStatus === 'SENT';
+    const persistentPushSent =
+      persistedLog?.pushStatus === 'SENT' ||
+      liveOutboxData?.pushStatus === 'SENT' ||
+      callerKnownStatuses?.pushStatus === 'SENT';
+
+    // Outbox-owned durable retries never rely on process-local memory for delivery proof;
+    // legacy direct callers keep existing in-memory acceleration alongside persistent logs.
+    const smsAlreadySent = persistentSmsSent || (!isOutboxOwned && this.processedEvents.has(smsMemKey));
+    const emailAlreadySent = persistentEmailSent || (!isOutboxOwned && this.processedEvents.has(emailMemKey));
+
     // Transaction alerts toggle applies to transaction/non-security alerts; security alerts remain mandatory
     if (category !== 'SECURITY' && prefs.transactionAlerts === false) {
       console.log(`[Notification Dispatcher] Transaction alerts disabled by user preferences for ${event.userId}.`);
+      const disabledPersist = await this.persistChannelOutcomes(
+        fs,
+        event,
+        category,
+        dispatchKey,
+        {
+          pushStatus: 'DISABLED_BY_USER',
+          smsStatus: 'DISABLED_BY_USER',
+          emailStatus: 'DISABLED_BY_USER',
+        },
+        { outboxContext: outboxCtx, requirePersistentTracking }
+      );
+      if (disabledPersist.leaseLost) {
+        return this.buildLeaseLostSummary(event);
+      }
       return {
         transactionId: event.transactionId,
         referenceNumber: event.referenceNumber,
@@ -532,59 +977,268 @@ export class ServerNotificationDispatcher {
       };
     }
 
+    // Resolve known/terminal push status from outbox or caller before hitting FCM
+    const knownOrLivePushStatus = String(liveOutboxData?.pushStatus || callerKnownStatuses?.pushStatus || '');
+    const pushKnownTerminal =
+      knownOrLivePushStatus === 'NO_ACTIVE_TOKENS' ||
+      knownOrLivePushStatus === 'DISABLED_BY_USER' ||
+      knownOrLivePushStatus === 'FAILED_PERMANENT';
+
     // 1. Dispatch Push Notification via Firebase Admin Messaging (HTTP v1) with persistent duplicate protection
     let pushResult: PushDispatchSummary;
-    if (prefs.pushEnabled === false) {
+    let nextPushSyncStatus: string | undefined;
+
+    if (persistentPushSent) {
+      pushResult = { attempted: false, delivered: false, status: 'DUPLICATE_IGNORED' };
+      if (persistedLog?.pushStatus !== 'SENT') {
+        nextPushSyncStatus = 'SENT';
+      }
+    } else if (pushKnownTerminal) {
+      pushResult = { attempted: false, delivered: false, status: knownOrLivePushStatus };
+      if (knownOrLivePushStatus === 'NO_ACTIVE_TOKENS' && persistedLog?.pushStatus !== 'NO_ACTIVE_TOKENS') {
+        nextPushSyncStatus = 'NO_ACTIVE_TOKENS';
+      }
+    } else if (channelSelection?.push === false) {
+      pushResult = {
+        attempted: false,
+        delivered: false,
+        status: 'SKIPPED',
+      };
+    } else if (prefs.pushEnabled === false) {
       pushResult = { attempted: false, delivered: false, status: 'DISABLED_BY_USER' };
+      const pushDisabledPersist = await this.persistChannelOutcomes(
+        fs,
+        event,
+        category,
+        dispatchKey,
+        { pushStatus: 'DISABLED_BY_USER' },
+        { outboxContext: outboxCtx, requirePersistentTracking }
+      );
+      if (pushDisabledPersist.leaseLost) {
+        return this.buildLeaseLostSummary(event);
+      }
     } else {
-      pushResult = await this.sendPush(event, category);
+      pushResult = await this.sendPush(event, category, outboxCtx, requirePersistentTracking);
     }
 
-    // Fast in-memory dedupe strictly for optional SMS/Email fan-out if same process replays immediately
-    const channelsAlreadyProcessedInMemory = this.processedEvents.has(eventKey);
-    if (!channelsAlreadyProcessedInMemory) {
-      this.rememberInMemory(eventKey);
+    // Immediate abort if outbox or dispatch lease was lost during Push
+    if (pushResult.status === 'LEASE_LOST') {
+      return this.buildLeaseLostSummary(event, pushResult);
     }
 
-    // 2. Dispatch SMS
+    const supportsSmsTemplate =
+      event.type === 'MONEY_RECEIVED' ||
+      event.type === 'MONEY_SENT' ||
+      event.type === 'SECURITY';
+    const supportsEmailTemplate =
+      event.type === 'MONEY_RECEIVED' ||
+      event.type === 'MONEY_SENT' ||
+      event.type === 'SECURITY';
+
+    const knownOrLiveSmsStatus = String(liveOutboxData?.smsStatus || callerKnownStatuses?.smsStatus || '');
+    const smsKnownTerminal =
+      knownOrLiveSmsStatus === 'DISABLED_BY_USER' ||
+      knownOrLiveSmsStatus === 'FAILED_PERMANENT';
+
+    // 2. Dispatch SMS (only if unfinished, enabled, supported, and active outbox lease still verified)
     let smsResult: SmsDispatchResult = { success: true, delivered: false, status: 'UNCONFIGURED_PROVIDER' };
-    if (channelsAlreadyProcessedInMemory) {
+    let nextSmsChannelStatus: string | undefined;
+
+    if (smsAlreadySent) {
       smsResult = { success: true, delivered: false, status: 'DUPLICATE_IGNORED' };
-    } else if (prefs.smsEnabled !== false && event.recipientPhone) {
-      smsResult = await smsService.sendTransactionSms({
-        to: event.recipientPhone,
-        type: event.type === 'MONEY_RECEIVED' || event.type === 'MONEY_SENT' ? event.type : 'SECURITY',
-        amount: event.amount,
-        currency: event.currency || 'USD',
-        senderName: event.senderName,
-        recipientName: event.recipientName,
-        referenceNumber: event.referenceNumber,
-      });
+      if (persistentSmsSent && persistedLog?.smsStatus !== 'SENT') {
+        nextSmsChannelStatus = 'SENT';
+      }
+    } else if (smsKnownTerminal) {
+      smsResult = {
+        success: true,
+        delivered: false,
+        status: knownOrLiveSmsStatus === 'FAILED_PERMANENT' ? 'INVALID_PHONE' : 'DISABLED_BY_USER',
+      };
+    } else if (channelSelection?.sms === false) {
+      smsResult = {
+        success: true,
+        delivered: false,
+        status:
+          knownOrLiveSmsStatus === 'UNCONFIGURED_PROVIDER' && !supportsSmsTemplate
+            ? 'UNCONFIGURED_PROVIDER'
+            : 'SKIPPED',
+      };
+    } else if (!supportsSmsTemplate) {
+      smsResult = {
+        success: true,
+        delivered: false,
+        status: 'UNCONFIGURED_PROVIDER',
+        error: `No SMS template configured for event type "${event.type}"`,
+      };
+      nextSmsChannelStatus = 'UNCONFIGURED_PROVIDER';
     } else if (prefs.smsEnabled === false) {
-      smsResult = { success: true, delivered: false, status: 'DUPLICATE_IGNORED', error: 'Disabled by user preference' };
-    } else {
+      smsResult = { success: true, delivered: false, status: 'DISABLED_BY_USER', error: 'Disabled by user preference' };
+      nextSmsChannelStatus = 'DISABLED_BY_USER';
+    } else if (!event.recipientPhone) {
       smsResult = { success: true, delivered: false, status: 'INVALID_PHONE', error: 'No phone number on profile' };
+      nextSmsChannelStatus = 'FAILED_PERMANENT';
+    } else {
+      // Immediate pre-send lease check & fresh persistent outbox check before external SMS call
+      if (outboxCtx) {
+        const preSmsCheck = await this.readOutboxRecordSnapshot(fs, outboxCtx);
+        if (!preSmsCheck.leaseValid) {
+          return this.buildLeaseLostSummary(event);
+        }
+        if (preSmsCheck.outboxData?.smsStatus === 'SENT') {
+          smsResult = { success: true, delivered: false, status: 'DUPLICATE_IGNORED' };
+          if (persistedLog?.smsStatus !== 'SENT') {
+            nextSmsChannelStatus = 'SENT';
+          }
+        } else {
+          smsResult = await smsService.sendTransactionSms({
+            to: event.recipientPhone,
+            type: event.type as 'MONEY_RECEIVED' | 'MONEY_SENT' | 'SECURITY',
+            amount: event.amount,
+            currency: event.currency || 'USD',
+            senderName: event.senderName,
+            recipientName: event.recipientName,
+            referenceNumber: event.referenceNumber,
+            eventKey: event.eventKey,
+          });
+        }
+      } else {
+        smsResult = await smsService.sendTransactionSms({
+          to: event.recipientPhone,
+          type: event.type as 'MONEY_RECEIVED' | 'MONEY_SENT' | 'SECURITY',
+          amount: event.amount,
+          currency: event.currency || 'USD',
+          senderName: event.senderName,
+          recipientName: event.recipientName,
+          referenceNumber: event.referenceNumber,
+          eventKey: event.eventKey,
+        });
+      }
+
+      if (smsResult.delivered && smsResult.status === 'SENT') {
+        this.rememberInMemory(smsMemKey);
+        nextSmsChannelStatus = 'SENT';
+      } else if (smsResult.status === 'INVALID_PHONE') {
+        nextSmsChannelStatus = 'FAILED_PERMANENT';
+      } else if (smsResult.status === 'UNCONFIGURED_PROVIDER') {
+        nextSmsChannelStatus = 'UNCONFIGURED_PROVIDER';
+      } else if (smsResult.status === 'FAILED') {
+        nextSmsChannelStatus = 'FAILED_RETRYABLE';
+      }
     }
 
-    // 3. Dispatch Transactional Email
+    const knownOrLiveEmailStatus = String(liveOutboxData?.emailStatus || callerKnownStatuses?.emailStatus || '');
+    const emailKnownTerminal =
+      knownOrLiveEmailStatus === 'DISABLED_BY_USER' ||
+      knownOrLiveEmailStatus === 'FAILED_PERMANENT';
+
+    // 3. Dispatch Transactional Email (only if unfinished, enabled, supported, and active outbox lease still verified)
     let emailResult: EmailDispatchResult = { success: true, delivered: false, status: 'UNCONFIGURED_PROVIDER' };
-    if (channelsAlreadyProcessedInMemory) {
+    let nextEmailChannelStatus: string | undefined;
+
+    if (emailAlreadySent) {
       emailResult = { success: true, delivered: false, status: 'DUPLICATE_IGNORED' };
-    } else if (prefs.emailEnabled !== false && event.recipientEmail) {
-      emailResult = await emailService.sendTransactionalEmail({
-        to: event.recipientEmail,
-        recipientName: event.recipientName,
-        type: event.type === 'MONEY_RECEIVED' || event.type === 'MONEY_SENT' ? event.type : 'SECURITY',
-        amount: event.amount,
-        currency: event.currency || 'USD',
-        senderName: event.senderName,
-        referenceNumber: event.referenceNumber,
-        accountMasked: event.accountMasked,
-      });
+      if (persistentEmailSent && persistedLog?.emailStatus !== 'SENT') {
+        nextEmailChannelStatus = 'SENT';
+      }
+    } else if (emailKnownTerminal) {
+      emailResult = {
+        success: true,
+        delivered: false,
+        status: knownOrLiveEmailStatus === 'FAILED_PERMANENT' ? 'INVALID_EMAIL' : 'DISABLED_BY_USER',
+      };
+    } else if (channelSelection?.email === false) {
+      emailResult = {
+        success: true,
+        delivered: false,
+        status:
+          knownOrLiveEmailStatus === 'UNCONFIGURED_PROVIDER' && !supportsEmailTemplate
+            ? 'UNCONFIGURED_PROVIDER'
+            : 'SKIPPED',
+      };
+    } else if (!supportsEmailTemplate) {
+      emailResult = {
+        success: true,
+        delivered: false,
+        status: 'UNCONFIGURED_PROVIDER',
+        error: `No email template configured for event type "${event.type}"`,
+      };
+      nextEmailChannelStatus = 'UNCONFIGURED_PROVIDER';
     } else if (prefs.emailEnabled === false) {
-      emailResult = { success: true, delivered: false, status: 'DUPLICATE_IGNORED', error: 'Disabled by user preference' };
-    } else {
+      emailResult = { success: true, delivered: false, status: 'DISABLED_BY_USER', error: 'Disabled by user preference' };
+      nextEmailChannelStatus = 'DISABLED_BY_USER';
+    } else if (!event.recipientEmail) {
       emailResult = { success: true, delivered: false, status: 'INVALID_EMAIL', error: 'No email address on profile' };
+      nextEmailChannelStatus = 'FAILED_PERMANENT';
+    } else {
+      // Immediate pre-send lease check & fresh persistent outbox check before external Email call
+      if (outboxCtx) {
+        const preEmailCheck = await this.readOutboxRecordSnapshot(fs, outboxCtx);
+        if (!preEmailCheck.leaseValid) {
+          return this.buildLeaseLostSummary(event);
+        }
+        if (preEmailCheck.outboxData?.emailStatus === 'SENT') {
+          emailResult = { success: true, delivered: false, status: 'DUPLICATE_IGNORED' };
+          if (persistedLog?.emailStatus !== 'SENT') {
+            nextEmailChannelStatus = 'SENT';
+          }
+        } else {
+          emailResult = await emailService.sendTransactionalEmail({
+            to: event.recipientEmail,
+            recipientName: event.recipientName,
+            type: event.type as 'MONEY_RECEIVED' | 'MONEY_SENT' | 'SECURITY',
+            amount: event.amount,
+            currency: event.currency || 'USD',
+            senderName: event.senderName,
+            referenceNumber: event.referenceNumber,
+            eventKey: event.eventKey,
+            accountMasked: event.accountMasked,
+          });
+        }
+      } else {
+        emailResult = await emailService.sendTransactionalEmail({
+          to: event.recipientEmail,
+          recipientName: event.recipientName,
+          type: event.type as 'MONEY_RECEIVED' | 'MONEY_SENT' | 'SECURITY',
+          amount: event.amount,
+          currency: event.currency || 'USD',
+          senderName: event.senderName,
+          referenceNumber: event.referenceNumber,
+          eventKey: event.eventKey,
+          accountMasked: event.accountMasked,
+        });
+      }
+
+      if (emailResult.delivered && emailResult.status === 'SENT') {
+        this.rememberInMemory(emailMemKey);
+        nextEmailChannelStatus = 'SENT';
+      } else if (emailResult.status === 'INVALID_EMAIL') {
+        nextEmailChannelStatus = 'FAILED_PERMANENT';
+      } else if (emailResult.status === 'UNCONFIGURED_PROVIDER') {
+        nextEmailChannelStatus = 'UNCONFIGURED_PROVIDER';
+      } else if (emailResult.status === 'FAILED') {
+        nextEmailChannelStatus = 'FAILED_RETRYABLE';
+      }
+    }
+
+    if (nextPushSyncStatus || nextSmsChannelStatus || nextEmailChannelStatus) {
+      const channelPersist = await this.persistChannelOutcomes(
+        fs,
+        event,
+        category,
+        dispatchKey,
+        {
+          pushStatus: nextPushSyncStatus,
+          smsStatus: nextSmsChannelStatus,
+          emailStatus: nextEmailChannelStatus,
+          smsError: smsResult.error,
+          emailError: emailResult.error,
+        },
+        { outboxContext: outboxCtx, requirePersistentTracking }
+      );
+      if (channelPersist.leaseLost) {
+        return this.buildLeaseLostSummary(event);
+      }
     }
 
     return {
@@ -732,11 +1386,11 @@ export class ServerNotificationDispatcher {
     leaseToken: string;
     alreadyDeliveredTokenIds: Set<string>;
   }> {
-    const eventKey = `${event.transactionId || event.referenceNumber}_${event.type}`;
+    const eventKey = resolveDispatchKey(event);
     const docId = computeDispatchLogId(event.userId, eventKey);
     const logRef = fs.collection('notification_dispatch_logs').doc(docId);
     const leaseDuration = this.deps.leaseDurationMs || DEFAULT_LEASE_DURATION_MS;
-    const leaseToken = crypto.randomBytes(8).toString('hex');
+    const leaseToken = crypto.randomBytes(16).toString('hex');
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
     const leaseExpiresIso = new Date(nowMs + leaseDuration).toISOString();
@@ -746,11 +1400,15 @@ export class ServerNotificationDispatcher {
       if (!snap.exists) {
         tx.set(logRef, {
           dispatchKey: eventKey,
+          ...(event.eventKey ? { eventKey: event.eventKey } : {}),
+          ...(event.lifecycleStage ? { lifecycleStage: event.lifecycleStage } : {}),
           userId: event.userId,
           transactionId: event.transactionId || event.referenceNumber,
           referenceNumber: event.referenceNumber,
           category,
           pushStatus: 'CLAIMED',
+          smsStatus: 'PENDING',
+          emailStatus: 'PENDING',
           leaseOwner: this.instanceId,
           leaseToken,
           leaseExpiresAt: leaseExpiresIso,
@@ -817,12 +1475,42 @@ export class ServerNotificationDispatcher {
     logRef: FirebaseFirestore.DocumentReference,
     leaseToken: string,
     newDeliveredIds: string[],
-    fields: Record<string, any>
+    fields: Record<string, any>,
+    outboxCtx?: OutboxDispatchOwnershipContext
   ): Promise<{ leaseLost: boolean; mergedDeliveredIds: string[] }> {
+    const outboxRef = outboxCtx
+      ? fs.collection(outboxCtx.outboxCollection || 'notification_outbox').doc(outboxCtx.outboxId)
+      : null;
+
     return fs.runTransaction(async (tx) => {
-      const snap = await tx.get(logRef);
+      const [snap, outboxSnap] = await Promise.all([
+        tx.get(logRef),
+        outboxRef ? tx.get(outboxRef) : Promise.resolve(null),
+      ]);
+
       if (!snap.exists) {
         return { leaseLost: true, mergedDeliveredIds: [] };
+      }
+
+      if (outboxCtx) {
+        if (!outboxSnap?.exists) {
+          return { leaseLost: true, mergedDeliveredIds: [] };
+        }
+        const outboxData = outboxSnap.data() || {};
+        if (
+          outboxData.status !== 'PROCESSING' ||
+          !outboxData.leaseToken ||
+          outboxData.leaseToken !== outboxCtx.leaseToken
+        ) {
+          return { leaseLost: true, mergedDeliveredIds: [] };
+        }
+        const effectiveNowMs = outboxCtx.nowMs ?? Date.now();
+        if (outboxData.leaseExpiresAt) {
+          const expMs = Date.parse(String(outboxData.leaseExpiresAt));
+          if (Number.isFinite(expMs) && expMs <= effectiveNowMs) {
+            return { leaseLost: true, mergedDeliveredIds: [] };
+          }
+        }
       }
 
       const data = snap.data() || {};
@@ -857,7 +1545,9 @@ export class ServerNotificationDispatcher {
    */
   private async sendPush(
     event: DispatchNotificationEvent,
-    category: NotificationCategory
+    category: NotificationCategory,
+    outboxCtx?: OutboxDispatchOwnershipContext,
+    requirePersistentTracking: boolean = false
   ): Promise<PushDispatchSummary> {
     const fs = this.getFirestore();
     const messaging = this.getMessaging();
@@ -866,12 +1556,22 @@ export class ServerNotificationDispatcher {
       return { attempted: false, delivered: false, status: 'UNCONFIGURED_PROVIDER' };
     }
 
+    if (outboxCtx) {
+      const leaseCheck = await this.readOutboxRecordSnapshot(fs, outboxCtx);
+      if (!leaseCheck.leaseValid) {
+        return { attempted: false, delivered: false, status: 'LEASE_LOST' };
+      }
+    }
+
     // 1. Claim persistent dispatch lease before hitting FCM
     let lease: Awaited<ReturnType<ServerNotificationDispatcher['claimPersistentDispatchLease']>>;
     try {
       lease = await this.claimPersistentDispatchLease(fs, event, category);
     } catch (leaseErr: any) {
       console.warn('[Push Service] Dispatch lease claim error:', leaseErr?.message || leaseErr);
+      if (requirePersistentTracking) {
+        throw leaseErr;
+      }
       return { attempted: false, delivered: false, status: 'LEASE_ERROR' };
     }
 
@@ -903,7 +1603,7 @@ export class ServerNotificationDispatcher {
       }
     } catch (tokErr: any) {
       const errIso = new Date().toISOString();
-      await this.updateDispatchRecordAsLeaseOwner(
+      const errUpdate = await this.updateDispatchRecordAsLeaseOwner(
         fs,
         lease.logRef,
         lease.leaseToken,
@@ -913,8 +1613,15 @@ export class ServerNotificationDispatcher {
           lastError: tokErr?.message || 'Token lookup failed',
           leaseExpiresAt: errIso,
           updatedAt: errIso,
-        }
-      ).catch(() => {});
+        },
+        outboxCtx
+      ).catch((uErr) => {
+        if (requirePersistentTracking) throw uErr;
+        return { leaseLost: false, mergedDeliveredIds: [] };
+      });
+      if (errUpdate.leaseLost) {
+        return { attempted: false, delivered: false, status: 'LEASE_LOST' };
+      }
       return { attempted: true, delivered: false, status: 'FAILED' };
     }
 
@@ -924,7 +1631,7 @@ export class ServerNotificationDispatcher {
     if (devices.length === 0) {
       const doneIso = new Date().toISOString();
       if (lease.alreadyDeliveredTokenIds.size > 0) {
-        await this.updateDispatchRecordAsLeaseOwner(
+        const prevSentUpdate = await this.updateDispatchRecordAsLeaseOwner(
           fs,
           lease.logRef,
           lease.leaseToken,
@@ -934,8 +1641,15 @@ export class ServerNotificationDispatcher {
             sentAt: doneIso,
             leaseExpiresAt: doneIso,
             updatedAt: doneIso,
-          }
-        ).catch(() => {});
+          },
+          outboxCtx
+        ).catch((uErr) => {
+          if (requirePersistentTracking) throw uErr;
+          return { leaseLost: false, mergedDeliveredIds: Array.from(lease.alreadyDeliveredTokenIds) };
+        });
+        if (prevSentUpdate.leaseLost) {
+          return { attempted: false, delivered: false, status: 'LEASE_LOST' };
+        }
         return {
           attempted: false,
           delivered: true,
@@ -945,7 +1659,7 @@ export class ServerNotificationDispatcher {
         };
       }
 
-      await this.updateDispatchRecordAsLeaseOwner(
+      const noTokUpdate = await this.updateDispatchRecordAsLeaseOwner(
         fs,
         lease.logRef,
         lease.leaseToken,
@@ -954,14 +1668,21 @@ export class ServerNotificationDispatcher {
           pushStatus: 'NO_ACTIVE_TOKENS',
           leaseExpiresAt: doneIso,
           updatedAt: doneIso,
-        }
-      ).catch(() => {});
+        },
+        outboxCtx
+      ).catch((uErr) => {
+        if (requirePersistentTracking) throw uErr;
+        return { leaseLost: false, mergedDeliveredIds: [] };
+      });
+      if (noTokUpdate.leaseLost) {
+        return { attempted: false, delivered: false, status: 'LEASE_LOST' };
+      }
       return { attempted: false, delivered: false, status: 'NO_ACTIVE_TOKENS', targetedDevices: 0 };
     }
 
     if (pendingDevices.length === 0 && lease.alreadyDeliveredTokenIds.size > 0) {
       const doneIso = new Date().toISOString();
-      await this.updateDispatchRecordAsLeaseOwner(
+      const pendingDoneUpdate = await this.updateDispatchRecordAsLeaseOwner(
         fs,
         lease.logRef,
         lease.leaseToken,
@@ -971,8 +1692,15 @@ export class ServerNotificationDispatcher {
           sentAt: doneIso,
           leaseExpiresAt: doneIso,
           updatedAt: doneIso,
-        }
-      ).catch(() => {});
+        },
+        outboxCtx
+      ).catch((uErr) => {
+        if (requirePersistentTracking) throw uErr;
+        return { leaseLost: false, mergedDeliveredIds: Array.from(lease.alreadyDeliveredTokenIds) };
+      });
+      if (pendingDoneUpdate.leaseLost) {
+        return { attempted: false, delivered: false, status: 'LEASE_LOST' };
+      }
       return {
         attempted: false,
         delivered: true,
@@ -1001,6 +1729,21 @@ export class ServerNotificationDispatcher {
 
     // 4. Send in batches <= 500 per FCM sendEachForMulticast limits, checkpointing confirmed IDs after each batch
     for (let i = 0; i < pendingDevices.length; i += FCM_MULTICAST_BATCH_SIZE) {
+      if (outboxCtx) {
+        const batchLease = await this.readOutboxRecordSnapshot(fs, outboxCtx);
+        if (!batchLease.leaseValid) {
+          return {
+            attempted: i > 0,
+            delivered: newlyDeliveredIds.length > 0,
+            status: 'LEASE_LOST',
+            targetedDevices: pendingDevices.length,
+            deliveredDevices: new Set([...lease.alreadyDeliveredTokenIds, ...newlyDeliveredIds]).size,
+            failedDevices: transientFailures.length,
+            removedInvalidTokens: removedInvalidCount,
+          };
+        }
+      }
+
       const batch = pendingDevices.slice(i, i + FCM_MULTICAST_BATCH_SIZE);
       const batchDeliveredIds: string[] = [];
 
@@ -1103,7 +1846,8 @@ export class ServerNotificationDispatcher {
             removedInvalidTokens: removedInvalidCount,
             leaseExpiresAt: new Date(checkpointMs + leaseDuration).toISOString(),
             updatedAt: new Date(checkpointMs).toISOString(),
-          }
+          },
+          outboxCtx
         );
 
         if (checkpointResult.leaseLost) {
@@ -1152,8 +1896,14 @@ export class ServerNotificationDispatcher {
         leaseExpiresAt: finishIso,
         updatedAt: finishIso,
         ...(finalStatus === 'SENT' ? { sentAt: finishIso } : {}),
+      },
+      outboxCtx
+    ).catch((err) => {
+      if (requirePersistentTracking) {
+        throw err;
       }
-    ).catch(() => ({ leaseLost: true, mergedDeliveredIds: totalDeliveredIds }));
+      return { leaseLost: true, mergedDeliveredIds: totalDeliveredIds };
+    });
 
     if (finalUpdate.leaseLost) {
       console.warn(

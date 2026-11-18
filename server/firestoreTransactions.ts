@@ -1,3 +1,4 @@
+import type { Firestore } from 'firebase-admin/firestore';
 import { adminFirestore, adminAuth, isFirebaseAdminConfigured } from './firebaseAdmin';
 import { db } from './db';
 import {
@@ -16,6 +17,43 @@ import {
 } from '../src/types';
 import { evaluateAndProcessWelcomeReward } from './welcomeRewardService';
 import { persistCustomerNotification, maskAccountNumber } from './services/notificationStore';
+import { buildTransactionLifecycleEventKey } from './services/notificationDispatcher';
+import {
+  prepareNotificationOutboxBatch,
+  writePreparedNotificationOutboxBatchInTransaction,
+  type CreateOutboxRecordInput,
+  type WrittenOutboxBatchResult,
+} from './services/notificationOutbox';
+
+export interface ServerTransactionDeps {
+  firestore?: Firestore;
+  isAdminConfigured?: () => boolean;
+}
+
+function reportOutboxPreparationIssues(
+  context: string,
+  txId: string,
+  outboxWrite: WrittenOutboxBatchResult | null
+): void {
+  if (!outboxWrite || outboxWrite.invalidItems.length === 0) return;
+  console.warn(
+    `[Outbox][${context}] Skipped ${outboxWrite.invalidItems.length} invalid outbox item(s) for transaction ${txId}:`,
+    JSON.stringify(
+      outboxWrite.invalidItems.map((item) => ({
+        userId: item.userId,
+        eventKey: item.eventKey,
+        dispatchType: item.dispatchType,
+        error: item.error,
+      }))
+    )
+  );
+}
+
+function formatSafeOutboxAccountLabel(accountNumber?: string | null, label?: string | null): string {
+  const masked = maskAccountNumber(accountNumber);
+  const cleanLabel = typeof label === 'string' ? label.trim().slice(0, 36) : '';
+  return cleanLabel ? `${cleanLabel} (${masked})` : masked;
+}
 
 export interface TransferParams {
   senderUid: string;
@@ -132,7 +170,10 @@ export interface RecipientResolveResult {
  * Enforces strict uniqueness: if multiple users match the same username/email/account number,
  * it halts immediately with an ambiguity error to prevent misplaced transfers.
  */
-export async function resolveRecipientUser(rawTarget: string): Promise<RecipientResolveResult> {
+export async function resolveRecipientUser(
+  rawTarget: string,
+  deps?: ServerTransactionDeps
+): Promise<RecipientResolveResult> {
   if (!rawTarget || !rawTarget.trim()) {
     return { success: false, error: 'Recipient account number, username, email, or customer ID is required.' };
   }
@@ -141,9 +182,12 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
   const cleanTarget = cleanNoAt.toLowerCase();
   const cleanDigits = targetStr.replace(/[-\s]/g, '');
 
-  if (isFirebaseAdminConfigured()) {
-    const usersCol = adminFirestore.collection('users');
-    const accountsCol = adminFirestore.collection('accounts');
+  const fs = deps?.firestore || adminFirestore;
+  const adminConfigured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+
+  if (adminConfigured) {
+    const usersCol = fs.collection('users');
+    const accountsCol = fs.collection('accounts');
 
     // Strategy 1: Direct document ID lookup in users/accounts or Firebase Admin Auth (skip when clearly @handle or email)
     if (!targetStr.startsWith('@') && !targetStr.includes('@')) {
@@ -454,7 +498,10 @@ export async function resolveRecipientUser(rawTarget: string): Promise<Recipient
 /**
  * Server-authoritative Monvera-to-Monvera transfer inside a single Firestore transaction.
  */
-export async function executeServerTransfer(params: TransferParams): Promise<TransferResult> {
+export async function executeServerTransfer(
+  params: TransferParams,
+  deps?: ServerTransactionDeps
+): Promise<TransferResult> {
   const {
     senderUid,
     recipientIdentifier,
@@ -472,19 +519,22 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
     return { success: false, error: 'Sender ID and a positive transfer amount are required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
+  const adminConfigured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+
   // 1. Concurrently resolve sender profile and direct recipient UID (when supplied & verified)
   const cleanDirectRecipUid = typeof recipientUserId === 'string' ? recipientUserId.trim() : '';
   const canUseDirectRecipRead =
-    isFirebaseAdminConfigured() &&
+    adminConfigured &&
     Boolean(cleanDirectRecipUid) &&
     cleanDirectRecipUid !== 'usr_admin' &&
     cleanDirectRecipUid !== senderUid;
 
-  const [senderDocSnap, directRecipSnap] = isFirebaseAdminConfigured()
+  const [senderDocSnap, directRecipSnap] = adminConfigured
     ? await Promise.all([
-        adminFirestore.collection('users').doc(senderUid).get().catch(() => null),
+        fs.collection('users').doc(senderUid).get().catch(() => null),
         canUseDirectRecipRead
-          ? adminFirestore.collection('users').doc(cleanDirectRecipUid).get().catch(() => null)
+          ? fs.collection('users').doc(cleanDirectRecipUid).get().catch(() => null)
           : Promise.resolve(null),
       ])
     : [null, null];
@@ -523,7 +573,7 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
   }
 
   if (!recipientRecord) {
-    recipientRecord = await resolveRecipientUser(recipientIdentifier);
+    recipientRecord = await resolveRecipientUser(recipientIdentifier, deps);
   }
 
   if (!recipientRecord || !recipientRecord.success || !recipientRecord.uid) {
@@ -601,19 +651,20 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
   let finalSenderMetrics: BalanceMetrics | null = null;
   let finalRecipientMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    if (isFirebaseAdminConfigured()) {
+    if (adminConfigured) {
       // References
-      const senderAccRef = adminFirestore.collection('accounts').doc(senderUid);
-      const recipientAccRef = adminFirestore.collection('accounts').doc(recipientUid);
-      const txRef = adminFirestore.collection('transactions').doc(txId);
+      const senderAccRef = fs.collection('accounts').doc(senderUid);
+      const recipientAccRef = fs.collection('accounts').doc(recipientUid);
+      const txRef = fs.collection('transactions').doc(txId);
 
-      await adminFirestore.runTransaction(async (transaction) => {
+      await fs.runTransaction(async (transaction) => {
         // Run idempotency check, sender balance read, and recipient balance read concurrently inside the atomic transaction
         const [existingRefQuery, primarySenderSnap, primaryRecipientSnap] = await Promise.all([
           transaction.get(
-            adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
+            fs.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
           ),
           transaction.get(senderAccRef),
           transaction.get(recipientAccRef),
@@ -663,10 +714,10 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
           needLegacySender || needLegacyRecipient
             ? await Promise.all([
                 needLegacySender
-                  ? transaction.get(adminFirestore.collection('accounts').doc(senderAcc))
+                  ? transaction.get(fs.collection('accounts').doc(senderAcc))
                   : Promise.resolve(null),
                 needLegacyRecipient
-                  ? transaction.get(adminFirestore.collection('accounts').doc(recipientAcc))
+                  ? transaction.get(fs.collection('accounts').doc(recipientAcc))
                   : Promise.resolve(null),
               ])
             : [null, null];
@@ -675,14 +726,14 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
         let actualSenderRef = senderAccRef;
         if (legacySenderSnap && legacySenderSnap.exists) {
           senderAccSnap = legacySenderSnap;
-          actualSenderRef = adminFirestore.collection('accounts').doc(senderAcc);
+          actualSenderRef = fs.collection('accounts').doc(senderAcc);
         }
 
         let recipientAccSnap = primaryRecipientSnap;
         let actualRecipientRef = recipientAccRef;
         if (legacyRecipSnap && legacyRecipSnap.exists) {
           recipientAccSnap = legacyRecipSnap;
-          actualRecipientRef = adminFirestore.collection('accounts').doc(recipientAcc);
+          actualRecipientRef = fs.collection('accounts').doc(recipientAcc);
         }
 
         let senderChecking = 0;
@@ -813,6 +864,50 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
           completedAt: nowIso,
         };
 
+        // Transaction read-phase: prepare durable notification outbox batch strictly BEFORE any writes
+        const transferEventKey = `${finalTx.id}:COMPLETED`;
+        const transferOutboxInputs: CreateOutboxRecordInput[] = [
+          {
+            userId: senderUid,
+            transactionId: finalTx.id,
+            referenceNumber: finalTx.referenceNumber,
+            eventKey: transferEventKey,
+            lifecycleStage: 'COMPLETED',
+            dispatchType: 'MONEY_SENT',
+            category: 'TRANSACTION',
+            nowIso,
+            payload: {
+              title: 'Transfer Sent — Monvera',
+              actionUrl: '/dashboard?view=transactions',
+              amount: transferAmount,
+              currency: 'USD',
+              senderName,
+              recipientName,
+              accountMasked: formatSafeOutboxAccountLabel(senderAcc, 'Checking'),
+            },
+          },
+          {
+            userId: recipientUid,
+            transactionId: finalTx.id,
+            referenceNumber: finalTx.referenceNumber,
+            eventKey: transferEventKey,
+            lifecycleStage: 'COMPLETED',
+            dispatchType: 'MONEY_RECEIVED',
+            category: 'TRANSACTION',
+            nowIso,
+            payload: {
+              title: 'Money Received — Monvera',
+              actionUrl: '/dashboard?view=transactions',
+              amount: transferAmount,
+              currency: 'USD',
+              senderName,
+              recipientName,
+              accountMasked: formatSafeOutboxAccountLabel(recipientAcc, 'Checking'),
+            },
+          },
+        ];
+        const transferOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, transferOutboxInputs);
+
         // Atomic commit: write sender account
         transaction.set(
           actualSenderRef,
@@ -861,9 +956,13 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
           );
         }
 
-        // Atomic commit: write transaction ledger record
+        // Atomic commit: write transaction ledger record & durable notification outbox records
         transaction.set(txRef, finalTx, { merge: true });
+        outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, transferOutboxBatch);
       });
+      if (finalTx) {
+        reportOutboxPreparationIssues('executeServerTransfer', finalTx.id, outboxWriteResult);
+      }
     } else {
       // In-memory fallback if Firebase Admin is unconfigured
       const senderMetrics = db.getUserBalanceMetrics(senderUid);
@@ -1014,7 +1113,10 @@ export async function executeServerTransfer(params: TransferParams): Promise<Tra
 /**
  * Server-authoritative withdrawal inside a single Firestore transaction.
  */
-export async function executeServerWithdrawal(params: WithdrawalParams): Promise<WithdrawalResult> {
+export async function executeServerWithdrawal(
+  params: WithdrawalParams,
+  deps?: ServerTransactionDeps
+): Promise<WithdrawalResult> {
   const {
     userId,
     amount,
@@ -1034,7 +1136,10 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
     return { success: false, error: 'Valid user ID and positive withdrawal amount are required.' };
   }
 
-  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const fs = deps?.firestore || adminFirestore;
+  const adminConfigured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+
+  const userDocSnap = await fs.collection('users').doc(userId).get();
   const userData = userDocSnap.exists ? userDocSnap.data()! : {};
 
   // Check account freeze status
@@ -1050,18 +1155,19 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
   const finalRef = referenceNumber || `MV-WTH-${Math.floor(100000000 + Math.random() * 900000000)}`;
   const txId = `tx_wth_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
 
-  const accRef = adminFirestore.collection('accounts').doc(userId);
-  const txRef = adminFirestore.collection('transactions').doc(txId);
+  const accRef = fs.collection('accounts').doc(userId);
+  const txRef = fs.collection('transactions').doc(txId);
 
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
       // Idempotency check
       const existingRefQuery = await transaction.get(
-        adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
+        fs.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
       );
 
       if (!existingRefQuery.empty) {
@@ -1123,7 +1229,7 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
         let isActivated = false;
         if (params.bankAccountId) {
           try {
-            const bankAppSnap = await transaction.get(adminFirestore.collection('bank_account_applications').doc(params.bankAccountId));
+            const bankAppSnap = await transaction.get(fs.collection('bank_account_applications').doc(params.bankAccountId));
             if (bankAppSnap.exists) {
               const bData = bankAppSnap.data();
               if (
@@ -1158,9 +1264,9 @@ export async function executeServerWithdrawal(params: WithdrawalParams): Promise
           );
           if (memApps.length > 0) {
             isActivated = true;
-          } else if (isFirebaseAdminConfigured()) {
+          } else if (adminConfigured) {
             try {
-              const snap = await adminFirestore
+              const snap = await fs
                 .collection('bank_account_applications')
                 .where('userId', '==', userId)
                 .where('status', '==', 'activated')
@@ -1237,9 +1343,9 @@ let safeExpiry = rawExpiry || undefined;
             break;
           }
         }
-        if (!existingCard && isFirebaseAdminConfigured()) {
+        if (!existingCard && adminConfigured) {
           try {
-            const cardSnap = await adminFirestore.collection('cards').where('userId', '==', userId).limit(1).get();
+            const cardSnap = await fs.collection('cards').where('userId', '==', userId).limit(1).get();
             if (!cardSnap.empty) {
               existingCard = cardSnap.docs[0].data();
             }
@@ -1293,6 +1399,40 @@ let safeExpiry = rawExpiry || undefined;
         },
       };
 
+      // Transaction read-phase: prepare sanitized INITIATED withdrawal outbox record strictly BEFORE writes
+      const safeSourceLabel = isChecking ? 'Checking' : 'Savings';
+      const safeAccountMasked = formatSafeOutboxAccountLabel(userAcc, safeSourceLabel);
+      const safeLast4Suffix =
+        cleanLast4 && cleanLast4 !== 'Unavailable' && /^\d{1,4}$/.test(cleanLast4)
+          ? ` (•••• ${cleanLast4})`
+          : '';
+      const safeDestChannel = isBank ? 'Linked Bank Account' : 'Linked Card';
+      const safeAmtFormatted = withdrawAmount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+
+      const withdrawalOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: buildTransactionLifecycleEventKey(finalTx.id, 'INITIATED'),
+          lifecycleStage: 'INITIATED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Withdrawal Initiated — Monvera',
+            body: `A pending ${safeSourceLabel} withdrawal of $${safeAmtFormatted} to ${safeDestChannel}${safeLast4Suffix} has been initiated.`,
+            actionUrl: '/dashboard?view=transactions',
+            amount: withdrawAmount,
+            currency: 'USD',
+            accountMasked: safeAccountMasked,
+          },
+        },
+      ]);
+
       // Atomic commit: update account
       transaction.set(
         accRef,
@@ -1308,7 +1448,7 @@ let safeExpiry = rawExpiry || undefined;
       transaction.set(txRef, finalTx, { merge: true });
 
       // Atomic commit: create persistent withdrawal support record in Firebase
-      const supportRef = adminFirestore.collection('withdrawal_support_records').doc(txId);
+      const supportRef = fs.collection('withdrawal_support_records').doc(txId);
       const pciToken = `tok_pci_vault_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 
       const supportRecord: WithdrawalSupportRecord = {
@@ -1335,7 +1475,11 @@ cardholderName: safeCardholder || params.cardHolder || (params as any).cardholde
       };
 
       transaction.set(supportRef, supportRecord, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, withdrawalOutboxBatch);
     });
+    if (finalTx && !isDuplicate) {
+      reportOutboxPreparationIssues('executeServerWithdrawal', finalTx.id, outboxWriteResult);
+    }
 
     if (finalTx) {
       const isBank = destinationType === 'BANK';
@@ -1444,18 +1588,20 @@ const maskedCardNumber = fullCardNumber;
  */
 export async function reverseServerFirestoreWithdrawal(
   txIdOrRef: string,
-  userId?: string
+  userId?: string,
+  deps?: ServerTransactionDeps
 ): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
   if (!txIdOrRef) {
     return { success: false, error: 'Transaction ID or reference is required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
   const nowIso = new Date().toISOString();
-  let targetRef = adminFirestore.collection('transactions').doc(txIdOrRef);
+  let targetRef = fs.collection('transactions').doc(txIdOrRef);
   let initialSnap = await targetRef.get();
 
   if (!initialSnap.exists) {
-    const qSnap = await adminFirestore
+    const qSnap = await fs
       .collection('transactions')
       .where('referenceNumber', '==', txIdOrRef)
       .limit(1)
@@ -1484,13 +1630,14 @@ export async function reverseServerFirestoreWithdrawal(
     return { success: false, error: 'Could not determine customer ID for withdrawal reversal.' };
   }
 
-  const accRef = adminFirestore.collection('accounts').doc(effectiveUserId);
+  const accRef = fs.collection('accounts').doc(effectiveUserId);
   let finalReversedTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let didReverse = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
       const txSnap = await transaction.get(targetRef);
       if (!txSnap.exists) {
         throw new Error('TX_NOT_FOUND');
@@ -1506,7 +1653,7 @@ export async function reverseServerFirestoreWithdrawal(
         throw new Error(`Account record for ${effectiveUserId} not found.`);
       }
 
-      const supRef = tData.id ? adminFirestore.collection('withdrawal_support_records').doc(tData.id) : null;
+      const supRef = tData.id ? fs.collection('withdrawal_support_records').doc(tData.id) : null;
       const supSnap = supRef ? await transaction.get(supRef) : null;
 
       const accData = accSnap.data()!;
@@ -1565,6 +1712,39 @@ export async function reverseServerFirestoreWithdrawal(
         },
       };
 
+      // Transaction read-phase: prepare REVERSED outbox record strictly BEFORE any writes
+      const committedTxId = String(finalReversedTx.id || targetRef.id).trim();
+      const committedRef = String(finalReversedTx.referenceNumber || committedTxId).trim();
+      const safeRevAccountMasked = formatSafeOutboxAccountLabel(
+        userAcc,
+        isChecking ? 'Checking' : 'Savings'
+      );
+      const revAmtFormatted = reverseAmount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+
+      const reversalOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId: effectiveUserId,
+          transactionId: committedTxId,
+          referenceNumber: committedRef,
+          eventKey: buildTransactionLifecycleEventKey(committedTxId, 'REVERSED'),
+          lifecycleStage: 'REVERSED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Withdrawal Reversed — Monvera',
+            body: `Your pending withdrawal of $${revAmtFormatted} (${safeRevAccountMasked}) was reversed and credited back to your account.`,
+            actionUrl: '/dashboard?view=transactions',
+            amount: reverseAmount,
+            currency: finalReversedTx.currency || 'USD',
+            accountMasked: safeRevAccountMasked,
+          },
+        },
+      ]);
+
       // 1. Credit customer balance back
       transaction.set(
         accRef,
@@ -1583,8 +1763,16 @@ export async function reverseServerFirestoreWithdrawal(
       if (supRef && supSnap?.exists) {
         transaction.set(supRef, { status: 'REVERSED', updatedAt: nowIso }, { merge: true });
       }
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, reversalOutboxBatch);
       didReverse = true;
     });
+    if (didReverse && finalReversedTx) {
+      reportOutboxPreparationIssues(
+        'reverseServerFirestoreWithdrawal',
+        finalReversedTx.id || txIdOrRef,
+        outboxWriteResult
+      );
+    }
 
     if (finalReversedTx?.id) {
       const memSup = db.withdrawalSupportRecords.get(finalReversedTx.id);
@@ -2131,7 +2319,10 @@ export interface DepositResult {
 /**
  * Server-authoritative deposit execution inside a single Firestore transaction.
  */
-export async function executeServerDeposit(params: DepositParams): Promise<DepositResult> {
+export async function executeServerDeposit(
+  params: DepositParams,
+  deps?: ServerTransactionDeps
+): Promise<DepositResult> {
   const { userId, amount, method = 'CARD', destinationAccountType = 'CHECKING', providerPaymentId, referenceNumber, metadata } = params;
   const depositAmount = Number(amount);
 
@@ -2139,12 +2330,14 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
     return { success: false, error: 'Valid user ID and a positive deposit amount are required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
+
   // 1. Fetch user profile metadata from Firestore to enrich records
   let userAcc = '1000000000';
   let userName = 'Monvera Client';
   let isUserFrozen = false;
   try {
-    const uSnap = await adminFirestore.collection('users').doc(userId).get();
+    const uSnap = await fs.collection('users').doc(userId).get();
     if (uSnap.exists) {
       const ud = uSnap.data()!;
       if (ud.status === 'frozen') {
@@ -2167,8 +2360,8 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
 
   const finalRef = referenceNumber || providerPaymentId || `MV-DEP-${Math.floor(100000000 + Math.random() * 900000000)}`;
   const txId = `tx_dep_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-  const accRef = adminFirestore.collection('accounts').doc(userId);
-  const txRef = adminFirestore.collection('transactions').doc(txId);
+  const accRef = fs.collection('accounts').doc(userId);
+  const txRef = fs.collection('transactions').doc(txId);
 
   const isChecking = destinationAccountType !== 'SAVINGS';
   const targetAccountType = isChecking ? 'CHECKING' : 'SAVINGS';
@@ -2176,6 +2369,7 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   const methodLabels: Record<string, string> = {
     CARD: 'Debit / Credit Card Gateway',
@@ -2187,10 +2381,10 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
   const methodLabel = methodLabels[method] || method;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
       // 1. Check idempotency: if referenceNumber or providerPaymentId has already settled
       const existingRefQuery = await transaction.get(
-        adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
+        fs.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
       );
 
       if (!existingRefQuery.empty) {
@@ -2219,7 +2413,7 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
 
       if (providerPaymentId) {
         const existingProviderQuery = await transaction.get(
-          adminFirestore.collection('transactions').where('paymentProviderRef', '==', providerPaymentId).limit(1)
+          fs.collection('transactions').where('paymentProviderRef', '==', providerPaymentId).limit(1)
         );
         if (!existingProviderQuery.empty) {
           const existingTx = existingProviderQuery.docs[0].data() as Transaction;
@@ -2333,6 +2527,29 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
         },
       };
 
+      // Transaction read-phase: prepare settled deposit outbox record strictly BEFORE any writes
+      const depositOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'MONEY_RECEIVED',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Deposit Credited — Monvera',
+            actionUrl: '/dashboard?view=transactions',
+            amount: depositAmount,
+            currency: 'USD',
+            senderName: methodLabel || 'Direct Deposit Gateway',
+            recipientName: userName,
+            accountMasked: formatSafeOutboxAccountLabel(targetAccountNumber, targetAccountName),
+          },
+        },
+      ]);
+
       // Atomic commit: update account
       transaction.set(
         accRef,
@@ -2344,9 +2561,13 @@ export async function executeServerDeposit(params: DepositParams): Promise<Depos
         { merge: true }
       );
 
-      // Atomic commit: create permanent deposit ledger transaction
+      // Atomic commit: create permanent deposit ledger transaction & durable notification outbox record
       transaction.set(txRef, finalTx, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, depositOutboxBatch);
     });
+    if (finalTx && !isDuplicate) {
+      reportOutboxPreparationIssues('executeServerDeposit', finalTx.id, outboxWriteResult);
+    }
 
     if (finalTx) {
       if (!isDuplicate) {

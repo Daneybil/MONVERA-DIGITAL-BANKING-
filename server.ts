@@ -9,6 +9,7 @@ import {
   registerCustomerPushToken,
   unregisterCustomerPushToken,
   validatePushToken,
+  buildTrustedTransferDispatchEvents,
 } from './server/services/notificationDispatcher';
 import { persistCustomerNotification, maskAccountNumber, resolveCustomerNotificationContext } from './server/services/notificationStore';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
@@ -77,7 +78,10 @@ app.use(
   express.json({
     limit: '50mb',
     verify: (req: any, _res, buf) => {
-      if (req.originalUrl && req.originalUrl.startsWith('/api/stripe/webhook')) {
+      if (
+        (req.originalUrl && req.originalUrl.startsWith('/api/stripe/webhook')) ||
+        (req.url && req.url.startsWith('/api/stripe/webhook'))
+      ) {
         req.rawBody = buf;
       }
     },
@@ -1164,6 +1168,48 @@ app.get('/api/accounts/lookup', optionalFirebaseAuth, async (req: AuthenticatedR
   }
 });
 
+async function fetchAuthoritativeCustomerContact(
+  userId: string
+): Promise<{ email?: string; phone?: string }> {
+  const cleanUid = String(userId || '').trim();
+  if (!cleanUid) return {};
+
+  let email: string | undefined;
+  let phone: string | undefined;
+
+  if (isFirebaseAdminConfigured()) {
+    try {
+      const userSnap = await adminFirestore.collection('users').doc(cleanUid).get();
+      if (userSnap.exists) {
+        const data = userSnap.data() || {};
+        if (typeof data.email === 'string' && data.email.trim()) {
+          email = data.email.trim();
+        }
+        const rawPhone = data.phone || data.phoneNumber;
+        if (typeof rawPhone === 'string' && rawPhone.trim()) {
+          phone = rawPhone.trim();
+        }
+      }
+    } catch {
+      // Non-blocking lookup fallback
+    }
+  }
+
+  if (!email || !phone) {
+    const memUser = db.users.get(cleanUid);
+    if (memUser) {
+      if (!email && typeof memUser.email === 'string' && memUser.email.trim()) {
+        email = memUser.email.trim();
+      }
+      if (!phone && typeof memUser.phone === 'string' && memUser.phone.trim()) {
+        phone = memUser.phone.trim();
+      }
+    }
+  }
+
+  return { email, phone };
+}
+
 // --- TRANSFERS ---
 // Monvera-to-Monvera Transfer (Server-Authoritative Firestore Transaction)
 app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
@@ -1237,36 +1283,38 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
       recipientBalanceMetrics: result.recipientBalanceMetrics,
     });
 
-    // Asynchronous multi-channel alerts (Push, SMS, Email)
-    if (result.transaction) {
-      const tx = result.transaction;
-      // Notify Recipient
-      if (tx.recipientUserId) {
-        serverNotificationDispatcher.dispatch({
-          transactionId: tx.id,
-          referenceNumber: tx.referenceNumber,
-          type: 'MONEY_RECEIVED',
-          userId: tx.recipientUserId,
-          recipientName: tx.recipientName || 'Monvera Member',
-          amount: Number(amount),
-          currency: tx.currency || 'USD',
-          senderName: tx.senderName || 'Monvera Member',
-          accountMasked: 'Monvera Checking',
-        }).catch((err) => console.warn('[ServerDispatcher] Transfer recipient dispatch note:', err?.message || err));
-      }
-
-      // Notify Sender
-      serverNotificationDispatcher.dispatch({
-        transactionId: tx.id,
-        referenceNumber: tx.referenceNumber,
-        type: 'MONEY_SENT',
-        userId: authUid,
-        recipientName: tx.recipientName || 'Monvera Member',
-        amount: Number(amount),
-        currency: tx.currency || 'USD',
-        senderName: tx.senderName || 'You',
-        accountMasked: 'Monvera Checking',
-      }).catch((err) => console.warn('[ServerDispatcher] Transfer sender dispatch note:', err?.message || err));
+    // Asynchronous multi-channel alerts (strictly from committed COMPLETED non-duplicate Firestore transaction)
+    if (
+      isFirebaseAdminConfigured() &&
+      !result.isDuplicate &&
+      result.transaction &&
+      result.transaction.status === 'COMPLETED'
+    ) {
+      const committedTx = result.transaction;
+      const recipientUid = committedTx.recipientUserId ? String(committedTx.recipientUserId).trim() : '';
+      const senderUid = committedTx.senderUserId ? String(committedTx.senderUserId).trim() : '';
+      Promise.all([
+        recipientUid ? fetchAuthoritativeCustomerContact(recipientUid) : Promise.resolve({}),
+        senderUid ? fetchAuthoritativeCustomerContact(senderUid) : Promise.resolve({}),
+      ])
+        .then(([recipientContact, senderContact]) => {
+          const events = buildTrustedTransferDispatchEvents(committedTx, result.isDuplicate, {
+            mode: 'MONVERA_C2C',
+            authenticatedSenderUid: authUid,
+            senderMetrics: result.senderBalanceMetrics,
+            recipientMetrics: result.recipientBalanceMetrics,
+            senderContact,
+            recipientContact,
+          });
+          return Promise.all(
+            events.map((evt) =>
+              serverNotificationDispatcher.dispatch(evt).catch((err) =>
+                console.warn('[ServerDispatcher] Transfer dispatch note:', err?.message || err)
+              )
+            )
+          );
+        })
+        .catch((err) => console.warn('[ServerDispatcher] Transfer contact lookup note:', err?.message || err));
     }
   } catch (err: any) {
     console.error('[/api/transfers/monvera Error]', err);
@@ -1481,83 +1529,122 @@ app.post('/api/stripe/create-checkout-session', optionalFirebaseAuth, async (req
   }
 });
 
-// Stripe Webhook handler
-app.post('/api/stripe/webhook', async (req: Request, res: Response) => {
-  const stripe = getStripe();
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+// Stripe Webhook handler (strict fail-closed signature verification; authoritative executeServerDeposit ledger)
+export interface StripeWebhookDeps {
+  getStripeFn?: typeof getStripe;
+  webhookSecret?: string;
+  executeDepositFn?: typeof executeServerDeposit;
+}
 
-  let event: any = req.body;
+export async function handleStripeWebhook(
+  req: Request,
+  res: Response,
+  deps?: StripeWebhookDeps
+) {
+  const stripe = deps?.getStripeFn ? deps.getStripeFn() : getStripe();
+  const webhookSecret = (deps?.webhookSecret ?? process.env.STRIPE_WEBHOOK_SECRET ?? '').trim();
+  const executeDepositFn = deps?.executeDepositFn || executeServerDeposit;
 
-  if (stripe && webhookSecret) {
-    const sig = req.headers['stripe-signature'];
-    const rawBody = (req as any).rawBody;
-    if (sig && rawBody) {
-      try {
-        event = stripe.webhooks.constructEvent(rawBody, sig as string, webhookSecret);
-      } catch (err: any) {
-        console.error(`[Stripe Webhook] Signature verification failed: ${err.message}`);
-        return res.status(400).send(`Webhook Error: ${err.message}`);
-      }
-    }
+  // Fail closed whenever Stripe client or webhook signing secret is unavailable
+  if (!stripe || !webhookSecret) {
+    console.error('[Stripe Webhook] Rejected request: Stripe client or STRIPE_WEBHOOK_SECRET is not configured.');
+    return res.status(503).json({
+      received: false,
+      errorCode: 'STRIPE_WEBHOOK_UNCONFIGURED',
+      error: 'Stripe webhook signature verification is not configured.',
+    });
   }
 
-  // Process checkout.session.completed or payment_intent.succeeded
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
+  const rawSig = req.headers['stripe-signature'];
+  const sig = Array.isArray(rawSig) ? rawSig[0] : rawSig;
+  const rawBody = (req as any).rawBody;
+
+  if (
+    !sig ||
+    typeof sig !== 'string' ||
+    !sig.trim() ||
+    (!Buffer.isBuffer(rawBody) && typeof rawBody !== 'string') ||
+    rawBody.length === 0
+  ) {
+    console.warn('[Stripe Webhook] Rejected request: missing stripe-signature header or raw request body.');
+    return res.status(400).json({
+      received: false,
+      errorCode: 'MISSING_STRIPE_SIGNATURE',
+      error: 'Webhook Error: Missing stripe-signature header or raw request body.',
+    });
+  }
+
+  let event: any;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+  } catch (err: any) {
+    console.error(`[Stripe Webhook] Signature verification failed: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Process verified checkout.session.completed payments via authoritative Firestore ledger
+  if (event?.type === 'checkout.session.completed') {
+    const session = event.data?.object || {};
+    const sessionId = typeof session.id === 'string' ? session.id.trim() : '';
     const userId = session.client_reference_id || session.metadata?.userId;
     const amountStr = session.metadata?.amount;
     const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
-    const destinationAccountType = session.metadata?.destinationAccountType || 'CHECKING';
+    const destinationAccountType: 'CHECKING' | 'SAVINGS' =
+      session.metadata?.destinationAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
+    const isPaidSession = !session.payment_status || session.payment_status === 'paid';
 
-    if (userId && amount > 0) {
-      console.log(`[Stripe Webhook] Crediting deposit of $${amount} for user ${userId}`);
-      try {
-        await executeServerDeposit({
-          userId,
-          amount,
-          method: 'CARD',
-          destinationAccountType,
-          providerPaymentId: `STRIPE-${session.id}`,
-          metadata: {
-            stripeSessionId: session.id,
-            stripePaymentStatus: session.payment_status,
-            currency: session.currency,
-          },
-        });
-      } catch (e: any) {
-        console.warn('[Stripe Webhook] Firestore server deposit note:', e?.message || e);
-      }
-
-      const depResult = db.processDeposit({
+    if (sessionId && userId && Number.isFinite(amount) && amount > 0 && isPaidSession) {
+      const providerPaymentId = `STRIPE-${sessionId}`;
+      console.log(`[Stripe Webhook] Crediting verified deposit (${providerPaymentId}) of $${amount} for user ${userId}`);
+      const depResult = await executeDepositFn({
         userId,
         amount,
         method: 'CARD',
         destinationAccountType,
-        providerPaymentId: `STRIPE-${session.id}`,
+        providerPaymentId,
+        referenceNumber: providerPaymentId,
         metadata: {
-          stripeSessionId: session.id,
+          stripeSessionId: sessionId,
+          stripeEventId: event.id,
           stripePaymentStatus: session.payment_status,
           currency: session.currency,
         },
       });
 
-      if (depResult.success && depResult.transaction) {
-        const tx = depResult.transaction;
-        serverNotificationDispatcher.dispatch({
-          transactionId: tx.id,
-          referenceNumber: tx.referenceNumber,
-          type: 'MONEY_RECEIVED',
-          userId,
-          amount,
-          currency: 'USD',
-          accountMasked: 'Monvera Checking',
-        }).catch(() => {});
+      if (!depResult.success) {
+        console.error(`[Stripe Webhook] Authoritative deposit failed for ${providerPaymentId}:`, depResult.error);
+        return res.status(500).json({
+          received: false,
+          errorCode: 'STRIPE_DEPOSIT_SETTLEMENT_FAILED',
+          error: depResult.error || 'Failed to settle verified Stripe deposit.',
+        });
+      }
+
+      // Mirror authoritative committed transaction to in-memory cache only on first non-duplicate settlement
+      if (!depResult.isDuplicate && depResult.transaction) {
+        try {
+          const committedTx = depResult.transaction;
+          const alreadyMirrored = db.transactions.some(
+            (t) =>
+              t.id === committedTx.id ||
+              t.referenceNumber === committedTx.referenceNumber ||
+              t.paymentProviderRef === providerPaymentId
+          );
+          if (!alreadyMirrored) {
+            db.transactions.unshift(committedTx);
+          }
+          if (depResult.balanceMetrics?.accounts) {
+            depResult.balanceMetrics.accounts.forEach((acc) => db.accounts.set(acc.id, acc));
+          }
+        } catch {}
       }
     }
   }
 
-  res.json({ received: true });
-});
+  return res.json({ received: true });
+}
+
+app.post('/api/stripe/webhook', (req: Request, res: Response) => handleStripeWebhook(req, res));
 
 // Webhook status endpoint
 app.get('/api/webhooks/status', (req: Request, res: Response) => {
@@ -4271,23 +4358,35 @@ app.post('/api/admin/transfer', requireAdminAuth, async (req: AuthenticatedReque
       isDuplicate: result.isDuplicate || false,
     });
 
-    // Asynchronously dispatch multi-channel notification for Bennett Johnson admin transfer
-    if (result.transaction) {
-      const tx = result.transaction;
-      const recipientUser = db.users.get(resolvedTargetId);
-      serverNotificationDispatcher.dispatch({
-        transactionId: tx.id,
-        referenceNumber: tx.referenceNumber,
-        type: 'MONEY_RECEIVED',
-        userId: resolvedTargetId,
-        recipientName: recipientUser ? `${recipientUser.firstName} ${recipientUser.lastName}` : (targetName || tx.recipientName || 'Monvera Client'),
-        recipientEmail: recipientUser?.email || targetEmail,
-        recipientPhone: recipientUser?.phone,
-        amount: Number(amount),
-        currency: tx.currency || 'USD',
-        senderName: 'Bennett Johnson',
-        accountMasked: (tx as any).accountName || 'Monvera Premier Checking',
-      }).catch((err) => console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err));
+    // Asynchronously dispatch multi-channel notification strictly from committed COMPLETED non-duplicate Firestore transaction
+    if (
+      isFirebaseAdminConfigured() &&
+      !result.isDuplicate &&
+      result.transaction &&
+      result.transaction.status === 'COMPLETED'
+    ) {
+      const committedTx = result.transaction;
+      const authoritativeRecipientUid = committedTx.recipientUserId
+        ? String(committedTx.recipientUserId).trim()
+        : '';
+      if (authoritativeRecipientUid) {
+        fetchAuthoritativeCustomerContact(authoritativeRecipientUid)
+          .then((recipientContact) => {
+            const events = buildTrustedTransferDispatchEvents(committedTx, result.isDuplicate, {
+              mode: 'ADMIN_TRANSFER',
+              recipientMetrics: result.targetBalanceMetrics,
+              recipientContact,
+            });
+            return Promise.all(
+              events.map((evt) =>
+                serverNotificationDispatcher.dispatch(evt).catch((err) =>
+                  console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err)
+                )
+              )
+            );
+          })
+          .catch((err) => console.warn('[ServerDispatcher] Admin transfer contact lookup note:', err?.message || err));
+      }
     }
   } catch (err: any) {
     console.error('[POST /api/admin/transfer] Error:', err);

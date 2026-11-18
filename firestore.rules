@@ -264,6 +264,17 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // 15. Durable Notification Outbox & Server Dispatch Logs
+    // Strictly backend-only operational records managed exclusively via Firebase Admin SDK.
+    // Direct browser-side reads, creates, updates, and deletes are strictly prohibited.
+    match /notification_outbox/{outboxId} {
+      allow read, write: if false;
+    }
+
+    match /notification_dispatch_logs/{logId} {
+      allow read, write: if false;
+    }
+
     // Default Fallback: Fail closed on all unspecified collections and paths
     match /{document=**} {
       allow read, write: if false;

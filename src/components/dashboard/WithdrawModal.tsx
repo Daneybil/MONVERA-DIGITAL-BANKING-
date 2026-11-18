@@ -970,7 +970,7 @@ export const WithdrawModal: React.FC = () => {
                         US Check
                       </span>
                     </div>
-                    <div className="font-black text-sm text-slate-950">Wire Check</div>
+                    <div className="font-black text-sm text-slate-950">Checkbook / Wire Check</div>
                     <div className="text-[11px] text-slate-500 font-medium mt-0.5">
                       Est. 5 business days delivery
                     </div>

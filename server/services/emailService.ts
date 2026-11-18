@@ -9,6 +9,7 @@ export interface EmailDispatchParams {
   amount?: number;
   senderName?: string;
   referenceNumber?: string;
+  eventKey?: string;
   accountMasked?: string;
   currency?: string;
   timestamp?: string;
@@ -18,7 +19,7 @@ export interface EmailDispatchParams {
 export interface EmailDispatchResult {
   success: boolean;
   delivered: boolean;
-  status: 'SENT' | 'UNCONFIGURED_PROVIDER' | 'FAILED' | 'INVALID_EMAIL' | 'DUPLICATE_IGNORED' | 'DISABLED_BY_USER';
+  status: 'SENT' | 'UNCONFIGURED_PROVIDER' | 'FAILED' | 'INVALID_EMAIL' | 'DUPLICATE_IGNORED' | 'DISABLED_BY_USER' | 'LEASE_LOST' | 'SKIPPED';
   messageId?: string;
   provider?: string;
   error?: string;
@@ -167,9 +168,11 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
    * Dispatch transactional email with deduplication and fail-safe behavior
    */
   public async sendTransactionalEmail(params: EmailDispatchParams): Promise<EmailDispatchResult> {
-    const dedupeKey = `${params.referenceNumber || ''}_${params.type}_EMAIL_${params.to}`;
-    if (params.referenceNumber && this.sentCache.has(dedupeKey)) {
-      console.log(`[Email Service] Deduplication prevented duplicate email for ref: ${params.referenceNumber}`);
+    const cleanEventKey = typeof params.eventKey === 'string' ? params.eventKey.trim() : '';
+    const dedupeIdentity = cleanEventKey || params.referenceNumber || '';
+    const dedupeKey = dedupeIdentity ? `${dedupeIdentity}_${params.type}_EMAIL_${params.to}` : '';
+    if (dedupeIdentity && this.sentCache.has(dedupeKey)) {
+      console.log(`[Email Service] Deduplication prevented duplicate email for identity: ${dedupeIdentity}`);
       return { success: true, delivered: false, status: 'DUPLICATE_IGNORED' };
     }
 
@@ -205,7 +208,7 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
 
         if (res.ok) {
           const json: any = await res.json();
-          this.sentCache.add(dedupeKey);
+          if (dedupeIdentity) this.sentCache.add(dedupeKey);
           console.log(`[Email Service] Resend email dispatched to ${params.to}. ID: ${json.id}`);
           return { success: true, delivered: true, status: 'SENT', messageId: json.id, provider: 'resend' };
         } else {
@@ -233,7 +236,7 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
         });
 
         if (res.ok || res.status === 202) {
-          this.sentCache.add(dedupeKey);
+          if (dedupeIdentity) this.sentCache.add(dedupeKey);
           console.log(`[Email Service] SendGrid email sent to ${params.to}`);
           return { success: true, delivered: true, status: 'SENT', provider: 'sendgrid' };
         } else {
@@ -242,9 +245,9 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
           return { success: true, delivered: false, status: 'FAILED', error: errText, provider: 'sendgrid' };
         }
       } else {
-        // Provider credentials not set in environment
-        this.sentCache.add(dedupeKey);
-        console.log(`[Email Service - Staging/Ready] Transactional email prepared for ${params.to}: "${subject}" (RESEND_API_KEY / SENDGRID_API_KEY not configured in .env)`);
+        // Provider credentials not set in environment:
+        // Do NOT cache UNCONFIGURED_PROVIDER in sentCache so future retries can recover when configured.
+        console.log(`[Email Service - Staging/Ready] Transactional email skipped for ${params.to}: "${subject}" (RESEND_API_KEY / SENDGRID_API_KEY not configured in .env)`);
         return {
           success: true,
           delivered: false,

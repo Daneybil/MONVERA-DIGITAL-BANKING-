@@ -8,6 +8,7 @@ export interface SmsDispatchParams {
   senderName?: string;
   recipientName?: string;
   referenceNumber?: string;
+  eventKey?: string;
   currency?: string;
   customMessage?: string;
 }
@@ -15,7 +16,7 @@ export interface SmsDispatchParams {
 export interface SmsDispatchResult {
   success: boolean;
   delivered: boolean;
-  status: 'SENT' | 'UNCONFIGURED_PROVIDER' | 'FAILED' | 'INVALID_PHONE' | 'DUPLICATE_IGNORED' | 'DISABLED_BY_USER';
+  status: 'SENT' | 'UNCONFIGURED_PROVIDER' | 'FAILED' | 'INVALID_PHONE' | 'DUPLICATE_IGNORED' | 'DISABLED_BY_USER' | 'LEASE_LOST' | 'SKIPPED';
   messageId?: string;
   provider?: string;
   error?: string;
@@ -72,9 +73,11 @@ class SmsService {
    * Dispatch SMS with deduplication and fail-safe error isolation
    */
   public async sendTransactionSms(params: SmsDispatchParams): Promise<SmsDispatchResult> {
-    const dedupeKey = `${params.referenceNumber || ''}_${params.type}_SMS_${params.to}`;
-    if (params.referenceNumber && this.sentCache.has(dedupeKey)) {
-      console.log(`[SMS Service] Deduplication prevented duplicate SMS for ref: ${params.referenceNumber}`);
+    const cleanEventKey = typeof params.eventKey === 'string' ? params.eventKey.trim() : '';
+    const dedupeIdentity = cleanEventKey || params.referenceNumber || '';
+    const dedupeKey = dedupeIdentity ? `${dedupeIdentity}_${params.type}_SMS_${params.to}` : '';
+    if (dedupeIdentity && this.sentCache.has(dedupeKey)) {
+      console.log(`[SMS Service] Deduplication prevented duplicate SMS for identity: ${dedupeIdentity}`);
       return { success: true, delivered: false, status: 'DUPLICATE_IGNORED' };
     }
 
@@ -115,7 +118,7 @@ class SmsService {
 
         if (res.ok) {
           const json: any = await res.json();
-          this.sentCache.add(dedupeKey);
+          if (dedupeIdentity) this.sentCache.add(dedupeKey);
           console.log(`[SMS Service] Twilio SMS dispatched successfully to ${phone}. SID: ${json.sid}`);
           return { success: true, delivered: true, status: 'SENT', messageId: json.sid, provider: 'twilio' };
         } else {
@@ -140,7 +143,7 @@ class SmsService {
 
         if (res.ok) {
           const json: any = await res.json();
-          this.sentCache.add(dedupeKey);
+          if (dedupeIdentity) this.sentCache.add(dedupeKey);
           console.log(`[SMS Service] Termii SMS sent successfully to ${phone}. ID: ${json.message_id || json.messageId}`);
           return { success: true, delivered: true, status: 'SENT', messageId: json.message_id, provider: 'termii' };
         } else {
@@ -149,10 +152,9 @@ class SmsService {
           return { success: true, delivered: false, status: 'FAILED', error: errText, provider: 'termii' };
         }
       } else {
-        // Provider credentials not yet present in environment
-        // Mark as cached to prevent repetitive logs, and log structured mock event
-        this.sentCache.add(dedupeKey);
-        console.log(`[SMS Service - Staging/Ready] SMS triggered for ${phone}: "${body}" (TWILIO_ACCOUNT_SID / TERMII_API_KEY not configured in .env)`);
+        // Provider credentials not yet present in environment:
+        // Do NOT cache UNCONFIGURED_PROVIDER in sentCache so future attempts can recover once configured.
+        console.log(`[SMS Service - Staging/Ready] SMS skipped for ${phone}: "${body}" (TWILIO_ACCOUNT_SID / TERMII_API_KEY not configured in .env)`);
         return {
           success: true,
           delivered: false,
