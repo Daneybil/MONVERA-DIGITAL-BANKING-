@@ -3,6 +3,11 @@ import type { Firestore } from 'firebase-admin/firestore';
 import { adminFirestore, isFirebaseAdminConfigured } from './firebaseAdmin';
 import { resolveRecipientUser } from './firestoreTransactions';
 import { persistCustomerNotification, maskAccountNumber } from './services/notificationStore';
+import {
+  prepareNotificationOutboxBatch,
+  writePreparedNotificationOutboxBatchInTransaction,
+  type WrittenOutboxBatchResult,
+} from './services/notificationOutbox';
 import { db } from './db';
 import {
   BalanceMetrics,
@@ -10,6 +15,31 @@ import {
   IssuedCheckRecord,
   Transaction,
 } from '../src/types';
+
+function reportOutboxPreparationIssues(
+  context: string,
+  txId: string,
+  outboxWrite: WrittenOutboxBatchResult | null
+): void {
+  if (!outboxWrite || outboxWrite.invalidItems.length === 0) return;
+  console.warn(
+    `[Outbox][${context}] Skipped ${outboxWrite.invalidItems.length} invalid outbox item(s) for transaction ${txId}:`,
+    JSON.stringify(
+      outboxWrite.invalidItems.map((item) => ({
+        userId: item.userId,
+        eventKey: item.eventKey,
+        dispatchType: item.dispatchType,
+        error: item.error,
+      }))
+    )
+  );
+}
+
+function formatSafeOutboxAccountLabel(accountNumber?: string | null, label?: string | null): string {
+  const masked = maskAccountNumber(accountNumber);
+  const cleanLabel = typeof label === 'string' ? label.trim().slice(0, 36) : '';
+  return cleanLabel ? `${cleanLabel} (${masked})` : masked;
+}
 
 export interface AdminCheckServiceDeps {
   firestore?: Firestore;
@@ -721,9 +751,16 @@ export async function executeServerAdminCheckWithdrawal(
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
     await firestore.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      finalCheck = null;
+      finalTx = null;
+      finalMetrics = null;
+      outboxWriteResult = null;
+
       // ALL READS MUST PRECEDE ALL WRITES
       const [idempSnap, checkNumSnap, userSnap, accSnap] = await Promise.all([
         transaction.get(idempRef),
@@ -985,6 +1022,36 @@ export async function executeServerAdminCheckWithdrawal(
         idempotencyKey: effectiveIdempotencyKey,
       };
 
+      // Transaction read-phase: prepare Admin Check COMPLETED outbox record strictly BEFORE any writes
+      // Never expose full check numbers, payee/memo PII, or unmasked account/routing details
+      const adminCheckAmtFormatted = amountDollars.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      const checkSourceLabel = sourceAccountType === 'CHECKING' ? 'Checking' : 'Savings';
+      const safeAdminCheckAccountMasked = formatSafeOutboxAccountLabel(sourceAccountNumber, checkSourceLabel);
+
+      const adminCheckOutboxBatch = await prepareNotificationOutboxBatch(transaction, firestore, [
+        {
+          userId: customerUid,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Official Check Issued — Monvera',
+            body: `An official check withdrawal of $${adminCheckAmtFormatted} from ${safeAdminCheckAccountMasked} has been issued.`,
+            actionUrl: '/dashboard?view=transactions',
+            amount: amountDollars,
+            currency: 'USD',
+            accountMasked: safeAdminCheckAccountMasked,
+          },
+        },
+      ]);
+
       // 6. Commit all financial & issuance writes atomically
       transaction.set(
         accRef,
@@ -1017,6 +1084,10 @@ export async function executeServerAdminCheckWithdrawal(
         idempotencyKey: effectiveIdempotencyKey,
         createdAt: nowIso,
       });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(
+        transaction,
+        adminCheckOutboxBatch
+      );
     });
   } catch (err: any) {
     if (err instanceof CheckIssuanceError) {
@@ -1043,6 +1114,10 @@ export async function executeServerAdminCheckWithdrawal(
       errorCode: 'INCOMPLETE_CHECK_RESULT',
       error: 'Check issuance did not produce a confirmed record.',
     };
+  }
+
+  if (!isDuplicate) {
+    reportOutboxPreparationIssues('executeServerAdminCheckWithdrawal', finalTx.id, outboxWriteResult);
   }
 
   const warnings: string[] = [];

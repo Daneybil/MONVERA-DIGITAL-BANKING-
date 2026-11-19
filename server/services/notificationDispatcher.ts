@@ -372,6 +372,16 @@ function resolveNotificationCategory(event: DispatchNotificationEvent): Notifica
   return 'TRANSACTION';
 }
 
+function sanitizePushText(raw: unknown, maxLength: number): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/[\x00-\x1f\x7f<>]/g, ' ')
+    .replace(/\b\d{8,}\b/g, '••••')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
 function formatSafePushContent(event: DispatchNotificationEvent): {
   title: string;
   body: string;
@@ -384,74 +394,44 @@ function formatSafePushContent(event: DispatchNotificationEvent): {
   const url = sanitizeActionUrl(event.actionUrl);
   const accountLabel = sanitizeAccountLabel(event.accountMasked);
 
-  if (event.title && event.body) {
-    return {
-      title: String(event.title).trim().slice(0, 120),
-      body: String(event.body).trim().slice(0, 320),
-      url,
-      category,
-      safeRef,
-    };
-  }
+  const customTitle = sanitizePushText(event.title, 120);
+  const customBody = sanitizePushText(event.body, 320);
 
   const formattedAmt =
     typeof event.amount === 'number' && Number.isFinite(event.amount)
       ? `$${event.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
       : '';
 
+  let fallbackTitle = 'Account Alert — Monvera';
+  let fallbackBody = formattedAmt
+    ? `Account activity of ${formattedAmt} on ${accountLabel}. Ref: ${safeRef}.`
+    : `New activity recorded on ${accountLabel}. Ref: ${safeRef}.`;
+
   if (event.type === 'MONEY_RECEIVED') {
     const sender = (event.senderName || 'Monvera Member').trim().slice(0, 60);
-    return {
-      title: 'Money Received — Monvera',
-      body: formattedAmt
-        ? `You received ${formattedAmt} from ${sender} (${accountLabel}). Ref: ${safeRef}.`
-        : `You received a deposit into ${accountLabel}. Ref: ${safeRef}.`,
-      url,
-      category,
-      safeRef,
-    };
-  }
-
-  if (event.type === 'MONEY_SENT') {
+    fallbackTitle = 'Money Received — Monvera';
+    fallbackBody = formattedAmt
+      ? `You received ${formattedAmt} from ${sender} (${accountLabel}). Ref: ${safeRef}.`
+      : `You received a deposit into ${accountLabel}. Ref: ${safeRef}.`;
+  } else if (event.type === 'MONEY_SENT') {
     const recipient = (event.recipientName || 'Recipient').trim().slice(0, 60);
-    return {
-      title: 'Transfer Sent — Monvera',
-      body: formattedAmt
-        ? `You sent ${formattedAmt} to ${recipient} from ${accountLabel}. Ref: ${safeRef}.`
-        : `Your transfer from ${accountLabel} was processed. Ref: ${safeRef}.`,
-      url,
-      category,
-      safeRef,
-    };
-  }
-
-  if (category === 'SECURITY') {
-    return {
-      title: 'Security Alert — Monvera',
-      body: `Important security update on your Monvera profile. Ref: ${safeRef}.`,
-      url,
-      category,
-      safeRef,
-    };
-  }
-
-  if (category === 'INVESTMENT') {
-    return {
-      title: 'Investment Update — Monvera',
-      body: formattedAmt
-        ? `Investment activity of ${formattedAmt} recorded. Ref: ${safeRef}.`
-        : `An update occurred on your Monvera investment portfolio. Ref: ${safeRef}.`,
-      url,
-      category,
-      safeRef,
-    };
+    fallbackTitle = 'Transfer Sent — Monvera';
+    fallbackBody = formattedAmt
+      ? `You sent ${formattedAmt} to ${recipient} from ${accountLabel}. Ref: ${safeRef}.`
+      : `Your transfer from ${accountLabel} was processed. Ref: ${safeRef}.`;
+  } else if (category === 'SECURITY') {
+    fallbackTitle = 'Security Alert — Monvera';
+    fallbackBody = `Important security update on your Monvera profile. Ref: ${safeRef}.`;
+  } else if (category === 'INVESTMENT') {
+    fallbackTitle = 'Investment Update — Monvera';
+    fallbackBody = formattedAmt
+      ? `Investment activity of ${formattedAmt} recorded. Ref: ${safeRef}.`
+      : `An update occurred on your Monvera investment portfolio. Ref: ${safeRef}.`;
   }
 
   return {
-    title: 'Account Alert — Monvera',
-    body: formattedAmt
-      ? `Account activity of ${formattedAmt} on ${accountLabel}. Ref: ${safeRef}.`
-      : `New activity recorded on ${accountLabel}. Ref: ${safeRef}.`,
+    title: customTitle || fallbackTitle,
+    body: customBody || fallbackBody,
     url,
     category,
     safeRef,

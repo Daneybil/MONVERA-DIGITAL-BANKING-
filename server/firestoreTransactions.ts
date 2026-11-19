@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import type { Firestore } from 'firebase-admin/firestore';
 import { adminFirestore, adminAuth, isFirebaseAdminConfigured } from './firebaseAdmin';
 import { db } from './db';
@@ -2643,7 +2644,10 @@ export interface AdminTransferResult {
 /**
  * Server-authoritative Admin Direct Transfer from Bennett Johnson inside a single Firestore transaction.
  */
-export async function executeServerAdminTransfer(params: AdminTransferParams): Promise<AdminTransferResult> {
+export async function executeServerAdminTransfer(
+  params: AdminTransferParams,
+  deps?: ServerTransactionDeps
+): Promise<AdminTransferResult> {
   const { adminId, targetIdentifier, amount, description, category, referenceNumber, clientRequestId } = params;
   const transferAmount = Number(amount);
 
@@ -2651,8 +2655,10 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
     return { success: false, error: 'Target customer ID and positive transfer amount are required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
+
   // 1. Resolve recipient from Firestore
-  const recipientRecord = await resolveRecipientUser(targetIdentifier);
+  const recipientRecord = await resolveRecipientUser(targetIdentifier, deps);
   if (!recipientRecord || !recipientRecord.success || !recipientRecord.uid) {
     return {
       success: false,
@@ -2668,25 +2674,29 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
   const finalRef = referenceNumber || clientRequestId || `MV-ADM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`;
   const effectiveClientReqId = clientRequestId || finalRef;
   const txId = `tx_adm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-  const accRef = adminFirestore.collection('accounts').doc(recipientUid);
-  const txRef = adminFirestore.collection('transactions').doc(txId);
+  const accRef = fs.collection('accounts').doc(recipientUid);
+  const txRef = fs.collection('transactions').doc(txId);
 
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      outboxWriteResult = null;
+
       // 1. Check idempotency by referenceNumber or clientRequestId
       const existingRefQuery = await transaction.get(
-        adminFirestore.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
+        fs.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
       );
 
       let existingDoc = !existingRefQuery.empty ? existingRefQuery.docs[0] : null;
 
       if (!existingDoc && effectiveClientReqId) {
         const existingReqQuery = await transaction.get(
-          adminFirestore.collection('transactions').where('clientRequestId', '==', effectiveClientReqId).limit(1)
+          fs.collection('transactions').where('clientRequestId', '==', effectiveClientReqId).limit(1)
         );
         if (!existingReqQuery.empty) {
           existingDoc = existingReqQuery.docs[0];
@@ -2719,7 +2729,7 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
 
       // 2. Read recipient account (gracefully initialize if first time) and admin source account if present
       const accSnap = await transaction.get(accRef);
-      const adminAccRef = (adminId && adminId !== recipientUid) ? adminFirestore.collection('accounts').doc(adminId) : null;
+      const adminAccRef = (adminId && adminId !== recipientUid) ? fs.collection('accounts').doc(adminId) : null;
       let adminSnap: FirebaseFirestore.DocumentSnapshot | null = null;
       if (adminAccRef) {
         try {
@@ -2804,6 +2814,29 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
         },
       };
 
+      // Transaction read-phase: prepare recipient-only MONEY_RECEIVED outbox record strictly BEFORE writes
+      const adminTransferOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId: recipientUid,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'MONEY_RECEIVED',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Money Received — Monvera',
+            actionUrl: '/dashboard?view=transactions',
+            amount: transferAmount,
+            currency: 'USD',
+            senderName: finalTx.senderName || 'Bennett Johnson',
+            recipientName: recipientDisplayName,
+            accountMasked: formatSafeOutboxAccountLabel(recipientAcc, 'Checking'),
+          },
+        },
+      ]);
+
       // Atomic commit: debit admin source account if present in Firestore
       if (adminSnap && adminSnap.exists && adminAccRef) {
         const adminData = adminSnap.data() || {};
@@ -2835,9 +2868,13 @@ export async function executeServerAdminTransfer(params: AdminTransferParams): P
         { merge: true }
       );
 
-      // Atomic commit: write transaction ledger record
+      // Atomic commit: write transaction ledger record & durable notification outbox record
       transaction.set(txRef, finalTx, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, adminTransferOutboxBatch);
     });
+    if (finalTx && !isDuplicate) {
+      reportOutboxPreparationIssues('executeServerAdminTransfer', finalTx.id, outboxWriteResult);
+    }
 
     if (finalTx) {
       if (!isDuplicate) {
@@ -3256,14 +3293,16 @@ export interface LoanDisbursementResult {
  * Server-authoritative loan disbursement inside a single atomic Firestore transaction.
  */
 export async function executeServerLoanDisbursement(
-  params: LoanDisbursementParams
+  params: LoanDisbursementParams,
+  deps?: ServerTransactionDeps
 ): Promise<LoanDisbursementResult> {
   const { loanId, adminId = 'usr_admin', fallbackLoan, fallbackUser } = params;
   if (!loanId) {
     return { success: false, error: 'Loan ID is required for disbursement.' };
   }
 
-  const loanRef = adminFirestore.collection('loans').doc(loanId);
+  const fs = deps?.firestore || adminFirestore;
+  const loanRef = fs.collection('loans').doc(loanId);
   const now = new Date().toISOString();
 
   let finalLoan: LoanApplication | null = null;
@@ -3271,9 +3310,13 @@ export async function executeServerLoanDisbursement(
   let finalMetrics: BalanceMetrics | null = null;
   let finalNotif: NotificationItem | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      outboxWriteResult = null;
+
       // 1. Reads
       const loanSnap = await transaction.get(loanRef);
       let loanData: LoanApplication;
@@ -3308,7 +3351,7 @@ export async function executeServerLoanDisbursement(
         throw new Error('INVALID_LOAN: Loan record has no associated target userId.');
       }
 
-      const accRef = adminFirestore.collection('accounts').doc(targetUserId);
+      const accRef = fs.collection('accounts').doc(targetUserId);
       const accSnap = await transaction.get(accRef);
 
       // Check deterministic idempotency reference:
@@ -3435,19 +3478,6 @@ export async function executeServerLoanDisbursement(
         accounts: updatedAccountsList,
       };
 
-      // 3. Atomically write updated account balance
-      transaction.set(
-        accRef,
-        {
-          userId: targetUserId,
-          ...finalMetrics,
-          creditedLoans,
-          updatedAt: now,
-        },
-        { merge: true }
-      );
-
-      // 4. Atomically update loan record
       finalLoan = {
         ...loanData,
         status: 'ACTIVE',
@@ -3463,11 +3493,9 @@ export async function executeServerLoanDisbursement(
         maturityDate,
         updatedAt: now,
       };
-      transaction.set(loanRef, finalLoan, { merge: true });
 
-      // 5. Atomically create transaction ledger record
       const txId = `tx_loan_disb_${loanId}`;
-      const txRef = adminFirestore.collection('transactions').doc(txId);
+      const txRef = fs.collection('transactions').doc(txId);
       finalTx = {
         id: txId,
         userId: targetUserId,
@@ -3489,11 +3517,9 @@ export async function executeServerLoanDisbursement(
         createdAt: now,
         completedAt: now,
       };
-      transaction.set(txRef, finalTx, { merge: true });
 
-      // 6. Atomically create notification record
       const notifId = `notif_loan_appr_${loanId}`;
-      const notifRef = adminFirestore.collection('notifications').doc(notifId);
+      const notifRef = fs.collection('notifications').doc(notifId);
       finalNotif = {
         id: notifId,
         userId: targetUserId,
@@ -3524,8 +3550,55 @@ export async function executeServerLoanDisbursement(
           date: now,
         },
       };
+
+      // Transaction read-phase: prepare MONEY_RECEIVED outbox record strictly BEFORE any writes
+      const loanDisbOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId: targetUserId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'MONEY_RECEIVED',
+          category: 'TRANSACTION',
+          nowIso: now,
+          payload: {
+            title: 'Money Received — Monvera',
+            actionUrl: '/dashboard?view=loans',
+            amount: loanAmount,
+            currency: 'USD',
+            senderName: 'Monvera Credit & Lending Facility',
+            recipientName: loanData.applicantName || 'Valued Client',
+            accountMasked: formatSafeOutboxAccountLabel(userAcc, 'Checking'),
+          },
+        },
+      ]);
+
+      // 3. Atomically write updated account balance
+      transaction.set(
+        accRef,
+        {
+          userId: targetUserId,
+          ...finalMetrics,
+          creditedLoans,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      // 4. Atomically update loan record
+      transaction.set(loanRef, finalLoan, { merge: true });
+
+      // 5. Atomically create transaction ledger record
+      transaction.set(txRef, finalTx, { merge: true });
+
+      // 6. Atomically create notification record & durable notification outbox record
       transaction.set(notifRef, finalNotif, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, loanDisbOutboxBatch);
     });
+    if (finalTx && !isDuplicate) {
+      reportOutboxPreparationIssues('executeServerLoanDisbursement', finalTx.id, outboxWriteResult);
+    }
 
     if (finalLoan) {
       return {
@@ -3573,7 +3646,8 @@ export interface LoanRepaymentResult {
  * Server-authoritative loan repayment inside a single atomic Firestore transaction.
  */
 export async function executeServerLoanRepayment(
-  params: LoanRepaymentParams
+  params: LoanRepaymentParams,
+  deps?: ServerTransactionDeps
 ): Promise<LoanRepaymentResult> {
   const { loanId, userId, amount, note, referenceNumber, fallbackLoan } = params;
 
@@ -3581,8 +3655,10 @@ export async function executeServerLoanRepayment(
     return { success: false, error: 'Loan ID, user ID, and a positive repayment amount are required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
+
   // Check account freeze status before any repayment debit
-  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userDocSnap = await fs.collection('users').doc(userId).get();
   const userData = userDocSnap.exists ? userDocSnap.data()! : {};
   if (userData.status === 'frozen') {
     return {
@@ -3592,8 +3668,8 @@ export async function executeServerLoanRepayment(
   }
 
   const repayAmount = Number(Number(amount).toFixed(2));
-  const loanRef = adminFirestore.collection('loans').doc(loanId);
-  const accRef = adminFirestore.collection('accounts').doc(userId);
+  const loanRef = fs.collection('loans').doc(loanId);
+  const accRef = fs.collection('accounts').doc(userId);
   const now = new Date().toISOString();
 
   let finalLoan: LoanApplication | null = null;
@@ -3601,15 +3677,30 @@ export async function executeServerLoanRepayment(
   let finalMetrics: BalanceMetrics | null = null;
   let finalRemaining: number = 0;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   const finalRef = referenceNumber || `MVB-RP-${loanId}-${Math.round(repayAmount * 100)}-${Date.now()}`;
+  const cleanRepKeyRaw = finalRef.replace(/[^a-zA-Z0-9_-]/g, '');
+  const stableRepKey = cleanRepKeyRaw
+    ? (cleanRepKeyRaw.length <= 80 ? cleanRepKeyRaw : crypto.createHash('sha256').update(finalRef).digest('hex').slice(0, 24))
+    : crypto.createHash('sha256').update(finalRef).digest('hex').slice(0, 24);
+  const txId = `tx_loan_repay_${stableRepKey}`;
+  const notifId = `notif_loan_rep_${stableRepKey}_${userId}`;
+  const repHistoryEntryId = `rep_${Date.now()}`;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      finalLoan = null;
+      finalTx = null;
+      finalMetrics = null;
+      finalRemaining = 0;
+      outboxWriteResult = null;
+
       // Check idempotency if referenceNumber was passed
       if (referenceNumber) {
         const existingTxQuery = await transaction.get(
-          adminFirestore.collection('transactions').where('referenceNumber', '==', referenceNumber).limit(1)
+          fs.collection('transactions').where('referenceNumber', '==', referenceNumber).limit(1)
         );
         if (!existingTxQuery.empty) {
           const existingTx = existingTxQuery.docs[0].data() as Transaction;
@@ -3654,9 +3745,9 @@ export async function executeServerLoanRepayment(
 
       let isAuthorizedOwner = loanData.userId === userId;
       if (!isAuthorizedOwner) {
-        const callerRecord = await resolveRecipientUser(userId);
+        const callerRecord = await resolveRecipientUser(userId, deps);
         const callerUid = (callerRecord && callerRecord.success && callerRecord.uid) ? callerRecord.uid : userId;
-        const loanUserRecord = await resolveRecipientUser(loanData.userId || loanData.permanentAccountNumber || loanData.applicantEmail);
+        const loanUserRecord = await resolveRecipientUser(loanData.userId || loanData.permanentAccountNumber || loanData.applicantEmail, deps);
         const loanUid = (loanUserRecord && loanUserRecord.success && loanUserRecord.uid) ? loanUserRecord.uid : loanData.userId;
         if (callerUid === loanUid || loanData.userId === callerUid || userId === loanUid) {
           isAuthorizedOwner = true;
@@ -3749,21 +3840,9 @@ export async function executeServerLoanRepayment(
         accounts: accountsList,
       };
 
-      // 4. Atomically commit account debit
-      transaction.set(
-        accRef,
-        {
-          userId,
-          ...finalMetrics,
-          updatedAt: now,
-        },
-        { merge: true }
-      );
-
-      // 5. Atomically commit loan update
       const updatedRepaymentHistory = Array.isArray(loanData.repaymentHistory) ? [...loanData.repaymentHistory] : [];
       updatedRepaymentHistory.unshift({
-        id: `rep_${Date.now()}`,
+        id: repHistoryEntryId,
         amount: actualRepay,
         date: now,
         paymentMethod: 'CHECKING_ACCOUNT',
@@ -3781,11 +3860,8 @@ export async function executeServerLoanRepayment(
         repaymentHistory: updatedRepaymentHistory,
         updatedAt: now,
       };
-      transaction.set(loanRef, finalLoan, { merge: true });
 
-      // 6. Atomically commit ledger transaction
-      const txId = `tx_loan_repay_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-      const txRef = adminFirestore.collection('transactions').doc(txId);
+      const txRef = fs.collection('transactions').doc(txId);
       finalTx = {
         id: txId,
         userId,
@@ -3804,12 +3880,8 @@ export async function executeServerLoanRepayment(
         createdAt: now,
         completedAt: now,
       };
-      transaction.set(txRef, finalTx, { merge: true });
 
-      // 7. Atomically commit notification (deterministic ID prevents duplicates on retry)
-      const cleanRepKey = finalRef.replace(/[^a-zA-Z0-9_-]/g, '');
-      const notifId = `notif_loan_rep_${cleanRepKey}_${userId}`;
-      const notifRef = adminFirestore.collection('notifications').doc(notifId);
+      const notifRef = fs.collection('notifications').doc(notifId);
       const notifItem: NotificationItem = {
         id: notifId,
         userId,
@@ -3844,8 +3916,66 @@ export async function executeServerLoanRepayment(
           date: now,
         },
       };
+
+      // Transaction read-phase: prepare TRANSACTION outbox record strictly BEFORE any writes
+      const repayAmtFormatted = actualRepay.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      const remainingFormatted = newRemaining.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      const safeRepayAccountMasked = formatSafeOutboxAccountLabel(userAcc, 'Checking');
+
+      const loanRepayOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso: now,
+          payload: {
+            title: isFullyPaid ? 'Loan Settled in Full — Monvera' : 'Loan Repayment Applied — Monvera',
+            body: isFullyPaid
+              ? `Your loan repayment of $${repayAmtFormatted} from ${safeRepayAccountMasked} settled your loan in full.`
+              : `Your partial loan repayment of $${repayAmtFormatted} from ${safeRepayAccountMasked} was applied. Remaining balance: $${remainingFormatted}.`,
+            actionUrl: '/dashboard?view=loans',
+            amount: actualRepay,
+            currency: 'USD',
+            recipientName: 'Monvera Credit & Lending Facility',
+            accountMasked: safeRepayAccountMasked,
+          },
+        },
+      ]);
+
+      // 4. Atomically commit account debit
+      transaction.set(
+        accRef,
+        {
+          userId,
+          ...finalMetrics,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
+
+      // 5. Atomically commit loan update
+      transaction.set(loanRef, finalLoan, { merge: true });
+
+      // 6. Atomically commit ledger transaction
+      transaction.set(txRef, finalTx, { merge: true });
+
+      // 7. Atomically commit notification & durable notification outbox record
       transaction.set(notifRef, notifItem, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, loanRepayOutboxBatch);
     });
+    if (finalLoan && !isDuplicate && finalTx) {
+      reportOutboxPreparationIssues('executeServerLoanRepayment', finalTx.id, outboxWriteResult);
+    }
 
     if (finalLoan) {
       return {
@@ -3892,7 +4022,8 @@ export interface InvestmentCreationResult {
  * Server-authoritative Term Investment Creation inside a single atomic Firestore transaction.
  */
 export async function executeServerInvestmentCreation(
-  params: InvestmentCreationParams
+  params: InvestmentCreationParams,
+  deps?: ServerTransactionDeps
 ): Promise<InvestmentCreationResult> {
   const { userId, termDays, amount, clientRequestId, userAccountNumber, fallbackUser } = params;
 
@@ -3900,8 +4031,10 @@ export async function executeServerInvestmentCreation(
     return { success: false, error: 'Customer user ID is required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
+
   // Check account freeze status before creating investment
-  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+  const userDocSnap = await fs.collection('users').doc(userId).get();
   const userData = userDocSnap.exists ? userDocSnap.data()! : {};
   if (userData.status === 'frozen') {
     return {
@@ -3931,20 +4064,37 @@ export async function executeServerInvestmentCreation(
   const maturityIso = new Date(Date.now() + numDays * 24 * 60 * 60 * 1000).toISOString();
 
   const refKey = clientRequestId || `MV-INV-${userId}-${numDays}-${Math.round(principal * 100)}-${Date.now()}`;
-  const accRef = adminFirestore.collection('accounts').doc(userId);
+  const cleanInvKeyRaw = refKey.replace(/[^a-zA-Z0-9_-]/g, '');
+  const stableInvSuffix =
+    clientRequestId && cleanInvKeyRaw
+      ? (cleanInvKeyRaw.length <= 48 ? cleanInvKeyRaw : crypto.createHash('sha256').update(refKey).digest('hex').slice(0, 16))
+      : `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+  const invId = `inv_${stableInvSuffix}`;
+  const txId = `tx_inv_${stableInvSuffix}`;
+  const cleanInvKey = cleanInvKeyRaw || crypto.createHash('sha256').update(refKey).digest('hex').slice(0, 24);
+  const notifId = `notif_inv_${cleanInvKey}_${userId}`;
+  const accRef = fs.collection('accounts').doc(userId);
 
   let finalInvestment: InvestmentPlan | null = null;
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let finalNotif: NotificationItem | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      finalInvestment = null;
+      finalTx = null;
+      finalMetrics = null;
+      finalNotif = null;
+      outboxWriteResult = null;
+
       // 1. Idempotency check: if clientRequestId was provided, check existing transaction
       if (clientRequestId) {
         const existingTxQuery = await transaction.get(
-          adminFirestore.collection('transactions').where('referenceNumber', '==', clientRequestId).limit(1)
+          fs.collection('transactions').where('referenceNumber', '==', clientRequestId).limit(1)
         );
         if (!existingTxQuery.empty) {
           const existingTx = existingTxQuery.docs[0].data() as Transaction;
@@ -3953,7 +4103,7 @@ export async function executeServerInvestmentCreation(
             finalTx = existingTx;
             const existingInvId = existingTx.metadata?.investmentId;
             if (existingInvId) {
-              const invSnap = await transaction.get(adminFirestore.collection('investments').doc(existingInvId));
+              const invSnap = await transaction.get(fs.collection('investments').doc(existingInvId));
               if (invSnap.exists) {
                 finalInvestment = invSnap.data() as InvestmentPlan;
               }
@@ -4003,7 +4153,7 @@ export async function executeServerInvestmentCreation(
         );
       }
 
-      // 4. Atomically compute updated balances
+      // 4. Atomically compute updated balances & authoritative investment/transaction/notification objects
       const newChecking = Number((currentChecking - principal).toFixed(2));
       const newAvailable = newChecking;
       const newInvested = Number((currentInvested + principal).toFixed(2));
@@ -4058,20 +4208,7 @@ export async function executeServerInvestmentCreation(
         accounts: accountsList,
       };
 
-      // 5. Atomically commit account debit
-      transaction.set(
-        accRef,
-        {
-          userId,
-          ...finalMetrics,
-          updatedAt: nowIso,
-        },
-        { merge: true }
-      );
-
-      // 6. Atomically create investment document
-      const invId = `inv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
-      const invRef = adminFirestore.collection('investments').doc(invId);
+      const invRef = fs.collection('investments').doc(invId);
       finalInvestment = {
         id: invId,
         userId,
@@ -4088,11 +4225,8 @@ export async function executeServerInvestmentCreation(
         status: 'ACTIVE',
         createdAt: nowIso,
       };
-      transaction.set(invRef, finalInvestment, { merge: true });
 
-      // 7. Atomically commit ledger transaction
-      const txId = `tx_inv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
-      const txRef = adminFirestore.collection('transactions').doc(txId);
+      const txRef = fs.collection('transactions').doc(txId);
       finalTx = {
         id: txId,
         userId,
@@ -4120,12 +4254,8 @@ export async function executeServerInvestmentCreation(
           expectedMaturityValue,
         },
       };
-      transaction.set(txRef, finalTx, { merge: true });
 
-      // 8. Atomically commit deterministic notification
-      const cleanInvKey = refKey.replace(/[^a-zA-Z0-9_-]/g, '');
-      const notifId = `notif_inv_${cleanInvKey}_${userId}`;
-      const notifRef = adminFirestore.collection('notifications').doc(notifId);
+      const notifRef = fs.collection('notifications').doc(notifId);
       finalNotif = {
         id: notifId,
         userId,
@@ -4153,8 +4283,59 @@ export async function executeServerInvestmentCreation(
           date: nowIso,
         },
       };
+
+      // Transaction read-phase: prepare INVESTMENT outbox record strictly BEFORE any writes
+      const invPrincipalFormatted = principal.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      const safeInvAccountMasked = formatSafeOutboxAccountLabel(userAcc, 'Checking');
+
+      const invCreateOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'INVESTMENT',
+          category: 'INVESTMENT',
+          nowIso,
+          payload: {
+            title: 'Term Investment Activated — Monvera',
+            body: `Your ${numDays}-day term investment of $${invPrincipalFormatted} from ${safeInvAccountMasked} has been activated.`,
+            actionUrl: '/dashboard?view=investments',
+            amount: principal,
+            currency: 'USD',
+            accountMasked: safeInvAccountMasked,
+          },
+        },
+      ]);
+
+      // 5. Atomically commit account debit
+      transaction.set(
+        accRef,
+        {
+          userId,
+          ...finalMetrics,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      // 6. Atomically create investment document
+      transaction.set(invRef, finalInvestment, { merge: true });
+
+      // 7. Atomically commit ledger transaction
+      transaction.set(txRef, finalTx, { merge: true });
+
+      // 8. Atomically commit deterministic notification & durable notification outbox record
       transaction.set(notifRef, finalNotif, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, invCreateOutboxBatch);
     });
+    if (finalInvestment && !isDuplicate && finalTx) {
+      reportOutboxPreparationIssues('executeServerInvestmentCreation', finalTx.id, outboxWriteResult);
+    }
 
     if (finalInvestment) {
       return {
@@ -4197,7 +4378,8 @@ export interface InvestmentMaturityResult {
  * Server-authoritative Term Investment Maturity Settlement inside a single atomic Firestore transaction.
  */
 export async function executeServerInvestmentMaturity(
-  params: InvestmentMaturityParams
+  params: InvestmentMaturityParams,
+  deps?: ServerTransactionDeps
 ): Promise<InvestmentMaturityResult> {
   const { investmentId, userId } = params;
 
@@ -4205,8 +4387,9 @@ export async function executeServerInvestmentMaturity(
     return { success: false, error: 'Investment ID and User ID are required.' };
   }
 
-  const invRef = adminFirestore.collection('investments').doc(investmentId);
-  const accRef = adminFirestore.collection('accounts').doc(userId);
+  const fs = deps?.firestore || adminFirestore;
+  const invRef = fs.collection('investments').doc(investmentId);
+  const accRef = fs.collection('accounts').doc(userId);
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
 
@@ -4215,9 +4398,13 @@ export async function executeServerInvestmentMaturity(
   let finalMetrics: BalanceMetrics | null = null;
   let payoutTotal = 0;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      outboxWriteResult = null;
+
       // 1. Read investment document
       const invSnap = await transaction.get(invRef);
       if (!invSnap.exists) {
@@ -4306,28 +4493,14 @@ export async function executeServerInvestmentMaturity(
         accounts: accountsList,
       };
 
-      // 7. Atomically commit account credit
-      transaction.set(
-        accRef,
-        {
-          userId,
-          ...finalMetrics,
-          updatedAt: nowIso,
-        },
-        { merge: true }
-      );
-
-      // 8. Atomically update investment status
       finalInvestment = {
         ...inv,
         status: 'MATURED',
         totalAccruedEarnings: inv.expectedYield,
       };
-      transaction.set(invRef, finalInvestment, { merge: true });
 
-      // 9. Atomically commit maturity ledger transaction
       const txId = `tx_mat_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
-      const txRef = adminFirestore.collection('transactions').doc(txId);
+      const txRef = fs.collection('transactions').doc(txId);
       finalTx = {
         id: txId,
         userId,
@@ -4354,11 +4527,9 @@ export async function executeServerInvestmentMaturity(
           payoutAmount: payoutTotal,
         },
       };
-      transaction.set(txRef, finalTx, { merge: true });
 
-      // 10. Atomically commit deterministic notification
       const notifId = `notif_mat_${investmentId}_${userId}`;
-      const notifRef = adminFirestore.collection('notifications').doc(notifId);
+      const notifRef = fs.collection('notifications').doc(notifId);
       const notifItem: NotificationItem = {
         id: notifId,
         userId,
@@ -4386,8 +4557,52 @@ export async function executeServerInvestmentMaturity(
           date: nowIso,
         },
       };
+
+      // Transaction read-phase: prepare INVESTMENT maturity outbox record strictly BEFORE any writes
+      const maturityOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'INVESTMENT',
+          category: 'INVESTMENT',
+          nowIso,
+          payload: {
+            title: 'Investment Matured & Settled — Monvera',
+            actionUrl: '/dashboard?view=investments',
+            amount: payoutTotal,
+            currency: 'USD',
+            accountMasked: formatSafeOutboxAccountLabel(userAcc, 'Checking'),
+          },
+        },
+      ]);
+
+      // 7. Atomically commit account credit
+      transaction.set(
+        accRef,
+        {
+          userId,
+          ...finalMetrics,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+
+      // 8. Atomically update investment status
+      transaction.set(invRef, finalInvestment, { merge: true });
+
+      // 9. Atomically commit maturity ledger transaction
+      transaction.set(txRef, finalTx, { merge: true });
+
+      // 10. Atomically commit deterministic notification & durable notification outbox record
       transaction.set(notifRef, notifItem, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, maturityOutboxBatch);
     });
+    if (finalInvestment && !isDuplicate && finalTx) {
+      reportOutboxPreparationIssues('executeServerInvestmentMaturity', finalTx.id, outboxWriteResult);
+    }
 
     if (finalInvestment) {
       return {
@@ -4442,7 +4657,8 @@ export interface CardIssuanceResult {
  * and records the fee transaction in the ledger.
  */
 export async function executeServerCardIssuance(
-  params: CardIssuanceParams
+  params: CardIssuanceParams,
+  deps?: ServerTransactionDeps
 ): Promise<CardIssuanceResult> {
   const {
     userId,
@@ -4464,9 +4680,11 @@ export async function executeServerCardIssuance(
     return { success: false, error: 'Customer user ID is required.' };
   }
 
+  const fs = deps?.firestore || adminFirestore;
+
   // 1. Verify account freeze / restrictions
   try {
-    const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
+    const userDocSnap = await fs.collection('users').doc(userId).get();
     if (userDocSnap.exists) {
       const uData = userDocSnap.data()!;
       if (uData.status === 'frozen') {
@@ -4489,26 +4707,46 @@ export async function executeServerCardIssuance(
 
   const feeAmount = 2.00; // $2.00 card issuance fee
   const nowIso = new Date().toISOString();
-  const accRef = adminFirestore.collection('accounts').doc(userId);
+  const accRef = fs.collection('accounts').doc(userId);
+
+  const stableCardSuffix = clientRequestId
+    ? (() => {
+        const cleaned = clientRequestId.replace(/[^a-zA-Z0-9_-]/g, '');
+        return cleaned && cleaned.length <= 48
+          ? cleaned
+          : crypto.createHash('sha256').update(clientRequestId).digest('hex').slice(0, 16);
+      })()
+    : `${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const cardId = `crd_${userId}_${stableCardSuffix}`;
+  const txId = `tx_crd_fee_${cardId}`;
+  const txRefNum = clientRequestId || `MV-CRD-${cardId}`;
+  const notifId = `notif_card_iss_${cardId}_${userId}`;
 
   let finalCard: CardItem | null = null;
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
-    await adminFirestore.runTransaction(async (transaction) => {
+    await fs.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      finalCard = null;
+      finalTx = null;
+      finalMetrics = null;
+      outboxWriteResult = null;
+
       // 2. Idempotency Check: if clientRequestId was provided, check if transaction already completed
       if (clientRequestId) {
         let existingDoc: any = null;
         const existingRefQuery = await transaction.get(
-          adminFirestore.collection('transactions').where('referenceNumber', '==', clientRequestId).limit(1)
+          fs.collection('transactions').where('referenceNumber', '==', clientRequestId).limit(1)
         );
         if (!existingRefQuery.empty) {
           existingDoc = existingRefQuery.docs[0];
         } else {
           const existingReqQuery = await transaction.get(
-            adminFirestore.collection('transactions').where('clientRequestId', '==', clientRequestId).limit(1)
+            fs.collection('transactions').where('clientRequestId', '==', clientRequestId).limit(1)
           );
           if (!existingReqQuery.empty) {
             existingDoc = existingReqQuery.docs[0];
@@ -4522,7 +4760,7 @@ export async function executeServerCardIssuance(
             finalTx = existingTx;
             const existingCardId = existingTx.metadata?.cardId;
             if (existingCardId) {
-              const cardSnap = await transaction.get(adminFirestore.collection('cards').doc(existingCardId));
+              const cardSnap = await transaction.get(fs.collection('cards').doc(existingCardId));
               if (cardSnap.exists) {
                 finalCard = cardSnap.data() as CardItem;
               } else if (db.cards.has(existingCardId)) {
@@ -4664,7 +4902,6 @@ export async function executeServerCardIssuance(
       const expiryDate = `${expMonth}/${expYear}`;
       const cvv = String(Math.floor(100 + Math.random() * 900));
 
-      const cardId = `crd_${userId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const defaultName = fallbackUser ? `${fallbackUser.firstName || ''} ${fallbackUser.lastName || ''}`.trim() : '';
       const holderName = (cardHolderName || defaultName || 'Valued Client').toUpperCase().trim();
       const dailyLimit = spendingLimitDaily || 20000;
@@ -4698,8 +4935,6 @@ export async function executeServerCardIssuance(
       };
 
       // 7. Create permanent Transaction ledger record
-      const txId = `tx_crd_fee_${cardId}`;
-      const txRefNum = clientRequestId || `MV-CRD-${cardId}`;
       finalTx = {
         id: txId,
         referenceNumber: txRefNum,
@@ -4729,7 +4964,6 @@ export async function executeServerCardIssuance(
       };
 
       // 8. Create deterministic notification record
-      const notifId = `notif_card_iss_${cardId}_${userId}`;
       const notifItem: NotificationItem = {
         id: notifId,
         userId,
@@ -4759,6 +4993,32 @@ export async function executeServerCardIssuance(
         },
       };
 
+      // Transaction read-phase: prepare masked TRANSACTION outbox record strictly BEFORE any writes (zero PAN/CVV/expiry/PIN/tokens)
+      const cardFeeFormatted = feeAmount.toFixed(2);
+      const safeCardAccountMasked = formatSafeOutboxAccountLabel(userAcc, 'Checking');
+
+      const cardIssOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+        {
+          userId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: `${brandName} Card Issued — Monvera`,
+            body: `Your new ${brandName} card has been issued. A $${cardFeeFormatted} card issuance fee was debited from ${safeCardAccountMasked}.`,
+            actionUrl: '/dashboard?view=cards',
+            amount: feeAmount,
+            currency: 'USD',
+            recipientName: 'Monvera Card Issuance Facility',
+            accountMasked: safeCardAccountMasked,
+          },
+        },
+      ]);
+
       // 9. Atomic commits in Firestore transaction
       transaction.set(
         accRef,
@@ -4770,10 +5030,14 @@ export async function executeServerCardIssuance(
         },
         { merge: true }
       );
-      transaction.set(adminFirestore.collection('cards').doc(cardId), finalCard, { merge: true });
-      transaction.set(adminFirestore.collection('transactions').doc(txId), finalTx, { merge: true });
-      transaction.set(adminFirestore.collection('notifications').doc(notifId), notifItem, { merge: true });
+      transaction.set(fs.collection('cards').doc(cardId), finalCard, { merge: true });
+      transaction.set(fs.collection('transactions').doc(txId), finalTx, { merge: true });
+      transaction.set(fs.collection('notifications').doc(notifId), notifItem, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, cardIssOutboxBatch);
     });
+    if (finalCard && !isDuplicate && finalTx) {
+      reportOutboxPreparationIssues('executeServerCardIssuance', finalTx.id, outboxWriteResult);
+    }
 
     if (finalCard && finalTx) {
       return {

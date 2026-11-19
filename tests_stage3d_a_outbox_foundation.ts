@@ -62,11 +62,23 @@ import { smsService } from './server/services/smsService';
 import { emailService } from './server/services/emailService';
 import { db as inMemoryDb } from './server/db';
 import {
+  executeServerAdminTransfer,
+  executeServerCardIssuance,
   executeServerDeposit,
+  executeServerInvestmentCreation,
+  executeServerInvestmentMaturity,
+  executeServerLoanDisbursement,
+  executeServerLoanRepayment,
   executeServerTransfer,
   executeServerWithdrawal,
   reverseServerFirestoreWithdrawal,
 } from './server/firestoreTransactions';
+import {
+  executeServerWireCheckWithdrawal,
+  markWireCheckRequestDeliveredAdmin,
+} from './server/wireCheckService';
+import { executeServerAdminCheckWithdrawal } from './server/adminCheckService';
+import { evaluateAndProcessWelcomeReward } from './server/welcomeRewardService';
 
 // ---------------------------------------------------------------------------
 // Strict Firestore-Faithful In-Memory Harness
@@ -225,89 +237,114 @@ class InMemoryCollectionRef extends InMemoryQuery {
 class StrictInMemoryFirestore {
   public readonly store: DocStore = new Map();
   public failNextTransactionWrite = false;
+  public onBeforeCommitConflictOnce: (() => Promise<void> | void) | null = null;
+  public lastTransactionAttempts = 0;
 
   collection(name: string): InMemoryCollectionRef {
     return new InMemoryCollectionRef(this.store, name);
   }
 
   async runTransaction<T>(fn: (tx: any) => Promise<T>): Promise<T> {
-    let hasWritten = false;
-    const readVersions = new Map<string, number>();
-    const pendingOps: Array<
-      | { type: 'set'; ref: InMemoryDocRef; data: Record<string, any>; merge: boolean }
-      | { type: 'delete'; ref: InMemoryDocRef }
-    > = [];
+    const maxAttempts = 5;
+    this.lastTransactionAttempts = 0;
 
-    const tx = {
-      get: async (refOrQuery: InMemoryDocRef | InMemoryQuery) => {
-        if (hasWritten) {
-          throw new Error('Firestore transactions require all reads to be executed before all writes.');
-        }
-        if (refOrQuery instanceof InMemoryQuery) {
-          const snap = await refOrQuery.get();
-          for (const d of snap.docs) {
-            const entry = d.ref.readRawEntry();
-            if (!readVersions.has(d.ref.path)) {
-              readVersions.set(d.ref.path, entry?.version ?? 0);
-            }
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.lastTransactionAttempts = attempt;
+      let hasWritten = false;
+      const readVersions = new Map<string, number>();
+      const pendingOps: Array<
+        | { type: 'set'; ref: InMemoryDocRef; data: Record<string, any>; merge: boolean }
+        | { type: 'delete'; ref: InMemoryDocRef }
+      > = [];
+
+      const tx = {
+        get: async (refOrQuery: InMemoryDocRef | InMemoryQuery) => {
+          if (hasWritten) {
+            throw new Error('Firestore transactions require all reads to be executed before all writes.');
           }
-          return snap;
-        }
-        const ref = refOrQuery as InMemoryDocRef;
-        const entry = ref.readRawEntry();
-        if (!readVersions.has(ref.path)) {
-          readVersions.set(ref.path, entry?.version ?? 0);
-        }
-        const { docId } = ref.splitParentAndId();
-        return {
-          id: docId,
-          exists: entry !== undefined,
-          ref,
-          data: () => (entry ? cloneVal(entry.data) : undefined),
-        };
-      },
-      set: (ref: InMemoryDocRef, data: Record<string, any>, opts?: { merge?: boolean }) => {
-        hasWritten = true;
-        pendingOps.push({ type: 'set', ref, data: cloneVal(data), merge: Boolean(opts?.merge) });
-      },
-      create: (ref: InMemoryDocRef, data: Record<string, any>) => {
-        hasWritten = true;
-        pendingOps.push({ type: 'set', ref, data: cloneVal(data), merge: false });
-      },
-      delete: (ref: InMemoryDocRef) => {
-        hasWritten = true;
-        pendingOps.push({ type: 'delete', ref });
-      },
-    };
+          if (refOrQuery instanceof InMemoryQuery) {
+            const snap = await refOrQuery.get();
+            for (const d of snap.docs) {
+              const entry = d.ref.readRawEntry();
+              if (!readVersions.has(d.ref.path)) {
+                readVersions.set(d.ref.path, entry?.version ?? 0);
+              }
+            }
+            return snap;
+          }
+          const ref = refOrQuery as InMemoryDocRef;
+          const entry = ref.readRawEntry();
+          if (!readVersions.has(ref.path)) {
+            readVersions.set(ref.path, entry?.version ?? 0);
+          }
+          const { docId } = ref.splitParentAndId();
+          return {
+            id: docId,
+            exists: entry !== undefined,
+            ref,
+            data: () => (entry ? cloneVal(entry.data) : undefined),
+          };
+        },
+        set: (ref: InMemoryDocRef, data: Record<string, any>, opts?: { merge?: boolean }) => {
+          hasWritten = true;
+          pendingOps.push({ type: 'set', ref, data: cloneVal(data), merge: Boolean(opts?.merge) });
+        },
+        create: (ref: InMemoryDocRef, data: Record<string, any>) => {
+          hasWritten = true;
+          pendingOps.push({ type: 'set', ref, data: cloneVal(data), merge: false });
+        },
+        delete: (ref: InMemoryDocRef) => {
+          hasWritten = true;
+          pendingOps.push({ type: 'delete', ref });
+        },
+      };
 
-    const result = await fn(tx);
+      const result = await fn(tx);
 
-    if (this.failNextTransactionWrite && pendingOps.length > 0) {
-      this.failNextTransactionWrite = false;
-      throw new Error('SIMULATED_FIRESTORE_COMMIT_FAILURE');
-    }
-
-    // Optimistic concurrency validation at commit time (if any read doc changed concurrently, abort!)
-    for (const [docPath, expectedVersion] of readVersions.entries()) {
-      const idx = docPath.lastIndexOf('/');
-      const colPath = docPath.slice(0, idx);
-      const docId = docPath.slice(idx + 1);
-      const currentVersion = this.store.get(colPath)?.get(docId)?.version ?? 0;
-      if (currentVersion !== expectedVersion) {
-        throw new Error(`ABORTED: Concurrent transaction conflict on ${docPath}`);
+      if (this.onBeforeCommitConflictOnce) {
+        const hook = this.onBeforeCommitConflictOnce;
+        this.onBeforeCommitConflictOnce = null;
+        await hook();
       }
-    }
 
-    // Apply all buffered writes atomically
-    for (const op of pendingOps) {
-      if (op.type === 'delete') {
-        await op.ref.delete();
-      } else {
-        await op.ref.set(op.data, { merge: op.merge });
+      if (this.failNextTransactionWrite && pendingOps.length > 0) {
+        this.failNextTransactionWrite = false;
+        throw new Error('SIMULATED_FIRESTORE_COMMIT_FAILURE');
       }
+
+      // Optimistic concurrency validation at commit time (if any read doc changed concurrently, abort & retry)
+      let conflictedPath: string | null = null;
+      for (const [docPath, expectedVersion] of readVersions.entries()) {
+        const idx = docPath.lastIndexOf('/');
+        const colPath = docPath.slice(0, idx);
+        const docId = docPath.slice(idx + 1);
+        const currentVersion = this.store.get(colPath)?.get(docId)?.version ?? 0;
+        if (currentVersion !== expectedVersion) {
+          conflictedPath = docPath;
+          break;
+        }
+      }
+
+      if (conflictedPath) {
+        if (attempt < maxAttempts) {
+          continue;
+        }
+        throw new Error(`ABORTED: Concurrent transaction conflict on ${conflictedPath}`);
+      }
+
+      // Apply all buffered writes atomically
+      for (const op of pendingOps) {
+        if (op.type === 'delete') {
+          await op.ref.delete();
+        } else {
+          await op.ref.set(op.data, { merge: op.merge });
+        }
+      }
+
+      return result;
     }
 
-    return result;
+    throw new Error('ABORTED: Exhausted transaction retry attempts');
   }
 }
 
@@ -2579,7 +2616,3001 @@ async function runTests() {
     console.log('✓ Tests 24-25 passed: executeServerWithdrawal (:INITIATED) and reverseServerFirestoreWithdrawal (:REVERSED) enforce PII masking, lifecycle separation, and duplicate protection');
   }
 
-  console.log('\nALL STAGE 3D-A / 3D-B1.1 OUTBOX TESTS PASSED (25/25).');
+  // -------------------------------------------------------------------------
+  // TEST 26 [3D-B1.2]: executeServerAdminTransfer transactional outbox integration
+  // - Strict read-before-write compliance
+  // - Single recipient MONEY_RECEIVED :COMPLETED outbox record (admin sender never gets customer outbox record)
+  // - Protects DISPATCHED records & ignores duplicates/invalid/rejected transfers
+  // - Atomic rollback on transaction commit failure
+  // - Excludes full account numbers, emails, phones, and unmasked 8+ digit body identifiers
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    await fsMem.collection('users').doc('uid_adm_recip_3db12').set({
+      id: 'uid_adm_recip_3db12',
+      firstName: 'Elena',
+      lastName: 'Vance',
+      permanentAccountNumber: '1099881122',
+      email: 'elena.private@monvera.test',
+      phone: '+15551239999',
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc('uid_adm_recip_3db12').set({
+      userId: 'uid_adm_recip_3db12',
+      permanentAccountNumber: '1099881122',
+      checkingBalance: 250,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 250,
+      availableBalance: 250,
+      pendingBalance: 0,
+    });
+    await fsMem.collection('accounts').doc('usr_admin').set({
+      userId: 'usr_admin',
+      checkingBalance: 50000,
+      availableBalance: 50000,
+      totalBalance: 50000,
+    });
+
+    const admRes = await executeServerAdminTransfer(
+      {
+        adminId: 'usr_admin',
+        targetIdentifier: 'uid_adm_recip_3db12',
+        amount: 750,
+        referenceNumber: 'MV-ADM-2026-123456789',
+        clientRequestId: 'req_adm_123456789',
+        description: 'Stage 3D-B1.2 Treasury Disbursement',
+      },
+      deps
+    );
+    assert.strictEqual(admRes.success, true);
+    assert.strictEqual(admRes.isDuplicate, false);
+    assert.strictEqual(admRes.transaction?.status, 'COMPLETED');
+    assert.strictEqual(admRes.targetBalanceMetrics?.checkingBalance, 1000);
+
+    const admTxId = admRes.transaction!.id;
+    const expectedOutboxId = computeNotificationOutboxId(
+      'uid_adm_recip_3db12',
+      `${admTxId}:COMPLETED`,
+      'MONEY_RECEIVED'
+    );
+    const admOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(admOutboxSnap.size, 1, 'Admin transfer must create exactly 1 recipient outbox record');
+
+    const recipOutboxDoc = admOutboxSnap.docs[0].data()!;
+    assert.strictEqual(admOutboxSnap.docs[0].id, expectedOutboxId);
+    assert.strictEqual(recipOutboxDoc.userId, 'uid_adm_recip_3db12');
+    assert.strictEqual(recipOutboxDoc.transactionId, admTxId);
+    assert.strictEqual(recipOutboxDoc.referenceNumber, 'MV-ADM-2026-123456789');
+    assert.strictEqual(recipOutboxDoc.eventKey, `${admTxId}:COMPLETED`);
+    assert.strictEqual(recipOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(recipOutboxDoc.dispatchType, 'MONEY_RECEIVED');
+    assert.strictEqual(recipOutboxDoc.status, 'PENDING');
+    assert.strictEqual(recipOutboxDoc.payload.amount, 750);
+    assert.strictEqual(recipOutboxDoc.payload.senderName, 'Bennett Johnson');
+    assert.strictEqual(recipOutboxDoc.payload.body, undefined);
+
+    // Ensure admin sender has NO customer outbox record and zero sensitive fields leaked
+    assert.strictEqual(
+      admOutboxSnap.docs.some((d) => d.data().userId === 'usr_admin'),
+      false,
+      'Admin sender must never receive a customer outbox record'
+    );
+    const serializedAdm = JSON.stringify(recipOutboxDoc);
+    assert.strictEqual(serializedAdm.includes('1099881122'), false);
+    assert.strictEqual(serializedAdm.includes('1000000001'), false);
+    assert.strictEqual(serializedAdm.includes('elena.private@monvera.test'), false);
+    assert.strictEqual(serializedAdm.includes('+15551239999'), false);
+
+    // Existing DISPATCHED record must remain untouched on duplicate replay
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedOutboxId).set({
+      ...recipOutboxDoc,
+      status: 'DISPATCHED',
+      pushStatus: 'SENT',
+    });
+
+    const dupAdmRes = await executeServerAdminTransfer(
+      {
+        adminId: 'usr_admin',
+        targetIdentifier: 'uid_adm_recip_3db12',
+        amount: 750,
+        referenceNumber: 'MV-ADM-2026-123456789',
+      },
+      deps
+    );
+    assert.strictEqual(dupAdmRes.success, true);
+    assert.strictEqual(dupAdmRes.isDuplicate, true);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedOutboxId).get()).data()?.status,
+      'DISPATCHED'
+    );
+
+    // Failed/invalid admin transfer writes ZERO outbox records
+    const badAdmRes = await executeServerAdminTransfer(
+      { adminId: 'usr_admin', targetIdentifier: 'uid_nonexistent_3db12', amount: 100 },
+      deps
+    );
+    assert.strictEqual(badAdmRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Simulated transaction commit failure rolls back BOTH balance/ledger and outbox atomically
+    fsMem.failNextTransactionWrite = true;
+    const rollbackAdmRes = await executeServerAdminTransfer(
+      {
+        adminId: 'usr_admin',
+        targetIdentifier: 'uid_adm_recip_3db12',
+        amount: 200,
+        referenceNumber: 'MV-ADM-2026-ROLLBACK1',
+      },
+      deps
+    );
+    assert.strictEqual(rollbackAdmRes.success, false);
+    assert.strictEqual(
+      (await fsMem.collection('accounts').doc('uid_adm_recip_3db12').get()).data()?.checkingBalance,
+      1000
+    );
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    console.log('✓ Test 26 passed: executeServerAdminTransfer creates 1 recipient MONEY_RECEIVED outbox record, excludes admin sender, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 27 [3D-B1.2]: executeServerLoanDisbursement transactional outbox integration
+  // - Strict read-before-write compliance
+  // - Single MONEY_RECEIVED :COMPLETED record using deterministic txId & MVB-LN-${loanId}
+  // - Repeated disbursement, rejected/non-pending, and rollback failure produce zero extra outbox docs
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const loanId = 'loan_88442211'; // includes 8-digit token in ID/reference
+    await fsMem.collection('accounts').doc('uid_loan_3db12').set({
+      userId: 'uid_loan_3db12',
+      permanentAccountNumber: '1077665544',
+      checkingBalance: 400,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 400,
+      availableBalance: 400,
+      pendingBalance: 0,
+      loanBalance: 0,
+      creditedLoans: [],
+    });
+    await fsMem.collection('loans').doc(loanId).set({
+      id: loanId,
+      userId: 'uid_loan_3db12',
+      applicantName: 'Marcus Vance',
+      applicantEmail: 'marcus.private@monvera.test',
+      applicantPhone: '+15550008888',
+      permanentAccountNumber: '1077665544',
+      amount: 2500,
+      termMonths: 12,
+      status: 'PENDING',
+      createdAt: new Date().toISOString(),
+    });
+
+    const loanRes = await executeServerLoanDisbursement({ loanId, adminId: 'usr_admin' }, deps);
+    assert.strictEqual(loanRes.success, true);
+    assert.strictEqual(loanRes.isDuplicate, false);
+    assert.strictEqual(loanRes.loan?.status, 'ACTIVE');
+    assert.strictEqual(loanRes.balanceMetrics?.checkingBalance, 2900);
+    assert.strictEqual(loanRes.balanceMetrics?.loanBalance, 3000);
+    assert.strictEqual(loanRes.transaction?.id, `tx_loan_disb_${loanId}`);
+    assert.strictEqual(loanRes.transaction?.referenceNumber, `MVB-LN-${loanId}`);
+
+    const loanOutboxId = computeNotificationOutboxId(
+      'uid_loan_3db12',
+      `tx_loan_disb_${loanId}:COMPLETED`,
+      'MONEY_RECEIVED'
+    );
+    const loanOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(loanOutboxSnap.size, 1);
+
+    const loanOutboxDoc = loanOutboxSnap.docs[0].data()!;
+    assert.strictEqual(loanOutboxSnap.docs[0].id, loanOutboxId);
+    assert.strictEqual(loanOutboxDoc.userId, 'uid_loan_3db12');
+    assert.strictEqual(loanOutboxDoc.transactionId, `tx_loan_disb_${loanId}`);
+    assert.strictEqual(loanOutboxDoc.referenceNumber, `MVB-LN-${loanId}`);
+    assert.strictEqual(loanOutboxDoc.eventKey, `tx_loan_disb_${loanId}:COMPLETED`);
+    assert.strictEqual(loanOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(loanOutboxDoc.dispatchType, 'MONEY_RECEIVED');
+    assert.strictEqual(loanOutboxDoc.payload.amount, 2500);
+    assert.strictEqual(loanOutboxDoc.payload.body, undefined);
+
+    const serializedLoan = JSON.stringify(loanOutboxDoc);
+    assert.strictEqual(serializedLoan.includes('1077665544'), false);
+    assert.strictEqual(serializedLoan.includes('marcus.private@monvera.test'), false);
+    assert.strictEqual(serializedLoan.includes('+15550008888'), false);
+
+    // Mark outbox PROCESSING & verify repeated disbursement creates zero additional records and preserves PROCESSING
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(loanOutboxId).set({
+      ...loanOutboxDoc,
+      status: 'PROCESSING',
+      leaseToken: 'loan_lease_keep',
+    });
+    const dupLoanRes = await executeServerLoanDisbursement({ loanId, adminId: 'usr_admin' }, deps);
+    assert.strictEqual(dupLoanRes.success, true);
+    assert.strictEqual(dupLoanRes.isDuplicate, true);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(loanOutboxId).get()).data()?.leaseToken,
+      'loan_lease_keep'
+    );
+
+    // Rejected loan creates zero outbox records
+    await fsMem.collection('loans').doc('loan_rejected_1').set({
+      id: 'loan_rejected_1',
+      userId: 'uid_loan_3db12',
+      amount: 1000,
+      termMonths: 12,
+      status: 'REJECTED',
+    });
+    const rejLoanRes = await executeServerLoanDisbursement({ loanId: 'loan_rejected_1', adminId: 'usr_admin' }, deps);
+    assert.strictEqual(rejLoanRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Simulated commit failure rolls back loan, balance, ledger, and outbox atomically
+    await fsMem.collection('loans').doc('loan_rollback_1').set({
+      id: 'loan_rollback_1',
+      userId: 'uid_loan_3db12',
+      applicantName: 'Marcus Vance',
+      amount: 500,
+      termMonths: 12,
+      status: 'PENDING',
+    });
+    fsMem.failNextTransactionWrite = true;
+    const rbLoanRes = await executeServerLoanDisbursement({ loanId: 'loan_rollback_1', adminId: 'usr_admin' }, deps);
+    assert.strictEqual(rbLoanRes.success, false);
+    assert.strictEqual((await fsMem.collection('loans').doc('loan_rollback_1').get()).data()?.status, 'PENDING');
+    assert.strictEqual((await fsMem.collection('accounts').doc('uid_loan_3db12').get()).data()?.checkingBalance, 2900);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    console.log('✓ Test 27 passed: executeServerLoanDisbursement writes 1 MONEY_RECEIVED outbox record, enforces creditedLoans/status checks, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 28 [3D-B1.2]: executeServerInvestmentMaturity transactional outbox integration
+  // - Strict read-before-write compliance
+  // - Single INVESTMENT :COMPLETED outbox record on maturity settlement
+  // - Repeated maturity, early maturity rejection, unauthorized user, and rollback failure create zero extra outbox docs
+  // - Zero sensitive fields or unmasked 8+ digit body strings
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const invId = 'inv_99887766';
+    const pastMaturity = new Date(Date.now() - 3_600_000).toISOString();
+    const futureMaturity = new Date(Date.now() + 86_400_000).toISOString();
+
+    await fsMem.collection('accounts').doc('uid_inv_3db12').set({
+      userId: 'uid_inv_3db12',
+      permanentAccountNumber: '1055443322',
+      checkingBalance: 500,
+      savingsBalance: 0,
+      investedBalance: 1000,
+      accruedEarnings: 0,
+      totalBalance: 1500,
+      availableBalance: 500,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+    await fsMem.collection('investments').doc(invId).set({
+      id: invId,
+      userId: 'uid_inv_3db12',
+      planName: 'Monvera Treasury 30D',
+      amount: 1000,
+      termDays: 30,
+      expectedYield: 75,
+      expectedMaturityValue: 1075,
+      status: 'ACTIVE',
+      maturityDate: pastMaturity,
+      createdAt: new Date(Date.now() - 31 * 86_400_000).toISOString(),
+    });
+    await fsMem.collection('investments').doc('inv_early_1').set({
+      id: 'inv_early_1',
+      userId: 'uid_inv_3db12',
+      planName: 'Monvera Early Block',
+      amount: 500,
+      termDays: 90,
+      expectedYield: 60,
+      expectedMaturityValue: 560,
+      status: 'ACTIVE',
+      maturityDate: futureMaturity,
+    });
+
+    // Unauthorized user or early maturity must fail with 0 outbox records
+    const unauthInvRes = await executeServerInvestmentMaturity(
+      { investmentId: invId, userId: 'uid_attacker_3db12' },
+      deps
+    );
+    assert.strictEqual(unauthInvRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    const earlyInvRes = await executeServerInvestmentMaturity(
+      { investmentId: 'inv_early_1', userId: 'uid_inv_3db12' },
+      deps
+    );
+    assert.strictEqual(earlyInvRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    // Valid maturity settlement creates exactly one INVESTMENT :COMPLETED outbox record
+    const matRes = await executeServerInvestmentMaturity(
+      { investmentId: invId, userId: 'uid_inv_3db12' },
+      deps
+    );
+    assert.strictEqual(matRes.success, true);
+    assert.strictEqual(matRes.isDuplicate, false);
+    assert.strictEqual(matRes.investment?.status, 'MATURED');
+    assert.strictEqual(matRes.payoutAmount, 1075);
+    assert.strictEqual(matRes.balanceMetrics?.checkingBalance, 1575);
+    assert.strictEqual(matRes.balanceMetrics?.investedBalance, 0);
+    assert.strictEqual(matRes.transaction?.referenceNumber, `MV-MAT-${invId}`);
+
+    const matTxId = matRes.transaction!.id;
+    const matOutboxId = computeNotificationOutboxId('uid_inv_3db12', `${matTxId}:COMPLETED`, 'INVESTMENT');
+    const matOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(matOutboxSnap.size, 1);
+
+    const matOutboxDoc = matOutboxSnap.docs[0].data()!;
+    assert.strictEqual(matOutboxSnap.docs[0].id, matOutboxId);
+    assert.strictEqual(matOutboxDoc.userId, 'uid_inv_3db12');
+    assert.strictEqual(matOutboxDoc.transactionId, matTxId);
+    assert.strictEqual(matOutboxDoc.referenceNumber, `MV-MAT-${invId}`);
+    assert.strictEqual(matOutboxDoc.eventKey, `${matTxId}:COMPLETED`);
+    assert.strictEqual(matOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(matOutboxDoc.dispatchType, 'INVESTMENT');
+    assert.strictEqual(matOutboxDoc.category, 'INVESTMENT');
+    assert.strictEqual(matOutboxDoc.payload.amount, 1075);
+    assert.strictEqual(matOutboxDoc.payload.body, undefined);
+    assert.strictEqual(JSON.stringify(matOutboxDoc).includes('1055443322'), false);
+
+    // Repeated maturity on MATURED investment must create ZERO additional outbox records
+    const dupMatRes = await executeServerInvestmentMaturity(
+      { investmentId: invId, userId: 'uid_inv_3db12' },
+      deps
+    );
+    assert.strictEqual(dupMatRes.success, true);
+    assert.strictEqual(dupMatRes.isDuplicate, true);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Simulated commit failure rolls back investment, balance, ledger, and outbox atomically
+    await fsMem.collection('investments').doc('inv_rollback_1').set({
+      id: 'inv_rollback_1',
+      userId: 'uid_inv_3db12',
+      planName: 'Monvera Rollback Plan',
+      amount: 200,
+      termDays: 30,
+      expectedYield: 15,
+      expectedMaturityValue: 215,
+      status: 'ACTIVE',
+      maturityDate: pastMaturity,
+    });
+    fsMem.failNextTransactionWrite = true;
+    const rbMatRes = await executeServerInvestmentMaturity(
+      { investmentId: 'inv_rollback_1', userId: 'uid_inv_3db12' },
+      deps
+    );
+    assert.strictEqual(rbMatRes.success, false);
+    assert.strictEqual((await fsMem.collection('investments').doc('inv_rollback_1').get()).data()?.status, 'ACTIVE');
+    assert.strictEqual((await fsMem.collection('accounts').doc('uid_inv_3db12').get()).data()?.checkingBalance, 1575);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    console.log('✓ Test 28 passed: executeServerInvestmentMaturity writes 1 INVESTMENT :COMPLETED outbox record, blocks duplicates/early settlement, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 29 [3D-B1.3A]: executeServerLoanRepayment transactional outbox integration
+  // - Strict read-before-write compliance
+  // - Single TRANSACTION :COMPLETED outbox record on partial & full payoff repayments
+  // - Duplicate referenceNumber preserves existing outbox state without extra doc
+  // - Failed/unauthorized/frozen/excess/rollback repayments create ZERO outbox docs
+  // - Zero raw PAN/account/email/phone or 8+ digit body tokens leaked
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const userId = 'uid_rep_3db13';
+    const loanId = 'loan_rep_88332211';
+
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Jordan',
+      lastName: 'Blake',
+      permanentAccountNumber: '1099112233',
+      email: 'jordan.repay.private@monvera.test',
+      phone: '+15551112222',
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: '1099112233',
+      checkingBalance: 1500,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 1500,
+      availableBalance: 1500,
+      pendingBalance: 0,
+      loanBalance: 1200,
+    });
+    await fsMem.collection('loans').doc(loanId).set({
+      id: loanId,
+      userId,
+      applicantName: 'Jordan Blake',
+      applicantEmail: 'jordan.repay.private@monvera.test',
+      permanentAccountNumber: '1099112233',
+      amount: 1000,
+      totalRepaymentAmount: 1200,
+      totalRepaid: 0,
+      remainingBalance: 1200,
+      termMonths: 12,
+      status: 'ACTIVE',
+      repaymentHistory: [],
+    });
+
+    // Unauthorized caller, excess amount, insufficient balance, and frozen account must write ZERO outbox docs
+    const unauthRepRes = await executeServerLoanRepayment(
+      { loanId, userId: 'uid_intruder_3db13', amount: 100 },
+      deps
+    );
+    assert.strictEqual(unauthRepRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    const excessRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 1500 },
+      deps
+    );
+    assert.strictEqual(excessRepRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    await fsMem.collection('users').doc(userId).set({ status: 'frozen' }, { merge: true });
+    const frozenRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 100 },
+      deps
+    );
+    assert.strictEqual(frozenRepRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+    await fsMem.collection('users').doc(userId).set({ status: 'active' }, { merge: true });
+
+    // Valid partial repayment with 8+ digit referenceNumber
+    const partialRef = 'MVB-RP-2026-88776655';
+    const repRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 400, referenceNumber: partialRef, note: 'Installment #1' },
+      deps
+    );
+    assert.strictEqual(repRes.success, true);
+    assert.strictEqual(repRes.isDuplicate, false);
+    assert.strictEqual(repRes.loan?.status, 'ACTIVE');
+    assert.strictEqual(repRes.remainingBalance, 800);
+    assert.strictEqual(repRes.balanceMetrics?.checkingBalance, 1100);
+    assert.strictEqual(repRes.balanceMetrics?.loanBalance, 800);
+
+    const repTxId = repRes.transaction!.id;
+    const expectedRepOutboxId = computeNotificationOutboxId(userId, `${repTxId}:COMPLETED`, 'TRANSACTION');
+    const repOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(repOutboxSnap.size, 1);
+
+    const repOutboxDoc = repOutboxSnap.docs[0].data()!;
+    assert.strictEqual(repOutboxSnap.docs[0].id, expectedRepOutboxId);
+    assert.strictEqual(repOutboxDoc.userId, userId);
+    assert.strictEqual(repOutboxDoc.transactionId, repTxId);
+    assert.strictEqual(repOutboxDoc.referenceNumber, partialRef);
+    assert.strictEqual(repOutboxDoc.eventKey, `${repTxId}:COMPLETED`);
+    assert.strictEqual(repOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(repOutboxDoc.dispatchType, 'TRANSACTION');
+    assert.strictEqual(repOutboxDoc.category, 'TRANSACTION');
+    assert.strictEqual(repOutboxDoc.status, 'PENDING');
+    assert.strictEqual(repOutboxDoc.payload.amount, 400);
+    assert.strictEqual(repOutboxDoc.payload.actionUrl, '/dashboard?view=loans');
+    assert.strictEqual(repOutboxDoc.payload.title, 'Loan Repayment Applied — Monvera');
+    assert.strictEqual(
+      repOutboxDoc.payload.body,
+      'Your partial loan repayment of $400.00 from Checking (MVB •••• 2233) was applied. Remaining balance: $800.00.'
+    );
+    assert.strictEqual(/\b\d{8,}\b/.test(String(repOutboxDoc.payload.body || '')), false);
+
+    const serializedRep = JSON.stringify(repOutboxDoc);
+    assert.strictEqual(serializedRep.includes('1099112233'), false);
+    assert.strictEqual(serializedRep.includes('jordan.repay.private@monvera.test'), false);
+    assert.strictEqual(serializedRep.includes('+15551112222'), false);
+
+    // Existing DISPATCHED record must remain untouched on duplicate replay
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedRepOutboxId).set({
+      ...repOutboxDoc,
+      status: 'DISPATCHED',
+      pushStatus: 'SENT',
+    });
+
+    const dupRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 400, referenceNumber: partialRef },
+      deps
+    );
+    assert.strictEqual(dupRepRes.success, true);
+    assert.strictEqual(dupRepRes.isDuplicate, true);
+    assert.strictEqual(dupRepRes.balanceMetrics?.checkingBalance, 1100);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedRepOutboxId).get()).data()?.status,
+      'DISPATCHED'
+    );
+
+    // Simulated commit failure rolls back balance, loan, ledger, and outbox atomically
+    fsMem.failNextTransactionWrite = true;
+    const rbRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 200, referenceNumber: 'MVB-RP-2026-ROLLBACK1' },
+      deps
+    );
+    assert.strictEqual(rbRepRes.success, false);
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 1100);
+    assert.strictEqual((await fsMem.collection('loans').doc(loanId).get()).data()?.remainingBalance, 800);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Full loan settlement creates a second distinct outbox record with settlement title
+    const fullRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 800, referenceNumber: 'MVB-RP-2026-FINAL99' },
+      deps
+    );
+    assert.strictEqual(fullRepRes.success, true);
+    assert.strictEqual(fullRepRes.loan?.status, 'PAID');
+    assert.strictEqual(fullRepRes.remainingBalance, 0);
+    assert.strictEqual(fullRepRes.balanceMetrics?.checkingBalance, 300);
+    assert.strictEqual(fullRepRes.balanceMetrics?.loanBalance, 0);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+
+    const fullOutboxId = computeNotificationOutboxId(userId, `${fullRepRes.transaction!.id}:COMPLETED`, 'TRANSACTION');
+    const fullOutboxDoc = (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(fullOutboxId).get()).data()!;
+    assert.strictEqual(fullOutboxDoc.payload.title, 'Loan Settled in Full — Monvera');
+    assert.strictEqual(
+      fullOutboxDoc.payload.body,
+      'Your loan repayment of $800.00 from Checking (MVB •••• 2233) settled your loan in full.'
+    );
+    assert.strictEqual(fullOutboxDoc.payload.amount, 800);
+
+    // Subsequent repayment on PAID loan must fail with zero extra outbox docs
+    const paidRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 50, referenceNumber: 'MVB-RP-2026-AFTERPAID' },
+      deps
+    );
+    assert.strictEqual(paidRepRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+
+    console.log('✓ Test 29 passed: executeServerLoanRepayment writes 1 TRANSACTION :COMPLETED outbox record, protects duplicates, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 30 [3D-B1.3A]: executeServerInvestmentCreation transactional outbox integration
+  // - Strict read-before-write compliance
+  // - Single INVESTMENT :COMPLETED outbox record with exact 4.5% daily yield math preserved
+  // - Invalid term, < $100, insufficient funds, frozen account, duplicate, and rollback checks
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const userId = 'uid_inv_cr_3db13';
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Nadia',
+      lastName: 'Kerr',
+      permanentAccountNumber: '1088776655',
+      email: 'nadia.inv.private@monvera.test',
+      phone: '+15553334444',
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: '1088776655',
+      checkingBalance: 2500,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 2500,
+      availableBalance: 2500,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+
+    // Invalid term, below minimum, insufficient funds, frozen account produce ZERO outbox docs
+    assert.strictEqual(
+      (await executeServerInvestmentCreation({ userId, termDays: 45 as any, amount: 500 }, deps)).success,
+      false
+    );
+    assert.strictEqual(
+      (await executeServerInvestmentCreation({ userId, termDays: 60, amount: 50 }, deps)).success,
+      false
+    );
+    assert.strictEqual(
+      (await executeServerInvestmentCreation({ userId, termDays: 60, amount: 5000 }, deps)).success,
+      false
+    );
+    await fsMem.collection('users').doc(userId).set({ status: 'frozen' }, { merge: true });
+    assert.strictEqual(
+      (await executeServerInvestmentCreation({ userId, termDays: 60, amount: 500 }, deps)).success,
+      false
+    );
+    await fsMem.collection('users').doc(userId).set({ status: 'active' }, { merge: true });
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    // Valid term investment creation
+    const reqId = 'req_inv_3db13_99887766';
+    const invRes = await executeServerInvestmentCreation(
+      { userId, termDays: 60, amount: 1000, clientRequestId: reqId },
+      deps
+    );
+    assert.strictEqual(invRes.success, true);
+    assert.strictEqual(invRes.isDuplicate, false);
+    assert.strictEqual(invRes.investment?.status, 'ACTIVE');
+    assert.strictEqual(invRes.investment?.expectedYield, 2700); // 1000 * 0.045 * 60
+    assert.strictEqual(invRes.investment?.expectedMaturityValue, 3700);
+    assert.strictEqual(invRes.balanceMetrics?.checkingBalance, 1500);
+    assert.strictEqual(invRes.balanceMetrics?.investedBalance, 1000);
+    assert.strictEqual(invRes.balanceMetrics?.totalBalance, 2500);
+
+    const invTxId = invRes.transaction!.id;
+    const expectedInvOutboxId = computeNotificationOutboxId(userId, `${invTxId}:COMPLETED`, 'INVESTMENT');
+    const invOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(invOutboxSnap.size, 1);
+
+    const invOutboxDoc = invOutboxSnap.docs[0].data()!;
+    assert.strictEqual(invOutboxSnap.docs[0].id, expectedInvOutboxId);
+    assert.strictEqual(invOutboxDoc.userId, userId);
+    assert.strictEqual(invOutboxDoc.transactionId, invTxId);
+    assert.strictEqual(invOutboxDoc.referenceNumber, reqId);
+    assert.strictEqual(invOutboxDoc.eventKey, `${invTxId}:COMPLETED`);
+    assert.strictEqual(invOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(invOutboxDoc.dispatchType, 'INVESTMENT');
+    assert.strictEqual(invOutboxDoc.category, 'INVESTMENT');
+    assert.strictEqual(invOutboxDoc.status, 'PENDING');
+    assert.strictEqual(invOutboxDoc.payload.amount, 1000);
+    assert.strictEqual(invOutboxDoc.payload.actionUrl, '/dashboard?view=investments');
+    assert.strictEqual(invOutboxDoc.payload.title, 'Term Investment Activated — Monvera');
+    assert.strictEqual(
+      invOutboxDoc.payload.body,
+      'Your 60-day term investment of $1,000.00 from Checking (MVB •••• 6655) has been activated.'
+    );
+    assert.strictEqual(/\b\d{8,}\b/.test(String(invOutboxDoc.payload.body || '')), false);
+
+    const serializedInv = JSON.stringify(invOutboxDoc);
+    assert.strictEqual(serializedInv.includes('1088776655'), false);
+    assert.strictEqual(serializedInv.includes('nadia.inv.private@monvera.test'), false);
+    assert.strictEqual(serializedInv.includes('+15553334444'), false);
+
+    // Mark outbox PROCESSING & verify duplicate clientRequestId preserves PROCESSING without re-debiting
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedInvOutboxId).set({
+      ...invOutboxDoc,
+      status: 'PROCESSING',
+      leaseToken: 'inv_create_lease_keep',
+    });
+    const dupInvRes = await executeServerInvestmentCreation(
+      { userId, termDays: 60, amount: 1000, clientRequestId: reqId },
+      deps
+    );
+    assert.strictEqual(dupInvRes.success, true);
+    assert.strictEqual(dupInvRes.isDuplicate, true);
+    assert.strictEqual(dupInvRes.balanceMetrics?.checkingBalance, 1500);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedInvOutboxId).get()).data()?.leaseToken,
+      'inv_create_lease_keep'
+    );
+
+    // Simulated commit failure rolls back investment, balance, ledger, notification, and outbox atomically
+    fsMem.failNextTransactionWrite = true;
+    const rbInvRes = await executeServerInvestmentCreation(
+      { userId, termDays: 90, amount: 500, clientRequestId: 'req_inv_3db13_rollback' },
+      deps
+    );
+    assert.strictEqual(rbInvRes.success, false);
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 1500);
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.investedBalance, 1000);
+    assert.strictEqual((await fsMem.collection('investments').get()).size, 1);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    console.log('✓ Test 30 passed: executeServerInvestmentCreation writes 1 INVESTMENT :COMPLETED outbox record, preserves yield/idempotency, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 31 [3D-B1.3A]: executeServerCardIssuance transactional outbox integration & PCI/PII scrubbing
+  // - Strict read-before-write compliance
+  // - Deducts exact $2.00 fee and writes 1 TRANSACTION :COMPLETED outbox record
+  // - Zero PAN, CVV, expiry, PIN, phone, tokens, or unmasked account numbers in outbox record
+  // - Insufficient funds, frozen account, duplicate clientRequestId, and rollback checks
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const userId = 'uid_crd_3db13';
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Avery',
+      lastName: 'Quinn',
+      permanentAccountNumber: '1066554433',
+      email: 'avery.card.private@monvera.test',
+      phone: '+15556667777',
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: '1066554433',
+      checkingBalance: 1.50,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 1.50,
+      availableBalance: 1.50,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+
+    // Insufficient funds (< $2.00) must create ZERO outbox records
+    const lowFundsRes = await executeServerCardIssuance(
+      { userId, cardHolderName: 'Avery Quinn', brand: 'MASTERCARD', clientRequestId: 'req_crd_low_1' },
+      deps
+    );
+    assert.strictEqual(lowFundsRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    // Fund account & verify frozen account also writes ZERO outbox records
+    await fsMem.collection('accounts').doc(userId).set(
+      {
+        checkingBalance: 100,
+        totalBalance: 100,
+        availableBalance: 100,
+      },
+      { merge: true }
+    );
+    await fsMem.collection('users').doc(userId).set({ status: 'frozen' }, { merge: true });
+    const frozenCrdRes = await executeServerCardIssuance(
+      { userId, cardHolderName: 'Avery Quinn', brand: 'MASTERCARD', clientRequestId: 'req_crd_frozen_1' },
+      deps
+    );
+    assert.strictEqual(frozenCrdRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+    await fsMem.collection('users').doc(userId).set({ status: 'active' }, { merge: true });
+
+    // Valid card issuance ($2.00 fee)
+    const crdReqId = 'req_crd_3db13_11223344';
+    const crdRes = await executeServerCardIssuance(
+      {
+        userId,
+        cardHolderName: 'Avery Quinn',
+        phone: '+15556667777',
+        cardType: 'VIRTUAL',
+        brand: 'MASTERCARD',
+        clientRequestId: crdReqId,
+      },
+      deps
+    );
+    assert.strictEqual(crdRes.success, true);
+    assert.strictEqual(crdRes.isDuplicate, false);
+    assert.strictEqual(crdRes.transaction?.type, 'FEE');
+    assert.strictEqual(crdRes.transaction?.amount, 2);
+    assert.strictEqual(crdRes.balanceMetrics?.checkingBalance, 98);
+    assert.strictEqual(crdRes.balanceMetrics?.totalBalance, 98);
+
+    const crdTxId = crdRes.transaction!.id;
+    const expectedCrdOutboxId = computeNotificationOutboxId(userId, `${crdTxId}:COMPLETED`, 'TRANSACTION');
+    const crdOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(crdOutboxSnap.size, 1);
+
+    const crdOutboxDoc = crdOutboxSnap.docs[0].data()!;
+    assert.strictEqual(crdOutboxSnap.docs[0].id, expectedCrdOutboxId);
+    assert.strictEqual(crdOutboxDoc.userId, userId);
+    assert.strictEqual(crdOutboxDoc.transactionId, crdTxId);
+    assert.strictEqual(crdOutboxDoc.referenceNumber, crdReqId);
+    assert.strictEqual(crdOutboxDoc.eventKey, `${crdTxId}:COMPLETED`);
+    assert.strictEqual(crdOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(crdOutboxDoc.dispatchType, 'TRANSACTION');
+    assert.strictEqual(crdOutboxDoc.category, 'TRANSACTION');
+    assert.strictEqual(crdOutboxDoc.payload.amount, 2);
+    assert.strictEqual(crdOutboxDoc.payload.title, 'Mastercard Card Issued — Monvera');
+    assert.strictEqual(crdOutboxDoc.payload.actionUrl, '/dashboard?view=cards');
+    assert.strictEqual(
+      crdOutboxDoc.payload.body,
+      'Your new Mastercard card has been issued. A $2.00 card issuance fee was debited from Checking (MVB •••• 4433).'
+    );
+    assert.strictEqual(/\b\d{8,}\b/.test(String(crdOutboxDoc.payload.body || '')), false);
+
+    // Strict PCI/PII verification on serialized outbox document
+    const serializedCrd = JSON.stringify(crdOutboxDoc);
+    const issuedCard = crdRes.card!;
+    const rawPanDigits = issuedCard.cardNumber.replace(/\s+/g, '');
+    assert.strictEqual(serializedCrd.includes(issuedCard.cardNumber), false);
+    assert.strictEqual(serializedCrd.includes(rawPanDigits), false);
+    assert.strictEqual(serializedCrd.includes(issuedCard.fullNumberMasked), false);
+    assert.strictEqual(serializedCrd.includes(issuedCard.maskedNumber), false);
+    assert.strictEqual(serializedCrd.includes(issuedCard.expiryDate), false);
+    assert.strictEqual(/\b\d{12,19}\b/.test(serializedCrd), false, 'Outbox must never contain PAN digit sequences');
+    assert.strictEqual('cvvMasked' in crdOutboxDoc.payload, false);
+    assert.strictEqual('expiryDate' in crdOutboxDoc.payload, false);
+    assert.strictEqual('cardNumber' in crdOutboxDoc.payload, false);
+    assert.strictEqual(serializedCrd.includes('1066554433'), false);
+    assert.strictEqual(serializedCrd.includes('avery.card.private@monvera.test'), false);
+    assert.strictEqual(serializedCrd.includes('+15556667777'), false);
+    assert.strictEqual(serializedCrd.includes('AVERY QUINN'), false);
+
+    // Existing DISPATCHED outbox record must remain untouched on duplicate replay
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedCrdOutboxId).set({
+      ...crdOutboxDoc,
+      status: 'DISPATCHED',
+      pushStatus: 'SENT',
+    });
+    const dupCrdRes = await executeServerCardIssuance(
+      { userId, cardHolderName: 'Avery Quinn', brand: 'MASTERCARD', clientRequestId: crdReqId },
+      deps
+    );
+    assert.strictEqual(dupCrdRes.success, true);
+    assert.strictEqual(dupCrdRes.isDuplicate, true);
+    assert.strictEqual(dupCrdRes.card?.id, issuedCard.id);
+    assert.strictEqual(dupCrdRes.balanceMetrics?.checkingBalance, 98);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedCrdOutboxId).get()).data()?.status,
+      'DISPATCHED'
+    );
+
+    // Simulated commit failure rolls back $2.00 fee, card, ledger tx, notification, and outbox atomically
+    fsMem.failNextTransactionWrite = true;
+    const rbCrdRes = await executeServerCardIssuance(
+      { userId, cardHolderName: 'Avery Quinn', brand: 'VISA', clientRequestId: 'req_crd_rollback_1' },
+      deps
+    );
+    assert.strictEqual(rbCrdRes.success, false);
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 98);
+    assert.strictEqual((await fsMem.collection('cards').get()).size, 1);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    console.log('✓ Test 31 passed: executeServerCardIssuance deducts $2.00, writes 1 scrubbed TRANSACTION :COMPLETED outbox record, protects PCI/PII, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 32 [3D-B1.3A]: Transaction contention retries across all 3 functions
+  // - Concurrent account update triggers ABORTED retry-then-commit with single deterministic artifacts
+  // - Concurrent duplicate completion before retry resets transient vars cleanly and avoids double debit/outbox
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const userId = 'uid_retry_3db13';
+    const loanId = 'loan_retry_3db13';
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Morgan',
+      lastName: 'Reed',
+      permanentAccountNumber: '1044332211',
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: '1044332211',
+      checkingBalance: 2000,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 2000,
+      availableBalance: 2000,
+      pendingBalance: 0,
+      loanBalance: 1200,
+    });
+    await fsMem.collection('loans').doc(loanId).set({
+      id: loanId,
+      userId,
+      applicantName: 'Morgan Reed',
+      amount: 1000,
+      totalRepaymentAmount: 1200,
+      totalRepaid: 0,
+      remainingBalance: 1200,
+      termMonths: 12,
+      status: 'ACTIVE',
+      repaymentHistory: [],
+    });
+
+    // Case A: Concurrent balance top-up conflicts on attempt 1 of investment creation -> retries & uses fresh checkingBalance (2500 -> 2000)
+    fsMem.onBeforeCommitConflictOnce = async () => {
+      const cur = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      await fsMem.collection('accounts').doc(userId).set({
+        ...cur,
+        checkingBalance: 2500,
+        availableBalance: 2500,
+        totalBalance: 2500,
+      });
+    };
+    const retryInvRes = await executeServerInvestmentCreation(
+      { userId, termDays: 60, amount: 500, clientRequestId: 'req_inv_retry_1' },
+      deps
+    );
+    assert.strictEqual(retryInvRes.success, true);
+    assert.strictEqual(retryInvRes.isDuplicate, false);
+    assert.strictEqual(fsMem.lastTransactionAttempts, 2, 'Investment creation should have retried after ABORTED conflict');
+    assert.strictEqual(retryInvRes.balanceMetrics?.checkingBalance, 2000);
+    assert.strictEqual(retryInvRes.balanceMetrics?.investedBalance, 500);
+    assert.strictEqual((await fsMem.collection('investments').get()).size, 1);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Case B: Concurrent balance change conflicts on attempt 1 of card issuance (without clientRequestId) -> retries deterministically
+    fsMem.onBeforeCommitConflictOnce = async () => {
+      const cur = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      await fsMem.collection('accounts').doc(userId).set({
+        ...cur,
+        checkingBalance: 2100,
+        availableBalance: 2100,
+        totalBalance: 2600,
+      });
+    };
+    const retryCrdRes = await executeServerCardIssuance(
+      { userId, cardHolderName: 'Morgan Reed', brand: 'VISA' },
+      deps
+    );
+    assert.strictEqual(retryCrdRes.success, true);
+    assert.strictEqual(retryCrdRes.isDuplicate, false);
+    assert.strictEqual(fsMem.lastTransactionAttempts, 2, 'Card issuance should have retried after ABORTED conflict');
+    assert.strictEqual(retryCrdRes.balanceMetrics?.checkingBalance, 2098);
+    assert.strictEqual((await fsMem.collection('cards').get()).size, 1);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+
+    // Case C: Attempt 1 of loan repayment computes non-duplicate writes, then another worker commits identical referenceNumber before attempt 1 commit -> attempt 2 detects duplicate & resets state cleanly
+    const raceRef = 'MVB-RP-2026-RACE99';
+    fsMem.onBeforeCommitConflictOnce = async () => {
+      await fsMem.collection('transactions').doc('tx_race_winner').set({
+        id: 'tx_race_winner',
+        userId,
+        type: 'TRANSFER',
+        amount: 300,
+        currency: 'USD',
+        status: 'COMPLETED',
+        referenceNumber: raceRef,
+        createdAt: new Date().toISOString(),
+      });
+      const curAcc = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      await fsMem.collection('accounts').doc(userId).set({
+        ...curAcc,
+        checkingBalance: 1798,
+        availableBalance: 1798,
+        loanBalance: 900,
+      });
+      const curLoan = (await fsMem.collection('loans').doc(loanId).get()).data()!;
+      await fsMem.collection('loans').doc(loanId).set({
+        ...curLoan,
+        totalRepaid: 300,
+        remainingBalance: 900,
+      });
+    };
+    const raceRepRes = await executeServerLoanRepayment(
+      { loanId, userId, amount: 300, referenceNumber: raceRef },
+      deps
+    );
+    assert.strictEqual(raceRepRes.success, true);
+    assert.strictEqual(raceRepRes.isDuplicate, true);
+    assert.strictEqual(fsMem.lastTransactionAttempts, 2, 'Loan repayment should have retried and detected duplicate');
+    assert.strictEqual(raceRepRes.transaction?.id, 'tx_race_winner');
+    assert.strictEqual(raceRepRes.balanceMetrics?.checkingBalance, 1798);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+
+    console.log('✓ Test 32 passed: Contention retries across loan repayment, investment creation, and card issuance are deterministic and duplicate-safe');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 33 [3D-B1.3A.1]: End-to-end outbox -> buildDispatchEventFromOutboxRecord ->
+  // ServerNotificationDispatcher.dispatch() FCM content & sanitization regression suite
+  // - Verifies final FCM notification/webpush/data title & body (not just outbox records)
+  // - Distinguishes partial loan repayment from full settlement & uses actualRepay
+  // - Verifies term investment activation wording (without implying maturity/earned yield)
+  // - Verifies card issuance $2.00 fee wording & zero PCI/PII in final FCM payload
+  // - Confirms unsupported SMS/Email remain UNCONFIGURED_PROVIDER (never SENT)
+  // - Verifies formatSafePushContent preserves custom title when body is omitted & redacts 8+ digits
+  // - Verifies preferences, persistent deduplication, lease ownership, and retry outcomes remain intact
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const txDeps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const userId = 'uid_dispatch_3db13a1';
+    const loanId = 'loan_disp_3db13a1';
+    const userPan = '1099887744';
+    const userEmail = 'claire.dispatch.private@monvera.test';
+    const userPhone = '+15559990001';
+    const fcmTok = 'fcm_stage3db13a1_dispatch_tok_' + 'q'.repeat(40);
+
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Claire',
+      lastName: 'Moran',
+      permanentAccountNumber: userPan,
+      email: userEmail,
+      phone: userPhone,
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: userPan,
+      checkingBalance: 5000,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 5000,
+      availableBalance: 5000,
+      pendingBalance: 0,
+      loanBalance: 1200,
+    });
+    await fsMem.collection('loans').doc(loanId).set({
+      id: loanId,
+      userId,
+      applicantName: 'Claire Moran',
+      applicantEmail: userEmail,
+      permanentAccountNumber: userPan,
+      amount: 1000,
+      totalRepaymentAmount: 1200,
+      totalRepaid: 0,
+      remainingBalance: 1200,
+      termMonths: 12,
+      status: 'ACTIVE',
+      repaymentHistory: [],
+    });
+
+    await registerCustomerPushToken(
+      { uid: userId, token: fcmTok, platform: 'web' },
+      fsMem as unknown as Firestore
+    );
+
+    const capturedFcmMessages: any[] = [];
+    let smsCallCount = 0;
+    let emailCallCount = 0;
+    const origSms = smsService.sendTransactionSms.bind(smsService);
+    const origEmail = emailService.sendTransactionalEmail.bind(emailService);
+    (smsService as any).sendTransactionSms = async () => {
+      smsCallCount++;
+      return { success: true, delivered: true, status: 'SENT' };
+    };
+    (emailService as any).sendTransactionalEmail = async () => {
+      emailCallCount++;
+      return { success: true, delivered: true, status: 'SENT' };
+    };
+
+    try {
+      const mockMessaging: Partial<Messaging> = {
+        sendEachForMulticast: async (message: any) => {
+          capturedFcmMessages.push(structuredClone(message));
+          return {
+            successCount: message.tokens.length,
+            failureCount: 0,
+            responses: message.tokens.map((_: string, idx: number) => ({
+              success: true,
+              messageId: `fcm_3db13a1_${capturedFcmMessages.length}_${idx}`,
+            })),
+          };
+        },
+      };
+
+      const dispatcher = new ServerNotificationDispatcher({
+        firestore: fsMem as unknown as Firestore,
+        messaging: mockMessaging as Messaging,
+        isAdminConfigured: () => true,
+        isMessagingConfigured: () => true,
+        instanceId: 'worker_3db13a1_regression',
+      });
+
+      const dispatchOutboxRecordAndAssert = async (outboxId: string, workerId: string) => {
+        const claim = await claimOutboxLease(fsMem as unknown as Firestore, outboxId, workerId);
+        assert.strictEqual(claim.claimed, true, `Failed to claim outbox ${outboxId}: ${claim.reason}`);
+        const dispatchEvent = buildDispatchEventFromOutboxRecord(claim.record!, {
+          email: userEmail,
+          phone: userPhone,
+        });
+        const dispatchRes = await dispatcher.dispatch(
+          dispatchEvent,
+          buildOutboxDispatchOptions(claim.record!, claim.leaseToken!)
+        );
+        const logSnap = await fetchDispatchLogForOutboxRecord(fsMem as unknown as Firestore, claim.record!);
+        const evaluated = evaluateOutboxAttemptOutcome({
+          outboxRecord: claim.record!,
+          dispatchResult: dispatchRes,
+          persistentLog: logSnap,
+        });
+        assert.strictEqual(evaluated.action, 'TRANSITION');
+        assert.strictEqual(evaluated.nextStatus, 'DISPATCHED');
+        assert.strictEqual(evaluated.smsStatus, 'UNCONFIGURED_PROVIDER');
+        assert.strictEqual(evaluated.emailStatus, 'UNCONFIGURED_PROVIDER');
+        const trans = await transitionOutboxAsLeaseOwner(
+          fsMem as unknown as Firestore,
+          outboxId,
+          claim.leaseToken!,
+          () => ({
+            status: evaluated.nextStatus!,
+            pushStatus: evaluated.pushStatus,
+            smsStatus: evaluated.smsStatus,
+            emailStatus: evaluated.emailStatus,
+            failureClassification: evaluated.failureClassification,
+            lastError: evaluated.lastError,
+            dispatchedAt: evaluated.dispatchedAt,
+          })
+        );
+        assert.strictEqual(trans.status, 'UPDATED');
+        return { dispatchRes, claimRecord: claim.record!, finalRecord: trans.record! };
+      };
+
+      // 1A. Partial loan repayment ($400.00 of $1,200.00 -> $800.00 remaining)
+      const partialRes = await executeServerLoanRepayment(
+        { loanId, userId, amount: 400, referenceNumber: 'MVB-RP-2026-44556677' },
+        txDeps
+      );
+      assert.strictEqual(partialRes.success, true);
+      const partialOutboxId = computeNotificationOutboxId(
+        userId,
+        `${partialRes.transaction!.id}:COMPLETED`,
+        'TRANSACTION'
+      );
+      const partialDispatch = await dispatchOutboxRecordAndAssert(partialOutboxId, 'worker_loan_partial');
+      assert.strictEqual(partialDispatch.dispatchRes.push.status, 'SENT');
+      assert.strictEqual(partialDispatch.dispatchRes.sms.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(partialDispatch.dispatchRes.sms.delivered, false);
+      assert.strictEqual(partialDispatch.dispatchRes.email.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(partialDispatch.dispatchRes.email.delivered, false);
+
+      const fcmPartial = capturedFcmMessages[0];
+      assert.strictEqual(fcmPartial.notification.title, 'Loan Repayment Applied — Monvera');
+      assert.strictEqual(
+        fcmPartial.notification.body,
+        'Your partial loan repayment of $400.00 from Checking (MVB •••• 7744) was applied. Remaining balance: $800.00.'
+      );
+      assert.strictEqual(fcmPartial.webpush.notification.title, fcmPartial.notification.title);
+      assert.strictEqual(fcmPartial.webpush.notification.body, fcmPartial.notification.body);
+      assert.strictEqual(fcmPartial.data.title, fcmPartial.notification.title);
+      assert.strictEqual(fcmPartial.data.body, fcmPartial.notification.body);
+      assert.strictEqual(fcmPartial.notification.body.toLowerCase().includes('settled'), false);
+      assert.strictEqual(/\b\d{8,}\b/.test(fcmPartial.notification.body), false);
+
+      // 1B. Full loan settlement using +0.01 tolerance (requested 800.01 vs remaining 800.00 -> actualRepay = $800.00)
+      const fullRes = await executeServerLoanRepayment(
+        { loanId, userId, amount: 800.01, referenceNumber: 'MVB-RP-2026-88990011' },
+        txDeps
+      );
+      assert.strictEqual(fullRes.success, true);
+      assert.strictEqual(fullRes.loan?.status, 'PAID');
+      assert.strictEqual(fullRes.transaction?.amount, 800);
+      const fullOutboxId = computeNotificationOutboxId(
+        userId,
+        `${fullRes.transaction!.id}:COMPLETED`,
+        'TRANSACTION'
+      );
+      const fullDispatch = await dispatchOutboxRecordAndAssert(fullOutboxId, 'worker_loan_full');
+      assert.strictEqual(fullDispatch.dispatchRes.push.status, 'SENT');
+      assert.strictEqual(fullDispatch.dispatchRes.sms.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(fullDispatch.dispatchRes.email.status, 'UNCONFIGURED_PROVIDER');
+
+      const fcmFull = capturedFcmMessages[1];
+      assert.strictEqual(fcmFull.notification.title, 'Loan Settled in Full — Monvera');
+      assert.strictEqual(
+        fcmFull.notification.body,
+        'Your loan repayment of $800.00 from Checking (MVB •••• 7744) settled your loan in full.'
+      );
+      assert.strictEqual(fcmFull.notification.body.includes('800.01'), false, 'Body must use actualRepay ($800.00), not requested $800.01');
+      assert.strictEqual(/\b\d{8,}\b/.test(fcmFull.notification.body), false);
+
+      // 2. Term investment creation ($1,000.00, 60 days)
+      const invRes = await executeServerInvestmentCreation(
+        { userId, termDays: 60, amount: 1000, clientRequestId: 'req_inv_disp_99887766' },
+        txDeps
+      );
+      assert.strictEqual(invRes.success, true);
+      const invOutboxId = computeNotificationOutboxId(
+        userId,
+        `${invRes.transaction!.id}:COMPLETED`,
+        'INVESTMENT'
+      );
+      const invDispatch = await dispatchOutboxRecordAndAssert(invOutboxId, 'worker_inv_create');
+      assert.strictEqual(invDispatch.dispatchRes.push.status, 'SENT');
+      assert.strictEqual(invDispatch.dispatchRes.sms.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(invDispatch.dispatchRes.sms.delivered, false);
+      assert.strictEqual(invDispatch.dispatchRes.email.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(invDispatch.dispatchRes.email.delivered, false);
+
+      const fcmInv = capturedFcmMessages[2];
+      assert.strictEqual(fcmInv.notification.title, 'Term Investment Activated — Monvera');
+      assert.strictEqual(
+        fcmInv.notification.body,
+        'Your 60-day term investment of $1,000.00 from Checking (MVB •••• 7744) has been activated.'
+      );
+      assert.strictEqual(fcmInv.webpush.notification.title, fcmInv.notification.title);
+      assert.strictEqual(fcmInv.webpush.notification.body, fcmInv.notification.body);
+      assert.strictEqual(fcmInv.notification.body.toLowerCase().includes('matured'), false);
+      assert.strictEqual(fcmInv.notification.body.toLowerCase().includes('earned'), false);
+      assert.strictEqual(/\b\d{8,}\b/.test(fcmInv.notification.body), false);
+
+      // 3. Card issuance ($2.00 fee, Mastercard + strict PCI/PII verification on final FCM message)
+      const crdRes = await executeServerCardIssuance(
+        {
+          userId,
+          cardHolderName: 'Claire Moran',
+          phone: userPhone,
+          cardType: 'VIRTUAL',
+          brand: 'MASTERCARD',
+          clientRequestId: 'req_crd_disp_11223344',
+        },
+        txDeps
+      );
+      assert.strictEqual(crdRes.success, true);
+      const crdOutboxId = computeNotificationOutboxId(
+        userId,
+        `${crdRes.transaction!.id}:COMPLETED`,
+        'TRANSACTION'
+      );
+      const crdDispatch = await dispatchOutboxRecordAndAssert(crdOutboxId, 'worker_card_issue');
+      assert.strictEqual(crdDispatch.dispatchRes.push.status, 'SENT');
+      assert.strictEqual(crdDispatch.dispatchRes.sms.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(crdDispatch.dispatchRes.sms.delivered, false);
+      assert.strictEqual(crdDispatch.dispatchRes.email.status, 'UNCONFIGURED_PROVIDER');
+      assert.strictEqual(crdDispatch.dispatchRes.email.delivered, false);
+
+      const fcmCard = capturedFcmMessages[3];
+      assert.strictEqual(fcmCard.notification.title, 'Mastercard Card Issued — Monvera');
+      assert.strictEqual(
+        fcmCard.notification.body,
+        'Your new Mastercard card has been issued. A $2.00 card issuance fee was debited from Checking (MVB •••• 7744).'
+      );
+      assert.strictEqual(fcmCard.webpush.notification.title, fcmCard.notification.title);
+      assert.strictEqual(fcmCard.webpush.notification.body, fcmCard.notification.body);
+      assert.strictEqual(fcmCard.data.title, fcmCard.notification.title);
+      assert.strictEqual(fcmCard.data.body, fcmCard.notification.body);
+
+      const issuedCard = crdRes.card!;
+      const serializedFcmCard = JSON.stringify({
+        notification: fcmCard.notification,
+        webpush: fcmCard.webpush,
+        data: fcmCard.data,
+      });
+      const rawCardDigits = issuedCard.cardNumber.replace(/\s+/g, '');
+      const cardLast4 = rawCardDigits.slice(-4);
+      assert.strictEqual(serializedFcmCard.includes(issuedCard.cardNumber), false);
+      assert.strictEqual(serializedFcmCard.includes(rawCardDigits), false);
+      assert.strictEqual(serializedFcmCard.includes(issuedCard.fullNumberMasked), false);
+      assert.strictEqual(serializedFcmCard.includes(issuedCard.maskedNumber), false);
+      assert.strictEqual(serializedFcmCard.includes(cardLast4), false, 'Card issuance push must not expose even masked card last-4');
+      assert.strictEqual(serializedFcmCard.includes(issuedCard.expiryDate), false);
+      assert.strictEqual(serializedFcmCard.includes(userPan), false);
+      assert.strictEqual(serializedFcmCard.includes(userEmail), false);
+      assert.strictEqual(serializedFcmCard.includes(userPhone), false);
+      assert.strictEqual(serializedFcmCard.includes('Claire Moran'), false);
+      assert.strictEqual(serializedFcmCard.includes('CLAIRE MORAN'), false);
+      assert.strictEqual(/\b\d{8,}\b/.test(fcmCard.notification.body), false);
+      assert.strictEqual(smsCallCount, 0, 'Unsupported SMS event types must make 0 SMS provider calls');
+      assert.strictEqual(emailCallCount, 0, 'Unsupported Email event types must make 0 Email provider calls');
+
+      // 4. Formatter preservation when body is omitted & numeric-reference/control-char sanitizer check
+      const titleOnlyRec = buildNotificationOutboxRecord({
+        userId,
+        transactionId: 'tx_title_only_inv_1',
+        referenceNumber: 'MV-INV-TITLE-1',
+        eventKey: 'tx_title_only_inv_1:COMPLETED',
+        lifecycleStage: 'COMPLETED',
+        dispatchType: 'INVESTMENT',
+        category: 'INVESTMENT',
+        payload: {
+          title: 'Term Investment Activated — Monvera',
+          amount: 750,
+          currency: 'USD',
+          accountMasked: 'Checking (MVB •••• 7744)',
+        },
+      });
+      await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(titleOnlyRec.id).set(titleOnlyRec);
+      await dispatchOutboxRecordAndAssert(titleOnlyRec.id, 'worker_title_only');
+      const fcmTitleOnly = capturedFcmMessages[4];
+      assert.strictEqual(
+        fcmTitleOnly.notification.title,
+        'Term Investment Activated — Monvera',
+        'Custom safe title must be preserved when body is omitted'
+      );
+      assert.strictEqual(
+        fcmTitleOnly.notification.body,
+        'Investment activity of $750.00 recorded. Ref: MV-INV-TITLE-1.'
+      );
+
+      // Verify custom 8+ digit numeric identifiers & HTML/control chars are sanitized in formatSafePushContent
+      await dispatcher.dispatch({
+        transactionId: 'tx_sanitize_direct_1',
+        referenceNumber: 'MV-SAN-1',
+        type: 'TRANSACTION',
+        userId,
+        title: 'Account\nUpdate <script>',
+        body: 'Transfer ref 998877665544 processed for $25.00\r\n',
+      });
+      const fcmSanitized = capturedFcmMessages[5];
+      assert.strictEqual(fcmSanitized.notification.title, 'Account Update script');
+      assert.strictEqual(fcmSanitized.notification.body, 'Transfer ref •••• processed for $25.00');
+      assert.strictEqual(/\b\d{8,}\b/.test(fcmSanitized.notification.body), false);
+
+      // 5. Persistent dedupe & user preference checks remain intact
+      const reclaimTerminal = await claimOutboxLease(fsMem as unknown as Firestore, crdOutboxId, 'worker_reclaim_terminal');
+      assert.strictEqual(reclaimTerminal.claimed, false);
+      assert.strictEqual(reclaimTerminal.reason, 'ALREADY_TERMINAL');
+
+      const dedupeReplay = await dispatcher.dispatch({
+        transactionId: 'tx_sanitize_direct_1',
+        referenceNumber: 'MV-SAN-1',
+        type: 'TRANSACTION',
+        userId,
+        title: 'Account Update',
+        body: 'Duplicate check',
+      });
+      assert.strictEqual(dedupeReplay.push.status, 'DUPLICATE_IGNORED');
+      assert.strictEqual(capturedFcmMessages.length, 6, 'Duplicate dispatch must not send extra FCM message');
+
+      await fsMem
+        .collection('users')
+        .doc(userId)
+        .collection('notificationPreferences')
+        .doc('settings')
+        .set({ pushEnabled: false, smsEnabled: true, emailEnabled: true, transactionAlerts: true });
+      const prefOffRes = await dispatcher.dispatch({
+        transactionId: 'tx_pref_off_1',
+        referenceNumber: 'MV-PREF-1',
+        type: 'TRANSACTION',
+        userId,
+        title: 'Should Be Skipped',
+        body: 'Push disabled test',
+      });
+      assert.strictEqual(prefOffRes.push.status, 'DISABLED_BY_USER');
+      assert.strictEqual(capturedFcmMessages.length, 6, 'Disabled push preference must not invoke FCM');
+    } finally {
+      (smsService as any).sendTransactionSms = origSms;
+      (emailService as any).sendTransactionalEmail = origEmail;
+    }
+
+    console.log('✓ Test 33 passed: End-to-end dispatch regression verified exact FCM payloads, M-1 fix, UNCONFIGURED_PROVIDER channels, zero PCI/PII, dedupe, and preferences');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 34 [3D-B1.3B]: executeServerWireCheckWithdrawal transactional outbox integration
+  // - Strict read-before-write & zero live Firestore/notification usage
+  // - Failed/rejected/frozen/insufficient attempts write 0 outbox docs
+  // - Successful submission writes 1 TRANSACTION :SUBMITTED outbox doc
+  // - Zero leakage of destination bank account, routing, address, email, phone, or 8+ digit refs
+  // - Duplicate idempotency replay preserves existing outbox status without double-debit
+  // - Commit failure rolls back atomically & ABORTED retry commits cleanly once
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const auxNotifs: any[] = [];
+    const auxAudits: any[] = [];
+    const deps = {
+      firestore: fsMem as unknown as Firestore,
+      persistNotification: async (n: any) => {
+        auxNotifs.push(n);
+        return { ...n, read: false };
+      },
+      recordAuditLog: (a: any) => {
+        auxAudits.push(a);
+      },
+    };
+
+    const userId = 'uid_wchk_3db13b';
+    const userPan = '1077889900';
+    const destAcct = '987654321098';
+    const destRouting = '021000021';
+    const resAddress = '742 Evergreen Terrace, Austin, TX 78701';
+    const custEmail = 'wchk.private@monvera.test';
+    const custPhone = '+15125550199';
+
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Jordan',
+      lastName: 'Ellis',
+      permanentAccountNumber: userPan,
+      email: custEmail,
+      phone: custPhone,
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: userPan,
+      checkingBalance: 3000,
+      savingsBalance: 1500,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 4500,
+      availableBalance: 3000,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+
+    const basePayload = {
+      userId,
+      bankName: 'Regions Bank',
+      destinationBankAccountNumber: destAcct,
+      destinationBankRoutingNumber: destRouting,
+      fullLegalName: 'Jordan Ellis',
+      residentialAddress: resAddress,
+      email: custEmail,
+      phoneNumber: custPhone,
+      amount: 600,
+      sourceAccountType: 'CHECKING' as const,
+      idempotencyKey: 'wchk_idemp_invalid_1',
+    };
+
+    // Insufficient funds -> 0 outbox docs
+    const lowRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, amount: 5000, idempotencyKey: 'wchk_idemp_low_1' },
+      deps
+    );
+    assert.strictEqual(lowRes.success, false);
+    assert.strictEqual(lowRes.errorCode, 'INSUFFICIENT_FUNDS');
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    // Invalid routing -> 0 outbox docs
+    const badRtRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, destinationBankRoutingNumber: '123456789', idempotencyKey: 'wchk_idemp_badrt_1' },
+      deps
+    );
+    assert.strictEqual(badRtRes.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    // Frozen account -> 0 outbox docs
+    await fsMem.collection('users').doc(userId).set({ status: 'frozen' }, { merge: true });
+    const frozenRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, idempotencyKey: 'wchk_idemp_frozen_1' },
+      deps
+    );
+    assert.strictEqual(frozenRes.success, false);
+    assert.strictEqual(frozenRes.errorCode, 'ACCOUNT_FROZEN');
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+    await fsMem.collection('users').doc(userId).set({ status: 'active' }, { merge: true });
+
+    // Valid Wire Check submission from CHECKING
+    const subKey = 'wchk_idemp_valid_1';
+    const subRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, amount: 600, idempotencyKey: subKey },
+      deps
+    );
+    assert.strictEqual(subRes.success, true);
+    assert.strictEqual(subRes.isDuplicate, false);
+    assert.strictEqual(subRes.request?.checkProcessingStatus, 'REQUESTED');
+    assert.strictEqual(subRes.transaction?.type, 'WIRE_CHECK_WITHDRAWAL');
+    assert.strictEqual(subRes.transaction?.status, 'COMPLETED');
+    assert.strictEqual(subRes.transaction?.amount, 600);
+    assert.strictEqual(subRes.balanceMetrics?.checkingBalance, 2400);
+    assert.strictEqual(subRes.balanceMetrics?.savingsBalance, 1500);
+    assert.strictEqual(subRes.balanceMetrics?.totalBalance, 3900);
+
+    const wchkTxId = subRes.transaction!.id;
+    const expectedSubOutboxId = computeNotificationOutboxId(userId, `${wchkTxId}:SUBMITTED`, 'TRANSACTION');
+    const subOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(subOutboxSnap.size, 1);
+
+    const subOutboxDoc = subOutboxSnap.docs[0].data()!;
+    assert.strictEqual(subOutboxSnap.docs[0].id, expectedSubOutboxId);
+    assert.strictEqual(subOutboxDoc.userId, userId);
+    assert.strictEqual(subOutboxDoc.transactionId, wchkTxId);
+    assert.strictEqual(subOutboxDoc.referenceNumber, subRes.request!.referenceNumber);
+    assert.strictEqual(subOutboxDoc.eventKey, `${wchkTxId}:SUBMITTED`);
+    assert.strictEqual(subOutboxDoc.lifecycleStage, 'SUBMITTED');
+    assert.strictEqual(subOutboxDoc.dispatchType, 'TRANSACTION');
+    assert.strictEqual(subOutboxDoc.category, 'TRANSACTION');
+    assert.strictEqual(subOutboxDoc.status, 'PENDING');
+    assert.strictEqual(subOutboxDoc.payload.amount, 600);
+    assert.strictEqual(subOutboxDoc.payload.currency, 'USD');
+    assert.strictEqual(subOutboxDoc.payload.actionUrl, '/dashboard?view=transactions');
+    assert.strictEqual(subOutboxDoc.payload.title, 'Wire Check Request Submitted — Monvera');
+    assert.strictEqual(
+      subOutboxDoc.payload.body,
+      'Your Wire Check withdrawal request for $600.00 from Checking (MVB •••• 9900) was submitted successfully.'
+    );
+    assert.strictEqual(subOutboxDoc.payload.body.toLowerCase().includes('delivered'), false);
+    assert.strictEqual(/\b\d{8,}\b/.test(subOutboxDoc.payload.body), false);
+
+    const serializedSub = JSON.stringify(subOutboxDoc);
+    assert.strictEqual(serializedSub.includes(destAcct), false);
+    assert.strictEqual(serializedSub.includes('321098'), false);
+    assert.strictEqual(serializedSub.includes(destRouting), false);
+    assert.strictEqual(serializedSub.includes(resAddress), false);
+    assert.strictEqual(serializedSub.includes(custEmail), false);
+    assert.strictEqual(serializedSub.includes(custPhone), false);
+    assert.strictEqual(serializedSub.includes(userPan), false);
+    assert.strictEqual(serializedSub.includes('Regions Bank'), false);
+
+    // Duplicate idempotency replay preserves PROCESSING/DISPATCHED status and avoids double debit
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedSubOutboxId).set({
+      ...subOutboxDoc,
+      status: 'DISPATCHED',
+      pushStatus: 'SENT',
+    });
+    const dupSubRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, amount: 600, idempotencyKey: subKey },
+      deps
+    );
+    assert.strictEqual(dupSubRes.success, true);
+    assert.strictEqual(dupSubRes.isDuplicate, true);
+    assert.strictEqual(dupSubRes.balanceMetrics?.checkingBalance, 2400);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedSubOutboxId).get()).data()?.status,
+      'DISPATCHED'
+    );
+
+    // Simulated commit failure rolls back balance, tx, request, idemp, and outbox atomically
+    fsMem.failNextTransactionWrite = true;
+    const rbSubRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, amount: 250, sourceAccountType: 'SAVINGS', idempotencyKey: 'wchk_idemp_rb_1' },
+      deps
+    );
+    assert.strictEqual(rbSubRes.success, false);
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.savingsBalance, 1500);
+    assert.strictEqual((await fsMem.collection('wire_check_requests').get()).size, 1);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // ABORTED retry contention test on SAVINGS withdrawal
+    fsMem.onBeforeCommitConflictOnce = async () => {
+      const cur = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      await fsMem.collection('accounts').doc(userId).set({
+        ...cur,
+        savingsBalance: 2000,
+        totalBalance: 4400,
+      });
+    };
+    const retrySubRes = await executeServerWireCheckWithdrawal(
+      { ...basePayload, amount: 300, sourceAccountType: 'SAVINGS', idempotencyKey: 'wchk_idemp_retry_1' },
+      deps
+    );
+    assert.strictEqual(retrySubRes.success, true);
+    assert.strictEqual(retrySubRes.isDuplicate, false);
+    assert.strictEqual(fsMem.lastTransactionAttempts, 2);
+    assert.strictEqual(retrySubRes.balanceMetrics?.savingsBalance, 1700);
+    assert.strictEqual((await fsMem.collection('wire_check_requests').get()).size, 2);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+    assert.strictEqual(auxNotifs.length, 2);
+    assert.strictEqual(auxAudits.length, 2);
+
+    console.log('✓ Test 34 passed: executeServerWireCheckWithdrawal writes 1 scrubbed TRANSACTION :SUBMITTED outbox record, enforces idempotency/rollback/retry, and protects bank PII');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 35 [3D-B1.3B]: markWireCheckRequestDeliveredAdmin transactional outbox integration
+  // - First valid REQUESTED -> DELIVERED transition writes 1 TRANSACTION :DELIVERED outbox doc
+  // - Reuses original transactionId alongside existing :SUBMITTED outbox doc
+  // - Never modifies balances or creates a second ledger transaction
+  // - Invalid status / missing tx / duplicate delivery (409 ALREADY_DELIVERED) write 0 extra outbox docs
+  // - Commit failure rolls back delivery + outbox atomically & ABORTED retry commits cleanly once
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const deps = {
+      firestore: fsMem as unknown as Firestore,
+      persistNotification: async (n: any) => ({ ...n, read: false }),
+      recordAuditLog: () => {},
+    };
+
+    const userId = 'uid_wchk_deliv_3db13b';
+    const userPan = '1033445566';
+    const destAcct = '554433221100';
+    const destRouting = '062005690';
+    const resAddress = '900 Congress Ave, Austin, TX 78701';
+
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Maya',
+      lastName: 'Lin',
+      permanentAccountNumber: userPan,
+      email: 'maya.deliv.private@monvera.test',
+      phone: '+15125550144',
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: userPan,
+      checkingBalance: 2200,
+      savingsBalance: 800,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 3000,
+      availableBalance: 2200,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+
+    const subRes = await executeServerWireCheckWithdrawal(
+      {
+        userId,
+        bankName: 'Regions Bank',
+        destinationBankAccountNumber: destAcct,
+        destinationBankRoutingNumber: destRouting,
+        fullLegalName: 'Maya Lin',
+        residentialAddress: resAddress,
+        email: 'maya.deliv.private@monvera.test',
+        phoneNumber: '+15125550144',
+        amount: 450,
+        sourceAccountType: 'CHECKING',
+        idempotencyKey: 'wchk_deliv_sub_1',
+      },
+      deps
+    );
+    assert.strictEqual(subRes.success, true);
+    const reqId = subRes.request!.requestId;
+    const origTxId = subRes.transaction!.id;
+    const txCountBefore = (await fsMem.collection('transactions').get()).size;
+    assert.strictEqual(txCountBefore, 1);
+
+    // Invalid targetStatus -> 0 extra outbox docs
+    const badTarget = await markWireCheckRequestDeliveredAdmin(
+      { requestId: reqId, targetStatus: 'CANCELLED', adminUid: 'usr_admin', adminEmail: 'admin@monvera.test' },
+      deps
+    );
+    assert.strictEqual(badTarget.success, false);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Simulated commit failure on delivery rolls back DELIVERED status AND :DELIVERED outbox doc, keeping :SUBMITTED
+    fsMem.failNextTransactionWrite = true;
+    const rbDeliv = await markWireCheckRequestDeliveredAdmin(
+      { requestId: reqId, targetStatus: 'DELIVERED', adminUid: 'usr_admin', adminEmail: 'admin@monvera.test' },
+      deps
+    );
+    assert.strictEqual(rbDeliv.success, false);
+    assert.strictEqual((await fsMem.collection('wire_check_requests').doc(reqId).get()).data()?.checkProcessingStatus, 'REQUESTED');
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // ABORTED retry contention test on delivery (e.g., concurrent metadata touch) -> commits cleanly once
+    fsMem.onBeforeCommitConflictOnce = async () => {
+      const curReq = (await fsMem.collection('wire_check_requests').doc(reqId).get()).data()!;
+      await fsMem.collection('wire_check_requests').doc(reqId).set({
+        ...curReq,
+        adminNote: 'Concurrent note update',
+      });
+    };
+    const delivRes = await markWireCheckRequestDeliveredAdmin(
+      { requestId: reqId, targetStatus: 'DELIVERED', adminUid: 'usr_admin', adminEmail: 'admin@monvera.test' },
+      deps
+    );
+    assert.strictEqual(delivRes.success, true);
+    assert.strictEqual(fsMem.lastTransactionAttempts, 2);
+    assert.strictEqual(delivRes.request?.checkProcessingStatus, 'DELIVERED');
+    assert.strictEqual(delivRes.transaction?.id, origTxId);
+    assert.strictEqual(delivRes.transaction?.amount, 450);
+    assert.strictEqual(delivRes.transaction?.status, 'COMPLETED');
+
+    // Balances & transaction count unchanged
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 1750);
+    assert.strictEqual((await fsMem.collection('transactions').get()).size, 1);
+
+    // Both :SUBMITTED and :DELIVERED coexist without collision
+    const outboxSnapAfter = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(outboxSnapAfter.size, 2);
+
+    const expectedDelivOutboxId = computeNotificationOutboxId(userId, `${origTxId}:DELIVERED`, 'TRANSACTION');
+    const delivOutboxDoc = (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedDelivOutboxId).get()).data()!;
+    assert.strictEqual(Boolean(delivOutboxDoc), true);
+    assert.strictEqual(delivOutboxDoc.id, expectedDelivOutboxId);
+    assert.strictEqual(delivOutboxDoc.userId, userId);
+    assert.strictEqual(delivOutboxDoc.transactionId, origTxId);
+    assert.strictEqual(delivOutboxDoc.referenceNumber, subRes.request!.referenceNumber);
+    assert.strictEqual(delivOutboxDoc.eventKey, `${origTxId}:DELIVERED`);
+    assert.strictEqual(delivOutboxDoc.lifecycleStage, 'DELIVERED');
+    assert.strictEqual(delivOutboxDoc.dispatchType, 'TRANSACTION');
+    assert.strictEqual(delivOutboxDoc.category, 'TRANSACTION');
+    assert.strictEqual(delivOutboxDoc.status, 'PENDING');
+    assert.strictEqual(delivOutboxDoc.payload.title, 'Wire Check Delivered — Monvera');
+    assert.strictEqual(
+      delivOutboxDoc.payload.body,
+      'Your Wire Check of $450.00 from Checking (MVB •••• 5566) has been marked as delivered.'
+    );
+    assert.strictEqual(/\b\d{8,}\b/.test(delivOutboxDoc.payload.body), false);
+
+    const serializedDeliv = JSON.stringify(delivOutboxDoc);
+    assert.strictEqual(serializedDeliv.includes(destAcct), false);
+    assert.strictEqual(serializedDeliv.includes(destRouting), false);
+    assert.strictEqual(serializedDeliv.includes(resAddress), false);
+    assert.strictEqual(serializedDeliv.includes('maya.deliv.private@monvera.test'), false);
+    assert.strictEqual(serializedDeliv.includes('+15125550144'), false);
+    assert.strictEqual(serializedDeliv.includes(userPan), false);
+    assert.strictEqual(serializedDeliv.includes('admin@monvera.test'), false);
+
+    // Duplicate delivery attempt -> 409 ALREADY_DELIVERED and 0 additional outbox records
+    const dupDeliv = await markWireCheckRequestDeliveredAdmin(
+      { requestId: reqId, targetStatus: 'DELIVERED', adminUid: 'usr_admin', adminEmail: 'admin@monvera.test' },
+      deps
+    );
+    assert.strictEqual(dupDeliv.success, false);
+    assert.strictEqual(dupDeliv.statusCode, 409);
+    assert.strictEqual(dupDeliv.errorCode, 'ALREADY_DELIVERED');
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+
+    console.log('✓ Test 35 passed: markWireCheckRequestDeliveredAdmin writes 1 scrubbed TRANSACTION :DELIVERED outbox record sharing transactionId, preserves balances, and blocks duplicate delivery');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 36 [3D-B1.3B]: executeServerAdminCheckWithdrawal transactional outbox integration
+  // - Overdraft / duplicate check number / missing customer create 0 outbox docs
+  // - Successful issuance debits customer & writes 1 TRANSACTION :COMPLETED outbox doc
+  // - Strictly excludes checkNumber, normalizedCheckNumber, payeeName, memo, emails, unmasked account, routing
+  // - Duplicate idempotencyKey preserves existing outbox status without re-debiting
+  // - Commit failure rolls back & ABORTED retry commits cleanly once
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_adchk_3db13b';
+    const userPan = '1055667788';
+    const custEmail = 'adchk.private@monvera.test';
+    const adminEmail = 'executive.admin@monvera.test';
+    const checkNumRaw = 'CHK-904215';
+    const payeePrivate = 'Acme Legal Escrow Partners LLC';
+    const memoPrivate = 'Confidential Settlement Escrow #7712';
+
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Devon',
+      lastName: 'Brooks',
+      permanentAccountNumber: userPan,
+      email: custEmail,
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: userPan,
+      checkingBalance: 5000,
+      savingsBalance: 1200,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 6200,
+      availableBalance: 5000,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+
+    const deps = {
+      firestore: fsMem as unknown as Firestore,
+      resolveCustomer: async (identifier: string) => {
+        if (identifier === userId || identifier === userPan) {
+          return {
+            success: true,
+            uid: userId,
+            data: (await fsMem.collection('users').doc(userId).get()).data(),
+          };
+        }
+        return { success: false, error: 'Customer not found' };
+      },
+      persistNotification: async (n: any) => ({ ...n, read: false }),
+      recordAuditLog: () => {},
+    };
+
+    // Overdraft attempt -> 0 outbox docs
+    const overdraftRes = await executeServerAdminCheckWithdrawal(
+      {
+        customerIdentifier: userId,
+        sourceAccountType: 'SAVINGS',
+        checkNumber: 'CHK-999001',
+        payeeName: payeePrivate,
+        amount: 2000,
+        idempotencyKey: 'adchk_overdraft_1',
+        adminUid: 'usr_admin',
+        adminEmail,
+      },
+      deps
+    );
+    assert.strictEqual(overdraftRes.success, false);
+    assert.strictEqual(overdraftRes.errorCode, 'INSUFFICIENT_FUNDS');
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+    // Valid check issuance from CHECKING
+    const idempKey = 'adchk_valid_1';
+    const chkRes = await executeServerAdminCheckWithdrawal(
+      {
+        customerIdentifier: userId,
+        sourceAccountType: 'CHECKING',
+        checkNumber: checkNumRaw,
+        payeeName: payeePrivate,
+        amount: 1250,
+        memo: memoPrivate,
+        idempotencyKey: idempKey,
+        adminUid: 'usr_admin',
+        adminEmail,
+      },
+      deps
+    );
+    assert.strictEqual(chkRes.success, true);
+    assert.strictEqual(chkRes.isDuplicate, false);
+    assert.strictEqual(chkRes.transaction?.type, 'CHECK_WITHDRAWAL');
+    assert.strictEqual(chkRes.transaction?.status, 'COMPLETED');
+    assert.strictEqual(chkRes.balanceMetrics?.checkingBalance, 3750);
+    assert.strictEqual(chkRes.balanceMetrics?.totalBalance, 4950);
+
+    const chkTxId = chkRes.transaction!.id;
+    const expectedChkOutboxId = computeNotificationOutboxId(userId, `${chkTxId}:COMPLETED`, 'TRANSACTION');
+    const chkOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+    assert.strictEqual(chkOutboxSnap.size, 1);
+
+    const chkOutboxDoc = chkOutboxSnap.docs[0].data()!;
+    assert.strictEqual(chkOutboxSnap.docs[0].id, expectedChkOutboxId);
+    assert.strictEqual(chkOutboxDoc.userId, userId);
+    assert.strictEqual(chkOutboxDoc.transactionId, chkTxId);
+    assert.strictEqual(chkOutboxDoc.referenceNumber, chkRes.check!.referenceNumber);
+    assert.strictEqual(chkOutboxDoc.eventKey, `${chkTxId}:COMPLETED`);
+    assert.strictEqual(chkOutboxDoc.lifecycleStage, 'COMPLETED');
+    assert.strictEqual(chkOutboxDoc.dispatchType, 'TRANSACTION');
+    assert.strictEqual(chkOutboxDoc.category, 'TRANSACTION');
+    assert.strictEqual(chkOutboxDoc.payload.amount, 1250);
+    assert.strictEqual(chkOutboxDoc.payload.title, 'Official Check Issued — Monvera');
+    assert.strictEqual(
+      chkOutboxDoc.payload.body,
+      'An official check withdrawal of $1,250.00 from Checking (MVB •••• 7788) has been issued.'
+    );
+    assert.strictEqual(/\b\d{8,}\b/.test(chkOutboxDoc.payload.body), false);
+
+    // Strict check: ZERO checkNumber, normalizedCheckNumber, payeeName, memo, emails, unmasked account, or routing
+    const serializedChk = JSON.stringify(chkOutboxDoc);
+    assert.strictEqual(serializedChk.includes(checkNumRaw), false);
+    assert.strictEqual(serializedChk.includes('CHK904215'), false);
+    assert.strictEqual(serializedChk.includes('904215'), false);
+    assert.strictEqual(serializedChk.includes(payeePrivate), false);
+    assert.strictEqual(serializedChk.includes(memoPrivate), false);
+    assert.strictEqual(serializedChk.includes('7712'), false);
+    assert.strictEqual(serializedChk.includes(custEmail), false);
+    assert.strictEqual(serializedChk.includes(adminEmail), false);
+    assert.strictEqual(serializedChk.includes(userPan), false);
+    assert.strictEqual(serializedChk.includes('021000021'), false);
+
+    // Duplicate check number -> 409 DUPLICATE_CHECK_NUMBER and 0 extra outbox docs
+    const dupNumRes = await executeServerAdminCheckWithdrawal(
+      {
+        customerIdentifier: userId,
+        sourceAccountType: 'CHECKING',
+        checkNumber: 'chk 904-215',
+        payeeName: payeePrivate,
+        amount: 100,
+        idempotencyKey: 'adchk_dup_num_2',
+        adminUid: 'usr_admin',
+        adminEmail,
+      },
+      deps
+    );
+    assert.strictEqual(dupNumRes.success, false);
+    assert.strictEqual(dupNumRes.errorCode, 'DUPLICATE_CHECK_NUMBER');
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // Replay same idempotencyKey -> preserves existing DISPATCHED outbox state without re-debiting
+    await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedChkOutboxId).set({
+      ...chkOutboxDoc,
+      status: 'DISPATCHED',
+      pushStatus: 'SENT',
+    });
+    const replayChkRes = await executeServerAdminCheckWithdrawal(
+      {
+        customerIdentifier: userId,
+        sourceAccountType: 'CHECKING',
+        checkNumber: checkNumRaw,
+        payeeName: payeePrivate,
+        amount: 1250,
+        memo: memoPrivate,
+        idempotencyKey: idempKey,
+        adminUid: 'usr_admin',
+        adminEmail,
+      },
+      deps
+    );
+    assert.strictEqual(replayChkRes.success, true);
+    assert.strictEqual(replayChkRes.isDuplicate, true);
+    assert.strictEqual(replayChkRes.balanceMetrics?.checkingBalance, 3750);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedChkOutboxId).get()).data()?.status,
+      'DISPATCHED'
+    );
+
+    // Simulated commit failure rolls back check, lock, balance, tx, and outbox atomically
+    fsMem.failNextTransactionWrite = true;
+    const rbChkRes = await executeServerAdminCheckWithdrawal(
+      {
+        customerIdentifier: userId,
+        sourceAccountType: 'SAVINGS',
+        checkNumber: 'CHK-904216',
+        payeeName: payeePrivate,
+        amount: 200,
+        idempotencyKey: 'adchk_rb_1',
+        adminUid: 'usr_admin',
+        adminEmail,
+      },
+      deps
+    );
+    assert.strictEqual(rbChkRes.success, false);
+    assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.savingsBalance, 1200);
+    assert.strictEqual((await fsMem.collection('issued_checks').get()).size, 1);
+    assert.strictEqual((await fsMem.collection('check_number_locks').get()).size, 1);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+    // ABORTED retry contention test on SAVINGS check issuance
+    fsMem.onBeforeCommitConflictOnce = async () => {
+      const cur = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      await fsMem.collection('accounts').doc(userId).set({
+        ...cur,
+        savingsBalance: 1400,
+        totalBalance: 5150,
+      });
+    };
+    const retryChkRes = await executeServerAdminCheckWithdrawal(
+      {
+        customerIdentifier: userId,
+        sourceAccountType: 'SAVINGS',
+        checkNumber: 'CHK-904217',
+        payeeName: payeePrivate,
+        amount: 200,
+        idempotencyKey: 'adchk_retry_1',
+        adminUid: 'usr_admin',
+        adminEmail,
+      },
+      deps
+    );
+    assert.strictEqual(retryChkRes.success, true);
+    assert.strictEqual(retryChkRes.isDuplicate, false);
+    assert.strictEqual(fsMem.lastTransactionAttempts, 2);
+    assert.strictEqual(retryChkRes.balanceMetrics?.savingsBalance, 1200);
+    assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+
+    console.log('✓ Test 36 passed: executeServerAdminCheckWithdrawal writes 1 scrubbed TRANSACTION :COMPLETED outbox record without checkNumber/payee/memo leakage');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 37 [3D-B1.3B]: evaluateAndProcessWelcomeReward transactional outbox integration
+  // - Below $10,000 qualifying deposits -> IN_PROGRESS, 0 reward credit, 0 outbox docs
+  // - Excluded C2C transfers / reversed / pending deposits never trigger threshold
+  // - Reaching >= $10,000 credits single $1,000.00 reward + 1 MONEY_RECEIVED :COMPLETED outbox doc
+  // - Already-PAID & existingTxSnap recovery paths do NOT duplicate credits or outbox records
+  // - Commit failure rolls back credit, welcome_rewards, tx & outbox cleanly; ABORTED retry settles once
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_3db13b';
+    const userPan = '1022334455';
+    const userIdRetry = 'uid_rwd_retry_3db13b';
+    const userIdRecover = 'uid_rwd_recover_3db13b';
+    const trackedUids = new Set([userId, userIdRetry, userIdRecover]);
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+
+    const rwdDeps = {
+      firestore: fsMem as unknown as Firestore,
+      isAdminConfigured: () => true,
+      persistNotification: async (n: any) => ({ ...n, read: false }),
+    };
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Elena',
+        lastName: 'Vance',
+        permanentAccountNumber: userPan,
+        email: 'elena.rwd.private@monvera.test',
+        phone: '+15557778899',
+        status: 'active',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 4000,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 4000,
+        availableBalance: 4000,
+        pendingBalance: 0,
+        loanBalance: 0,
+      });
+
+      // $4,000 completed deposit + $7,000 C2C transfer (excluded) + $7,000 reversed deposit (excluded) -> only $4,000 qualifies
+      await fsMem.collection('transactions').doc('tx_dep_q1').set({
+        id: 'tx_dep_q1',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 4000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-Q1',
+      });
+      await fsMem.collection('transactions').doc('tx_trf_excl').set({
+        id: 'tx_trf_excl',
+        userId,
+        type: 'TRANSFER',
+        status: 'COMPLETED',
+        amount: 7000,
+        currency: 'USD',
+        referenceNumber: 'MV-TRF-EXCL',
+      });
+      await fsMem.collection('transactions').doc('tx_dep_rev').set({
+        id: 'tx_dep_rev',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 7000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-REV',
+        metadata: { isReversed: true },
+      });
+
+      const inProgRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(inProgRes.status, 'IN_PROGRESS');
+      assert.strictEqual(inProgRes.qualifyingDeposits, 4000);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 4000);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+      // Add second qualifying deposit ($6,000 -> total $10,000), first test commit failure rollback
+      await fsMem.collection('transactions').doc('tx_dep_q2').set({
+        id: 'tx_dep_q2',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-Q2',
+      });
+      fsMem.failNextTransactionWrite = true;
+      const rbRwdRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(rbRwdRes.status, 'QUALIFIED');
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 4000);
+      assert.strictEqual((await fsMem.collection('welcome_rewards').doc(userId).get()).data()?.status, 'IN_PROGRESS');
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+      // Clean evaluation -> atomic $1,000.00 credit + 1 MONEY_RECEIVED :COMPLETED outbox doc
+      const paidRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(paidRes.status, 'PAID');
+      assert.strictEqual(paidRes.rewardAmount, 1000);
+      const rewardTxId = `tx_rwd_welcome_${userId}`;
+      assert.strictEqual(paidRes.transactionId, rewardTxId);
+      assert.strictEqual(paidRes.transactionReference, `MV-RWD-WELCOME-${userId}`);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 5000);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.totalBalance, 5000);
+
+      const expectedRwdOutboxId = computeNotificationOutboxId(
+        userId,
+        `${rewardTxId}:COMPLETED`,
+        'MONEY_RECEIVED'
+      );
+      const rwdOutboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+      assert.strictEqual(rwdOutboxSnap.size, 1);
+
+      const rwdOutboxDoc = rwdOutboxSnap.docs[0].data()!;
+      assert.strictEqual(rwdOutboxSnap.docs[0].id, expectedRwdOutboxId);
+      assert.strictEqual(rwdOutboxDoc.userId, userId);
+      assert.strictEqual(rwdOutboxDoc.transactionId, rewardTxId);
+      assert.strictEqual(rwdOutboxDoc.referenceNumber, `MV-RWD-WELCOME-${userId}`);
+      assert.strictEqual(rwdOutboxDoc.eventKey, `${rewardTxId}:COMPLETED`);
+      assert.strictEqual(rwdOutboxDoc.lifecycleStage, 'COMPLETED');
+      assert.strictEqual(rwdOutboxDoc.dispatchType, 'MONEY_RECEIVED');
+      assert.strictEqual(rwdOutboxDoc.category, 'TRANSACTION');
+      assert.strictEqual(rwdOutboxDoc.payload.amount, 1000);
+      assert.strictEqual(rwdOutboxDoc.payload.title, 'Welcome Reward Credited — Monvera');
+      assert.strictEqual(
+        rwdOutboxDoc.payload.body,
+        'Congratulations! Your $1,000.00 Monvera Welcome Reward has been credited to Checking (MVB •••• 4455).'
+      );
+      assert.strictEqual(/\b\d{8,}\b/.test(rwdOutboxDoc.payload.body), false);
+
+      const serializedRwd = JSON.stringify(rwdOutboxDoc);
+      assert.strictEqual(serializedRwd.includes(userPan), false);
+      assert.strictEqual(serializedRwd.includes('elena.rwd.private@monvera.test'), false);
+      assert.strictEqual(serializedRwd.includes('+15557778899'), false);
+
+      // Mark DISPATCHED, then replay -> must NOT pay twice or overwrite outbox
+      await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedRwdOutboxId).set({
+        ...rwdOutboxDoc,
+        status: 'DISPATCHED',
+        pushStatus: 'SENT',
+      });
+      const replayPaidRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(replayPaidRes.status, 'PAID');
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 5000);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+      assert.strictEqual(
+        (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedRwdOutboxId).get()).data()?.status,
+        'DISPATCHED'
+      );
+
+      // Recovery path: reward transaction already exists while welcome_rewards doc is missing -> marks PAID, writes 0 new outbox docs
+      await fsMem.collection('users').doc(userIdRecover).set({
+        id: userIdRecover,
+        firstName: 'Sam',
+        lastName: 'Recover',
+        permanentAccountNumber: '1011223344',
+        status: 'active',
+      });
+      await fsMem.collection('accounts').doc(userIdRecover).set({
+        userId: userIdRecover,
+        permanentAccountNumber: '1011223344',
+        checkingBalance: 11000,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 11000,
+        availableBalance: 11000,
+      });
+      await fsMem.collection('transactions').doc('tx_dep_rec_1').set({
+        id: 'tx_dep_rec_1',
+        userId: userIdRecover,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 10000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-REC-1',
+      });
+      await fsMem.collection('transactions').doc(`tx_rwd_welcome_${userIdRecover}`).set({
+        id: `tx_rwd_welcome_${userIdRecover}`,
+        referenceNumber: `MV-RWD-WELCOME-${userIdRecover}`,
+        type: 'WELCOME_REWARD',
+        amount: 1000,
+        currency: 'USD',
+        status: 'COMPLETED',
+        userId: userIdRecover,
+        createdAt: new Date().toISOString(),
+      });
+      const recRes = await evaluateAndProcessWelcomeReward(userIdRecover, rwdDeps);
+      assert.strictEqual(recRes.status, 'PAID');
+      assert.strictEqual((await fsMem.collection('accounts').doc(userIdRecover).get()).data()?.checkingBalance, 11000);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+      // ABORTED retry contention test for Welcome Reward payout
+      await fsMem.collection('users').doc(userIdRetry).set({
+        id: userIdRetry,
+        firstName: 'Tessa',
+        lastName: 'Retry',
+        permanentAccountNumber: '1088990011',
+        status: 'active',
+      });
+      await fsMem.collection('accounts').doc(userIdRetry).set({
+        userId: userIdRetry,
+        permanentAccountNumber: '1088990011',
+        checkingBalance: 10000,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 10000,
+        availableBalance: 10000,
+      });
+      await fsMem.collection('transactions').doc('tx_dep_rtry_1').set({
+        id: 'tx_dep_rtry_1',
+        userId: userIdRetry,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 10000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-RTRY-1',
+      });
+      fsMem.onBeforeCommitConflictOnce = async () => {
+        const cur = (await fsMem.collection('accounts').doc(userIdRetry).get()).data()!;
+        await fsMem.collection('accounts').doc(userIdRetry).set({
+          ...cur,
+          checkingBalance: 10500,
+          availableBalance: 10500,
+          totalBalance: 10500,
+        });
+      };
+      const retryRwdRes = await evaluateAndProcessWelcomeReward(userIdRetry, rwdDeps);
+      assert.strictEqual(retryRwdRes.status, 'PAID');
+      assert.strictEqual(fsMem.lastTransactionAttempts, 2);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userIdRetry).get()).data()?.checkingBalance, 11500);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && trackedUids.has(tx.userId)) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 37 passed: evaluateAndProcessWelcomeReward writes 1 MONEY_RECEIVED :COMPLETED outbox record cleanly, preserves idempotency/recovery, and rolls back atomically');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 38 [3D-B1.3B]: End-to-end dispatch regression across all 4 Stage 3D-B1.3B integrations
+  // - Builds dispatch events from actual Wire Check Submitted, Wire Check Delivered,
+  //   Admin Check Issued, and Welcome Reward outbox records
+  // - Verifies exact FCM payloads, zero PII/bank-account/routing/check-number leakage,
+  //   UNCONFIGURED_PROVIDER isolation, and safe SMS/Email invocation on MONEY_RECEIVED only
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_e2e_3db13b';
+    const userPan = '1066112233';
+    const destAcct = '443322119988';
+    const destRouting = '062005690';
+    const checkNumRaw = 'CHK-551199';
+    const payeePrivate = 'Northstar Closing Escrow';
+    const memoPrivate = 'Escrow Ref 99110022';
+    const custEmail = 'e2e.3db13b.private@monvera.test';
+    const custPhone = '+15559990011';
+    const capturedFcmMessages: any[] = [];
+    const smsPayloads: any[] = [];
+    const emailPayloads: any[] = [];
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+
+    await fsMem.collection('users').doc(userId).set({
+      id: userId,
+      firstName: 'Nolan',
+      lastName: 'Price',
+      permanentAccountNumber: userPan,
+      email: custEmail,
+      phone: custPhone,
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(userId).set({
+      userId,
+      permanentAccountNumber: userPan,
+      checkingBalance: 20000,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 20000,
+      availableBalance: 20000,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+    await fsMem.collection('transactions').doc('tx_e2e_dep_10k').set({
+      id: 'tx_e2e_dep_10k',
+      userId,
+      type: 'DEPOSIT',
+      status: 'COMPLETED',
+      amount: 10000,
+      currency: 'USD',
+      referenceNumber: 'MV-E2E-DEP-10K',
+    });
+    const regTokRes = await registerCustomerPushToken(
+      { uid: userId, token: 'fcm_tok_3db13b_e2e_valid_device_token_12345', platform: 'web' },
+      fsMem as unknown as Firestore
+    );
+    assert.strictEqual(regTokRes.success, true, `Failed to register test push token: ${regTokRes.error}`);
+
+    const mockMessaging = {
+      sendEachForMulticast: async (message: any) => {
+        capturedFcmMessages.push(structuredClone(message));
+        return {
+          successCount: message.tokens.length,
+          failureCount: 0,
+          responses: message.tokens.map((_: string, idx: number) => ({
+            success: true,
+            messageId: `fcm_3db13b_${capturedFcmMessages.length}_${idx}`,
+          })),
+        };
+      },
+    } as unknown as Messaging;
+
+    const dispatcher = new ServerNotificationDispatcher({
+      firestore: fsMem as unknown as Firestore,
+      messaging: mockMessaging,
+      isAdminConfigured: () => true,
+      isMessagingConfigured: () => true,
+      instanceId: 'worker_3db13b_e2e',
+    });
+
+    const origSms = smsService.sendTransactionSms.bind(smsService);
+    const origEmail = emailService.sendTransactionalEmail.bind(emailService);
+    (smsService as any).sendTransactionSms = async (params: any) => {
+      smsPayloads.push(params);
+      return { success: false, delivered: false, status: 'UNCONFIGURED_PROVIDER', reason: 'Mock unconfigured' };
+    };
+    (emailService as any).sendTransactionalEmail = async (params: any) => {
+      emailPayloads.push(params);
+      return { success: false, delivered: false, status: 'UNCONFIGURED_PROVIDER', reason: 'Mock unconfigured' };
+    };
+
+    const dispatchOutbox = async (outboxId: string, workerId: string) => {
+      const claim = await claimOutboxLease(fsMem as unknown as Firestore, outboxId, workerId);
+      assert.strictEqual(claim.claimed, true, `Failed to claim outbox ${outboxId}: ${claim.reason}`);
+      const rec = claim.record!;
+      const evt = buildDispatchEventFromOutboxRecord(rec, {
+        email: custEmail,
+        phone: custPhone,
+      });
+      const opts = buildOutboxDispatchOptions(rec, claim.leaseToken!);
+      const res = await dispatcher.dispatch(evt, opts);
+      const persistentLog = await fetchDispatchLogForOutboxRecord(fsMem as unknown as Firestore, rec);
+      const outcome = evaluateOutboxAttemptOutcome({
+        outboxRecord: rec,
+        dispatchResult: res,
+        persistentLog,
+      });
+      assert.strictEqual(outcome.action, 'TRANSITION');
+      await transitionOutboxAsLeaseOwner(
+        fsMem as unknown as Firestore,
+        outboxId,
+        claim.leaseToken!,
+        () => ({
+          status: outcome.nextStatus!,
+          pushStatus: outcome.pushStatus,
+          smsStatus: outcome.smsStatus,
+          emailStatus: outcome.emailStatus,
+          failureClassification: outcome.failureClassification,
+          lastError: outcome.lastError,
+          nextAttemptAt: outcome.nextAttemptAt,
+          dispatchedAt: outcome.dispatchedAt,
+        })
+      );
+      return outcome;
+    };
+
+    try {
+      const wchkDeps = {
+        firestore: fsMem as unknown as Firestore,
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+        recordAuditLog: () => {},
+      };
+      const chkDeps = {
+        firestore: fsMem as unknown as Firestore,
+        resolveCustomer: async () => ({
+          success: true,
+          uid: userId,
+          data: (await fsMem.collection('users').doc(userId).get()).data(),
+        }),
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+        recordAuditLog: () => {},
+      };
+      const rwdDeps = {
+        firestore: fsMem as unknown as Firestore,
+        isAdminConfigured: () => true,
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+      };
+
+      const wchkSub = await executeServerWireCheckWithdrawal(
+        {
+          userId,
+          bankName: 'Regions Bank',
+          destinationBankAccountNumber: destAcct,
+          destinationBankRoutingNumber: destRouting,
+          fullLegalName: 'Nolan Price',
+          residentialAddress: '100 Main St, Austin, TX 78701',
+          email: custEmail,
+          phoneNumber: custPhone,
+          amount: 500,
+          sourceAccountType: 'CHECKING',
+          idempotencyKey: 'e2e_wchk_sub_1',
+        },
+        wchkDeps
+      );
+      assert.strictEqual(wchkSub.success, true);
+
+      const wchkDeliv = await markWireCheckRequestDeliveredAdmin(
+        {
+          requestId: wchkSub.request!.requestId,
+          targetStatus: 'DELIVERED',
+          adminUid: 'usr_admin',
+          adminEmail: 'admin@monvera.test',
+        },
+        wchkDeps
+      );
+      assert.strictEqual(wchkDeliv.success, true);
+
+      const adChk = await executeServerAdminCheckWithdrawal(
+        {
+          customerIdentifier: userId,
+          sourceAccountType: 'CHECKING',
+          checkNumber: checkNumRaw,
+          payeeName: payeePrivate,
+          amount: 800,
+          memo: memoPrivate,
+          idempotencyKey: 'e2e_adchk_1',
+          adminUid: 'usr_admin',
+          adminEmail: 'admin@monvera.test',
+        },
+        chkDeps
+      );
+      assert.strictEqual(adChk.success, true);
+
+      const rwd = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(rwd.status, 'PAID');
+
+      const outSub = await dispatchOutbox(
+        computeNotificationOutboxId(userId, `${wchkSub.transaction!.id}:SUBMITTED`, 'TRANSACTION'),
+        'w_e2e_1'
+      );
+      const outDeliv = await dispatchOutbox(
+        computeNotificationOutboxId(userId, `${wchkSub.transaction!.id}:DELIVERED`, 'TRANSACTION'),
+        'w_e2e_2'
+      );
+      const outChk = await dispatchOutbox(
+        computeNotificationOutboxId(userId, `${adChk.transaction!.id}:COMPLETED`, 'TRANSACTION'),
+        'w_e2e_3'
+      );
+      const outRwd = await dispatchOutbox(
+        computeNotificationOutboxId(userId, `${rwd.transactionId}:COMPLETED`, 'MONEY_RECEIVED'),
+        'w_e2e_4'
+      );
+
+      assert.strictEqual(outSub.nextStatus, 'DISPATCHED');
+      assert.strictEqual(outSub.pushStatus, 'SENT');
+      assert.strictEqual(outDeliv.nextStatus, 'DISPATCHED');
+      assert.strictEqual(outDeliv.pushStatus, 'SENT');
+      assert.strictEqual(outChk.nextStatus, 'DISPATCHED');
+      assert.strictEqual(outChk.pushStatus, 'SENT');
+      assert.strictEqual(outRwd.nextStatus, 'DISPATCHED');
+      assert.strictEqual(outRwd.pushStatus, 'SENT');
+      assert.strictEqual(capturedFcmMessages.length, 4);
+
+      assert.strictEqual(capturedFcmMessages[0].notification.title, 'Wire Check Request Submitted — Monvera');
+      assert.strictEqual(
+        capturedFcmMessages[0].notification.body,
+        'Your Wire Check withdrawal request for $500.00 from Checking (MVB •••• 2233) was submitted successfully.'
+      );
+      assert.strictEqual(capturedFcmMessages[1].notification.title, 'Wire Check Delivered — Monvera');
+      assert.strictEqual(
+        capturedFcmMessages[1].notification.body,
+        'Your Wire Check of $500.00 from Checking (MVB •••• 2233) has been marked as delivered.'
+      );
+      assert.strictEqual(capturedFcmMessages[2].notification.title, 'Official Check Issued — Monvera');
+      assert.strictEqual(
+        capturedFcmMessages[2].notification.body,
+        'An official check withdrawal of $800.00 from Checking (MVB •••• 2233) has been issued.'
+      );
+      assert.strictEqual(capturedFcmMessages[3].notification.title, 'Welcome Reward Credited — Monvera');
+      assert.strictEqual(
+        capturedFcmMessages[3].notification.body,
+        'Congratulations! Your $1,000.00 Monvera Welcome Reward has been credited to Checking (MVB •••• 2233).'
+      );
+
+      // TRANSACTION events make 0 SMS/Email calls; MONEY_RECEIVED (Welcome Reward) invokes mocked SMS/Email cleanly
+      assert.strictEqual(smsPayloads.length, 1);
+      assert.strictEqual(emailPayloads.length, 1);
+
+      const allSerializedNotifications = JSON.stringify({
+        fcm: capturedFcmMessages.map((m) => ({ notification: m.notification, data: m.data })),
+        sms: smsPayloads,
+        email: emailPayloads,
+      });
+      for (const secret of [userPan, destAcct, destRouting, checkNumRaw, '551199', payeePrivate, memoPrivate, 'admin@monvera.test', '100 Main St']) {
+        assert.strictEqual(allSerializedNotifications.includes(secret), false, `Dispatched payloads must not contain ${secret}`);
+      }
+    } finally {
+      (smsService as any).sendTransactionSms = origSms;
+      (emailService as any).sendTransactionalEmail = origEmail;
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && tx.userId === userId) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 38 passed: End-to-end Stage 3D-B1.3B dispatch regression verified exact FCM payloads, channel safety, and zero sensitive data leakage');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 39 [3D-B1.3B.1 Test A]: Welcome Reward concurrent payout evaluations
+  // - Two parallel evaluateAndProcessWelcomeReward calls for same eligible user
+  // - Only one $1,000.00 reward is credited
+  // - Exactly one WELCOME_REWARD ledger transaction and one deterministic outbox doc
+  // - Final reward status is PAID
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_conc_3db13b1';
+    const userPan = '1091234567';
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+    const auxNotifs: any[] = [];
+
+    const rwdDeps = {
+      firestore: fsMem as unknown as Firestore,
+      isAdminConfigured: () => true,
+      persistNotification: async (n: any) => {
+        auxNotifs.push(n);
+        return { ...n, read: false };
+      },
+    };
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Aria',
+        lastName: 'Concurrent',
+        permanentAccountNumber: userPan,
+        status: 'active',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 2000,
+        savingsBalance: 500,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 2500,
+        availableBalance: 2000,
+      });
+      await fsMem.collection('transactions').doc('tx_dep_conc_1').set({
+        id: 'tx_dep_conc_1',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 4000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-CONC-1',
+      });
+      await fsMem.collection('transactions').doc('tx_dep_conc_2').set({
+        id: 'tx_dep_conc_2',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-CONC-2',
+      });
+
+      const [resA, resB] = await Promise.all([
+        evaluateAndProcessWelcomeReward(userId, rwdDeps),
+        evaluateAndProcessWelcomeReward(userId, rwdDeps),
+      ]);
+
+      assert.strictEqual(resA.status, 'PAID');
+      assert.strictEqual(resB.status, 'PAID');
+      assert.strictEqual(resA.transactionId, `tx_rwd_welcome_${userId}`);
+      assert.strictEqual(resB.transactionId, `tx_rwd_welcome_${userId}`);
+
+      const accAfter = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      assert.strictEqual(accAfter.checkingBalance, 3000);
+      assert.strictEqual(accAfter.totalBalance, 3500);
+
+      const allTxSnap = await fsMem.collection('transactions').get();
+      const rewardTxs = allTxSnap.docs.filter((d) => d.data()?.type === 'WELCOME_REWARD');
+      assert.strictEqual(rewardTxs.length, 1);
+
+      const expectedOutboxId = computeNotificationOutboxId(
+        userId,
+        `tx_rwd_welcome_${userId}:COMPLETED`,
+        'MONEY_RECEIVED'
+      );
+      const outboxSnap = await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+      assert.strictEqual(outboxSnap.size, 1);
+      assert.strictEqual(outboxSnap.docs[0].id, expectedOutboxId);
+
+      const rwdDoc = (await fsMem.collection('welcome_rewards').doc(userId).get()).data()!;
+      assert.strictEqual(rwdDoc.status, 'PAID');
+      assert.strictEqual(auxNotifs.length, 1);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && tx.userId === userId) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 39 [3D-B1.3B.1 Test A] passed: Concurrent Welcome Reward evaluations credit strictly one $1,000 reward and one outbox record');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 40 [3D-B1.3B.1 Test B]: Stale below-threshold evaluation cannot regress PAID
+  // - Eval 1 enters transaction and observes below-threshold ($4,000), then pauses
+  //   before committing IN_PROGRESS
+  // - Second deposit ($6,000) arrives and Eval 2 qualifies & commits PAID + $1,000 credit
+  // - Eval 1 resumes and attempts to commit stale IN_PROGRESS
+  // - Verify PAID status, paidAt, transactionId, balance ($2,500), and single outbox stay intact
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_stale_3db13b1';
+    const userPan = '1092345678';
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+
+    let signalBelowThresholdRead!: () => void;
+    const belowThresholdReadDone = new Promise<void>((resolve) => {
+      signalBelowThresholdRead = resolve;
+    });
+    let releaseStaleEval!: () => void;
+    const staleEvalPaused = new Promise<void>((resolve) => {
+      releaseStaleEval = resolve;
+    });
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Lucas',
+        lastName: 'StaleRace',
+        permanentAccountNumber: userPan,
+        status: 'active',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 1500,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 1500,
+        availableBalance: 1500,
+      });
+      await fsMem.collection('transactions').doc('tx_dep_stale_1').set({
+        id: 'tx_dep_stale_1',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 4000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-STALE-1',
+      });
+
+      // Firestore wrapper for Eval 1: pauses Attempt 1 right after reading below-threshold state
+      // and right before tx.set(welcome_rewards/userId, IN_PROGRESS)
+      let pausedOnce = false;
+      const pausingFirestore = {
+        collection: (name: string) => fsMem.collection(name),
+        runTransaction: async <T>(fn: (tx: any) => Promise<T>): Promise<T> => {
+          return fsMem.runTransaction(async (innerTx) => {
+            const wrappedTx = {
+              get: (refOrQuery: any) => innerTx.get(refOrQuery),
+              create: (ref: any, data: any) => innerTx.create(ref, data),
+              delete: (ref: any) => innerTx.delete(ref),
+              set: async (ref: any, data: any, opts?: any) => {
+                // Only reached synchronously after all tx.get calls; if Attempt 1 writes IN_PROGRESS,
+                // wait via wrapped runTransaction wrapper below
+                innerTx.set(ref, data, opts);
+              },
+            };
+            const res = await fn(wrappedTx);
+            if (!pausedOnce && (res as any)?.action === 'IN_PROGRESS') {
+              pausedOnce = true;
+              signalBelowThresholdRead();
+              await staleEvalPaused;
+            }
+            return res;
+          });
+        },
+      } as unknown as Firestore;
+
+      const staleEvalPromise = evaluateAndProcessWelcomeReward(userId, {
+        firestore: pausingFirestore,
+        isAdminConfigured: () => true,
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+      });
+
+      // Wait until Eval 1 has observed $4,000 (below threshold) and is paused before commit
+      await belowThresholdReadDone;
+
+      // Second qualifying deposit lands and Eval 2 completes $1,000 PAID payout
+      await fsMem.collection('transactions').doc('tx_dep_stale_2').set({
+        id: 'tx_dep_stale_2',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-STALE-2',
+      });
+
+      const winningEval = await evaluateAndProcessWelcomeReward(userId, {
+        firestore: fsMem as unknown as Firestore,
+        isAdminConfigured: () => true,
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+      });
+      assert.strictEqual(winningEval.status, 'PAID');
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 2500);
+
+      // Resume stale Eval 1 — optimistic retry must detect PAID and never regress welcome_rewards/{userId}
+      releaseStaleEval();
+      const resumedStale = await staleEvalPromise;
+      assert.strictEqual(resumedStale.status, 'PAID');
+      assert.strictEqual(resumedStale.transactionId, `tx_rwd_welcome_${userId}`);
+
+      const persistedReward = (await fsMem.collection('welcome_rewards').doc(userId).get()).data()!;
+      assert.strictEqual(persistedReward.status, 'PAID');
+      assert.strictEqual(persistedReward.transactionId, `tx_rwd_welcome_${userId}`);
+      assert.strictEqual(Boolean(persistedReward.paidAt), true);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 2500);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+      // Even if a subsequent stale transaction fails commit completely, PAID remains preserved
+      fsMem.failNextTransactionWrite = true;
+      const errFallbackRes = await evaluateAndProcessWelcomeReward(userId, {
+        firestore: {
+          collection: (name: string) => {
+            if (name === 'welcome_rewards') {
+              const realRef = fsMem.collection('welcome_rewards').doc(userId);
+              let fastCheckDone = false;
+              return {
+                doc: (id: string) =>
+                  id === userId
+                    ? {
+                        get: async () => {
+                          if (!fastCheckDone) {
+                            fastCheckDone = true;
+                            return { id: userId, exists: false, ref: realRef, data: () => undefined };
+                          }
+                          return realRef.get();
+                        },
+                      }
+                    : fsMem.collection('welcome_rewards').doc(id),
+              };
+            }
+            return fsMem.collection(name);
+          },
+          runTransaction: async () => {
+            throw new Error('SIMULATED_STALE_EVAL_FAILURE');
+          },
+        } as unknown as Firestore,
+        isAdminConfigured: () => true,
+      });
+      fsMem.failNextTransactionWrite = false;
+      assert.strictEqual(errFallbackRes.status, 'PAID');
+      assert.strictEqual((await fsMem.collection('welcome_rewards').doc(userId).get()).data()?.status, 'PAID');
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && tx.userId === userId) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 40 [3D-B1.3B.1 Test B] passed: Stale below-threshold evaluation cannot overwrite PAID status or regress reward metadata');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 41 [3D-B1.3B.1 Test C]: Concurrent deposit reversal aborts unauthorized reward
+  // - User starts at $10,000 ($4,000 + $6,000)
+  // - Right before payout commit, $6,000 deposit is reversed concurrently
+  // - Transaction detects conflict, revalidates inside transaction ($4,000 < $10,000),
+  //   and blocks unauthorized $1,000 credit & outbox creation
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_rev_3db13b1';
+    const userPan = '1093456789';
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+    const auxNotifs: any[] = [];
+
+    const rwdDeps = {
+      firestore: fsMem as unknown as Firestore,
+      isAdminConfigured: () => true,
+      persistNotification: async (n: any) => {
+        auxNotifs.push(n);
+        return { ...n, read: false };
+      },
+    };
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Nadia',
+        lastName: 'ReversalRace',
+        permanentAccountNumber: userPan,
+        status: 'active',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 5000,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 5000,
+        availableBalance: 5000,
+      });
+      await fsMem.collection('transactions').doc('tx_dep_rev_a').set({
+        id: 'tx_dep_rev_a',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 4000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-REV-A',
+      });
+      await fsMem.collection('transactions').doc('tx_dep_rev_b').set({
+        id: 'tx_dep_rev_b',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-REV-B',
+      });
+
+      fsMem.onBeforeCommitConflictOnce = async () => {
+        const depB = (await fsMem.collection('transactions').doc('tx_dep_rev_b').get()).data()!;
+        await fsMem.collection('transactions').doc('tx_dep_rev_b').set({
+          ...depB,
+          status: 'REVERSED',
+          metadata: { isReversed: true },
+        });
+      };
+
+      const revRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(fsMem.lastTransactionAttempts, 2);
+      assert.strictEqual(revRes.status, 'IN_PROGRESS');
+      assert.strictEqual(revRes.qualifyingDeposits, 4000);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 5000);
+      assert.strictEqual((await fsMem.collection('transactions').doc(`tx_rwd_welcome_${userId}`).get()).exists, false);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+      assert.strictEqual((await fsMem.collection('welcome_rewards').doc(userId).get()).data()?.status, 'IN_PROGRESS');
+      assert.strictEqual(auxNotifs.length, 0);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && tx.userId === userId) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 41 [3D-B1.3B.1 Test C] passed: Concurrent deposit reversal prevents unauthorized $1,000 credit and outbox creation');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 42 [3D-B1.3B.1 Test D]: Currency and in-memory fallback isolation
+  // - Firestore mode rejects non-USD, pending, reversed, transfer, and ALL inMemoryDb records
+  // - Non-Firestore fallback mode also strictly rejects non-USD and reversed records
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_curr_3db13b1';
+    const userIdFallback = 'uid_rwd_fallback_curr';
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+    const initialMemNotifIds = new Set(inMemoryDb.notifications.map((n) => n.id));
+    const initialMemLedgerIds = new Set(inMemoryDb.ledgerEntries.map((l) => l.id));
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Theo',
+        lastName: 'CurrencyIso',
+        permanentAccountNumber: '1094567890',
+        status: 'active',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: '1094567890',
+        checkingBalance: 1000,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 1000,
+        availableBalance: 1000,
+      });
+
+      // Only $6,000 valid USD completed deposit in Firestore
+      await fsMem.collection('transactions').doc('tx_curr_usd_ok').set({
+        id: 'tx_curr_usd_ok',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'MV-CURR-USD-1',
+      });
+      // Ineligible entries in Firestore: EUR, GBP, PENDING, isReversed, TRANSFER, WELCOME_REWARD
+      await fsMem.collection('transactions').doc('tx_curr_eur').set({
+        id: 'tx_curr_eur',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 12000,
+        currency: 'EUR',
+        referenceNumber: 'MV-CURR-EUR-1',
+      });
+      await fsMem.collection('transactions').doc('tx_curr_pending').set({
+        id: 'tx_curr_pending',
+        userId,
+        type: 'DEPOSIT',
+        status: 'PENDING',
+        amount: 10000,
+        currency: 'USD',
+        referenceNumber: 'MV-CURR-PEND-1',
+      });
+      await fsMem.collection('transactions').doc('tx_curr_rev').set({
+        id: 'tx_curr_rev',
+        userId,
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 10000,
+        currency: 'USD',
+        referenceNumber: 'MV-CURR-REV-1',
+        metadata: { isReversed: true },
+      });
+      await fsMem.collection('transactions').doc('tx_curr_trf').set({
+        id: 'tx_curr_trf',
+        userId,
+        type: 'TRANSFER',
+        status: 'COMPLETED',
+        amount: 10000,
+        currency: 'USD',
+        referenceNumber: 'MV-CURR-TRF-1',
+      });
+
+      // Plant stale/ineligible memory db deposits for the Firestore user (must NEVER leak into Firestore threshold)
+      inMemoryDb.transactions.push(
+        {
+          id: 'mem_leak_usd',
+          referenceNumber: 'MV-MEM-LEAK-USD',
+          type: 'DEPOSIT',
+          amount: 15000,
+          currency: 'USD',
+          status: 'COMPLETED',
+          userId,
+          createdAt: new Date().toISOString(),
+        } as any,
+        {
+          id: 'mem_leak_eur',
+          referenceNumber: 'MV-MEM-LEAK-EUR',
+          type: 'DEPOSIT',
+          amount: 15000,
+          currency: 'EUR',
+          status: 'COMPLETED',
+          userId,
+          createdAt: new Date().toISOString(),
+        } as any
+      );
+
+      const fsIsoRes = await evaluateAndProcessWelcomeReward(userId, {
+        firestore: fsMem as unknown as Firestore,
+        isAdminConfigured: () => true,
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+      });
+
+      assert.strictEqual(fsIsoRes.status, 'IN_PROGRESS');
+      assert.strictEqual(fsIsoRes.qualifyingDeposits, 6000);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 1000);
+      assert.strictEqual((await fsMem.collection('transactions').doc(`tx_rwd_welcome_${userId}`).get()).exists, false);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+      // Non-Firestore fallback also enforces strict USD + non-reversed exclusion
+      inMemoryDb.transactions.push(
+        {
+          id: 'mem_fb_usd_ok',
+          referenceNumber: 'MV-FB-USD-1',
+          type: 'DEPOSIT',
+          amount: 5000,
+          currency: 'USD',
+          status: 'COMPLETED',
+          userId: userIdFallback,
+          createdAt: new Date().toISOString(),
+        } as any,
+        {
+          id: 'mem_fb_eur',
+          referenceNumber: 'MV-FB-EUR-1',
+          type: 'DEPOSIT',
+          amount: 15000,
+          currency: 'EUR',
+          status: 'COMPLETED',
+          userId: userIdFallback,
+          createdAt: new Date().toISOString(),
+        } as any,
+        {
+          id: 'mem_fb_rev',
+          referenceNumber: 'MV-FB-REV-1',
+          type: 'DEPOSIT',
+          amount: 9000,
+          currency: 'USD',
+          status: 'COMPLETED',
+          userId: userIdFallback,
+          metadata: { isReversed: true },
+          createdAt: new Date().toISOString(),
+        } as any
+      );
+
+      const fbRes = await evaluateAndProcessWelcomeReward(userIdFallback, {
+        isAdminConfigured: () => false,
+      });
+      assert.strictEqual(fbRes.status, 'IN_PROGRESS');
+      assert.strictEqual(fbRes.qualifyingDeposits, 5000);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        if (!initialMemTxIds.has(inMemoryDb.transactions[i].id)) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+      for (let i = inMemoryDb.notifications.length - 1; i >= 0; i--) {
+        if (!initialMemNotifIds.has(inMemoryDb.notifications[i].id)) {
+          inMemoryDb.notifications.splice(i, 1);
+        }
+      }
+      for (let i = inMemoryDb.ledgerEntries.length - 1; i >= 0; i--) {
+        if (!initialMemLedgerIds.has(inMemoryDb.ledgerEntries[i].id)) {
+          inMemoryDb.ledgerEntries.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 42 [3D-B1.3B.1 Test D] passed: Non-USD and in-memory fallback records cannot pollute Firestore-authoritative reward thresholds');
+  }
+
+  console.log('\nALL STAGE 3D-A / 3D-B1.1 / 3D-B1.2 / 3D-B1.3A / 3D-B1.3B / 3D-B1.3B.1 OUTBOX TESTS PASSED (42/42).');
   process.exit(0);
 }
 

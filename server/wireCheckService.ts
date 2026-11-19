@@ -2,6 +2,11 @@ import crypto from 'crypto';
 import type { Firestore } from 'firebase-admin/firestore';
 import { adminFirestore, isFirebaseAdminConfigured } from './firebaseAdmin';
 import { persistCustomerNotification, maskAccountNumber } from './services/notificationStore';
+import {
+  prepareNotificationOutboxBatch,
+  writePreparedNotificationOutboxBatchInTransaction,
+  type WrittenOutboxBatchResult,
+} from './services/notificationOutbox';
 import { db } from './db';
 import {
   BalanceMetrics,
@@ -10,6 +15,31 @@ import {
   WireCheckDeliveryAudit,
   WireCheckRequestRecord,
 } from '../src/types';
+
+function reportOutboxPreparationIssues(
+  context: string,
+  txId: string,
+  outboxWrite: WrittenOutboxBatchResult | null
+): void {
+  if (!outboxWrite || outboxWrite.invalidItems.length === 0) return;
+  console.warn(
+    `[Outbox][${context}] Skipped ${outboxWrite.invalidItems.length} invalid outbox item(s) for transaction ${txId}:`,
+    JSON.stringify(
+      outboxWrite.invalidItems.map((item) => ({
+        userId: item.userId,
+        eventKey: item.eventKey,
+        dispatchType: item.dispatchType,
+        error: item.error,
+      }))
+    )
+  );
+}
+
+function formatSafeOutboxAccountLabel(accountNumber?: string | null, label?: string | null): string {
+  const masked = maskAccountNumber(accountNumber);
+  const cleanLabel = typeof label === 'string' ? label.trim().slice(0, 36) : '';
+  return cleanLabel ? `${cleanLabel} (${masked})` : masked;
+}
 
 /**
  * Curated United States destination banks supported for Wire Check withdrawals
@@ -691,9 +721,16 @@ export async function executeServerWireCheckWithdrawal(
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
     await firestore.runTransaction(async (transaction) => {
+      isDuplicate = false;
+      finalRequest = null;
+      finalTx = null;
+      finalMetrics = null;
+      outboxWriteResult = null;
+
       // ALL READS MUST PRECEDE ALL WRITES
       const [idempSnap, userSnap, accSnap] = await Promise.all([
         transaction.get(idempRef),
@@ -960,6 +997,36 @@ export async function executeServerWireCheckWithdrawal(
         updatedAt: nowIso,
       });
 
+      // Transaction read-phase: prepare Wire Check SUBMITTED outbox record strictly BEFORE any writes
+      // Never include destination account number, routing number, credentials, address, email, phone, or 8+ digit refs
+      const wireCheckAmtFormatted = amountDollars.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      const sourceLabel = sourceAccountType === 'CHECKING' ? 'Checking' : 'Savings';
+      const safeWireCheckSourceMasked = formatSafeOutboxAccountLabel(sourceAccountNumber, sourceLabel);
+
+      const wireCheckSubmitOutboxBatch = await prepareNotificationOutboxBatch(transaction, firestore, [
+        {
+          userId: customerUid,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:SUBMITTED`,
+          lifecycleStage: 'SUBMITTED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Wire Check Request Submitted — Monvera',
+            body: `Your Wire Check withdrawal request for $${wireCheckAmtFormatted} from ${safeWireCheckSourceMasked} was submitted successfully.`,
+            actionUrl: '/dashboard?view=transactions',
+            amount: amountDollars,
+            currency: 'USD',
+            accountMasked: safeWireCheckSourceMasked,
+          },
+        },
+      ]);
+
       // 7. Commit all writes atomically
       transaction.set(
         accRef,
@@ -984,6 +1051,10 @@ export async function executeServerWireCheckWithdrawal(
         transaction: finalTx,
         createdAt: nowIso,
       });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(
+        transaction,
+        wireCheckSubmitOutboxBatch
+      );
     });
   } catch (err: any) {
     if (err instanceof WireCheckError) {
@@ -1010,6 +1081,10 @@ export async function executeServerWireCheckWithdrawal(
       errorCode: 'INCOMPLETE_WIRE_CHECK_RESULT',
       error: 'Wire Check submission did not produce a confirmed record.',
     };
+  }
+
+  if (!isDuplicate) {
+    reportOutboxPreparationIssues('executeServerWireCheckWithdrawal', finalTx.id, outboxWriteResult);
   }
 
   const warnings: string[] = [];
@@ -1200,9 +1275,14 @@ export async function markWireCheckRequestDeliveredAdmin(
 
   let updatedRequest: WireCheckRequestRecord | null = null;
   let updatedTx: Transaction | null = null;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
     await firestore.runTransaction(async (transaction) => {
+      updatedRequest = null;
+      updatedTx = null;
+      outboxWriteResult = null;
+
       const reqSnap = await transaction.get(wireCheckReqRef);
       if (!reqSnap.exists) {
         throw new WireCheckError(
@@ -1289,6 +1369,56 @@ export async function markWireCheckRequestDeliveredAdmin(
         metadata: nextTxMeta,
       };
 
+      const targetCustomerUid = String(reqData.userId || txData.userId || '').trim();
+      const authoritativeAmount = Number(txData.amount ?? reqData.amount ?? 0);
+      const delivSourceType = String(
+        txData.metadata?.sourceAccountType || reqData.sourceAccountType || ''
+      )
+        .trim()
+        .toUpperCase();
+      const delivSourceLabel =
+        delivSourceType === 'CHECKING'
+          ? 'Checking'
+          : delivSourceType === 'SAVINGS'
+            ? 'Savings'
+            : 'Account';
+      const safeDelivAccountMasked = formatSafeOutboxAccountLabel(
+        txData.senderAccountNumber || reqData.customerAccountNumber,
+        delivSourceLabel
+      );
+      const hasPositiveDelivAmt = Number.isFinite(authoritativeAmount) && authoritativeAmount > 0;
+      const delivAmtFormatted = hasPositiveDelivAmt
+        ? authoritativeAmount.toLocaleString('en-US', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          })
+        : '';
+
+      // Transaction read-phase: prepare Wire Check DELIVERED outbox record strictly BEFORE any writes
+      // Uses existing authoritative transactionId & `:DELIVERED` lifecycle milestone without destination bank/routing details
+      const wireCheckDelivOutboxBatch = await prepareNotificationOutboxBatch(transaction, firestore, [
+        {
+          userId: targetCustomerUid,
+          transactionId: txId,
+          referenceNumber: String(reqData.referenceNumber || txData.referenceNumber || txId).trim(),
+          eventKey: `${txId}:DELIVERED`,
+          lifecycleStage: 'DELIVERED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Wire Check Delivered — Monvera',
+            body: hasPositiveDelivAmt
+              ? `Your Wire Check of $${delivAmtFormatted} from ${safeDelivAccountMasked} has been marked as delivered.`
+              : `Your Wire Check from ${safeDelivAccountMasked} has been marked as delivered.`,
+            actionUrl: '/dashboard?view=transactions',
+            ...(hasPositiveDelivAmt ? { amount: authoritativeAmount } : {}),
+            currency: String(txData.currency || reqData.currency || 'USD').trim() || 'USD',
+            accountMasked: safeDelivAccountMasked,
+          },
+        },
+      ]);
+
       // Update request status & linked transaction history metadata (NEVER balances, amount, or status)
       transaction.set(
         wireCheckReqRef,
@@ -1310,6 +1440,11 @@ export async function markWireCheckRequestDeliveredAdmin(
           metadata: nextTxMeta,
         },
         { merge: true }
+      );
+
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(
+        transaction,
+        wireCheckDelivOutboxBatch
       );
     });
   } catch (err: any) {
@@ -1338,6 +1473,12 @@ export async function markWireCheckRequestDeliveredAdmin(
       error: 'Delivery update did not produce a confirmed record.',
     };
   }
+
+  reportOutboxPreparationIssues(
+    'markWireCheckRequestDeliveredAdmin',
+    updatedRequest.transactionId || updatedRequest.requestId,
+    outboxWriteResult
+  );
 
   const warnings: string[] = [];
   const notifyFn = deps?.persistNotification || persistCustomerNotification;

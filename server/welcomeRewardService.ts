@@ -1,10 +1,47 @@
+import type { Firestore } from 'firebase-admin/firestore';
 import { adminFirestore, isFirebaseAdminConfigured } from './firebaseAdmin';
 import { db } from './db';
 import { Transaction, WelcomeRewardInfo, WelcomeRewardStatus, BankAccount, BalanceMetrics } from '../src/types';
 import { persistCustomerNotification, maskAccountNumber } from './services/notificationStore';
+import {
+  prepareNotificationOutboxBatch,
+  writePreparedNotificationOutboxBatchInTransaction,
+  type WrittenOutboxBatchResult,
+} from './services/notificationOutbox';
 
 export const WELCOME_REWARD_TARGET = 10000.0; // $10,000.00 in qualifying deposits
 export const WELCOME_REWARD_AMOUNT = 1000.0; // $1,000.00 one-time welcome reward
+
+export interface WelcomeRewardDeps {
+  firestore?: Firestore;
+  isAdminConfigured?: () => boolean;
+  persistNotification?: typeof persistCustomerNotification;
+}
+
+function reportOutboxPreparationIssues(
+  context: string,
+  txId: string,
+  outboxWrite: WrittenOutboxBatchResult | null
+): void {
+  if (!outboxWrite || outboxWrite.invalidItems.length === 0) return;
+  console.warn(
+    `[Outbox][${context}] Skipped ${outboxWrite.invalidItems.length} invalid outbox item(s) for transaction ${txId}:`,
+    JSON.stringify(
+      outboxWrite.invalidItems.map((item) => ({
+        userId: item.userId,
+        eventKey: item.eventKey,
+        dispatchType: item.dispatchType,
+        error: item.error,
+      }))
+    )
+  );
+}
+
+function formatSafeOutboxAccountLabel(accountNumber?: string | null, label?: string | null): string {
+  const masked = maskAccountNumber(accountNumber);
+  const cleanLabel = typeof label === 'string' ? label.trim().slice(0, 36) : '';
+  return cleanLabel ? `${cleanLabel} (${masked})` : masked;
+}
 
 /**
  * Builds standard 2-account BankAccount structure if not present on account document
@@ -44,29 +81,83 @@ function buildDefaultAccounts(userId: string, checking: number, savings: number,
   ];
 }
 
+interface AggregatedDepositsResult {
+  qualifyingSum: number;
+  eligibleDepositRefs: Set<string>;
+}
+
+function aggregateQualifyingUsdDeposits(
+  entries: Iterable<{ id: string; data: Record<string, any> }>
+): AggregatedDepositsResult {
+  let qualifyingSum = 0;
+  const eligibleDepositRefs = new Set<string>();
+  const seenPaymentRefs = new Set<string>();
+
+  for (const { id: docId, data: tx } of entries) {
+    if (!tx || typeof tx !== 'object') continue;
+    if (tx.type !== 'DEPOSIT' || tx.status !== 'COMPLETED') continue;
+
+    const amt = Number(tx.amount ?? 0);
+    const ref = tx.referenceNumber || docId;
+    const provRef = tx.paymentProviderRef || tx.metadata?.stripeSessionId || '';
+    const meta = tx.metadata || {};
+
+    // Strict exclusions:
+    // - Positive amounts only
+    // - No reversed deposits (status REVERSED or metadata.isReversed === true)
+    // - USD deposits only
+    // - No reward credits / transfers / withdrawals
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    if (meta.isReversed === true || tx.status === 'REVERSED') continue;
+    if (tx.currency && String(tx.currency).trim().toUpperCase() !== 'USD') continue;
+    if (tx.category === 'Rewards' || tx.type === 'WELCOME_REWARD') continue;
+
+    // Deduplication check
+    if (provRef && seenPaymentRefs.has(provRef)) continue;
+    if (seenPaymentRefs.has(ref)) continue;
+
+    if (provRef) seenPaymentRefs.add(provRef);
+    seenPaymentRefs.add(ref);
+    eligibleDepositRefs.add(ref);
+    qualifyingSum += amt;
+  }
+
+  return {
+    qualifyingSum: Number(qualifyingSum.toFixed(2)),
+    eligibleDepositRefs,
+  };
+}
+
 /**
  * Evaluates a customer's verified, completed deposits against the $10,000 Welcome Reward threshold.
  * If the threshold is satisfied and the reward has not been paid, atomically credits $1,000
  * directly to the user's Monvera account ledger with strict idempotency protection.
  */
-export async function evaluateAndProcessWelcomeReward(userId: string): Promise<WelcomeRewardInfo> {
+export async function evaluateAndProcessWelcomeReward(
+  userId: string,
+  deps?: WelcomeRewardDeps
+): Promise<WelcomeRewardInfo> {
   if (!userId) {
     throw new Error('Valid user ID is required to evaluate Welcome Reward.');
   }
 
-  const nowIso = new Date().toISOString();
-  const rewardDocRef = isFirebaseAdminConfigured()
-    ? adminFirestore.collection('welcome_rewards').doc(userId)
+  const adminConfigured = deps?.isAdminConfigured
+    ? deps.isAdminConfigured()
+    : Boolean(deps?.firestore) || isFirebaseAdminConfigured();
+  const fs = deps?.firestore || (adminConfigured ? adminFirestore : null);
+
+  const rewardDocRef = adminConfigured && fs
+    ? fs.collection('welcome_rewards').doc(userId)
     : null;
 
-  // 1. Fetch user profile for metadata & account number
+  // 1. Fetch user profile for fallback metadata & account number
   let customerName = 'Monvera Customer';
   let permanentAccountNumber = '1000000000';
   let registrationDate = new Date().toISOString();
 
-  if (isFirebaseAdminConfigured()) {
+  if (adminConfigured && fs) {
     try {
-      const uSnap = await adminFirestore.collection('users').doc(userId).get();
+      const uSnap = await fs.collection('users').doc(userId).get();
       if (uSnap.exists) {
         const ud = uSnap.data()!;
         customerName = `${ud.firstName || ''} ${ud.lastName || ''}`.trim() || ud.username || customerName;
@@ -85,19 +176,21 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
     }
   }
 
-  // 2. Check if already paid from persistent store
+  // 2. Fast-path terminal check: PAID state never regresses
   if (rewardDocRef) {
     try {
       const existingRewardSnap = await rewardDocRef.get();
       if (existingRewardSnap.exists) {
         const rData = existingRewardSnap.data() as WelcomeRewardInfo;
         if (rData.status === 'PAID') {
-          return {
+          const paidRecord: WelcomeRewardInfo = {
             ...rData,
             customerName: rData.customerName || customerName,
             permanentAccountNumber: rData.permanentAccountNumber || permanentAccountNumber,
             registrationDate: rData.registrationDate || registrationDate,
           };
+          syncRewardToMemoryDb(paidRecord);
+          return paidRecord;
         }
       }
     } catch (e) {
@@ -105,295 +198,202 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
     }
   }
 
-  // 3. Authoritatively aggregate all successfully completed, verified USD deposits
-  // EXCLUSIONS (Strict Rule #3):
-  // - No pending, failed, cancelled, reversed, or refunded deposits
-  // - No transfers between Monvera users
-  // - No withdrawals, investment movements, or reward credits
-  // - Deduplicate by provider reference / reference number
-  let qualifyingSum = 0;
-  const eligibleDepositRefs = new Set<string>();
-  const seenPaymentRefs = new Set<string>();
-
-  if (isFirebaseAdminConfigured()) {
-    try {
-      // Query completed deposits for this user
-      const txQueryA = await adminFirestore
-        .collection('transactions')
-        .where('userId', '==', userId)
-        .where('type', '==', 'DEPOSIT')
-        .where('status', '==', 'COMPLETED')
-        .get();
-
-      const txQueryB = await adminFirestore
-        .collection('transactions')
-        .where('recipientUserId', '==', userId)
-        .where('type', '==', 'DEPOSIT')
-        .where('status', '==', 'COMPLETED')
-        .get();
-
-      const combinedDocs = new Map<string, any>();
-      txQueryA.docs.forEach((d) => combinedDocs.set(d.id, d.data()));
-      txQueryB.docs.forEach((d) => combinedDocs.set(d.id, d.data()));
-
-      for (const [docId, tx] of combinedDocs.entries()) {
-        const amt = Number(tx.amount ?? 0);
-        const ref = tx.referenceNumber || docId;
-        const provRef = tx.paymentProviderRef || tx.metadata?.stripeSessionId || '';
-        const meta = tx.metadata || {};
-
-        // Exclusions:
-        if (amt <= 0) continue;
-        if (meta.isReversed === true || tx.status === 'REVERSED') continue;
-        if (tx.currency && tx.currency.toUpperCase() !== 'USD') continue;
-        if (tx.category === 'Rewards' || tx.type === 'WELCOME_REWARD') continue;
-
-        // Deduplication check
-        if (provRef && seenPaymentRefs.has(provRef)) continue;
-        if (seenPaymentRefs.has(ref)) continue;
-
-        if (provRef) seenPaymentRefs.add(provRef);
-        seenPaymentRefs.add(ref);
-        eligibleDepositRefs.add(ref);
-        qualifyingSum += amt;
-      }
-    } catch (err) {
-      console.error(`[WelcomeReward] Error querying Firestore deposits for ${userId}:`, err);
-    }
-  }
-
-  // Also include any verified completed deposits from memory db (with strict reference deduplication)
-  const memoryUserTxs = db.transactions.filter(
-    (t) => (t.userId === userId || t.recipientUserId === userId) &&
-           t.type === 'DEPOSIT' &&
-           t.status === 'COMPLETED' &&
-           t.category !== 'Rewards' &&
-           !(t.metadata?.isReversed)
-  );
-
-  for (const tx of memoryUserTxs) {
-    const amt = Number(tx.amount ?? 0);
-    const ref = tx.referenceNumber || tx.id;
-    const provRef = tx.paymentProviderRef || '';
-    if (amt <= 0) continue;
-    if (provRef && seenPaymentRefs.has(provRef)) continue;
-    if (seenPaymentRefs.has(ref)) continue;
-    if (provRef) seenPaymentRefs.add(provRef);
-    seenPaymentRefs.add(ref);
-    eligibleDepositRefs.add(ref);
-    qualifyingSum += amt;
-  }
-
-  qualifyingSum = Number(qualifyingSum.toFixed(2));
-  const isEligibleForPayment = qualifyingSum >= WELCOME_REWARD_TARGET;
-  const remainingAmount = Math.max(0, Number((WELCOME_REWARD_TARGET - qualifyingSum).toFixed(2)));
-  const progressPercentage = Math.min(100, Number(((qualifyingSum / WELCOME_REWARD_TARGET) * 100).toFixed(1)));
-
   const idempotencyKey = `MV-RWD-WELCOME-${userId}`;
   const rewardTxId = `tx_rwd_welcome_${userId}`;
 
-  // 4. If qualified, execute atomic idempotent $1,000 credit
-  if (isEligibleForPayment) {
-    if (isFirebaseAdminConfigured() && rewardDocRef) {
-      try {
-        const creditResult = await adminFirestore.runTransaction(async (transaction) => {
-          // Double-check reward record inside transaction lock
-          const rewardSnap = await transaction.get(rewardDocRef);
-          if (rewardSnap.exists) {
-            const rd = rewardSnap.data() as WelcomeRewardInfo;
-            if (rd.status === 'PAID') {
-              return { alreadyPaid: true, record: rd };
-            }
-          }
+  // 3. Authoritative Firestore execution path:
+  //    Revalidate qualifying deposits, existing PAID state, ledger recovery, account credit,
+  //    IN_PROGRESS status updates, and outbox creation inside one atomic Firestore transaction
+  //    with strict read-before-write ordering and zero in-memory fallback contamination.
+  if (adminConfigured && fs && rewardDocRef) {
+    const userRef = fs.collection('users').doc(userId);
+    const accRef = fs.collection('accounts').doc(userId);
+    const rewardTxRef = fs.collection('transactions').doc(rewardTxId);
+    const existingTxQuery = fs
+      .collection('transactions')
+      .where('referenceNumber', '==', idempotencyKey)
+      .limit(1);
+    const txQueryA = fs
+      .collection('transactions')
+      .where('userId', '==', userId)
+      .where('type', '==', 'DEPOSIT')
+      .where('status', '==', 'COMPLETED');
+    const txQueryB = fs
+      .collection('transactions')
+      .where('recipientUserId', '==', userId)
+      .where('type', '==', 'DEPOSIT')
+      .where('status', '==', 'COMPLETED');
 
-          // Double-check if reward transaction already exists in ledger
-          const existingTxSnap = await transaction.get(
-            adminFirestore.collection('transactions').where('referenceNumber', '==', idempotencyKey).limit(1)
-          );
-          if (!existingTxSnap.empty) {
-            const existingTx = existingTxSnap.docs[0].data() as Transaction;
-            const updatedRecord: WelcomeRewardInfo = {
-              userId,
-              rewardAmount: WELCOME_REWARD_AMOUNT,
-              targetAmount: WELCOME_REWARD_TARGET,
-              qualifyingDeposits: qualifyingSum,
-              progressPercentage: 100,
-              remainingAmount: 0,
-              status: 'PAID',
-              qualifyingDepositCount: eligibleDepositRefs.size,
-              paidAt: existingTx.completedAt || existingTx.createdAt || nowIso,
-              transactionReference: idempotencyKey,
-              transactionId: existingTx.id,
-              customerName,
-              permanentAccountNumber,
-              registrationDate,
-              updatedAt: nowIso,
-            };
-            transaction.set(rewardDocRef, updatedRecord, { merge: true });
-            return { alreadyPaid: true, record: updatedRecord };
-          }
+    // Attempt-scoped closure state (reset at the start of every Firestore retry)
+    let outboxWriteResult: WrittenOutboxBatchResult | null = null;
+    let attemptQualifyingSum = 0;
+    let attemptEligibleCount = 0;
+    let attemptWasEligible = false;
+    let attemptNowIso = new Date().toISOString();
 
-          // Read customer account document
-          const accRef = adminFirestore.collection('accounts').doc(userId);
-          const accSnap = await transaction.get(accRef);
+    try {
+      const txOutcome = await fs.runTransaction(async (transaction) => {
+        outboxWriteResult = null;
+        attemptQualifyingSum = 0;
+        attemptEligibleCount = 0;
+        attemptWasEligible = false;
+        attemptNowIso = new Date().toISOString();
+        const nowIso = attemptNowIso;
 
-          let currentChecking = 0;
-          let currentSavings = 0;
-          let currentInvested = 0;
-          let currentAccrued = 0;
-          let accountsList: BankAccount[] = [];
+        // READ PHASE (ALL tx.get calls strictly precede ALL tx.set calls)
+        const [rewardSnap, existingTxSnap, rewardTxSnap, userSnap, txQueryASnap, txQueryBSnap] =
+          await Promise.all([
+            transaction.get(rewardDocRef),
+            transaction.get(existingTxQuery),
+            transaction.get(rewardTxRef),
+            transaction.get(userRef),
+            transaction.get(txQueryA),
+            transaction.get(txQueryB),
+          ]);
 
-          if (accSnap.exists) {
-            const d = accSnap.data()!;
-            currentChecking = Number(d.checkingBalance ?? d.availableBalance ?? 0);
-            currentSavings = Number(d.savingsBalance ?? d.savings ?? 0);
-            currentInvested = Number(d.investedBalance ?? d.investmentBalance ?? 0);
-            currentAccrued = Number(d.accruedEarnings ?? 0);
-            if (Array.isArray(d.accounts) && d.accounts.length > 0) {
-              accountsList = d.accounts;
-            }
-          }
+        let txCustomerName = customerName;
+        let txPan = permanentAccountNumber;
+        let txRegistrationDate = registrationDate;
+        if (userSnap.exists) {
+          const ud = userSnap.data()!;
+          txCustomerName = `${ud.firstName || ''} ${ud.lastName || ''}`.trim() || ud.username || txCustomerName;
+          txPan = ud.permanentAccountNumber || ud.accountNumber || txPan;
+          txRegistrationDate = ud.createdAt || txRegistrationDate;
+        }
 
-          // Credit $1,000 to Premier Checking
-          const newChecking = Number((currentChecking + WELCOME_REWARD_AMOUNT).toFixed(2));
-          const newTotal = Number((newChecking + currentSavings + currentInvested + currentAccrued).toFixed(2));
-          const newAvailable = newChecking;
+        // Recompute authoritative USD completed deposits strictly from Firestore snapshots
+        const combinedDocs = new Map<string, { id: string; data: Record<string, any> }>();
+        txQueryASnap.docs.forEach((d) => combinedDocs.set(d.id, { id: d.id, data: d.data() }));
+        txQueryBSnap.docs.forEach((d) => combinedDocs.set(d.id, { id: d.id, data: d.data() }));
 
-          const updatedAccounts = accountsList.length > 0
-            ? accountsList.map((a) => {
-                if (a.type === 'CHECKING') {
-                  return { ...a, balance: newChecking, availableBalance: newChecking };
-                }
-                return a;
-              })
-            : buildDefaultAccounts(userId, newChecking, currentSavings, currentInvested, permanentAccountNumber);
+        const { qualifyingSum, eligibleDepositRefs } = aggregateQualifyingUsdDeposits(combinedDocs.values());
+        attemptQualifyingSum = qualifyingSum;
+        attemptEligibleCount = eligibleDepositRefs.size;
 
-          const finalMetrics: BalanceMetrics = {
-            checkingBalance: newChecking,
-            savingsBalance: currentSavings,
-            investedBalance: currentInvested,
-            accruedEarnings: currentAccrued,
-            totalBalance: newTotal,
-            availableBalance: newAvailable,
-            pendingBalance: 0,
-            accounts: updatedAccounts,
-          };
+        const existingRewardData = rewardSnap.exists ? (rewardSnap.data() as WelcomeRewardInfo) : undefined;
+        const preservedRegistrationDate = existingRewardData?.registrationDate || txRegistrationDate;
 
-          // Build permanent Welcome Reward transaction record
-          const rewardTx: Transaction = {
-            id: rewardTxId,
-            referenceNumber: idempotencyKey,
-            type: 'WELCOME_REWARD',
-            amount: WELCOME_REWARD_AMOUNT,
-            currency: 'USD',
-            status: 'COMPLETED',
-            userId,
-            recipientUserId: userId,
-            recipientAccountNumber: permanentAccountNumber,
-            recipientName: customerName,
-            senderName: 'Monvera Executive Treasury',
-            senderAccountNumber: 'MONVERA-TREASURY-001',
-            fee: 0.0,
-            description: 'Monvera $1,000 New User Welcome Reward',
-            category: 'Rewards',
-            paymentProviderRef: idempotencyKey,
-            createdAt: nowIso,
-            completedAt: nowIso,
-            metadata: {
-              rewardProgram: 'NEW_USER_WELCOME_1000',
-              qualifyingDepositsVerified: qualifyingSum,
-              depositTarget: WELCOME_REWARD_TARGET,
-              creditedAt: nowIso,
-              isWelcomeReward: true,
+        // Guard 1: Reward already marked PAID must NEVER regress or duplicate
+        if (existingRewardData?.status === 'PAID') {
+          return {
+            action: 'ALREADY_PAID' as const,
+            record: {
+              ...existingRewardData,
+              customerName: existingRewardData.customerName || txCustomerName,
+              permanentAccountNumber: existingRewardData.permanentAccountNumber || txPan,
+              registrationDate: preservedRegistrationDate,
             },
           };
+        }
 
-          const rewardRecord: WelcomeRewardInfo = {
+        // Guard 2: Existing reward transaction in ledger recovers PAID cleanly without double payout
+        const recoveredTxDoc = !existingTxSnap.empty
+          ? (existingTxSnap.docs[0].data() as Transaction)
+          : rewardTxSnap.exists
+            ? (rewardTxSnap.data() as Transaction)
+            : null;
+        if (recoveredTxDoc) {
+          const recoveredRecord: WelcomeRewardInfo = {
+            ...(existingRewardData || {}),
+            userId,
+            rewardAmount: WELCOME_REWARD_AMOUNT,
+            targetAmount: WELCOME_REWARD_TARGET,
+            qualifyingDeposits: Math.max(qualifyingSum, Number(existingRewardData?.qualifyingDeposits ?? 0)),
+            progressPercentage: 100,
+            remainingAmount: 0,
+            status: 'PAID',
+            qualifyingDepositCount: Math.max(
+              eligibleDepositRefs.size,
+              Number(existingRewardData?.qualifyingDepositCount ?? 0)
+            ),
+            paidAt: recoveredTxDoc.completedAt || recoveredTxDoc.createdAt || existingRewardData?.paidAt || nowIso,
+            transactionReference: idempotencyKey,
+            transactionId: recoveredTxDoc.id || rewardTxId,
+            customerName: txCustomerName,
+            permanentAccountNumber: txPan,
+            registrationDate: preservedRegistrationDate,
+            updatedAt: nowIso,
+          };
+          transaction.set(rewardDocRef, recoveredRecord, { merge: true });
+          return { action: 'ALREADY_PAID' as const, record: recoveredRecord };
+        }
+
+        const isEligibleForPayment = qualifyingSum >= WELCOME_REWARD_TARGET;
+        attemptWasEligible = isEligibleForPayment;
+
+        // Guard 3: Below-threshold path — awaited transactional write protected against concurrent PAID commits
+        if (!isEligibleForPayment) {
+          const remainingAmount = Math.max(0, Number((WELCOME_REWARD_TARGET - qualifyingSum).toFixed(2)));
+          const progressPercentage = Math.min(
+            100,
+            Number(((qualifyingSum / WELCOME_REWARD_TARGET) * 100).toFixed(1))
+          );
+
+          const inProgressRecord: WelcomeRewardInfo = {
             userId,
             rewardAmount: WELCOME_REWARD_AMOUNT,
             targetAmount: WELCOME_REWARD_TARGET,
             qualifyingDeposits: qualifyingSum,
-            progressPercentage: 100,
-            remainingAmount: 0,
-            status: 'PAID',
+            progressPercentage,
+            remainingAmount,
+            status: 'IN_PROGRESS',
             qualifyingDepositCount: eligibleDepositRefs.size,
-            paidAt: nowIso,
-            transactionReference: idempotencyKey,
-            transactionId: rewardTxId,
-            customerName,
-            permanentAccountNumber,
-            registrationDate,
+            customerName: txCustomerName,
+            permanentAccountNumber: txPan,
+            registrationDate: preservedRegistrationDate,
             updatedAt: nowIso,
           };
 
-          // 1. Commit balance updates to account document
-          transaction.set(accRef, { userId, ...finalMetrics, updatedAt: nowIso }, { merge: true });
-
-          // 2. Commit permanent transaction ledger record
-          transaction.set(adminFirestore.collection('transactions').doc(rewardTxId), rewardTx, { merge: true });
-
-          // 3. Commit reward status as PAID
-          transaction.set(rewardDocRef, rewardRecord, { merge: true });
-
-          return { alreadyPaid: false, record: rewardRecord };
-        });
-
-        // Dispatch asynchronous customer notification (deterministic ID prevents duplicates)
-        if (!creditResult.alreadyPaid) {
-          persistCustomerNotification({
-            id: `notif_welcome_${userId}`,
-            userId,
-            title: 'Welcome Reward Credited! 🎉',
-            message: `Congratulations! You completed $10,000 in qualifying deposits and your $1,000.00 Welcome Reward has been credited to your Monvera Checking Account.`,
-            type: 'TRANSACTION',
-            severity: 'success',
-            createdAt: nowIso,
-            referenceId: idempotencyKey,
-            actionView: 'transactions',
-            actionRecordId: rewardTxId,
-            metadata: {
-              category: 'TRANSACTION',
-              eventType: 'WELCOME_REWARD',
-              customerName,
-              accountNumberMasked: maskAccountNumber(permanentAccountNumber),
-              transactionType: 'WELCOME_REWARD',
-              direction: 'CREDIT',
-              amount: WELCOME_REWARD_AMOUNT,
-              currency: 'USD',
-              status: 'COMPLETED',
-              referenceNumber: idempotencyKey,
-              date: nowIso,
-            },
-          }).catch((e) => console.warn('[WelcomeReward] Notification error:', e?.message || e));
+          transaction.set(rewardDocRef, inProgressRecord, { merge: true });
+          return { action: 'IN_PROGRESS' as const, record: inProgressRecord };
         }
 
-        // Mirror in memory db
-        syncRewardToMemoryDb(creditResult.record);
+        // Eligible path: complete remaining READS before ANY transaction.set(...)
+        const accSnap = await transaction.get(accRef);
 
-        return creditResult.record;
-      } catch (err: any) {
-        console.error(`[WelcomeReward] Error executing reward credit for ${userId}:`, err);
-        // Fallback: return qualified with error note
-        return {
-          userId,
-          rewardAmount: WELCOME_REWARD_AMOUNT,
-          targetAmount: WELCOME_REWARD_TARGET,
-          qualifyingDeposits: qualifyingSum,
-          progressPercentage: 100,
-          remainingAmount: 0,
-          status: 'QUALIFIED',
-          qualifyingDepositCount: eligibleDepositRefs.size,
-          customerName,
-          permanentAccountNumber,
-          registrationDate,
-          updatedAt: nowIso,
-          failureReason: err?.message || 'Transaction credit failed',
+        let currentChecking = 0;
+        let currentSavings = 0;
+        let currentInvested = 0;
+        let currentAccrued = 0;
+        let accountsList: BankAccount[] = [];
+
+        if (accSnap.exists) {
+          const d = accSnap.data()!;
+          currentChecking = Number(d.checkingBalance ?? d.availableBalance ?? 0);
+          currentSavings = Number(d.savingsBalance ?? d.savings ?? 0);
+          currentInvested = Number(d.investedBalance ?? d.investmentBalance ?? 0);
+          currentAccrued = Number(d.accruedEarnings ?? 0);
+          if (Array.isArray(d.accounts) && d.accounts.length > 0) {
+            accountsList = d.accounts;
+          }
+        }
+
+        // Credit $1,000 to Premier Checking
+        const newChecking = Number((currentChecking + WELCOME_REWARD_AMOUNT).toFixed(2));
+        const newTotal = Number((newChecking + currentSavings + currentInvested + currentAccrued).toFixed(2));
+        const newAvailable = newChecking;
+
+        const updatedAccounts = accountsList.length > 0
+          ? accountsList.map((a) => {
+              if (a.type === 'CHECKING') {
+                return { ...a, balance: newChecking, availableBalance: newChecking };
+              }
+              return a;
+            })
+          : buildDefaultAccounts(userId, newChecking, currentSavings, currentInvested, txPan);
+
+        const finalMetrics: BalanceMetrics = {
+          checkingBalance: newChecking,
+          savingsBalance: currentSavings,
+          investedBalance: currentInvested,
+          accruedEarnings: currentAccrued,
+          totalBalance: newTotal,
+          availableBalance: newAvailable,
+          pendingBalance: 0,
+          accounts: updatedAccounts,
         };
-      }
-    } else {
-      // Memory DB fallback implementation
-      const existingTx = db.transactions.find((t) => t.referenceNumber === idempotencyKey);
-      if (!existingTx) {
+
+        // Build permanent Welcome Reward transaction record
         const rewardTx: Transaction = {
           id: rewardTxId,
           referenceNumber: idempotencyKey,
@@ -403,8 +403,8 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
           status: 'COMPLETED',
           userId,
           recipientUserId: userId,
-          recipientAccountNumber: permanentAccountNumber,
-          recipientName: customerName,
+          recipientAccountNumber: txPan,
+          recipientName: txCustomerName,
           senderName: 'Monvera Executive Treasury',
           senderAccountNumber: 'MONVERA-TREASURY-001',
           fee: 0.0,
@@ -422,66 +422,253 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
           },
         };
 
-        db.transactions.unshift(rewardTx);
-
-        // Credit memory checking account
-        const chkId = `acc_chk_${userId}`;
-        const chkAcc = db.accounts.get(chkId);
-        if (chkAcc) {
-          chkAcc.balance = Number((chkAcc.balance + WELCOME_REWARD_AMOUNT).toFixed(2));
-          chkAcc.availableBalance = chkAcc.balance;
-          db.accounts.set(chkId, chkAcc);
-        }
-
-        db.ledgerEntries.push({
-          id: `led_rwd_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          transactionId: rewardTxId,
+        const rewardRecord: WelcomeRewardInfo = {
           userId,
-          accountId: chkId,
-          entryType: 'CREDIT',
-          amount: WELCOME_REWARD_AMOUNT,
-          balanceAfter: chkAcc?.balance || WELCOME_REWARD_AMOUNT,
-          description: rewardTx.description,
-          timestamp: nowIso,
-        });
+          rewardAmount: WELCOME_REWARD_AMOUNT,
+          targetAmount: WELCOME_REWARD_TARGET,
+          qualifyingDeposits: qualifyingSum,
+          progressPercentage: 100,
+          remainingAmount: 0,
+          status: 'PAID',
+          qualifyingDepositCount: eligibleDepositRefs.size,
+          paidAt: nowIso,
+          transactionReference: idempotencyKey,
+          transactionId: rewardTxId,
+          customerName: txCustomerName,
+          permanentAccountNumber: txPan,
+          registrationDate: preservedRegistrationDate,
+          updatedAt: nowIso,
+        };
 
-        db.notifications.unshift({
-          id: `notif_rwd_${Date.now()}`,
+        // Transaction read-phase: prepare MONEY_RECEIVED outbox record strictly BEFORE any writes
+        const rewardAmtFormatted = WELCOME_REWARD_AMOUNT.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        });
+        const safeRewardAccountMasked = formatSafeOutboxAccountLabel(txPan, 'Checking');
+
+        const welcomeRewardOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
+          {
+            userId,
+            transactionId: rewardTx.id,
+            referenceNumber: rewardTx.referenceNumber,
+            eventKey: `${rewardTx.id}:COMPLETED`,
+            lifecycleStage: 'COMPLETED',
+            dispatchType: 'MONEY_RECEIVED',
+            category: 'TRANSACTION',
+            nowIso,
+            payload: {
+              title: 'Welcome Reward Credited — Monvera',
+              body: `Congratulations! Your $${rewardAmtFormatted} Monvera Welcome Reward has been credited to ${safeRewardAccountMasked}.`,
+              actionUrl: '/dashboard?view=transactions',
+              amount: WELCOME_REWARD_AMOUNT,
+              currency: 'USD',
+              senderName: 'Monvera Executive Treasury',
+              recipientName: txCustomerName,
+              accountMasked: safeRewardAccountMasked,
+            },
+          },
+        ]);
+
+        // WRITE PHASE
+        // 1. Commit balance updates to account document
+        transaction.set(accRef, { userId, ...finalMetrics, updatedAt: nowIso }, { merge: true });
+
+        // 2. Commit permanent transaction ledger record
+        transaction.set(rewardTxRef, rewardTx, { merge: true });
+
+        // 3. Commit reward status as PAID
+        transaction.set(rewardDocRef, rewardRecord, { merge: true });
+
+        // 4. Commit durable notification outbox record atomically
+        outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(
+          transaction,
+          welcomeRewardOutboxBatch
+        );
+
+        return { action: 'NEWLY_PAID' as const, record: rewardRecord };
+      });
+
+      // Dispatch asynchronous customer notification only on newly committed payout
+      if (txOutcome.action === 'NEWLY_PAID') {
+        reportOutboxPreparationIssues('evaluateAndProcessWelcomeReward', rewardTxId, outboxWriteResult);
+        const notifyFn = deps?.persistNotification || persistCustomerNotification;
+        notifyFn({
+          id: `notif_welcome_${userId}`,
           userId,
           title: 'Welcome Reward Credited! 🎉',
-          message: `Congratulations! You completed $10,000 in qualifying deposits and your $1,000 Welcome Reward has been credited to your Monvera Checking Account.`,
+          message: `Congratulations! You completed $10,000 in qualifying deposits and your $1,000.00 Welcome Reward has been credited to your Monvera Checking Account.`,
           type: 'TRANSACTION',
           severity: 'success',
-          read: false,
-          createdAt: nowIso,
+          createdAt: txOutcome.record.paidAt || attemptNowIso,
           referenceId: idempotencyKey,
-        });
+          actionView: 'transactions',
+          actionRecordId: rewardTxId,
+          metadata: {
+            category: 'TRANSACTION',
+            eventType: 'WELCOME_REWARD',
+            customerName: txOutcome.record.customerName || customerName,
+            accountNumberMasked: maskAccountNumber(txOutcome.record.permanentAccountNumber || permanentAccountNumber),
+            transactionType: 'WELCOME_REWARD',
+            direction: 'CREDIT',
+            amount: WELCOME_REWARD_AMOUNT,
+            currency: 'USD',
+            status: 'COMPLETED',
+            referenceNumber: idempotencyKey,
+            date: txOutcome.record.paidAt || attemptNowIso,
+          },
+        }).catch((e) => console.warn('[WelcomeReward] Notification error:', e?.message || e));
       }
 
-      const memoryRecord: WelcomeRewardInfo = {
+      // Mirror in memory db (guarded so PAID never regresses)
+      syncRewardToMemoryDb(txOutcome.record);
+      return txOutcome.record;
+    } catch (err: any) {
+      console.error(`[WelcomeReward] Error executing reward evaluation/credit for ${userId}:`, err);
+      // Do not overwrite an already-committed PAID reward on error/failure
+      try {
+        const latestSnap = await rewardDocRef.get();
+        if (latestSnap.exists) {
+          const latestData = latestSnap.data() as WelcomeRewardInfo;
+          if (latestData.status === 'PAID') {
+            syncRewardToMemoryDb(latestData);
+            return latestData;
+          }
+        }
+      } catch {
+        // Ignore follow-up read errors in fallback path
+      }
+
+      const remainingAmount = Math.max(0, Number((WELCOME_REWARD_TARGET - attemptQualifyingSum).toFixed(2)));
+      const progressPercentage = Math.min(
+        100,
+        Number(((attemptQualifyingSum / WELCOME_REWARD_TARGET) * 100).toFixed(1))
+      );
+
+      return {
         userId,
         rewardAmount: WELCOME_REWARD_AMOUNT,
         targetAmount: WELCOME_REWARD_TARGET,
-        qualifyingDeposits: qualifyingSum,
-        progressPercentage: 100,
-        remainingAmount: 0,
-        status: 'PAID',
-        qualifyingDepositCount: eligibleDepositRefs.size,
-        paidAt: nowIso,
-        transactionReference: idempotencyKey,
-        transactionId: rewardTxId,
+        qualifyingDeposits: attemptQualifyingSum,
+        progressPercentage: attemptWasEligible ? 100 : progressPercentage,
+        remainingAmount: attemptWasEligible ? 0 : remainingAmount,
+        status: attemptWasEligible ? 'QUALIFIED' : 'IN_PROGRESS',
+        qualifyingDepositCount: attemptEligibleCount,
         customerName,
         permanentAccountNumber,
         registrationDate,
-        updatedAt: nowIso,
+        updatedAt: attemptNowIso,
+        failureReason: err?.message || 'Transaction credit failed',
       };
-
-      syncRewardToMemoryDb(memoryRecord);
-      return memoryRecord;
     }
   }
 
-  // 5. Still in progress
+  // 4. Non-Firestore / In-Memory-Only Fallback Path (strictly applies identical USD/completed/non-reversed rules)
+  const existingMemReward = memoryRewardStore.get(userId);
+  if (existingMemReward?.status === 'PAID') {
+    return existingMemReward;
+  }
+
+  const nowIso = new Date().toISOString();
+  const memoryEntries = db.transactions
+    .filter((t) => t.userId === userId || t.recipientUserId === userId)
+    .map((t) => ({ id: t.id, data: t as Record<string, any> }));
+
+  const { qualifyingSum, eligibleDepositRefs } = aggregateQualifyingUsdDeposits(memoryEntries);
+  const isEligibleForPayment = qualifyingSum >= WELCOME_REWARD_TARGET;
+  const remainingAmount = Math.max(0, Number((WELCOME_REWARD_TARGET - qualifyingSum).toFixed(2)));
+  const progressPercentage = Math.min(100, Number(((qualifyingSum / WELCOME_REWARD_TARGET) * 100).toFixed(1)));
+
+  if (isEligibleForPayment) {
+    const existingTx = db.transactions.find((t) => t.referenceNumber === idempotencyKey || t.id === rewardTxId);
+    if (!existingTx) {
+      const rewardTx: Transaction = {
+        id: rewardTxId,
+        referenceNumber: idempotencyKey,
+        type: 'WELCOME_REWARD',
+        amount: WELCOME_REWARD_AMOUNT,
+        currency: 'USD',
+        status: 'COMPLETED',
+        userId,
+        recipientUserId: userId,
+        recipientAccountNumber: permanentAccountNumber,
+        recipientName: customerName,
+        senderName: 'Monvera Executive Treasury',
+        senderAccountNumber: 'MONVERA-TREASURY-001',
+        fee: 0.0,
+        description: 'Monvera $1,000 New User Welcome Reward',
+        category: 'Rewards',
+        paymentProviderRef: idempotencyKey,
+        createdAt: nowIso,
+        completedAt: nowIso,
+        metadata: {
+          rewardProgram: 'NEW_USER_WELCOME_1000',
+          qualifyingDepositsVerified: qualifyingSum,
+          depositTarget: WELCOME_REWARD_TARGET,
+          creditedAt: nowIso,
+          isWelcomeReward: true,
+        },
+      };
+
+      db.transactions.unshift(rewardTx);
+
+      // Credit memory checking account
+      const chkId = `acc_chk_${userId}`;
+      const chkAcc = db.accounts.get(chkId);
+      if (chkAcc) {
+        chkAcc.balance = Number((chkAcc.balance + WELCOME_REWARD_AMOUNT).toFixed(2));
+        chkAcc.availableBalance = chkAcc.balance;
+        db.accounts.set(chkId, chkAcc);
+      }
+
+      db.ledgerEntries.push({
+        id: `led_rwd_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        transactionId: rewardTxId,
+        userId,
+        accountId: chkId,
+        entryType: 'CREDIT',
+        amount: WELCOME_REWARD_AMOUNT,
+        balanceAfter: chkAcc?.balance || WELCOME_REWARD_AMOUNT,
+        description: rewardTx.description,
+        timestamp: nowIso,
+      });
+
+      db.notifications.unshift({
+        id: `notif_rwd_${Date.now()}`,
+        userId,
+        title: 'Welcome Reward Credited! 🎉',
+        message: `Congratulations! You completed $10,000 in qualifying deposits and your $1,000 Welcome Reward has been credited to your Monvera Checking Account.`,
+        type: 'TRANSACTION',
+        severity: 'success',
+        read: false,
+        createdAt: nowIso,
+        referenceId: idempotencyKey,
+      });
+    }
+
+    const memoryRecord: WelcomeRewardInfo = {
+      userId,
+      rewardAmount: WELCOME_REWARD_AMOUNT,
+      targetAmount: WELCOME_REWARD_TARGET,
+      qualifyingDeposits: qualifyingSum,
+      progressPercentage: 100,
+      remainingAmount: 0,
+      status: 'PAID',
+      qualifyingDepositCount: eligibleDepositRefs.size,
+      paidAt: existingTx?.completedAt || existingTx?.createdAt || nowIso,
+      transactionReference: idempotencyKey,
+      transactionId: existingTx?.id || rewardTxId,
+      customerName,
+      permanentAccountNumber,
+      registrationDate,
+      updatedAt: nowIso,
+    };
+
+    syncRewardToMemoryDb(memoryRecord);
+    return memoryRecord;
+  }
+
+  // Fallback in-progress (only when Firestore is unavailable)
   const inProgressRecord: WelcomeRewardInfo = {
     userId,
     rewardAmount: WELCOME_REWARD_AMOUNT,
@@ -497,13 +684,7 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
     updatedAt: nowIso,
   };
 
-  if (rewardDocRef) {
-    rewardDocRef.set(inProgressRecord, { merge: true }).catch((e) =>
-      console.warn(`[WelcomeReward] In-progress record write note:`, e?.message || e)
-    );
-  }
   syncRewardToMemoryDb(inProgressRecord);
-
   return inProgressRecord;
 }
 
@@ -511,6 +692,10 @@ export async function evaluateAndProcessWelcomeReward(userId: string): Promise<W
 const memoryRewardStore = new Map<string, WelcomeRewardInfo>();
 
 function syncRewardToMemoryDb(record: WelcomeRewardInfo) {
+  const existingMem = memoryRewardStore.get(record.userId);
+  if (existingMem?.status === 'PAID' && record.status !== 'PAID') {
+    return;
+  }
   memoryRewardStore.set(record.userId, record);
   if (record.status === 'PAID') {
     const chkId = `acc_chk_${record.userId}`;
