@@ -1111,6 +1111,591 @@ export async function executeServerTransfer(
   }
 }
 
+export interface InternalTransferParams {
+  userId: string;
+  fromAccountType: 'CHECKING' | 'SAVINGS';
+  toAccountType: 'CHECKING' | 'SAVINGS';
+  amount: number;
+  description?: string;
+  idempotencyKey: string;
+}
+
+export interface InternalTransferResult {
+  success: boolean;
+  transaction?: Transaction;
+  balanceMetrics?: BalanceMetrics;
+  isDuplicate?: boolean;
+  statusCode?: number;
+  errorCode?: string;
+  error?: string;
+}
+
+export interface InternalTransferDeps extends ServerTransactionDeps {
+  prepareOutboxBatch?: typeof prepareNotificationOutboxBatch;
+}
+
+export class InternalTransferError extends Error {
+  statusCode: number;
+  errorCode: string;
+
+  constructor(message: string, statusCode = 400, errorCode = 'INTERNAL_TRANSFER_ERROR') {
+    super(message);
+    this.name = 'InternalTransferError';
+    this.statusCode = statusCode;
+    this.errorCode = errorCode;
+  }
+}
+
+function hasInternalTransferControlChars(value: string): boolean {
+  return /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(value);
+}
+
+/**
+ * Server-authoritative internal account transfer (Checking <-> Savings) inside a single Firestore transaction.
+ * Fail-closed when Firestore is not configured; enforces idempotency, sub-account status/ownership,
+ * integer-cent precision, availableBalance == checkingBalance parity, and atomic notification_outbox writes.
+ */
+export async function executeServerInternalTransfer(
+  params: InternalTransferParams,
+  deps?: InternalTransferDeps
+): Promise<InternalTransferResult> {
+  const cleanUserId = typeof params?.userId === 'string' ? params.userId.trim() : '';
+  if (!cleanUserId || hasInternalTransferControlChars(cleanUserId)) {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'INVALID_USER_ID',
+      error: 'Valid customer user ID is required.',
+    };
+  }
+
+  const fromAccountType = params?.fromAccountType;
+  const toAccountType = params?.toAccountType;
+  if (
+    (fromAccountType !== 'CHECKING' && fromAccountType !== 'SAVINGS') ||
+    (toAccountType !== 'CHECKING' && toAccountType !== 'SAVINGS')
+  ) {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'INVALID_ACCOUNT_TYPE',
+      error: 'Source and destination accounts must be CHECKING or SAVINGS.',
+    };
+  }
+
+  if (fromAccountType === toAccountType) {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'SAME_ACCOUNT_TRANSFER',
+      error: 'Source and destination accounts must be different.',
+    };
+  }
+
+  const rawAmount = params?.amount;
+  if (typeof rawAmount !== 'number' || !Number.isFinite(rawAmount) || rawAmount <= 0) {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'INVALID_AMOUNT',
+      error: 'Transfer amount must be a positive finite USD amount.',
+    };
+  }
+
+  const scaledCents = rawAmount * 100;
+  const amountCents = Math.round(scaledCents);
+  if (Math.abs(scaledCents - amountCents) > 1e-6 || amountCents < 1) {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'INVALID_AMOUNT',
+      error: 'Transfer amount must be at least $0.01 USD with at most 2 decimal places.',
+    };
+  }
+  const amountDollars = Number((amountCents / 100).toFixed(2));
+
+  const rawIdempotencyKey = params?.idempotencyKey;
+  if (typeof rawIdempotencyKey !== 'string') {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'IDEMPOTENCY_KEY_REQUIRED',
+      error: 'Valid idempotencyKey is required.',
+    };
+  }
+  const cleanIdempotencyKey = rawIdempotencyKey.trim();
+  if (
+    !cleanIdempotencyKey ||
+    cleanIdempotencyKey.length > 256 ||
+    hasInternalTransferControlChars(cleanIdempotencyKey)
+  ) {
+    return {
+      success: false,
+      statusCode: 400,
+      errorCode: 'IDEMPOTENCY_KEY_REQUIRED',
+      error: 'idempotencyKey must be 1 to 256 printable characters.',
+    };
+  }
+
+  let cleanDescription = '';
+  if (params?.description !== undefined) {
+    if (typeof params.description !== 'string' || hasInternalTransferControlChars(params.description)) {
+      return {
+        success: false,
+        statusCode: 400,
+        errorCode: 'INVALID_DESCRIPTION',
+        error: 'Description must be plain printable text.',
+      };
+    }
+    cleanDescription = params.description.replace(/\s+/g, ' ').trim().slice(0, 180);
+  }
+
+  const fs = deps?.firestore || adminFirestore;
+  const adminConfigured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+  if (!adminConfigured) {
+    return {
+      success: false,
+      statusCode: 503,
+      errorCode: 'FIRESTORE_NOT_CONFIGURED',
+      error: 'Database service unavailable: internal transfers require persistent Firestore storage.',
+    };
+  }
+
+  const prepareOutboxBatch = deps?.prepareOutboxBatch || prepareNotificationOutboxBatch;
+
+  const idempDocId = crypto
+    .createHash('sha256')
+    .update(`${cleanUserId}\0${cleanIdempotencyKey}`)
+    .digest('hex');
+
+  const requestFingerprint = crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        userId: cleanUserId,
+        fromAccountType,
+        toAccountType,
+        amountCents,
+      })
+    )
+    .digest('hex');
+
+  const txId = `tx_int_${idempDocId.slice(0, 20)}`;
+  const referenceNumber = `MV-INT-${idempDocId.slice(0, 12).toUpperCase()}`;
+
+  const idempRef = fs.collection('internal_transfer_idempotency').doc(idempDocId);
+  const userRef = fs.collection('users').doc(cleanUserId);
+  const accRef = fs.collection('accounts').doc(cleanUserId);
+  const txRef = fs.collection('transactions').doc(txId);
+
+  let finalTx: Transaction | null = null;
+  let finalMetrics: BalanceMetrics | null = null;
+  let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
+  let customerName = 'Monvera Client';
+  let customerPrimaryAccount = '1000000000';
+
+  try {
+    await fs.runTransaction(async (transaction) => {
+      // Reset attempt-scoped state so OCC retries cannot leak stale results
+      finalTx = null;
+      finalMetrics = null;
+      isDuplicate = false;
+      outboxWriteResult = null;
+      customerName = 'Monvera Client';
+      customerPrimaryAccount = '1000000000';
+
+      // Phase 1: Execute ALL reads strictly before any writes
+      const [idempSnap, userSnap, accSnap] = await Promise.all([
+        transaction.get(idempRef),
+        transaction.get(userRef),
+        transaction.get(accRef),
+      ]);
+
+      if (!userSnap.exists) {
+        throw new InternalTransferError('Customer user profile not found.', 404, 'USER_NOT_FOUND');
+      }
+
+      const userData = userSnap.data() || {};
+      if (String(userData.status || '').toLowerCase() === 'frozen') {
+        throw new InternalTransferError(
+          'Your account is currently restricted/frozen. Internal transfers are disabled. Please contact compliance support.',
+          403,
+          'ACCOUNT_FROZEN'
+        );
+      }
+
+      customerName =
+        String(
+          userData.verifiedLegalName ||
+            userData.kycFullName ||
+            userData.fullName ||
+            `${userData.firstName || ''} ${userData.lastName || ''}`.trim() ||
+            userData.username ||
+            'Monvera Client'
+        ).trim() || 'Monvera Client';
+
+      const accDataFromRead = accSnap.exists ? accSnap.data()! : null;
+      customerPrimaryAccount = String(
+        userData.permanentAccountNumber ||
+          userData.accountNumber ||
+          accDataFromRead?.permanentAccountNumber ||
+          accDataFromRead?.accountNumber ||
+          '1000000000'
+      );
+
+      // Idempotency replay check (read existing authoritative transaction doc during read phase)
+      if (idempSnap.exists) {
+        const existingIdemp = idempSnap.data()!;
+        if (existingIdemp.requestFingerprint !== requestFingerprint) {
+          throw new InternalTransferError(
+            'Idempotency key was already used with different internal transfer parameters.',
+            409,
+            'IDEMPOTENCY_CONFLICT'
+          );
+        }
+
+        const existingTxId = String(existingIdemp.transactionId || txId);
+        const existingTxRef = fs.collection('transactions').doc(existingTxId);
+        const existingTxSnap = await transaction.get(existingTxRef);
+
+        if (accDataFromRead) {
+          const chk = Number(accDataFromRead.checkingBalance ?? accDataFromRead.availableBalance ?? 0);
+          const sav = Number(accDataFromRead.savingsBalance ?? accDataFromRead.savings ?? 0);
+          const inv = Number(accDataFromRead.investedBalance ?? accDataFromRead.investmentBalance ?? 0);
+          const accr = Number(accDataFromRead.accruedEarnings ?? 0);
+          finalMetrics = {
+            checkingBalance: chk,
+            savingsBalance: sav,
+            investedBalance: inv,
+            accruedEarnings: accr,
+            totalBalance: Number((accDataFromRead.totalBalance ?? chk + sav + inv + accr).toFixed(2)),
+            availableBalance: chk,
+            pendingBalance: Number(accDataFromRead.pendingBalance ?? 0),
+            ...(accDataFromRead.loanBalance !== undefined ? { loanBalance: Number(accDataFromRead.loanBalance) } : {}),
+            accounts: Array.isArray(accDataFromRead.accounts) ? accDataFromRead.accounts : [],
+          };
+        }
+
+        finalTx = existingTxSnap.exists
+          ? (existingTxSnap.data() as Transaction)
+          : (existingIdemp.transaction as Transaction);
+        isDuplicate = true;
+        return;
+      }
+
+      if (!accSnap.exists || !accDataFromRead) {
+        throw new InternalTransferError('Customer account record not found.', 404, 'ACCOUNT_NOT_FOUND');
+      }
+
+      if (accDataFromRead.userId && accDataFromRead.userId !== cleanUserId) {
+        throw new InternalTransferError('Account ownership verification failed.', 403, 'ACCOUNT_OWNERSHIP_MISMATCH');
+      }
+
+      const existingAccounts: BankAccount[] = Array.isArray(accDataFromRead.accounts)
+        ? (accDataFromRead.accounts as BankAccount[])
+        : [];
+
+      const existingCheckingAcc = existingAccounts.find((a) => a.type === 'CHECKING');
+      const existingSavingsAcc = existingAccounts.find((a) => a.type === 'SAVINGS');
+      const sourceSubAcc = fromAccountType === 'CHECKING' ? existingCheckingAcc : existingSavingsAcc;
+      const destSubAcc = toAccountType === 'CHECKING' ? existingCheckingAcc : existingSavingsAcc;
+
+      if (
+        (sourceSubAcc?.userId && sourceSubAcc.userId !== cleanUserId) ||
+        (destSubAcc?.userId && destSubAcc.userId !== cleanUserId)
+      ) {
+        throw new InternalTransferError('Sub-account ownership verification failed.', 403, 'ACCOUNT_OWNERSHIP_MISMATCH');
+      }
+
+      if (
+        String(sourceSubAcc?.status || '').toUpperCase() === 'FROZEN' ||
+        String(destSubAcc?.status || '').toUpperCase() === 'FROZEN'
+      ) {
+        throw new InternalTransferError(
+          'Source or destination sub-account is currently frozen. Internal transfers are disabled.',
+          403,
+          'SUBACCOUNT_FROZEN'
+        );
+      }
+
+      const currentCheckingCents = Math.round(
+        Number(accDataFromRead.checkingBalance ?? accDataFromRead.availableBalance ?? 0) * 100
+      );
+      const currentSavingsCents = Math.round(
+        Number(accDataFromRead.savingsBalance ?? accDataFromRead.savings ?? 0) * 100
+      );
+      const currentInvestedCents = Math.round(
+        Number(accDataFromRead.investedBalance ?? accDataFromRead.investmentBalance ?? 0) * 100
+      );
+      const currentAccruedCents = Math.round(Number(accDataFromRead.accruedEarnings ?? 0) * 100);
+      const pendingBalance = Number(accDataFromRead.pendingBalance ?? 0);
+
+      const sourceCents = fromAccountType === 'CHECKING' ? currentCheckingCents : currentSavingsCents;
+      if (sourceCents < amountCents) {
+        throw new InternalTransferError(
+          `Insufficient balance in ${fromAccountType === 'CHECKING' ? 'Checking' : 'Savings'} ($${(sourceCents / 100).toFixed(2)}).`,
+          400,
+          'INSUFFICIENT_FUNDS'
+        );
+      }
+
+      const newCheckingCents =
+        fromAccountType === 'CHECKING' ? currentCheckingCents - amountCents : currentCheckingCents + amountCents;
+      const newSavingsCents =
+        fromAccountType === 'SAVINGS' ? currentSavingsCents - amountCents : currentSavingsCents + amountCents;
+
+      const newChecking = Number((newCheckingCents / 100).toFixed(2));
+      const newSavings = Number((newSavingsCents / 100).toFixed(2));
+      const investedDollars = Number((currentInvestedCents / 100).toFixed(2));
+      const accruedDollars = Number((currentAccruedCents / 100).toFixed(2));
+      const newTotal = Number(
+        ((newCheckingCents + newSavingsCents + currentInvestedCents + currentAccruedCents) / 100).toFixed(2)
+      );
+      const newAvailable = newChecking;
+
+      const defaultAccounts = buildDefaultAccounts(
+        cleanUserId,
+        newChecking,
+        newSavings,
+        investedDollars,
+        customerPrimaryAccount
+      );
+
+      let updatedAccounts: BankAccount[];
+      if (existingAccounts.length > 0) {
+        updatedAccounts = existingAccounts.map((a) => {
+          if (a.type === 'CHECKING') {
+            return { ...a, balance: newChecking, availableBalance: newChecking };
+          }
+          if (a.type === 'SAVINGS') {
+            return { ...a, balance: newSavings, availableBalance: newSavings };
+          }
+          return a;
+        });
+        if (!updatedAccounts.some((a) => a.type === 'CHECKING')) {
+          updatedAccounts.push(defaultAccounts[0]);
+        }
+        if (!updatedAccounts.some((a) => a.type === 'SAVINGS')) {
+          updatedAccounts.push(defaultAccounts[1]);
+        }
+      } else {
+        updatedAccounts = defaultAccounts;
+      }
+
+      finalMetrics = {
+        checkingBalance: newChecking,
+        savingsBalance: newSavings,
+        investedBalance: investedDollars,
+        accruedEarnings: accruedDollars,
+        totalBalance: newTotal,
+        availableBalance: newAvailable,
+        pendingBalance,
+        ...(accDataFromRead.loanBalance !== undefined ? { loanBalance: Number(accDataFromRead.loanBalance) } : {}),
+        accounts: updatedAccounts,
+      };
+
+      const finalCheckingAcc = updatedAccounts.find((a) => a.type === 'CHECKING') || defaultAccounts[0];
+      const finalSavingsAcc = updatedAccounts.find((a) => a.type === 'SAVINGS') || defaultAccounts[1];
+      const sourceAccObj = fromAccountType === 'CHECKING' ? finalCheckingAcc : finalSavingsAcc;
+      const destAccObj = toAccountType === 'CHECKING' ? finalCheckingAcc : finalSavingsAcc;
+
+      const sourceAccountId = sourceAccObj.id || (fromAccountType === 'CHECKING' ? `acc_chk_${cleanUserId}` : `acc_sav_${cleanUserId}`);
+      const destAccountId = destAccObj.id || (toAccountType === 'CHECKING' ? `acc_chk_${cleanUserId}` : `acc_sav_${cleanUserId}`);
+      const sourceAccountNumber = sourceAccObj.accountNumber || customerPrimaryAccount;
+      const destAccountNumber = destAccObj.accountNumber || customerPrimaryAccount;
+
+      const defaultDescription =
+        fromAccountType === 'CHECKING'
+          ? 'Internal Transfer: Checking to Savings'
+          : 'Internal Transfer: Savings to Checking';
+      const nowIso = new Date().toISOString();
+
+      finalTx = {
+        id: txId,
+        referenceNumber,
+        type: 'TRANSFER',
+        amount: amountDollars,
+        currency: 'USD',
+        status: 'COMPLETED',
+        userId: cleanUserId,
+        senderUserId: cleanUserId,
+        senderName: customerName,
+        senderAccountNumber: sourceAccountNumber,
+        recipientUserId: cleanUserId,
+        recipientName: customerName,
+        recipientAccountNumber: destAccountNumber,
+        fee: 0.0,
+        description: cleanDescription || defaultDescription,
+        category: 'Transfers',
+        createdAt: nowIso,
+        completedAt: nowIso,
+        metadata: {
+          isInternalTransfer: true,
+          transferScope: 'INTERNAL_ACCOUNT_TRANSFER',
+          sourceAccountType: fromAccountType,
+          destinationAccountType: toAccountType,
+          sourceAccountId,
+          destinationAccountId: destAccountId,
+          sourceAccountMasked: maskAccountNumber(sourceAccountNumber),
+          destinationAccountMasked: maskAccountNumber(destAccountNumber),
+          idempotencyKey: cleanIdempotencyKey,
+        },
+      };
+
+      // Transaction read-phase: prepare durable notification outbox record strictly BEFORE any writes
+      const sourceLabel = fromAccountType === 'CHECKING' ? 'Checking' : 'Savings';
+      const destLabel = toAccountType === 'CHECKING' ? 'Checking' : 'Savings';
+      const safeSourceMasked = formatSafeOutboxAccountLabel(sourceAccountNumber, sourceLabel);
+      const safeDestMasked = formatSafeOutboxAccountLabel(destAccountNumber, destLabel);
+      const amtFormatted = amountDollars.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+
+      const outboxBatch = await prepareOutboxBatch(transaction, fs, [
+        {
+          userId: cleanUserId,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'TRANSACTION',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Internal Account Transfer Completed — Monvera',
+            body: `$${amtFormatted} transferred from ${safeSourceMasked} to ${safeDestMasked}.`,
+            actionUrl: '/dashboard?view=transactions',
+            amount: amountDollars,
+            currency: 'USD',
+            senderName: customerName,
+            recipientName: customerName,
+            accountMasked: safeSourceMasked,
+          },
+        },
+      ]);
+
+      if (outboxBatch.invalidItems.length > 0) {
+        throw new InternalTransferError(
+          outboxBatch.invalidItems[0].error || 'Failed to prepare durable notification outbox record.',
+          500,
+          'OUTBOX_INVALID_PAYLOAD'
+        );
+      }
+
+      // Phase 2: Atomic commit — accounts, transactions, idempotency, and notification_outbox
+      transaction.set(
+        accRef,
+        {
+          userId: cleanUserId,
+          ...finalMetrics,
+          updatedAt: nowIso,
+        },
+        { merge: true }
+      );
+      transaction.set(txRef, finalTx);
+      transaction.set(idempRef, {
+        idempotencyKey: cleanIdempotencyKey,
+        userId: cleanUserId,
+        requestFingerprint,
+        transactionId: txId,
+        referenceNumber,
+        transaction: finalTx,
+        createdAt: nowIso,
+      });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, outboxBatch);
+    });
+
+    if (finalTx && !isDuplicate) {
+      reportOutboxPreparationIssues('executeServerInternalTransfer', finalTx.id, outboxWriteResult);
+
+      // Keep in-memory compatibility cache updated only after Firestore commit succeeds
+      try {
+        if (finalMetrics) {
+          const chkAcc = db.accounts.get(`acc_chk_${cleanUserId}`);
+          if (chkAcc) {
+            chkAcc.balance = finalMetrics.checkingBalance;
+            chkAcc.availableBalance = finalMetrics.availableBalance;
+          }
+          const savAcc = db.accounts.get(`acc_sav_${cleanUserId}`);
+          if (savAcc) {
+            savAcc.balance = finalMetrics.savingsBalance;
+            savAcc.availableBalance = finalMetrics.savingsBalance;
+          }
+        }
+        if (!db.transactions.some((t) => t.id === finalTx!.id)) {
+          db.transactions.unshift(finalTx);
+        }
+      } catch {}
+
+      const sourceLabel = fromAccountType === 'CHECKING' ? 'Checking' : 'Savings';
+      const destLabel = toAccountType === 'CHECKING' ? 'Checking' : 'Savings';
+      const amtFormatted = amountDollars.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+
+      persistCustomerNotification({
+        id: `notif_int_${finalTx.id}_${cleanUserId}`,
+        userId: cleanUserId,
+        title: 'Internal Account Transfer Completed',
+        message: `$${amtFormatted} transferred from ${sourceLabel} to ${destLabel}. Reference: ${finalTx.referenceNumber}.`,
+        type: 'TRANSACTION',
+        severity: 'success',
+        createdAt: finalTx.createdAt,
+        referenceId: finalTx.referenceNumber,
+        actionView: 'transactions',
+        actionRecordId: finalTx.id,
+        metadata: {
+          category: 'TRANSACTION',
+          eventType: 'INTERNAL_TRANSFER',
+          customerName,
+          accountNumberMasked: maskAccountNumber(customerPrimaryAccount),
+          transactionType: 'INTERNAL_TRANSFER',
+          amount: amountDollars,
+          currency: 'USD',
+          status: finalTx.status,
+          referenceNumber: finalTx.referenceNumber,
+          date: finalTx.createdAt,
+        },
+      }).catch(() => {});
+    }
+
+    if (finalTx) {
+      return {
+        success: true,
+        transaction: finalTx,
+        balanceMetrics: finalMetrics || undefined,
+        isDuplicate,
+      };
+    }
+
+    return {
+      success: false,
+      statusCode: 500,
+      errorCode: 'INTERNAL_TRANSFER_EMPTY_RESULT',
+      error: 'Internal transfer completed without returning transaction record.',
+    };
+  } catch (err: any) {
+    if (err instanceof InternalTransferError) {
+      return {
+        success: false,
+        statusCode: err.statusCode,
+        errorCode: err.errorCode,
+        error: err.message,
+      };
+    }
+    console.error('[executeServerInternalTransfer] Atomic transaction failed:', err);
+    return {
+      success: false,
+      statusCode: 500,
+      errorCode: 'INTERNAL_TRANSFER_FAILED',
+      error: err?.message || 'Server internal transfer transaction failed.',
+    };
+  }
+}
+
 /**
  * Server-authoritative withdrawal inside a single Firestore transaction.
  */

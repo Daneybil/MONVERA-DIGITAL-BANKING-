@@ -24,6 +24,7 @@ import {
 } from './server/wireCheckService';
 import {
   executeServerTransfer,
+  executeServerInternalTransfer,
   executeServerWithdrawal,
   executeServerDeposit,
   executeServerAdminTransfer,
@@ -1322,72 +1323,67 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
   }
 });
 
-// Internal Transfer (between Checking & Savings)
-app.post('/api/transfers/internal', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { userId: reqUserId, fromAccountType, toAccountType, amount, description } = req.body;
-  const callerUid = req.auth?.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-  const userId = (callerUid && !isCallerAdmin) ? callerUid : (reqUserId || callerUid);
+// Internal Transfer (between Checking & Savings — authoritative Firestore transaction + outbox)
+app.post('/api/transfers/internal', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const authUid = req.auth!.uid;
+  const body = req.body || {};
 
-  if (!userId || !fromAccountType || !toAccountType || !amount || amount <= 0) {
-    return res.status(400).json({ error: 'All transfer fields are required.' });
-  }
-
-  // Check account freeze status
-  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
-  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
-  if (userData.status === 'frozen') {
+  // Reject any attempt to spoof another customer's userId
+  if (body.userId !== undefined && body.userId !== null && String(body.userId).trim() !== '' && String(body.userId).trim() !== authUid) {
     return res.status(403).json({
-      error: 'Your account is currently restricted/frozen. Internal transfers are disabled. Please contact compliance support.',
+      success: false,
+      errorCode: 'FORBIDDEN_USER_MISMATCH',
+      error: 'You are not authorized to perform internal transfers for another customer.',
     });
   }
 
-  const metrics = db.getUserBalanceMetrics(userId);
-  const fromAccId = fromAccountType === 'CHECKING' ? `acc_chk_${userId}` : `acc_sav_${userId}`;
-  const toAccId = toAccountType === 'CHECKING' ? `acc_chk_${userId}` : `acc_sav_${userId}`;
+  const rawAmount = body.amount;
+  const parsedAmount =
+    typeof rawAmount === 'number'
+      ? rawAmount
+      : typeof rawAmount === 'string' && rawAmount.trim() !== ''
+      ? Number(rawAmount.trim())
+      : NaN;
 
-  const available = fromAccountType === 'CHECKING' ? metrics.checkingBalance : metrics.savingsBalance;
-  if (available < amount) {
-    return res.status(400).json({ error: `Insufficient balance in ${fromAccountType} ($${available.toFixed(2)}).` });
+  const idempotencyKey =
+    typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()
+      ? body.idempotencyKey
+      : typeof body.clientRequestId === 'string'
+      ? body.clientRequestId
+      : '';
+
+  try {
+    const result = await executeServerInternalTransfer({
+      userId: authUid,
+      fromAccountType: body.fromAccountType,
+      toAccountType: body.toAccountType,
+      amount: parsedAmount,
+      description: body.description,
+      idempotencyKey,
+    });
+
+    if (!result.success) {
+      return res.status(result.statusCode || 400).json({
+        success: false,
+        errorCode: result.errorCode,
+        error: result.error || 'Internal transfer failed.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      transaction: result.transaction,
+      balanceMetrics: result.balanceMetrics,
+      isDuplicate: result.isDuplicate || false,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/transfers/internal Error]:', err);
+    return res.status(500).json({
+      success: false,
+      errorCode: 'INTERNAL_ERROR',
+      error: err?.message || 'Unexpected server error processing internal transfer.',
+    });
   }
-
-  const tx = db.recordInternalAccountTransfer(
-    userId,
-    fromAccId,
-    toAccId,
-    Number(amount),
-    description || `Transfer from ${fromAccountType} to ${toAccountType}`
-  );
-
-  const updatedMetrics = db.getUserBalanceMetrics(userId);
-  if (tx) {
-    const cleanKey = (tx.referenceNumber || tx.id).replace(/[^a-zA-Z0-9_-]/g, '');
-    persistCustomerNotification({
-      id: `notif_int_${cleanKey}_${userId}`,
-      userId,
-      title: 'Internal Account Transfer Completed',
-      message: `$${Number(amount).toLocaleString('en-US', { minimumFractionDigits: 2 })} transferred from ${fromAccountType} to ${toAccountType}. Reference: ${tx.referenceNumber}.`,
-      type: 'TRANSACTION',
-      severity: 'success',
-      createdAt: tx.createdAt,
-      referenceId: tx.referenceNumber,
-      actionView: 'transactions',
-      actionRecordId: tx.id,
-      metadata: {
-        category: 'TRANSACTION',
-        eventType: 'INTERNAL_TRANSFER',
-        customerName: `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || undefined,
-        accountNumberMasked: maskAccountNumber(userData.permanentAccountNumber),
-        transactionType: 'INTERNAL_TRANSFER',
-        amount: Number(amount),
-        currency: 'USD',
-        status: tx.status,
-        referenceNumber: tx.referenceNumber,
-        date: tx.createdAt,
-      },
-    }).catch(() => {});
-  }
-  res.json({ success: true, transaction: tx, balanceMetrics: updatedMetrics });
 });
 
 // --- DEPOSITS & PAYMENT GATEWAY VERIFICATION ---
@@ -2502,8 +2498,37 @@ app.get('/api/transactions', requireFirebaseAuth, async (req: AuthenticatedReque
   }
 
   if (flow && flow !== 'ALL' && userId) {
+    const isInternalMovement = (t: any) => {
+      if (t.metadata?.isInternalTransfer === true || t.metadata?.transferScope === 'INTERNAL_ACCOUNT_TRANSFER') {
+        return true;
+      }
+      if (t.type !== 'TRANSFER') return false;
+      const desc = String(t.description || '').toLowerCase();
+      if (
+        desc.includes('checking to savings') ||
+        desc.includes('savings to checking') ||
+        desc.includes('internal transfer') ||
+        desc.includes('internal account transfer')
+      ) {
+        return true;
+      }
+      const isAdminTransfer =
+        t.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+        t.senderAccountNumber === '1000000001' ||
+        t.senderName?.includes('Bennett Johnson');
+      return Boolean(
+        !isAdminTransfer &&
+        !desc.includes('loan') &&
+        !desc.includes('disburs') &&
+        t.senderUserId &&
+        t.recipientUserId &&
+        t.senderUserId === t.recipientUserId
+      );
+    };
+
     if (flow === 'CREDIT') {
       txs = txs.filter((t) => {
+        if (isInternalMovement(t)) return false;
         if (t.type === 'CHECK_WITHDRAWAL' || t.type === 'WIRE_CHECK_WITHDRAWAL') return false;
         const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
         const txRecipClean = (t.recipientAccountNumber || '').replace(/[-\s]/g, '');
@@ -2524,6 +2549,7 @@ app.get('/api/transactions', requireFirebaseAuth, async (req: AuthenticatedReque
       });
     } else if (flow === 'DEBIT') {
       txs = txs.filter((t) => {
+        if (isInternalMovement(t)) return false;
         if (t.type === 'CHECK_WITHDRAWAL' || t.type === 'WIRE_CHECK_WITHDRAWAL') return true;
         const userAccClean = userAcc ? userAcc.replace(/[-\s]/g, '') : '';
         const txSenderClean = (t.senderAccountNumber || '').replace(/[-\s]/g, '');

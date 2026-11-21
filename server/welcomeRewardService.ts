@@ -86,6 +86,32 @@ interface AggregatedDepositsResult {
   eligibleDepositRefs: Set<string>;
 }
 
+function isLoanDisbursementTransaction(docId: string, tx: Record<string, any>): boolean {
+  const effectiveId = String(tx.id || docId || '').trim();
+  const ref = String(tx.referenceNumber || '').trim();
+  const senderAcc = String(tx.senderAccountNumber || '').trim();
+  const senderName = String(tx.senderName || '').trim();
+  const desc = String(tx.description || '').trim();
+  const meta = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : {};
+
+  if (effectiveId.startsWith('tx_loan_disb_')) return true;
+  if (ref.startsWith('MVB-LN-')) return true;
+  if (senderAcc === 'MVB-LN-001') return true;
+  if (senderName === 'Monvera Credit & Lending Facility') return true;
+  if (/^(?:Approved Commercial Loan Disbursement|Monvera Approved Loan Credit Disbursement)\b/i.test(desc)) {
+    return true;
+  }
+  if (
+    meta.isLoanDisbursement === true ||
+    meta.transactionType === 'LOAN_DISBURSEMENT' ||
+    meta.disbursementType === 'LOAN_DISBURSEMENT' ||
+    Boolean(meta.loanId)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function aggregateQualifyingUsdDeposits(
   entries: Iterable<{ id: string; data: Record<string, any> }>
 ): AggregatedDepositsResult {
@@ -107,10 +133,12 @@ function aggregateQualifyingUsdDeposits(
     // - No reversed deposits (status REVERSED or metadata.isReversed === true)
     // - USD deposits only
     // - No reward credits / transfers / withdrawals
+    // - No loan disbursements (including transactions recorded with type: 'DEPOSIT')
     if (!Number.isFinite(amt) || amt <= 0) continue;
     if (meta.isReversed === true || tx.status === 'REVERSED') continue;
     if (tx.currency && String(tx.currency).trim().toUpperCase() !== 'USD') continue;
     if (tx.category === 'Rewards' || tx.type === 'WELCOME_REWARD') continue;
+    if (isLoanDisbursementTransaction(docId, tx)) continue;
 
     // Deduplication check
     if (provRef && seenPaymentRefs.has(provRef)) continue;

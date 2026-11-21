@@ -5610,7 +5610,399 @@ async function runTests() {
     console.log('✓ Test 42 [3D-B1.3B.1 Test D] passed: Non-USD and in-memory fallback records cannot pollute Firestore-authoritative reward thresholds');
   }
 
-  console.log('\nALL STAGE 3D-A / 3D-B1.1 / 3D-B1.2 / 3D-B1.3A / 3D-B1.3B / 3D-B1.3B.1 OUTBOX TESTS PASSED (42/42).');
+  // -------------------------------------------------------------------------
+  // TEST 43 [3D-B1.3B.2]: Loan disbursement (type: 'DEPOSIT') excluded across Firestore & fallback
+  // - Actual executeServerLoanDisbursement ($12,000) keeps loan accounting & loan outbox intact
+  // - evaluateAndProcessWelcomeReward counts $0 qualifying deposits and stays IN_PROGRESS
+  // - Non-Firestore fallback path also excludes MVB-LN-* / Monvera Credit & Lending Facility deposits
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_loan_excl_1';
+    const userPan = '1095678901';
+    const loanId = 'loan_3db13b2_1';
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+    const initialMemNotifIds = new Set(inMemoryDb.notifications.map((n) => n.id));
+    const initialMemLedgerIds = new Set(inMemoryDb.ledgerEntries.map((l) => l.id));
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Claire',
+        lastName: 'Borrower',
+        permanentAccountNumber: userPan,
+        status: 'active',
+        createdAt: '2026-02-01T00:00:00.000Z',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 0,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 0,
+        availableBalance: 0,
+        pendingBalance: 0,
+        loanBalance: 0,
+        creditedLoans: [],
+      });
+      await fsMem.collection('loans').doc(loanId).set({
+        id: loanId,
+        userId,
+        applicantName: 'Claire Borrower',
+        applicantEmail: 'claire.borrower@monvera.test',
+        applicantPhone: '+15551112233',
+        permanentAccountNumber: userPan,
+        amount: 12000,
+        termMonths: 12,
+        status: 'PENDING',
+        createdAt: new Date().toISOString(),
+      });
+
+      const loanRes = await executeServerLoanDisbursement(
+        { loanId, adminId: 'usr_admin' },
+        { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true }
+      );
+      assert.strictEqual(loanRes.success, true);
+      assert.strictEqual(loanRes.loan?.status, 'ACTIVE');
+      assert.strictEqual(loanRes.transaction?.type, 'DEPOSIT');
+      assert.strictEqual(loanRes.balanceMetrics?.checkingBalance, 12000);
+      assert.strictEqual(loanRes.balanceMetrics?.loanBalance, 14400);
+
+      const loanOutboxId = computeNotificationOutboxId(
+        userId,
+        `tx_loan_disb_${loanId}:COMPLETED`,
+        'MONEY_RECEIVED'
+      );
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(loanOutboxId).get()).exists, true);
+
+      const rwdRes = await evaluateAndProcessWelcomeReward(userId, {
+        firestore: fsMem as unknown as Firestore,
+        isAdminConfigured: () => true,
+        persistNotification: async (n: any) => ({ ...n, read: false }),
+      });
+
+      assert.strictEqual(rwdRes.status, 'IN_PROGRESS');
+      assert.strictEqual(rwdRes.qualifyingDeposits, 0);
+      assert.strictEqual(rwdRes.qualifyingDepositCount, 0);
+      assert.strictEqual(rwdRes.remainingAmount, 10000);
+
+      const accAfter = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      assert.strictEqual(accAfter.checkingBalance, 12000);
+      assert.strictEqual(accAfter.loanBalance, 14400);
+      assert.strictEqual((await fsMem.collection('transactions').doc(`tx_rwd_welcome_${userId}`).get()).exists, false);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+      // Verify fallback mode excludes loan disbursement DEPOSIT records as well
+      const fallbackUid = 'uid_rwd_loan_fallback_1';
+      inMemoryDb.transactions.push({
+        id: `tx_loan_disb_fb_${fallbackUid}`,
+        referenceNumber: `MVB-LN-FB-${fallbackUid}`,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        amount: 15000,
+        fee: 0,
+        currency: 'USD',
+        status: 'COMPLETED',
+        description: 'Approved Commercial Loan Disbursement ($15,000.00) - Ref: fb1',
+        senderName: 'Monvera Credit & Lending Facility',
+        senderAccountNumber: 'MVB-LN-001',
+        userId: fallbackUid,
+        recipientUserId: fallbackUid,
+        createdAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      } as any);
+
+      const fbRes = await evaluateAndProcessWelcomeReward(fallbackUid, {
+        isAdminConfigured: () => false,
+      });
+      assert.strictEqual(fbRes.status, 'IN_PROGRESS');
+      assert.strictEqual(fbRes.qualifyingDeposits, 0);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        if (!initialMemTxIds.has(inMemoryDb.transactions[i].id)) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+      for (let i = inMemoryDb.notifications.length - 1; i >= 0; i--) {
+        if (!initialMemNotifIds.has(inMemoryDb.notifications[i].id)) {
+          inMemoryDb.notifications.splice(i, 1);
+        }
+      }
+      for (let i = inMemoryDb.ledgerEntries.length - 1; i >= 0; i--) {
+        if (!initialMemLedgerIds.has(inMemoryDb.ledgerEntries[i].id)) {
+          inMemoryDb.ledgerEntries.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 43 [3D-B1.3B.2] passed: Loan disbursements (type: DEPOSIT) are excluded from Welcome Reward eligibility while loan accounting & outbox remain intact');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 44 [3D-B1.3B.2]: $9,999 genuine deposits + loan disbursement does NOT qualify;
+  // qualifies ONLY once genuine deposits alone reach $10,000 (+ replay idempotency)
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_loan_combo_1';
+    const userPan = '1096789012';
+    const loanId = 'loan_3db13b2_2';
+    const auxNotifs: any[] = [];
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+
+    const rwdDeps = {
+      firestore: fsMem as unknown as Firestore,
+      isAdminConfigured: () => true,
+      persistNotification: async (n: any) => {
+        auxNotifs.push(n);
+        return { ...n, read: false };
+      },
+    };
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Devon',
+        lastName: 'Combo',
+        permanentAccountNumber: userPan,
+        status: 'active',
+        createdAt: '2026-02-02T00:00:00.000Z',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 100,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 100,
+        availableBalance: 100,
+        pendingBalance: 0,
+        loanBalance: 0,
+        creditedLoans: [],
+      });
+      await fsMem.collection('loans').doc(loanId).set({
+        id: loanId,
+        userId,
+        applicantName: 'Devon Combo',
+        applicantEmail: 'devon.combo@monvera.test',
+        applicantPhone: '+15553334455',
+        permanentAccountNumber: userPan,
+        amount: 12000,
+        termMonths: 12,
+        status: 'PENDING',
+        createdAt: new Date().toISOString(),
+      });
+
+      const loanRes = await executeServerLoanDisbursement(
+        { loanId, adminId: 'usr_admin' },
+        { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true }
+      );
+      assert.strictEqual(loanRes.success, true);
+      assert.strictEqual(loanRes.balanceMetrics?.checkingBalance, 12100);
+
+      // Also plant a $1+ loan disbursement with LOAN_DISBURSEMENT metadata & $9,999 in genuine customer deposits
+      await fsMem.collection('transactions').doc('tx_loan_meta_1').set({
+        id: 'tx_loan_meta_1',
+        userId,
+        recipientUserId: userId,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        status: 'COMPLETED',
+        amount: 1,
+        currency: 'USD',
+        referenceNumber: 'MV-CUSTOM-LN-META-1',
+        metadata: { transactionType: 'LOAN_DISBURSEMENT', loanId: 'loan_meta_99' },
+      });
+      await fsMem.collection('transactions').doc('tx_dep_gen_1').set({
+        id: 'tx_dep_gen_1',
+        userId,
+        recipientUserId: userId,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'STRIPE-cs_combo_6000',
+        paymentProviderRef: 'STRIPE-cs_combo_6000',
+        senderName: 'Debit / Credit Card Gateway',
+        senderAccountNumber: 'STRIPE-cs_combo_6000',
+        description: 'Deposit to Premier Checking via Debit / Credit Card Gateway',
+      });
+      await fsMem.collection('transactions').doc('tx_dep_gen_2').set({
+        id: 'tx_dep_gen_2',
+        userId,
+        recipientUserId: userId,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        status: 'COMPLETED',
+        amount: 3999,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-COMBO-3999',
+        paymentProviderRef: 'MV-DEP-COMBO-3999',
+        senderName: 'Bank ACH Transfer',
+        senderAccountNumber: 'EXTERNAL_GATEWAY',
+        description: 'Deposit to Premier Checking via Bank ACH Transfer',
+      });
+
+      // $9,999 genuine + $12,001 loan disbursements MUST NOT qualify
+      const belowRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(belowRes.status, 'IN_PROGRESS');
+      assert.strictEqual(belowRes.qualifyingDeposits, 9999);
+      assert.strictEqual(belowRes.remainingAmount, 1);
+      assert.strictEqual(belowRes.qualifyingDepositCount, 2);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 12100);
+      assert.strictEqual((await fsMem.collection('transactions').doc(`tx_rwd_welcome_${userId}`).get()).exists, false);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+      assert.strictEqual(auxNotifs.length, 0);
+
+      // Add final $1.00 genuine customer deposit -> genuine deposits alone hit $10,000 -> qualifies!
+      await fsMem.collection('transactions').doc('tx_dep_gen_3').set({
+        id: 'tx_dep_gen_3',
+        userId,
+        recipientUserId: userId,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        status: 'COMPLETED',
+        amount: 1,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-COMBO-1',
+        paymentProviderRef: 'MV-DEP-COMBO-1',
+        senderName: 'Instant RTP Network',
+        senderAccountNumber: 'EXTERNAL_GATEWAY',
+        description: 'Deposit to Premier Checking via Instant RTP Network',
+      });
+
+      const paidRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(paidRes.status, 'PAID');
+      assert.strictEqual(paidRes.qualifyingDeposits, 10000);
+      assert.strictEqual(paidRes.qualifyingDepositCount, 3);
+      assert.strictEqual(paidRes.rewardAmount, 1000);
+      assert.strictEqual(paidRes.transactionId, `tx_rwd_welcome_${userId}`);
+
+      const accAfterPaid = (await fsMem.collection('accounts').doc(userId).get()).data()!;
+      assert.strictEqual(accAfterPaid.checkingBalance, 13100);
+      assert.strictEqual(accAfterPaid.loanBalance, 14400);
+      assert.strictEqual((await fsMem.collection('transactions').doc(`tx_rwd_welcome_${userId}`).get()).exists, true);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+      assert.strictEqual(auxNotifs.length, 1);
+
+      const expectedRwdOutboxId = computeNotificationOutboxId(
+        userId,
+        `tx_rwd_welcome_${userId}:COMPLETED`,
+        'MONEY_RECEIVED'
+      );
+      const rwdOutboxDoc = (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedRwdOutboxId).get()).data()!;
+      assert.strictEqual(rwdOutboxDoc.payload.amount, 1000);
+
+      // Replay remains strictly idempotent
+      const replayRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(replayRes.status, 'PAID');
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 13100);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 2);
+      assert.strictEqual(auxNotifs.length, 1);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && tx.userId === userId) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 44 [3D-B1.3B.2] passed: $9,999 genuine + loan disbursements stays IN_PROGRESS and qualifies only at $10,000 genuine deposits');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST 45 [3D-B1.3B.2]: Pure genuine USD deposits totaling $10,000 qualify & preserve outbox/replay
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new StrictInMemoryFirestore();
+    const userId = 'uid_rwd_genuine_10k';
+    const userPan = '1097890123';
+    const initialMemTxIds = new Set(inMemoryDb.transactions.map((t) => t.id));
+    const rwdDeps = {
+      firestore: fsMem as unknown as Firestore,
+      isAdminConfigured: () => true,
+      persistNotification: async (n: any) => ({ ...n, read: false }),
+    };
+
+    try {
+      await fsMem.collection('users').doc(userId).set({
+        id: userId,
+        firstName: 'Maya',
+        lastName: 'Genuine',
+        permanentAccountNumber: userPan,
+        status: 'active',
+        createdAt: '2026-02-03T00:00:00.000Z',
+      });
+      await fsMem.collection('accounts').doc(userId).set({
+        userId,
+        permanentAccountNumber: userPan,
+        checkingBalance: 10000,
+        savingsBalance: 0,
+        investedBalance: 0,
+        accruedEarnings: 0,
+        totalBalance: 10000,
+        availableBalance: 10000,
+      });
+      await fsMem.collection('transactions').doc('tx_pure_dep_1').set({
+        id: 'tx_pure_dep_1',
+        userId,
+        recipientUserId: userId,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        status: 'COMPLETED',
+        amount: 4000,
+        currency: 'USD',
+        referenceNumber: 'STRIPE-cs_pure_4000',
+        paymentProviderRef: 'STRIPE-cs_pure_4000',
+        senderName: 'Debit / Credit Card Gateway',
+        senderAccountNumber: 'STRIPE-cs_pure_4000',
+        description: 'Deposit to Premier Checking via Debit / Credit Card Gateway',
+      });
+      await fsMem.collection('transactions').doc('tx_pure_dep_2').set({
+        id: 'tx_pure_dep_2',
+        userId,
+        recipientUserId: userId,
+        type: 'DEPOSIT',
+        category: 'Deposits',
+        status: 'COMPLETED',
+        amount: 6000,
+        currency: 'USD',
+        referenceNumber: 'MV-DEP-PURE-6000',
+        paymentProviderRef: 'MV-DEP-PURE-6000',
+        senderName: 'Domestic FedWire',
+        senderAccountNumber: 'EXTERNAL_GATEWAY',
+        description: 'Deposit to Premier Checking via Domestic FedWire',
+      });
+
+      const paidRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(paidRes.status, 'PAID');
+      assert.strictEqual(paidRes.qualifyingDeposits, 10000);
+      assert.strictEqual(paidRes.qualifyingDepositCount, 2);
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 11000);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+
+      const replayRes = await evaluateAndProcessWelcomeReward(userId, rwdDeps);
+      assert.strictEqual(replayRes.status, 'PAID');
+      assert.strictEqual((await fsMem.collection('accounts').doc(userId).get()).data()?.checkingBalance, 11000);
+      assert.strictEqual((await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+    } finally {
+      for (let i = inMemoryDb.transactions.length - 1; i >= 0; i--) {
+        const tx = inMemoryDb.transactions[i];
+        if (!initialMemTxIds.has(tx.id) && tx.userId === userId) {
+          inMemoryDb.transactions.splice(i, 1);
+        }
+      }
+    }
+
+    console.log('✓ Test 45 [3D-B1.3B.2] passed: Genuine USD deposits totaling $10,000 qualify cleanly with idempotent replay');
+  }
+
+  console.log('\nALL STAGE 3D-A / 3D-B1.1 / 3D-B1.2 / 3D-B1.3A / 3D-B1.3B / 3D-B1.3B.1 / 3D-B1.3B.2 OUTBOX TESTS PASSED (45/45).');
   process.exit(0);
 }
 

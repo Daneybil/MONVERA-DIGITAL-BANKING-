@@ -852,11 +852,23 @@ export const firestoreSync = {
           checking += amount;
         } else if (isSender && isRecipient) {
           // Internal account movement or loan disbursement
+          const metaSource = String(tx.metadata?.sourceAccountType || '').toUpperCase();
+          const metaDest = String(tx.metadata?.destinationAccountType || '').toUpperCase();
           const desc = (tx.description || '').toLowerCase();
-          if (desc.includes('checking to savings') || desc.includes('chk to sav')) {
+          if (
+            (tx.metadata?.isInternalTransfer && metaSource === 'CHECKING' && metaDest === 'SAVINGS') ||
+            desc.includes('checking to savings') ||
+            desc.includes('from checking to savings') ||
+            desc.includes('chk to sav')
+          ) {
             checking = Math.max(0, checking - amount);
             savings += amount;
-          } else if (desc.includes('savings to checking') || desc.includes('sav to chk')) {
+          } else if (
+            (tx.metadata?.isInternalTransfer && metaSource === 'SAVINGS' && metaDest === 'CHECKING') ||
+            desc.includes('savings to checking') ||
+            desc.includes('from savings to checking') ||
+            desc.includes('sav to chk')
+          ) {
             savings = Math.max(0, savings - amount);
             checking += amount;
           } else if (desc.includes('loan') || desc.includes('disburs') || desc.includes('credit')) {

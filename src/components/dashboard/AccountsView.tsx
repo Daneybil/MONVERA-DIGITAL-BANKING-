@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { LinkedBankAccountApplication } from '../../types';
@@ -54,6 +54,14 @@ export const AccountsView: React.FC = () => {
   const [transferAmount, setTransferAmount] = useState<string>('1000');
   const [isTransferring, setIsTransferring] = useState<boolean>(false);
   const [transferMsg, setTransferMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const pendingIdempotencyKeyRef = useRef<string | null>(null);
+
+  const createInternalIdempotencyKey = () => {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return `int_${crypto.randomUUID()}`;
+    }
+    return `int_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  };
 
   if (!currentUser) return null;
 
@@ -87,20 +95,33 @@ export const AccountsView: React.FC = () => {
 
   const handleInternalTransfer = async (e: React.FormEvent) => {
     e.preventDefault();
-    const amount = parseFloat(transferAmount);
-    if (isNaN(amount) || amount <= 0) {
-      setTransferMsg({ type: 'error', text: 'Please enter a valid transfer amount.' });
+    if (isTransferring) return;
+
+    const amount = Number(transferAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setTransferMsg({ type: 'error', text: 'Please enter a valid positive transfer amount.' });
       return;
     }
 
+    const scaledCents = amount * 100;
+    const roundedCents = Math.round(scaledCents);
+    if (Math.abs(scaledCents - roundedCents) > 1e-6 || roundedCents < 1) {
+      setTransferMsg({ type: 'error', text: 'Transfer amount must have at most 2 decimal places.' });
+      return;
+    }
+    const cleanAmount = Number((roundedCents / 100).toFixed(2));
+
     const available = fromType === 'CHECKING' ? balanceMetrics.checkingBalance : balanceMetrics.savingsBalance;
-    if (amount > available) {
+    if (cleanAmount > available) {
       setTransferMsg({
         type: 'error',
         text: `Insufficient funds in ${fromType === 'CHECKING' ? 'Checking' : 'Savings'} account ($${available.toLocaleString()}).`,
       });
       return;
     }
+
+    const idempotencyKey = pendingIdempotencyKeyRef.current || createInternalIdempotencyKey();
+    pendingIdempotencyKeyRef.current = idempotencyKey;
 
     setIsTransferring(true);
     setTransferMsg(null);
@@ -110,21 +131,26 @@ export const AccountsView: React.FC = () => {
         userId: currentUser.id,
         fromAccountType: fromType,
         toAccountType: fromType === 'CHECKING' ? 'SAVINGS' : 'CHECKING',
-        amount,
+        amount: cleanAmount,
+        idempotencyKey,
       });
 
       if (res.success) {
+        pendingIdempotencyKeyRef.current = null;
         setTransferMsg({
           type: 'success',
-          text: `Successfully transferred $${amount.toLocaleString()} between your accounts.`,
+          text: `Successfully transferred $${cleanAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} between your accounts.`,
         });
         await refreshBalance();
         await refreshNotifications();
       } else {
+        if (!res.isRetryableTimeout && res.errorCode !== 'REQUEST_TIMEOUT' && res.errorCode !== 'NETWORK_FAILURE') {
+          pendingIdempotencyKeyRef.current = null;
+        }
         setTransferMsg({ type: 'error', text: res.error || 'Internal transfer failed.' });
       }
-    } catch (err: any) {
-      setTransferMsg({ type: 'error', text: 'Internal transfer request failed.' });
+    } catch {
+      setTransferMsg({ type: 'error', text: 'Internal transfer request failed. Your request key is preserved for safe retry.' });
     } finally {
       setIsTransferring(false);
     }
@@ -247,6 +273,7 @@ export const AccountsView: React.FC = () => {
           <div className="flex items-center gap-2 pt-1">
             <button
               onClick={() => {
+                pendingIdempotencyKeyRef.current = null;
                 setFromType('CHECKING');
                 setTransferAmount('5000');
               }}
@@ -339,7 +366,10 @@ export const AccountsView: React.FC = () => {
               </label>
               <select
                 value={fromType}
-                onChange={(e) => setFromType(e.target.value as any)}
+                onChange={(e) => {
+                  pendingIdempotencyKeyRef.current = null;
+                  setFromType(e.target.value as any);
+                }}
                 className="w-full px-4 py-2.5 text-xs font-semibold rounded-xl border border-slate-300 bg-white"
               >
                 <option value="CHECKING">
@@ -376,7 +406,10 @@ export const AccountsView: React.FC = () => {
                   min="1"
                   required
                   value={transferAmount}
-                  onChange={(e) => setTransferAmount(e.target.value)}
+                  onChange={(e) => {
+                    pendingIdempotencyKeyRef.current = null;
+                    setTransferAmount(e.target.value);
+                  }}
                   className="w-full pl-7 pr-4 py-2 text-sm font-bold font-mono rounded-xl border border-slate-300 bg-white"
                 />
               </div>

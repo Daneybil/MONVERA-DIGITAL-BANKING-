@@ -9,6 +9,7 @@ import {
   Download,
   ArrowUpRight,
   ArrowDownLeft,
+  ArrowRightLeft,
   ArrowLeft,
   CheckCircle2,
   Clock,
@@ -32,6 +33,118 @@ import { auth } from '../../services/firebase';
 
 type DateFilterPreset = 'all' | 'today' | 'this_week' | 'this_month' | 'prev_month' | 'custom';
 type FlowFilter = 'ALL' | 'CREDIT' | 'DEBIT';
+
+export interface TransactionFlowClassification {
+  isInternalTransfer: boolean;
+  isCredit: boolean;
+  flowKind: 'INTERNAL' | 'CREDIT' | 'DEBIT';
+  sourceAccountLabel: string;
+  destAccountLabel: string;
+}
+
+export function classifyTransactionFlow(
+  tx: Transaction,
+  userId?: string | null,
+  effectiveUid?: string | null,
+  userPermanentAccountNumber?: string | null
+): TransactionFlowClassification {
+  const userAccClean = (userPermanentAccountNumber || '').replace(/[-\s]/g, '');
+  const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
+  const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+  const isRecipient =
+    (effectiveUid ? tx.recipientUserId === effectiveUid : false) ||
+    (!tx.recipientUserId && effectiveUid ? tx.userId === effectiveUid : false) ||
+    (userId ? tx.recipientUserId === userId : false) ||
+    (!tx.recipientUserId && userId ? tx.userId === userId : false) ||
+    Boolean(userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
+
+  const isSender =
+    (effectiveUid ? tx.senderUserId === effectiveUid && tx.recipientUserId !== effectiveUid : false) ||
+    (userId ? tx.senderUserId === userId && tx.recipientUserId !== userId : false) ||
+    Boolean(userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
+
+  const isAdminTransferCredit = Boolean(
+    (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+      tx.senderAccountNumber === '1000000001' ||
+      tx.senderName?.includes('Bennett Johnson')) &&
+      (isRecipient ||
+        (effectiveUid ? tx.userId === effectiveUid || tx.recipientUserId === effectiveUid : false) ||
+        (userId ? tx.userId === userId || tx.recipientUserId === userId : false))
+  );
+
+  const desc = (tx.description || '').toLowerCase();
+  const isSameUserTransfer =
+    tx.type === 'TRANSFER' &&
+    Boolean(tx.senderUserId && tx.recipientUserId && tx.senderUserId === tx.recipientUserId) &&
+    !isAdminTransferCredit &&
+    !desc.includes('loan') &&
+    !desc.includes('disburs');
+
+  const isInternalTransfer =
+    tx.metadata?.isInternalTransfer === true ||
+    tx.metadata?.transferScope === 'INTERNAL_ACCOUNT_TRANSFER' ||
+    (tx.type === 'TRANSFER' &&
+      (desc.includes('checking to savings') ||
+        desc.includes('savings to checking') ||
+        desc.includes('internal transfer') ||
+        desc.includes('internal account transfer'))) ||
+    isSameUserTransfer;
+
+  const metaSource = String(tx.metadata?.sourceAccountType || '').toUpperCase();
+  const metaDest = String(tx.metadata?.destinationAccountType || '').toUpperCase();
+  const inferredCheckingToSavings =
+    metaSource === 'CHECKING' ||
+    desc.includes('checking to savings') ||
+    desc.includes('from checking to savings') ||
+    desc.includes('chk to sav');
+  const inferredSavingsToChecking =
+    metaSource === 'SAVINGS' ||
+    desc.includes('savings to checking') ||
+    desc.includes('from savings to checking') ||
+    desc.includes('sav to chk');
+
+  const sourceAccountLabel =
+    metaSource === 'SAVINGS' || (!metaSource && inferredSavingsToChecking)
+      ? 'High-Yield Savings'
+      : 'Checking';
+  const destAccountLabel =
+    metaDest === 'CHECKING' || (!metaDest && inferredSavingsToChecking)
+      ? 'Checking'
+      : inferredCheckingToSavings || metaDest === 'SAVINGS'
+      ? 'High-Yield Savings'
+      : 'Savings';
+
+  if (isInternalTransfer) {
+    return {
+      isInternalTransfer: true,
+      isCredit: false,
+      flowKind: 'INTERNAL',
+      sourceAccountLabel,
+      destAccountLabel,
+    };
+  }
+
+  const isCheckWithdrawalDebit =
+    tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
+  const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
+  const isDeposit =
+    !isCheckWithdrawalDebit &&
+    (tx.type === 'DEPOSIT' ||
+      tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+      tx.type === 'INVESTMENT_EARNING' ||
+      tx.type === 'INVESTMENT_MATURITY' ||
+      isAdminTransferCredit);
+  const isCredit = isCheckWithdrawalDebit ? false : isIncoming || isDeposit;
+
+  return {
+    isInternalTransfer: false,
+    isCredit,
+    flowKind: isCredit ? 'CREDIT' : 'DEBIT',
+    sourceAccountLabel,
+    destAccountLabel,
+  };
+}
 
 export const TransactionsView: React.FC = () => {
   const { currentUser, balanceMetrics, lastUpdateTimestamp } = useAuth();
@@ -167,45 +280,16 @@ export const TransactionsView: React.FC = () => {
         }
       }
 
-      // 2. Flow Filter (Credit vs Debit)
-      const userAccClean = (currentUser.permanentAccountNumber || '').replace(/[-\s]/g, '');
-      const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
-      const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+      // 2. Flow Filter (Credit vs Debit — internal transfers appear in ALL only)
+      const flowClass = classifyTransactionFlow(
+        tx,
+        currentUser.id,
+        effectiveUid,
+        currentUser.permanentAccountNumber
+      );
 
-      const isRecipient =
-        (effectiveUid && tx.recipientUserId === effectiveUid) ||
-        (!tx.recipientUserId && effectiveUid && tx.userId === effectiveUid) ||
-        tx.recipientUserId === currentUser.id ||
-        (!tx.recipientUserId && tx.userId === currentUser.id) ||
-        (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
-
-      const isSender =
-        (effectiveUid && tx.senderUserId === effectiveUid && tx.recipientUserId !== effectiveUid) ||
-        (tx.senderUserId === currentUser.id && tx.recipientUserId !== currentUser.id) ||
-        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
-
-      const isAdminTransferCredit =
-        (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
-         tx.senderAccountNumber === '1000000001' ||
-         tx.senderName?.includes('Bennett Johnson')) &&
-        (isRecipient ||
-         (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
-         tx.userId === currentUser.id || tx.recipientUserId === currentUser.id);
-
-      const isCheckWithdrawalDebit =
-        tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
-      const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
-      const isDeposit =
-        !isCheckWithdrawalDebit &&
-        (tx.type === 'DEPOSIT' ||
-          tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-          tx.type === 'INVESTMENT_EARNING' ||
-          tx.type === 'INVESTMENT_MATURITY' ||
-          isAdminTransferCredit);
-      const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
-
-      if (flowFilter === 'CREDIT' && !isCredit) return false;
-      if (flowFilter === 'DEBIT' && isCredit) return false;
+      if (flowFilter === 'CREDIT' && flowClass.flowKind !== 'CREDIT') return false;
+      if (flowFilter === 'DEBIT' && flowClass.flowKind !== 'DEBIT') return false;
 
       // 3. Category Filter
       if (selectedCategory !== 'ALL' && tx.category !== selectedCategory) {
@@ -239,40 +323,16 @@ export const TransactionsView: React.FC = () => {
     let totalOutflow = 0;
 
     for (const tx of filteredTransactions) {
-      const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
-      const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
-      const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+      const flowClass = classifyTransactionFlow(
+        tx,
+        currentUser?.id,
+        effectiveUid,
+        currentUser?.permanentAccountNumber
+      );
 
-      const isRecipient =
-        tx.recipientUserId === currentUser?.id ||
-        (!tx.recipientUserId && tx.userId === currentUser?.id) ||
-        (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
-
-      const isSender =
-        (tx.senderUserId === currentUser?.id && tx.recipientUserId !== currentUser?.id) ||
-        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
-
-      const isAdminTransferCredit =
-        (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
-         tx.senderAccountNumber === '1000000001' ||
-         tx.senderName?.includes('Bennett Johnson')) &&
-        (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
-
-      const isCheckWithdrawalDebit =
-        tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
-      const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
-      const isDeposit =
-        !isCheckWithdrawalDebit &&
-        (tx.type === 'DEPOSIT' ||
-          tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-          tx.type === 'INVESTMENT_EARNING' ||
-          tx.type === 'INVESTMENT_MATURITY' ||
-          isAdminTransferCredit);
-      const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
-
-      if (isCredit) {
+      if (flowClass.flowKind === 'CREDIT') {
         totalInflow += tx.amount;
-      } else {
+      } else if (flowClass.flowKind === 'DEBIT') {
         totalOutflow += tx.amount;
       }
     }
@@ -283,9 +343,15 @@ export const TransactionsView: React.FC = () => {
       netVolume: totalInflow - totalOutflow,
       count: filteredTransactions.length,
     };
-  }, [filteredTransactions, currentUser]);
+  }, [filteredTransactions, currentUser, effectiveUid]);
 
-  const getCleanTypeLabel = (type: string) => {
+  const getCleanTypeLabel = (type: string, tx?: Transaction) => {
+    if (
+      tx &&
+      classifyTransactionFlow(tx, currentUser?.id, effectiveUid, currentUser?.permanentAccountNumber).isInternalTransfer
+    ) {
+      return 'Internal Transfer';
+    }
     switch (type) {
       case 'TRANSFER':
         return 'Peer Transfer';
@@ -328,30 +394,32 @@ export const TransactionsView: React.FC = () => {
     ];
 
     const rows = filteredTransactions.map((t) => {
-      const isCheckWithdrawalDebit =
-        t.type === 'CHECK_WITHDRAWAL' || t.type === 'WIRE_CHECK_WITHDRAWAL';
-      const isIncoming = !isCheckWithdrawalDebit && t.recipientUserId === currentUser.id && t.senderUserId !== currentUser.id;
-      const isDeposit =
-        !isCheckWithdrawalDebit &&
-        (t.type === 'DEPOSIT' ||
-          t.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-          t.type === 'INVESTMENT_EARNING' ||
-          t.type === 'INVESTMENT_MATURITY');
-      const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
+      const flowClass = classifyTransactionFlow(
+        t,
+        currentUser.id,
+        effectiveUid,
+        currentUser.permanentAccountNumber
+      );
 
       const dateObj = new Date(t.createdAt);
-      const party = isCredit ? t.senderName || 'Authorized Sender' : t.recipientName || 'Authorized Recipient';
+      const party = flowClass.isInternalTransfer
+        ? `${flowClass.sourceAccountLabel} -> ${flowClass.destAccountLabel}`
+        : flowClass.isCredit
+        ? t.senderName || 'Authorized Sender'
+        : t.recipientName || 'Authorized Recipient';
 
       return [
         t.referenceNumber,
         dateObj.toLocaleDateString(),
         dateObj.toLocaleTimeString(),
-        isCredit ? 'CREDIT' : 'DEBIT',
-        t.type,
+        flowClass.flowKind,
+        flowClass.isInternalTransfer ? 'INTERNAL_TRANSFER' : t.type,
         t.category,
         `"${t.description.replace(/"/g, '""')}"`,
         `"${party.replace(/"/g, '""')}"`,
-        (isCredit ? t.amount : -t.amount).toFixed(2),
+        flowClass.isInternalTransfer
+          ? t.amount.toFixed(2)
+          : (flowClass.isCredit ? t.amount : -t.amount).toFixed(2),
         (t.fee || 0).toFixed(2),
         t.status,
       ];
@@ -638,36 +706,13 @@ export const TransactionsView: React.FC = () => {
         ) : (
           <div className="divide-y divide-slate-100">
             {filteredTransactions.map((tx) => {
-              const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
-              const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
-              const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
-
-              const isRecipient =
-                tx.recipientUserId === currentUser?.id ||
-                (!tx.recipientUserId && tx.userId === currentUser?.id) ||
-                (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
-
-              const isSender =
-                (tx.senderUserId === currentUser?.id && tx.recipientUserId !== currentUser?.id) ||
-                (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
-
-              const isAdminTransferCredit =
-                (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
-                 tx.senderAccountNumber === '1000000001' ||
-                 tx.senderName?.includes('Bennett Johnson')) &&
-                (isRecipient || tx.userId === currentUser?.id || tx.recipientUserId === currentUser?.id);
-
-              const isCheckWithdrawalDebit =
-                tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
-              const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
-              const isDeposit =
-                !isCheckWithdrawalDebit &&
-                (tx.type === 'DEPOSIT' ||
-                  tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-                  tx.type === 'INVESTMENT_EARNING' ||
-                  tx.type === 'INVESTMENT_MATURITY' ||
-                  isAdminTransferCredit);
-              const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
+              const flowClass = classifyTransactionFlow(
+                tx,
+                currentUser?.id,
+                effectiveUid,
+                currentUser?.permanentAccountNumber
+              );
+              const { isInternalTransfer, isCredit, sourceAccountLabel, destAccountLabel } = flowClass;
 
               const dateObj = new Date(tx.createdAt);
               const formattedDate = dateObj.toLocaleDateString('en-US', {
@@ -702,12 +747,20 @@ export const TransactionsView: React.FC = () => {
                   <div className="flex items-start sm:items-center space-x-3.5 min-w-0">
                     <div
                       className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 transition-transform group-hover:scale-105 ${
-                        isCredit
+                        isInternalTransfer
+                          ? 'bg-sky-50 text-sky-700 border border-sky-200'
+                          : isCredit
                           ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                           : 'bg-slate-100 text-slate-800 border border-slate-200'
                       }`}
                     >
-                      {isCredit ? <ArrowDownLeft className="w-5 h-5" /> : <ArrowUpRight className="w-5 h-5" />}
+                      {isInternalTransfer ? (
+                        <ArrowRightLeft className="w-5 h-5" />
+                      ) : isCredit ? (
+                        <ArrowDownLeft className="w-5 h-5" />
+                      ) : (
+                        <ArrowUpRight className="w-5 h-5" />
+                      )}
                     </div>
 
                     <div className="space-y-1 min-w-0">
@@ -717,19 +770,23 @@ export const TransactionsView: React.FC = () => {
                         </span>
                         <span
                           className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider ${
-                            isCredit
+                            isInternalTransfer
+                              ? 'bg-sky-100 text-sky-800 border border-sky-200'
+                              : isCredit
                               ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                               : 'bg-slate-200 text-slate-800'
                           }`}
                         >
-                          {isCredit ? 'Credit' : 'Debit'}
+                          {isInternalTransfer ? 'Internal' : isCredit ? 'Credit' : 'Debit'}
                         </span>
                       </div>
 
                       {/* Party & Type info */}
                       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
                         <span className="font-semibold text-slate-800">
-                          {tx.type === 'WIRE_CHECK_WITHDRAWAL'
+                          {isInternalTransfer
+                            ? `${sourceAccountLabel} → ${destAccountLabel}`
+                            : tx.type === 'WIRE_CHECK_WITHDRAWAL'
                             ? `Bank: ${tx.metadata?.bankName || cleanRecipName || 'Destination Bank'}${tx.metadata?.destinationBankAccountNumberMasked ? ` (${tx.metadata.destinationBankAccountNumberMasked})` : ''}`
                             : tx.type === 'CHECK_WITHDRAWAL'
                             ? `Payee: ${partyName}`
@@ -738,7 +795,7 @@ export const TransactionsView: React.FC = () => {
                             : `To: ${partyName}`}
                         </span>
                         <span className="text-slate-300">•</span>
-                        <span className="text-slate-500">{getCleanTypeLabel(tx.type)}</span>
+                        <span className="text-slate-500">{getCleanTypeLabel(tx.type, tx)}</span>
                         {tx.type === 'CHECK_WITHDRAWAL' && tx.metadata?.checkNumber && (
                           <>
                             <span className="text-slate-300">•</span>
@@ -789,10 +846,10 @@ export const TransactionsView: React.FC = () => {
                     <div className="text-left sm:text-right space-y-1">
                       <div
                         className={`text-base sm:text-lg font-extrabold font-mono tracking-tight ${
-                          isCredit ? 'text-emerald-600' : 'text-slate-900'
+                          isInternalTransfer ? 'text-slate-900' : isCredit ? 'text-emerald-600' : 'text-slate-900'
                         }`}
                       >
-                        {isCredit ? '+' : '-'}$
+                        {isInternalTransfer ? '' : isCredit ? '+' : '-'}$
                         {tx.amount.toLocaleString('en-US', {
                           minimumFractionDigits: 2,
                           maximumFractionDigits: 2,

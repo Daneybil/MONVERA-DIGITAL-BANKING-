@@ -755,6 +755,177 @@ export async function submitWireCheckWithdrawalWithAuthRetry(
   }
 }
 
+export async function sendInternalTransferWithAuthRetry(
+  data: {
+    userId?: string;
+    fromAccountType: 'CHECKING' | 'SAVINGS';
+    toAccountType: 'CHECKING' | 'SAVINGS';
+    amount: number;
+    description?: string;
+    idempotencyKey?: string;
+  },
+  deps?: SubmitWireCheckDeps
+): Promise<{
+  success: boolean;
+  transaction?: Transaction;
+  balanceMetrics?: BalanceMetrics;
+  isDuplicate?: boolean;
+  isRetryableTimeout?: boolean;
+  errorCode?: string;
+  error?: string;
+}> {
+  const hasUser = deps?.hasAuthenticatedUser ? deps.hasAuthenticatedUser() : Boolean(auth?.currentUser);
+  const buildHeaders = deps?.buildHeaders || ((forceRefresh = false) => getCustomerAuthHeaders(forceRefresh));
+  const fetchFn = deps?.fetchFn || fetchWithSameOriginFallback;
+
+  if (!hasUser) {
+    return {
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'Customer authentication required. Please sign in and retry your internal transfer.',
+    };
+  }
+
+  const effectiveKey =
+    typeof data.idempotencyKey === 'string' && data.idempotencyKey.trim()
+      ? data.idempotencyKey.trim()
+      : `int_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+  // Never trust or send client userId when backend derives UID from verified Firebase token;
+  // serialize once so retries preserve identical payload and idempotencyKey.
+  const serializedBody = JSON.stringify({
+    fromAccountType: data.fromAccountType,
+    toAccountType: data.toAccountType,
+    amount: data.amount,
+    ...(data.description !== undefined ? { description: data.description } : {}),
+    idempotencyKey: effectiveKey,
+  });
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), 30000) : null;
+
+  let refreshAttempted = false;
+  let refreshSucceeded = false;
+  let initialTokenValidated = false;
+
+  const safeBuildHeaders = async (forceRefresh = false): Promise<Record<string, string>> => {
+    const hdrs = await buildHeaders(forceRefresh);
+    if (!forceRefresh && !hdrs['Authorization']) {
+      const freshHdrs = await buildHeaders(true);
+      initialTokenValidated = Boolean(freshHdrs['Authorization']);
+      return freshHdrs;
+    }
+    if (!forceRefresh) {
+      initialTokenValidated = Boolean(hdrs['Authorization']);
+    }
+    return hdrs;
+  };
+
+  try {
+    const preHeaders = await safeBuildHeaders(false);
+    if (!preHeaders['Authorization']) {
+      if (timeoutId) clearTimeout(timeoutId);
+      return {
+        success: false,
+        errorCode: 'TOKEN_REFRESH_FAILED',
+        error: 'Unable to obtain a valid authentication token. Please sign in again and safely retry.',
+      };
+    }
+
+    let firstAttempt = true;
+    const res = await fetchWithFreshAuthRetry(
+      '/api/transfers/internal',
+      async (forceRefresh = false) => {
+        if (firstAttempt && !forceRefresh && initialTokenValidated) {
+          firstAttempt = false;
+          return preHeaders;
+        }
+        firstAttempt = false;
+        return await buildHeaders(forceRefresh);
+      },
+      {
+        method: 'POST',
+        body: serializedBody,
+        ...(controller ? { signal: controller.signal } : {}),
+      },
+      {
+        hasAuthenticatedUser: () => hasUser,
+        fetchFn,
+        onRefreshAttempted: (succeeded: boolean) => {
+          refreshAttempted = true;
+          refreshSucceeded = succeeded;
+        },
+      }
+    );
+
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const parsed = await parseJsonResponse<{
+      success?: boolean;
+      transaction?: Transaction;
+      balanceMetrics?: BalanceMetrics;
+      isDuplicate?: boolean;
+      errorCode?: string;
+      error?: string;
+    }>(res, { success: false });
+
+    if (!res.ok || !parsed.success || !parsed.transaction) {
+      const isTransient = res.status >= 500;
+      const derivedErrorCode =
+        refreshAttempted && !refreshSucceeded
+          ? 'TOKEN_REFRESH_FAILED'
+          : parsed.errorCode || (res.status === 401 ? 'UNAUTHORIZED' : undefined);
+      return {
+        success: false,
+        errorCode: derivedErrorCode,
+        isRetryableTimeout: isTransient,
+        error:
+          refreshAttempted && !refreshSucceeded
+            ? 'Authentication token renewal failed. Please refresh your session and retry safely.'
+            : parsed.error || `Internal transfer failed (HTTP ${res.status}).`,
+      };
+    }
+
+    const effectiveUid = parsed.transaction.userId || auth?.currentUser?.uid || data.userId;
+    if (typeof window !== 'undefined' && effectiveUid) {
+      try {
+        if (parsed.balanceMetrics) {
+          localStorage.setItem(`monvera_balances_${effectiveUid}`, JSON.stringify(parsed.balanceMetrics));
+          localStorage.setItem('monvera_account_balances', JSON.stringify(parsed.balanceMetrics));
+        }
+        window.dispatchEvent(
+          new CustomEvent('monvera_balance_updated', {
+            detail: { userId: effectiveUid, balanceMetrics: parsed.balanceMetrics },
+          })
+        );
+        window.dispatchEvent(
+          new CustomEvent('monvera_transaction_created', {
+            detail: { userId: effectiveUid, transaction: parsed.transaction },
+          })
+        );
+      } catch {}
+    }
+
+    return {
+      success: true,
+      transaction: parsed.transaction,
+      balanceMetrics: parsed.balanceMetrics,
+      isDuplicate: parsed.isDuplicate || false,
+    };
+  } catch (err: any) {
+    if (timeoutId) clearTimeout(timeoutId);
+    const isAbort = err?.name === 'AbortError';
+    return {
+      success: false,
+      isRetryableTimeout: true,
+      errorCode: isAbort ? 'REQUEST_TIMEOUT' : 'NETWORK_FAILURE',
+      error: isAbort
+        ? 'Your internal transfer request timed out waiting for server confirmation. Your idempotency key is preserved so retrying will safely confirm or complete without double-transferring.'
+        : formatApiNetworkError(err, 'execute internal transfer'),
+    };
+  }
+}
+
 export const api = {
   async getUsers(): Promise<{ users: UserProfile[] }> {
     try {
@@ -1247,22 +1418,22 @@ export const api = {
   },
 
   async sendInternalTransfer(data: {
-    userId: string;
+    userId?: string;
     fromAccountType: 'CHECKING' | 'SAVINGS';
     toAccountType: 'CHECKING' | 'SAVINGS';
     amount: number;
     description?: string;
-  }): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
-    try {
-      const res = await fetch('/api/transfers/internal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      return await parseJsonResponse(res, { success: false, error: 'Internal transfer service unavailable' });
-    } catch {
-      return { success: false, error: 'Internal transfer request failed' };
-    }
+    idempotencyKey?: string;
+  }): Promise<{
+    success: boolean;
+    transaction?: Transaction;
+    balanceMetrics?: BalanceMetrics;
+    isDuplicate?: boolean;
+    isRetryableTimeout?: boolean;
+    errorCode?: string;
+    error?: string;
+  }> {
+    return sendInternalTransferWithAuthRetry(data);
   },
 
   async createDeposit(data: {

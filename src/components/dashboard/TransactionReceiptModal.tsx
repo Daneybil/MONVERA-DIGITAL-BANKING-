@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   ArrowUpRight,
   ArrowDownLeft,
+  ArrowRightLeft,
   Calendar,
   Clock,
   Hash,
@@ -172,15 +173,45 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
        (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean))
     : false;
 
-  const isAdminTransferCredit =
+  const isAdminTransferCredit = Boolean(
     (transaction.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
-     transaction.senderAccountNumber === '1000000001' ||
-     transaction.senderName?.includes('Bennett Johnson')) &&
-    (isRecipient || transaction.userId === currentUser?.id || transaction.recipientUserId === currentUser?.id);
+      transaction.senderAccountNumber === '1000000001' ||
+      transaction.senderName?.includes('Bennett Johnson')) &&
+      (isRecipient || transaction.userId === currentUser?.id || transaction.recipientUserId === currentUser?.id)
+  );
 
   const isCheckWithdrawalDebit = transaction.type === 'CHECK_WITHDRAWAL';
   const isWireCheckWithdrawalDebit = transaction.type === 'WIRE_CHECK_WITHDRAWAL';
   const isPermanentCheckDebit = isCheckWithdrawalDebit || isWireCheckWithdrawalDebit;
+  const txDescLower = (transaction.description || '').toLowerCase();
+  const isInternalTransfer =
+    transaction.metadata?.isInternalTransfer === true ||
+    transaction.metadata?.transferScope === 'INTERNAL_ACCOUNT_TRANSFER' ||
+    (transaction.type === 'TRANSFER' &&
+      (txDescLower.includes('checking to savings') ||
+        txDescLower.includes('savings to checking') ||
+        txDescLower.includes('internal transfer') ||
+        txDescLower.includes('internal account transfer') ||
+        (Boolean(
+          transaction.senderUserId &&
+            transaction.recipientUserId &&
+            transaction.senderUserId === transaction.recipientUserId
+        ) &&
+          !isAdminTransferCredit &&
+          !txDescLower.includes('loan') &&
+          !txDescLower.includes('disburs'))));
+
+  const metaSource = String(transaction.metadata?.sourceAccountType || '').toUpperCase();
+  const metaDest = String(transaction.metadata?.destinationAccountType || '').toUpperCase();
+  const internalSourceIsSavings =
+    metaSource === 'SAVINGS' ||
+    (!metaSource && (txDescLower.includes('savings to checking') || txDescLower.includes('sav to chk')));
+  const internalDestIsChecking =
+    metaDest === 'CHECKING' ||
+    (!metaDest && (txDescLower.includes('savings to checking') || txDescLower.includes('sav to chk')));
+  const internalSourceLabel = internalSourceIsSavings ? 'High-Yield Savings' : 'Checking';
+  const internalDestLabel = internalDestIsChecking ? 'Checking' : 'High-Yield Savings';
+
   const wireCheckBankName = String(transaction.metadata?.bankName || 'United States Financial Institution');
   const wireCheckDestAccMasked = transaction.metadata?.destinationBankAccountNumberMasked
     ? String(transaction.metadata.destinationBankAccountNumberMasked)
@@ -197,7 +228,7 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
       ? 'Your Wire Check has been delivered.'
       : `Estimated delivery is ${wireCheckEstBusinessDays} business days. You will receive a notification when your Wire Check has been delivered.`;
 
-  const isCredit = isPermanentCheckDebit
+  const isCredit = isPermanentCheckDebit || isInternalTransfer
     ? false
     : (isRecipient && !isSender) ||
       isAdminTransferCredit ||
@@ -225,6 +256,9 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
   });
 
   const getCleanTypeLabel = (type: string) => {
+    if (isInternalTransfer) {
+      return 'Internal Account Transfer';
+    }
     switch (type) {
       case 'TRANSFER':
         return 'Monvera Instant Peer Transfer';
@@ -256,16 +290,17 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
 ═══════════════════════════════════
 Status: ${isWireCheckWithdrawalDebit ? `COMPLETED • ${wireCheckDeliveryStatus}` : 'VERIFIED & SETTLED'}
 Type: ${getCleanTypeLabel(transaction.type)}
-Flow: ${isCredit ? 'CREDIT (+)' : 'DEBIT (-)'}
+Flow: ${isInternalTransfer ? 'INTERNAL (Account-to-Account)' : isCredit ? 'CREDIT (+)' : 'DEBIT (-)'}
 Amount: $${transaction.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
 Fee: $${(transaction.fee || 0).toFixed(2)} USD
-Sender: ${transaction.senderName || 'Monvera Authorized Account'} (${isWireCheckWithdrawalDebit ? wireCheckSourceAccMasked : transaction.senderAccountNumber || 'MVB •••• 9921'})
+${isInternalTransfer ? `Source Account: Monvera ${internalSourceLabel} (${transaction.metadata?.sourceAccountMasked || transaction.senderAccountNumber || 'MVB ••••'})
+Destination Account: Monvera ${internalDestLabel} (${transaction.metadata?.destinationAccountMasked || transaction.recipientAccountNumber || 'MVB ••••'})` : `Sender: ${transaction.senderName || 'Monvera Authorized Account'} (${isWireCheckWithdrawalDebit ? wireCheckSourceAccMasked : transaction.senderAccountNumber || 'MVB •••• 9921'})
 ${isWireCheckWithdrawalDebit ? `Destination Bank: ${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}
 Source Account: ${wireCheckSourceAccount}
 Delivery Status: ${wireCheckDeliveryStatus}
 Estimated Delivery: ${wireCheckEstBusinessDays} business days
 Notice: ${wireCheckNoticeMessage}` : isCheckWithdrawalDebit ? `Payee: ${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Payee'} (${transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'Check'})
-Source Account: ${transaction.metadata?.sourceAccountType || 'CHECKING'}` : `Recipient: ${transaction.recipientName || 'Monvera Authorized Account'} (${transaction.recipientAccountNumber || 'MVB •••• 7391'})`}
+Source Account: ${transaction.metadata?.sourceAccountType || 'CHECKING'}` : `Recipient: ${transaction.recipientName || 'Monvera Authorized Account'} (${transaction.recipientAccountNumber || 'MVB •••• 7391'})`}`}
 Date & Time: ${formattedDate} at ${formattedTime}
 Reference: ${transaction.referenceNumber}
 Ledger Hash: ${transaction.id}
@@ -492,8 +527,8 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
   </div>
 
   <div class="amount-box">
-    <div class="amount-label">${isCredit ? 'Credit Transaction • Incoming' : 'Debit Transaction • Outgoing'}</div>
-    <div class="amount-val">${isCredit ? '+' : '-'}$${transaction.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD</div>
+    <div class="amount-label">${isInternalTransfer ? 'Internal Account Movement • Self-Transfer' : isCredit ? 'Credit Transaction • Incoming' : 'Debit Transaction • Outgoing'}</div>
+    <div class="amount-val">${isInternalTransfer ? '' : isCredit ? '+' : '-'}$${transaction.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD</div>
     <div style="font-size: 13px; color: #64748b; margin-top: 6px;">${displayDescription}</div>
   </div>
 
@@ -507,12 +542,12 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
       <div class="item-val" style="color: #059669;">${isWireCheckWithdrawalDebit ? `Completed • ${wireCheckDeliveryStatus}` : 'Completed & Settled'}</div>
     </div>
     <div class="item">
-      <div class="item-label">Sender</div>
-      <div class="item-val">${transaction.senderName || 'Authorized Sender'} (${isWireCheckWithdrawalDebit ? wireCheckSourceAccMasked : transaction.senderAccountNumber || 'MVB •••• 9921'})</div>
+      <div class="item-label">${isInternalTransfer ? 'Source Account' : 'Sender'}</div>
+      <div class="item-val">${isInternalTransfer ? `Monvera ${internalSourceLabel} (${transaction.metadata?.sourceAccountMasked || transaction.senderAccountNumber || 'MVB ••••'})` : `${transaction.senderName || 'Authorized Sender'} (${isWireCheckWithdrawalDebit ? wireCheckSourceAccMasked : transaction.senderAccountNumber || 'MVB •••• 9921'})`}</div>
     </div>
     <div class="item">
-      <div class="item-label">${isWireCheckWithdrawalDebit ? 'Destination Bank' : isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient'}</div>
-      <div class="item-val">${isWireCheckWithdrawalDebit ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}` : `${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Recipient'} (${isCheckWithdrawalDebit && transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'MVB •••• 7391'})`}</div>
+      <div class="item-label">${isInternalTransfer ? 'Destination Account' : isWireCheckWithdrawalDebit ? 'Destination Bank' : isCheckWithdrawalDebit ? 'Check Payee & Check #' : 'Recipient'}</div>
+      <div class="item-val">${isInternalTransfer ? `Monvera ${internalDestLabel} (${transaction.metadata?.destinationAccountMasked || transaction.recipientAccountNumber || 'MVB ••••'})` : isWireCheckWithdrawalDebit ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}` : `${transaction.recipientName || transaction.metadata?.payeeName || 'Authorized Recipient'} (${isCheckWithdrawalDebit && transaction.metadata?.checkNumber ? `Check #${transaction.metadata.checkNumber}` : transaction.recipientAccountNumber || 'MVB •••• 7391'})`}</div>
     </div>
     ${isCheckWithdrawalDebit ? `<div class="item" style="grid-column: span 2;"><div class="item-label">Source Account</div><div class="item-val">${transaction.metadata?.sourceAccountType || 'CHECKING'}</div></div>` : ''}
     ${isWireCheckWithdrawalDebit ? `<div class="item"><div class="item-label">Source Account</div><div class="item-val">${wireCheckSourceAccount}</div></div><div class="item"><div class="item-label">Delivery Estimate & Notification</div><div class="item-val">${wireCheckDeliveryStatus} • ${wireCheckNoticeMessage}</div></div>` : ''}
@@ -607,11 +642,15 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
               </div>
 
               <div className="text-xs uppercase font-bold text-slate-500 tracking-wider mb-1 font-mono">
-                {isCredit ? 'Credit Inflow • Received' : 'Debit Outflow • Dispatched'}
+                {isInternalTransfer
+                  ? 'Internal Account Movement • Self-Transfer'
+                  : isCredit
+                  ? 'Credit Inflow • Received'
+                  : 'Debit Outflow • Dispatched'}
               </div>
 
-              <div className={`text-4xl font-black tracking-tight font-mono ${isCredit ? 'text-emerald-700' : 'text-slate-950'}`}>
-                {isCredit ? '+' : '-'}$
+              <div className={`text-4xl font-black tracking-tight font-mono ${isInternalTransfer ? 'text-slate-950' : isCredit ? 'text-emerald-700' : 'text-slate-950'}`}>
+                {isInternalTransfer ? '' : isCredit ? '+' : '-'}$
                 {transaction.amount.toLocaleString('en-US', {
                   minimumFractionDigits: 2,
                   maximumFractionDigits: 2,
@@ -630,8 +669,8 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                   Transaction Type
                 </span>
                 <div className="flex items-center space-x-2">
-                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${isCredit ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-800'}`}>
-                    {isCredit ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${isInternalTransfer ? 'bg-sky-100 text-sky-700' : isCredit ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-800'}`}>
+                    {isInternalTransfer ? <ArrowRightLeft className="w-4 h-4" /> : isCredit ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
                   </div>
                   <span className="text-sm font-bold text-slate-900">
                     {getCleanTypeLabel(transaction.type)}
@@ -655,13 +694,17 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
 
               <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
                 <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                  Sender Information
+                  {isInternalTransfer ? 'Source Account' : 'Sender Information'}
                 </span>
                 <div className="text-sm font-black text-slate-950">
-                  {transaction.senderName || 'Monvera Authorized Account'}
+                  {isInternalTransfer
+                    ? `Monvera ${internalSourceLabel}`
+                    : transaction.senderName || 'Monvera Authorized Account'}
                 </div>
                 <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                  {isWireCheckWithdrawalDebit
+                  {isInternalTransfer
+                    ? transaction.metadata?.sourceAccountMasked || transaction.senderAccountNumber || 'MVB ••••'
+                    : isWireCheckWithdrawalDebit
                     ? wireCheckSourceAccMasked
                     : transaction.senderAccountNumber || 'MVB •••• 9921'}
                 </div>
@@ -669,19 +712,25 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
 
               <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
                 <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                  {isWireCheckWithdrawalDebit
+                  {isInternalTransfer
+                    ? 'Destination Account'
+                    : isWireCheckWithdrawalDebit
                     ? 'Destination Bank & Source'
                     : isCheckWithdrawalDebit
                     ? 'Check Payee & Check #'
                     : 'Recipient Information'}
                 </span>
                 <div className="text-sm font-black text-slate-950">
-                  {isWireCheckWithdrawalDebit
+                  {isInternalTransfer
+                    ? `Monvera ${internalDestLabel}`
+                    : isWireCheckWithdrawalDebit
                     ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}`
                     : transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
                 </div>
                 <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                  {isWireCheckWithdrawalDebit
+                  {isInternalTransfer
+                    ? transaction.metadata?.destinationAccountMasked || transaction.recipientAccountNumber || 'MVB ••••'
+                    : isWireCheckWithdrawalDebit
                     ? `${wireCheckSourceAccount} • ${wireCheckDeliveryStatus}`
                     : isCheckWithdrawalDebit && transaction.metadata?.checkNumber
                     ? `Check #${transaction.metadata.checkNumber}${transaction.metadata?.sourceAccountType ? ` • ${transaction.metadata.sourceAccountType}` : ''}`
@@ -799,11 +848,15 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
             </div>
 
             <div className="text-xs uppercase font-bold text-slate-500 tracking-wider mb-1 font-mono">
-              {isCredit ? 'Credit Inflow • Received' : 'Debit Outflow • Dispatched'}
+              {isInternalTransfer
+                ? 'Internal Account Movement • Self-Transfer'
+                : isCredit
+                ? 'Credit Inflow • Received'
+                : 'Debit Outflow • Dispatched'}
             </div>
 
-            <div className={`text-4xl sm:text-5xl font-black tracking-tight font-mono ${isCredit ? 'text-emerald-700' : 'text-slate-950'}`}>
-              {isCredit ? '+' : '-'}$
+            <div className={`text-4xl sm:text-5xl font-black tracking-tight font-mono ${isInternalTransfer ? 'text-slate-950' : isCredit ? 'text-emerald-700' : 'text-slate-950'}`}>
+              {isInternalTransfer ? '' : isCredit ? '+' : '-'}$
               {transaction.amount.toLocaleString('en-US', {
                 minimumFractionDigits: 2,
                 maximumFractionDigits: 2,
@@ -823,8 +876,8 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                 Transaction Type
               </span>
               <div className="flex items-center space-x-2">
-                <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${isCredit ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-800'}`}>
-                  {isCredit ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+                <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${isInternalTransfer ? 'bg-sky-100 text-sky-700' : isCredit ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-800'}`}>
+                  {isInternalTransfer ? <ArrowRightLeft className="w-4 h-4" /> : isCredit ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
                 </div>
                 <span className="text-sm font-bold text-slate-900">
                   {getCleanTypeLabel(transaction.type)}
@@ -849,13 +902,17 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
             {/* Sender Details */}
             <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
               <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                Sender Information
+                {isInternalTransfer ? 'Source Account' : 'Sender Information'}
               </span>
               <div className="text-sm font-black text-slate-950">
-                {transaction.senderName || 'Monvera Authorized Account'}
+                {isInternalTransfer
+                  ? `Monvera ${internalSourceLabel}`
+                  : transaction.senderName || 'Monvera Authorized Account'}
               </div>
               <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                {isWireCheckWithdrawalDebit
+                {isInternalTransfer
+                  ? transaction.metadata?.sourceAccountMasked || transaction.senderAccountNumber || 'MVB ••••'
+                  : isWireCheckWithdrawalDebit
                   ? wireCheckSourceAccMasked
                   : transaction.senderAccountNumber || 'MVB •••• 9921'}
               </div>
@@ -864,19 +921,25 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
             {/* Recipient / Check Payee / Wire Check Details */}
             <div className="p-4 rounded-2xl bg-white border-2 border-slate-200">
               <span className="text-[11px] font-black text-slate-500 uppercase tracking-wide block mb-1 font-mono">
-                {isWireCheckWithdrawalDebit
+                {isInternalTransfer
+                  ? 'Destination Account'
+                  : isWireCheckWithdrawalDebit
                   ? 'Destination Bank & Source'
                   : isCheckWithdrawalDebit
                   ? 'Check Payee & Check #'
                   : 'Recipient Information'}
               </span>
               <div className="text-sm font-black text-slate-950">
-                {isWireCheckWithdrawalDebit
+                {isInternalTransfer
+                  ? `Monvera ${internalDestLabel}`
+                  : isWireCheckWithdrawalDebit
                   ? `${wireCheckBankName}${wireCheckDestAccMasked ? ` (${wireCheckDestAccMasked})` : ''}`
                   : transaction.recipientName || transaction.metadata?.payeeName || 'Monvera Authorized Account'}
               </div>
               <div className="text-xs text-slate-500 font-mono font-bold mt-0.5">
-                {isWireCheckWithdrawalDebit
+                {isInternalTransfer
+                  ? transaction.metadata?.destinationAccountMasked || transaction.recipientAccountNumber || 'MVB ••••'
+                  : isWireCheckWithdrawalDebit
                   ? `${wireCheckSourceAccount} • ${wireCheckDeliveryStatus}`
                   : isCheckWithdrawalDebit && transaction.metadata?.checkNumber
                   ? `Check #${transaction.metadata.checkNumber}${transaction.metadata?.sourceAccountType ? ` • ${transaction.metadata.sourceAccountType}` : ''}`
