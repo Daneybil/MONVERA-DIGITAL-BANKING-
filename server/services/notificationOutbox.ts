@@ -226,6 +226,25 @@ export function generateOutboxLeaseToken(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
+const ISO_TIMESTAMP_PREFIX_RE = /^\d{4}-\d{2}-\d{2}(?:T|\s)\d{2}:\d{2}:\d{2}/;
+
+/**
+ * Strictly parses an ISO-8601 timestamp string into finite epoch milliseconds.
+ * Rejects missing values, non-strings, garbage strings, and numeric coercions (e.g. "1").
+ */
+export function parseValidOutboxTimestampMs(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || !ISO_TIMESTAMP_PREFIX_RE.test(trimmed)) {
+    return null;
+  }
+  const parsed = Date.parse(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
 function sanitizeRelativeUrl(rawUrl?: string): string | undefined {
   if (typeof rawUrl !== 'string') return undefined;
   const trimmed = rawUrl.trim();
@@ -541,14 +560,21 @@ export interface ClaimOutboxLeaseResult {
     | 'ALREADY_TERMINAL'
     | 'LEASE_ACTIVE'
     | 'RETRY_NOT_DUE'
-    | 'MAX_ATTEMPTS_EXCEEDED';
+    | 'MAX_ATTEMPTS_EXCEEDED'
+    | 'INELIGIBLE';
+  ineligibleReason?: string;
   leaseToken?: string;
   record?: NotificationOutboxRecord;
+}
+
+export interface ClaimOutboxLeaseOptions {
+  validateRecord?: (record: NotificationOutboxRecord) => boolean | { eligible: boolean; reason?: string };
 }
 
 /**
  * Atomically claims an outbox entry for processing with an unpredictable cryptographic leaseToken.
  * Independently enforces inside the transaction:
+ * - Optional pre-claim eligibility validator (rejects historical/malformed/non-allowlisted records without mutation).
  * - Terminal states (DISPATCHED / DEAD_LETTER) cannot be claimed.
  * - Records already at maxAttempts cannot be claimed for another attempt.
  * - FAILED_RETRYABLE records cannot be claimed before nextAttemptAt.
@@ -559,7 +585,8 @@ export async function claimOutboxLease(
   outboxId: string,
   workerId: string,
   leaseDurationMs: number = DEFAULT_OUTBOX_LEASE_DURATION_MS,
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  options?: ClaimOutboxLeaseOptions
 ): Promise<ClaimOutboxLeaseResult> {
   const cleanWorkerId = String(workerId || '').trim();
   if (!cleanWorkerId) {
@@ -578,6 +605,19 @@ export async function claimOutboxLease(
     }
 
     const current = snap.data() as NotificationOutboxRecord;
+    if (options?.validateRecord) {
+      const validation = options.validateRecord(current);
+      const isEligible = typeof validation === 'boolean' ? validation : validation.eligible;
+      if (!isEligible) {
+        return {
+          claimed: false,
+          reason: 'INELIGIBLE',
+          ...(typeof validation === 'object' && validation.reason ? { ineligibleReason: validation.reason } : {}),
+          record: current,
+        };
+      }
+    }
+
     if (OUTBOX_TERMINAL_STATES.has(current.status)) {
       return { claimed: false, reason: 'ALREADY_TERMINAL', record: current };
     }
@@ -717,7 +757,8 @@ export interface SettleExhaustedOutboxResult {
     | 'ALREADY_DISPATCHED'
     | 'NOT_FOUND'
     | 'LEASE_ACTIVE'
-    | 'NOT_EXHAUSTED';
+    | 'NOT_EXHAUSTED'
+    | 'INELIGIBLE';
   record?: NotificationOutboxRecord;
 }
 
@@ -734,6 +775,7 @@ export async function settleExhaustedOutboxRecord(
   options?: {
     nowMs?: number;
     reason?: string;
+    validateRecord?: (record: NotificationOutboxRecord) => boolean | { eligible: boolean; reason?: string };
   }
 ): Promise<SettleExhaustedOutboxResult> {
   const nowMs = options?.nowMs ?? Date.now();
@@ -747,6 +789,14 @@ export async function settleExhaustedOutboxRecord(
     }
 
     const current = snap.data() as NotificationOutboxRecord;
+
+    if (options?.validateRecord) {
+      const validation = options.validateRecord(current);
+      const isEligible = typeof validation === 'boolean' ? validation : validation.eligible;
+      if (!isEligible) {
+        return { settled: false, reason: 'INELIGIBLE', record: current };
+      }
+    }
 
     if (current.status === 'DEAD_LETTER') {
       return { settled: true, reason: 'ALREADY_DEAD_LETTER', record: current };
@@ -1170,6 +1220,11 @@ export async function fetchDispatchLogForOutboxRecord(
   };
 }
 
+export interface OutboxQueryOptions {
+  minNextAttemptAtIso?: string;
+  startAfterDoc?: any;
+}
+
 /**
  * Composite-indexed query for claimable PENDING and FAILED_RETRYABLE outbox items.
  * Backed by composite index: (status ASC, nextAttemptAt ASC).
@@ -1177,14 +1232,24 @@ export async function fetchDispatchLogForOutboxRecord(
 export function buildRetryableOutboxQuery(
   fs: Firestore,
   nowIso: string = new Date().toISOString(),
-  limitCount: number = 50
+  limitCount: number = 50,
+  options?: OutboxQueryOptions
 ): Query {
-  return fs
+  let query: Query = fs
     .collection(NOTIFICATION_OUTBOX_COLLECTION)
-    .where('status', 'in', ['PENDING', 'FAILED_RETRYABLE'])
-    .where('nextAttemptAt', '<=', nowIso)
-    .orderBy('nextAttemptAt', 'asc')
-    .limit(limitCount);
+    .where('status', 'in', ['PENDING', 'FAILED_RETRYABLE']);
+
+  if (options?.minNextAttemptAtIso) {
+    query = query.where('nextAttemptAt', '>=', options.minNextAttemptAtIso);
+  }
+
+  query = query.where('nextAttemptAt', '<=', nowIso).orderBy('nextAttemptAt', 'asc');
+
+  if (options?.startAfterDoc !== undefined && options?.startAfterDoc !== null) {
+    query = query.startAfter(options.startAfterDoc);
+  }
+
+  return query.limit(limitCount);
 }
 
 /**
@@ -1194,12 +1259,18 @@ export function buildRetryableOutboxQuery(
 export function buildExpiredProcessingOutboxQuery(
   fs: Firestore,
   nowIso: string = new Date().toISOString(),
-  limitCount: number = 50
+  limitCount: number = 50,
+  options?: Pick<OutboxQueryOptions, 'startAfterDoc'>
 ): Query {
-  return fs
+  let query: Query = fs
     .collection(NOTIFICATION_OUTBOX_COLLECTION)
     .where('status', '==', 'PROCESSING')
     .where('leaseExpiresAt', '<=', nowIso)
-    .orderBy('leaseExpiresAt', 'asc')
-    .limit(limitCount);
+    .orderBy('leaseExpiresAt', 'asc');
+
+  if (options?.startAfterDoc !== undefined && options?.startAfterDoc !== null) {
+    query = query.startAfter(options.startAfterDoc);
+  }
+
+  return query.limit(limitCount);
 }

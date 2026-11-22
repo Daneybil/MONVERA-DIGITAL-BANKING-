@@ -1180,7 +1180,10 @@ export const api = {
 
     // 2. Fetch from backend API
     try {
-      const res = await fetch(`/api/accounts/balance?userId=${encodeURIComponent(userId)}`);
+      const headers = await getAuthHeaders();
+      const res = await fetch(`/api/accounts/balance?userId=${encodeURIComponent(userId)}`, {
+        headers,
+      });
       if (res.ok) {
         const data = await parseJsonResponse<BalanceMetrics>(res, null as any);
         if (data && (typeof data.checkingBalance === 'number' || typeof data.totalBalance === 'number')) {
@@ -1621,20 +1624,41 @@ export const api = {
   async reversePendingWithdrawal(
     transactionId: string,
     userId: string
-  ): Promise<{ success: boolean; balanceMetrics?: BalanceMetrics }> {
+  ): Promise<{ success: boolean; balanceMetrics?: BalanceMetrics; error?: string }> {
     try {
-      await fetch('/api/withdrawals/reverse', {
+      const headers = await getAuthHeaders();
+      const res = await fetch('/api/withdrawals/reverse', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ transactionId, userId }),
       });
-    } catch {}
 
-    // Execute reverse in firestoreSync
-    await firestoreSync.reversePendingWithdrawal(transactionId, userId);
-    const restoredMetrics = await this.getBalanceMetrics(userId);
+      const parsed = await parseJsonResponse<{
+        success?: boolean;
+        balanceMetrics?: BalanceMetrics;
+        error?: string;
+      }>(res, {});
 
-    return { success: true, balanceMetrics: restoredMetrics };
+      if (res.status === 401 || res.status === 403 || res.status === 400) {
+        return {
+          success: false,
+          error: parsed.error || `Withdrawal reversal rejected (${res.status})`,
+        };
+      }
+
+      if (res.ok && parsed.success) {
+        const metrics = parsed.balanceMetrics || (await this.getBalanceMetrics(userId)) || undefined;
+        return { success: true, balanceMetrics: metrics };
+      }
+    } catch {
+      // Network unavailable; fall back to client Firestore sync below
+    }
+
+    // Fallback reverse in firestoreSync when backend server is unreachable
+    const reversed = await firestoreSync.reversePendingWithdrawal(transactionId, userId);
+    const restoredMetrics = (await this.getBalanceMetrics(userId)) || undefined;
+
+    return { success: reversed, balanceMetrics: restoredMetrics };
   },
 
   /**
@@ -1656,14 +1680,17 @@ export const api = {
     destinationAccountType?: 'CHECKING' | 'SAVINGS';
   }): Promise<{ success: boolean; url?: string; sessionId?: string; configured?: boolean; error?: string }> {
     try {
-      const res = await fetch('/api/stripe/create-checkout-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...params,
-          origin: typeof window !== 'undefined' ? window.location.origin : '',
-        }),
-      });
+      const res = await fetchWithFreshAuthRetry(
+        '/api/stripe/create-checkout-session',
+        getCustomerAuthHeaders,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ...params,
+            origin: typeof window !== 'undefined' ? window.location.origin : '',
+          }),
+        }
+      );
       return await parseJsonResponse(res, { success: false, error: 'Payment gateway temporarily offline' });
     } catch (err: any) {
       return { success: false, error: 'Failed to communicate with Stripe checkout service.' };

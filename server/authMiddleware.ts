@@ -125,6 +125,17 @@ export function verifyAdminSessionToken(
   return { valid: true, payload };
 }
 
+function resolveAdminSessionHeaderOrClaim(
+  rawHeader: string | string[] | undefined,
+  claimToken: unknown
+): string | undefined {
+  if (rawHeader !== undefined) {
+    const headerVal = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+    return typeof headerVal === 'string' ? headerVal.trim() : '';
+  }
+  return typeof claimToken === 'string' ? claimToken.trim() : undefined;
+}
+
 /**
  * Express middleware to authenticate Firebase ID tokens from:
  * Authorization: Bearer <Firebase ID token>
@@ -155,13 +166,16 @@ export async function requireFirebaseAuth(req: AuthenticatedRequest, res: Respon
 
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);
-    const sessionToken = (req.headers['x-admin-session'] as string) || (decodedToken.adminSessionToken as string);
+    const sessionToken = resolveAdminSessionHeaderOrClaim(
+      req.headers['x-admin-session'],
+      decodedToken.adminSessionToken
+    );
     req.auth = {
+      ...decodedToken,
       uid: decodedToken.uid,
       email: decodedToken.email,
       email_verified: decodedToken.email_verified,
       adminSessionToken: sessionToken,
-      ...decodedToken,
     };
     next();
   } catch (err: any) {
@@ -174,7 +188,8 @@ export async function requireFirebaseAuth(req: AuthenticatedRequest, res: Respon
 }
 
 /**
- * Optional helper for endpoints that allow both Firebase ID token auth AND admin fallback
+ * Optional helper for endpoints that allow anonymous fallback for non-sensitive flows
+ * while attaching verified Firebase ID token context when present.
  */
 export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
   if (!isFirebaseAdminConfigured()) {
@@ -187,13 +202,16 @@ export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Resp
     if (token) {
       try {
         const decodedToken = await adminAuth.verifyIdToken(token);
-        const sessionToken = (req.headers['x-admin-session'] as string) || (decodedToken.adminSessionToken as string);
+        const sessionToken = resolveAdminSessionHeaderOrClaim(
+          req.headers['x-admin-session'],
+          decodedToken.adminSessionToken
+        );
         req.auth = {
+          ...decodedToken,
           uid: decodedToken.uid,
           email: decodedToken.email,
           email_verified: decodedToken.email_verified,
           adminSessionToken: sessionToken,
-          ...decodedToken,
         };
       } catch (err) {
         // Token provided but invalid
@@ -206,34 +224,68 @@ export async function optionalFirebaseAuth(req: AuthenticatedRequest, _res: Resp
 
 /**
  * Reads configured administrator emails from server environment variables.
- * Fails closed if not explicitly configured in server environment.
+ * Fails closed (returns empty array) if not explicitly configured in server environment.
  */
 export function getConfiguredAdminEmails(): string[] {
   const envEmails = [process.env.ADMIN_EMAILS, process.env.ADMIN_EMAIL].filter(Boolean).join(',');
-  const parsed = envEmails
+  return envEmails
     .split(/[,;\s]+/)
     .map((e) => e.replace(/^["']|["']$/g, '').trim().toLowerCase())
     .filter(Boolean);
-  if (parsed.length > 0) return parsed;
-  return ['daneybil2020@gmail.com', 'admin@monvera.com'];
 }
 
 /**
  * Reads configured administrator UIDs from server environment variables.
- * Fails closed if not explicitly configured in server environment.
+ * Fails closed (returns empty array) if not explicitly configured in server environment.
  */
 export function getConfiguredAdminUids(): string[] {
   const envUids = [process.env.ADMIN_UIDS, process.env.ADMIN_UID].filter(Boolean).join(',');
-  const parsed = envUids
+  return envUids
     .split(/[,;\s]+/)
     .map((u) => u.replace(/^["']|["']$/g, '').trim())
     .filter(Boolean);
-  if (parsed.length > 0) return parsed;
-  return ['usr_admin'];
 }
 
 /**
- * Verifies if a verified Firebase Auth caller has administrator privileges.
+ * Checks whether a verified Firebase Auth identity explicitly belongs to the configured
+ * server administrator allowlist (UID allowlist, or verified-email allowlist).
+ * Persistent custom claims alone never bypass the configured allowlist.
+ */
+export function isIdentityInAdminAllowlist(
+  uid?: string,
+  email?: string,
+  decodedClaims?: Record<string, any>
+): { allowed: boolean; isConfiguredUid: boolean; isConfiguredVerifiedEmail: boolean } {
+  if (!uid || typeof uid !== 'string' || !uid.trim()) {
+    return { allowed: false, isConfiguredUid: false, isConfiguredVerifiedEmail: false };
+  }
+
+  const configuredEmails = getConfiguredAdminEmails();
+  const configuredUids = getConfiguredAdminUids();
+  if (configuredEmails.length === 0 && configuredUids.length === 0) {
+    return { allowed: false, isConfiguredUid: false, isConfiguredVerifiedEmail: false };
+  }
+
+  const cleanUid = uid.trim();
+  const normalizedEmail = (email || '').toLowerCase().trim();
+  const isEmailVerified = decodedClaims?.email_verified === true;
+
+  const isConfiguredUid = configuredUids.includes(cleanUid);
+  const isConfiguredVerifiedEmail =
+    Boolean(normalizedEmail) && isEmailVerified && configuredEmails.includes(normalizedEmail);
+
+  return {
+    allowed: isConfiguredUid || isConfiguredVerifiedEmail,
+    isConfiguredUid,
+    isConfiguredVerifiedEmail,
+  };
+}
+
+/**
+ * Verifies if a verified Firebase Auth caller has active administrator authorization:
+ * 1. Verified non-empty Firebase UID and configured ADMIN_PASSWORD secret.
+ * 2. Explicit membership in ADMIN_UIDS or verified-email membership in ADMIN_EMAILS.
+ * 3. Valid, non-expired HMAC administrator session token bound to caller UID and email.
  */
 export async function isCallerAdministrator(
   uid?: string,
@@ -241,45 +293,44 @@ export async function isCallerAdministrator(
   decodedClaims?: Record<string, any>,
   sessionToken?: string
 ): Promise<boolean> {
-  if (!uid && !email) return false;
+  if (!uid || typeof uid !== 'string' || !uid.trim()) return false;
   if (!getAdminSessionSecret()) return false;
 
-  const normalizedEmail = (email || '').toLowerCase().trim();
-  const configuredEmails = getConfiguredAdminEmails();
-  const configuredUids = getConfiguredAdminUids();
-
-  // 1. Identity check: Email or UID must be in configured administrator list or custom claims
-  const isConfiguredEmail = normalizedEmail && configuredEmails.includes(normalizedEmail);
-  const isConfiguredUid = uid && configuredUids.includes(uid);
-  const hasAdminClaim = decodedClaims?.admin === true || decodedClaims?.role === 'admin' || decodedClaims?.role === 'super_admin';
-
-  if (!isConfiguredEmail && !isConfiguredUid && !hasAdminClaim) {
+  const allowlist = isIdentityInAdminAllowlist(uid, email, decodedClaims);
+  if (!allowlist.allowed) {
     return false;
   }
 
-  // 2. Session verification: Check token if provided
-  const tokenToVerify = sessionToken || (decodedClaims?.adminSessionToken as string) || (decodedClaims?.adminSessionSignature as string);
-  if (tokenToVerify) {
-    const verification = verifyAdminSessionToken(tokenToVerify, uid, normalizedEmail);
-    if (verification.valid) {
-      return true;
-    }
+  const tokenToVerify =
+    sessionToken !== undefined
+      ? sessionToken
+      : ((decodedClaims?.adminSessionToken as string | undefined) ||
+         (decodedClaims?.adminSessionSignature as string | undefined));
+
+  if (!tokenToVerify || typeof tokenToVerify !== 'string' || !tokenToVerify.trim()) {
+    return false;
   }
 
-  // If identity matches recognized platform administrator and authenticated via Firebase Auth / claims
-  if (isConfiguredEmail || isConfiguredUid || hasAdminClaim) {
-    return true;
-  }
-
-  return false;
+  const normalizedEmail = (email || '').toLowerCase().trim();
+  const verification = verifyAdminSessionToken(tokenToVerify.trim(), uid.trim(), normalizedEmail || undefined);
+  return verification.valid;
 }
 
-/**
- * Express middleware to authenticate and authorize administrator requests.
- * Requires a valid Firebase Bearer token and verifies active administrator session.
- */
-export async function requireAdminAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  if (!isFirebaseAdminConfigured()) {
+export interface RequireAdminAuthDeps {
+  isFirebaseConfiguredFn?: () => boolean;
+  verifyIdTokenFn?: (token: string) => Promise<Record<string, any>>;
+}
+
+export async function evaluateRequireAdminAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+  deps?: RequireAdminAuthDeps
+) {
+  const isFbConfigured = deps?.isFirebaseConfiguredFn
+    ? deps.isFirebaseConfiguredFn()
+    : isFirebaseAdminConfigured();
+  if (!isFbConfigured) {
     return res.status(503).json({
       error: 'SERVICE_UNAVAILABLE: Administrator authentication service is unavailable because Firebase Admin credentials are not configured.',
     });
@@ -290,6 +341,7 @@ export async function requireAdminAuth(req: AuthenticatedRequest, res: Response,
       errorCode: 'CONFIG_UNAVAILABLE',
     });
   }
+
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -306,28 +358,55 @@ export async function requireAdminAuth(req: AuthenticatedRequest, res: Response,
   }
 
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    const sessionToken = (req.headers['x-admin-session'] as string) || (decodedToken.adminSessionToken as string);
+    const verifyFn = deps?.verifyIdTokenFn || ((t: string) => adminAuth.verifyIdToken(t));
+    const decodedToken = await verifyFn(token);
+    const configuredEmails = getConfiguredAdminEmails();
+    const configuredUids = getConfiguredAdminUids();
+    if (configuredEmails.length === 0 && configuredUids.length === 0) {
+      return res.status(403).json({
+        error: 'FORBIDDEN: Administrator allowlist is not configured on the server.',
+        errorCode: 'ADMIN_ALLOWLIST_UNCONFIGURED',
+      });
+    }
+
+    const sessionToken = resolveAdminSessionHeaderOrClaim(
+      req.headers['x-admin-session'],
+      decodedToken.adminSessionToken
+    );
 
     req.auth = {
+      ...decodedToken,
       uid: decodedToken.uid,
       email: decodedToken.email,
       email_verified: decodedToken.email_verified,
       adminSessionToken: sessionToken,
-      ...decodedToken,
     };
 
     const email = (decodedToken.email || '').toLowerCase().trim();
     const uid = decodedToken.uid;
 
-    const hasAdminAccess = await isCallerAdministrator(uid, email, req.auth, sessionToken);
-    if (hasAdminAccess) {
-      return next();
+    const allowlist = isIdentityInAdminAllowlist(uid, email, req.auth);
+    if (!allowlist.allowed) {
+      return res.status(403).json({
+        error: 'FORBIDDEN: Administrative privileges required to perform this action.',
+        errorCode: 'FORBIDDEN',
+      });
     }
 
-    return res.status(403).json({
-      error: 'FORBIDDEN: Administrative privileges required to perform this action. Active administrator session is missing or invalid.',
-    });
+    const sessionCheck = verifyAdminSessionToken(sessionToken, uid, email || undefined);
+    if (!sessionCheck.valid) {
+      const isExpired = sessionCheck.reason === 'Admin session expired';
+      return res.status(401).json({
+        success: false,
+        isAdmin: false,
+        hasAdminIdentity: true,
+        sessionExpired: isExpired,
+        errorCode: 'ADMIN_SESSION_INVALID',
+        error: `UNAUTHORIZED: ${sessionCheck.reason || 'Valid non-expired administrator session is required.'}`,
+      });
+    }
+
+    return next();
   } catch (err: any) {
     console.warn('[requireAdminAuth] Token verification failed:', err?.message || err);
     return res.status(401).json({
@@ -335,4 +414,13 @@ export async function requireAdminAuth(req: AuthenticatedRequest, res: Response,
       details: err?.code || err?.message,
     });
   }
+}
+
+/**
+ * Express middleware (strictly 3-argument arity) to authenticate and authorize administrator requests.
+ * Requires a valid Firebase Bearer token, explicit allowlist membership, and a valid
+ * non-expired administrator session token bound to the verified Firebase identity.
+ */
+export function requireAdminAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  return evaluateRequireAdminAuth(req, res, next);
 }

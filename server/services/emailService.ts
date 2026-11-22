@@ -168,6 +168,15 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
    * Dispatch transactional email with deduplication and fail-safe behavior
    */
   public async sendTransactionalEmail(params: EmailDispatchParams): Promise<EmailDispatchResult> {
+    if (process.env.DISABLE_OUTBOUND_NOTIFICATIONS === 'true') {
+      return {
+        success: true,
+        delivered: false,
+        status: 'SKIPPED',
+        provider: 'disabled',
+      };
+    }
+
     const cleanEventKey = typeof params.eventKey === 'string' ? params.eventKey.trim() : '';
     const dedupeIdentity = cleanEventKey || params.referenceNumber || '';
     const dedupeKey = dedupeIdentity ? `${dedupeIdentity}_${params.type}_EMAIL_${params.to}` : '';
@@ -187,6 +196,10 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
     const resendKey = process.env.RESEND_API_KEY;
     const sendgridKey = process.env.SENDGRID_API_KEY;
     const fromAddress = process.env.EMAIL_FROM || 'Monvera Digital Bank <notifications@monvera.com>';
+    const requestTimeoutSignal =
+      typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(10_000)
+        : undefined;
 
     try {
       if (resendKey) {
@@ -204,6 +217,7 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
             html,
             text,
           }),
+          ...(requestTimeoutSignal ? { signal: requestTimeoutSignal } : {}),
         });
 
         if (res.ok) {
@@ -233,6 +247,7 @@ Monvera Digital Banking | Premier Private Wealth & Treasury
               { type: 'text/html', value: html },
             ],
           }),
+          ...(requestTimeoutSignal ? { signal: requestTimeoutSignal } : {}),
         });
 
         if (res.ok || res.status === 202) {

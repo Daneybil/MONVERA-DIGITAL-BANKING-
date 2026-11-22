@@ -73,6 +73,15 @@ class SmsService {
    * Dispatch SMS with deduplication and fail-safe error isolation
    */
   public async sendTransactionSms(params: SmsDispatchParams): Promise<SmsDispatchResult> {
+    if (process.env.DISABLE_OUTBOUND_NOTIFICATIONS === 'true') {
+      return {
+        success: true,
+        delivered: false,
+        status: 'SKIPPED',
+        provider: 'disabled',
+      };
+    }
+
     const cleanEventKey = typeof params.eventKey === 'string' ? params.eventKey.trim() : '';
     const dedupeIdentity = cleanEventKey || params.referenceNumber || '';
     const dedupeKey = dedupeIdentity ? `${dedupeIdentity}_${params.type}_SMS_${params.to}` : '';
@@ -96,6 +105,10 @@ class SmsService {
 
     // 2. Check Termii configuration (Nigerian gateway)
     const termiiKey = process.env.TERMII_API_KEY;
+    const requestTimeoutSignal =
+      typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(10_000)
+        : undefined;
 
     try {
       if (twilioSid && twilioAuth && twilioPhone) {
@@ -114,6 +127,7 @@ class SmsService {
             'Content-Type': 'application/x-www-form-urlencoded',
           },
           body: postData.toString(),
+          ...(requestTimeoutSignal ? { signal: requestTimeoutSignal } : {}),
         });
 
         if (res.ok) {
@@ -139,6 +153,7 @@ class SmsService {
             channel: 'generic',
             api_key: termiiKey,
           }),
+          ...(requestTimeoutSignal ? { signal: requestTimeoutSignal } : {}),
         });
 
         if (res.ok) {

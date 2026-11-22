@@ -127,8 +127,13 @@ try {
       console.error(`[FirebaseAdmin] CRITICAL CONFIGURATION ERROR: No Firebase Admin credentials found in production environment.`);
       console.error(`[FirebaseAdmin] Railway must be configured with FIREBASE_SERVICE_ACCOUNT_KEY (complete service account JSON string) or FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY.`);
       isConfigured = false;
+    } else if (process.env.ALLOW_FIREBASE_ADC !== 'true') {
+      configDiagnosticError =
+        'Local Firebase Admin ADC fallback is disabled by fail-closed policy (set ALLOW_FIREBASE_ADC=true or configure service account credentials).';
+      console.warn(`[FirebaseAdmin] ${configDiagnosticError}`);
+      isConfigured = false;
     } else {
-      // 3. Ambient Google Application Default Credentials (AI Studio preview / GCP Cloud Run environment only)
+      // 3. Ambient Google Application Default Credentials (explicitly authorized development environment only)
       try {
         resolvedProjectId = FIREBASE_PROJECT_ID;
         const mismatchErr = validateProjectAlignment(FIREBASE_PROJECT_ID);
@@ -145,7 +150,7 @@ try {
           rawAuth = getAuth(rawApp);
           rawMessaging = getMessaging(rawApp);
           isConfigured = true;
-          console.log(`[FirebaseAdmin] Initialized for development project "${FIREBASE_PROJECT_ID}" via Application Default Credentials.`);
+          console.log(`[FirebaseAdmin] Initialized for development project "${FIREBASE_PROJECT_ID}" via authorized Application Default Credentials.`);
         }
       } catch (adcErr) {
         configDiagnosticError = 'Application Default Credentials unavailable in development environment.';

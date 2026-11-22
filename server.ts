@@ -10,7 +10,15 @@ import {
   unregisterCustomerPushToken,
   validatePushToken,
   buildTrustedTransferDispatchEvents,
+  areTransferParticipantsAllowlisted,
+  isOutboundNotificationsDisabled,
+  isUidAllowlisted,
+  parseNotificationAllowlistUids,
 } from './server/services/notificationDispatcher';
+import {
+  isNotificationWorkerEnabled,
+  startNotificationOutboxWorker,
+} from './server/services/notificationOutboxWorker';
 import { persistCustomerNotification, maskAccountNumber, resolveCustomerNotificationContext } from './server/services/notificationStore';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
 import { getStripe, isStripeConfigured } from './server/stripe';
@@ -1023,19 +1031,53 @@ app.post('/api/kyc/approve', requireAdminAuth, async (req: AuthenticatedRequest,
 });
 
 // --- ACCOUNT & BALANCE METRICS ---
-app.get('/api/accounts/balance', async (req: Request, res: Response) => {
-  const userId = req.query.userId as string;
-  if (!userId) return res.status(400).json({ error: 'userId is required' });
+export interface AccountBalanceHandlerDeps {
+  firestore?: typeof adminFirestore;
+  isFirebaseAdminConfiguredFn?: typeof isFirebaseAdminConfigured;
+  isAdminFn?: typeof isCallerAdministrator;
+}
 
-  if (!isFirebaseAdminConfigured()) {
+export async function handleGetAccountBalance(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: AccountBalanceHandlerDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
+    return res.status(401).json({
+      error: 'Authentication required to access account balances.',
+      code: 'UNAUTHORIZED',
+    });
+  }
+
+  const adminSessionToken =
+    (req.headers?.['x-admin-session'] as string | undefined) || req.auth?.adminSessionToken;
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const isCallerAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, adminSessionToken);
+
+  const rawRequestedUserId = typeof req.query?.userId === 'string' ? req.query.userId.trim() : '';
+  if (!isCallerAdmin && rawRequestedUserId && rawRequestedUserId !== callerUid) {
+    return res.status(403).json({
+      error: 'FORBIDDEN: You are not authorized to access another customer\'s account balances.',
+      code: 'FORBIDDEN',
+    });
+  }
+
+  const userId = isCallerAdmin && rawRequestedUserId ? rawRequestedUserId : callerUid;
+  const adminConfigured = deps?.firestore
+    ? true
+    : (deps?.isFirebaseAdminConfiguredFn || isFirebaseAdminConfigured)();
+
+  if (!adminConfigured) {
     return res.status(503).json({
       error: 'Authoritative account balances temporarily unavailable: Firebase Admin credentials not configured on backend.',
       code: 'FIRESTORE_NOT_CONFIGURED',
     });
   }
 
+  const fs = deps?.firestore || adminFirestore;
   try {
-    const accSnap = await adminFirestore.collection('accounts').doc(userId).get();
+    const accSnap = await fs.collection('accounts').doc(userId).get();
     if (accSnap.exists) {
       const ad = accSnap.data()!;
       const chk = Number(ad.checkingBalance ?? 0);
@@ -1107,7 +1149,11 @@ app.get('/api/accounts/balance', async (req: Request, res: Response) => {
       code: isQuota ? 'RESOURCE_EXHAUSTED' : 'FIRESTORE_ERROR',
     });
   }
-});
+}
+
+app.get('/api/accounts/balance', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleGetAccountBalance(req, res)
+);
 
 // Lookup recipient by Account Number OR Username before transfer confirmation
 app.get('/api/accounts/lookup', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
@@ -1284,39 +1330,16 @@ app.post('/api/transfers/monvera', requireFirebaseAuth, async (req: Authenticate
       recipientBalanceMetrics: result.recipientBalanceMetrics,
     });
 
-    // Asynchronous multi-channel alerts (strictly from committed COMPLETED non-duplicate Firestore transaction)
-    if (
-      isFirebaseAdminConfigured() &&
-      !result.isDuplicate &&
-      result.transaction &&
-      result.transaction.status === 'COMPLETED'
-    ) {
-      const committedTx = result.transaction;
-      const recipientUid = committedTx.recipientUserId ? String(committedTx.recipientUserId).trim() : '';
-      const senderUid = committedTx.senderUserId ? String(committedTx.senderUserId).trim() : '';
-      Promise.all([
-        recipientUid ? fetchAuthoritativeCustomerContact(recipientUid) : Promise.resolve({}),
-        senderUid ? fetchAuthoritativeCustomerContact(senderUid) : Promise.resolve({}),
-      ])
-        .then(([recipientContact, senderContact]) => {
-          const events = buildTrustedTransferDispatchEvents(committedTx, result.isDuplicate, {
-            mode: 'MONVERA_C2C',
-            authenticatedSenderUid: authUid,
-            senderMetrics: result.senderBalanceMetrics,
-            recipientMetrics: result.recipientBalanceMetrics,
-            senderContact,
-            recipientContact,
-          });
-          return Promise.all(
-            events.map((evt) =>
-              serverNotificationDispatcher.dispatch(evt).catch((err) =>
-                console.warn('[ServerDispatcher] Transfer dispatch note:', err?.message || err)
-              )
-            )
-          );
-        })
-        .catch((err) => console.warn('[ServerDispatcher] Transfer contact lookup note:', err?.message || err));
-    }
+    // Asynchronous multi-channel alerts (solely handled by durable outbox worker when enabled;
+    // direct dispatch runs only when the worker is disabled)
+    dispatchOutboxBackedTransferDirectIfWorkerDisabled({
+      mode: 'MONVERA_C2C',
+      transaction: result.transaction,
+      isDuplicate: result.isDuplicate,
+      authenticatedSenderUid: authUid,
+      senderMetrics: result.senderBalanceMetrics,
+      recipientMetrics: result.recipientBalanceMetrics,
+    }).catch((err) => console.warn('[ServerDispatcher] Transfer dispatch note:', err?.message || err));
   } catch (err: any) {
     console.error('[/api/transfers/monvera Error]', err);
     res.status(500).json({ error: err?.message || 'Internal transfer processing error.' });
@@ -1387,98 +1410,322 @@ app.post('/api/transfers/internal', requireFirebaseAuth, async (req: Authenticat
 });
 
 // --- DEPOSITS & PAYMENT GATEWAY VERIFICATION ---
-app.post('/api/deposits/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { amount, method, destinationAccountType, providerPaymentId, referenceNumber, metadata } = req.body;
-  const callerUid = req.auth?.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (req.body.userId || callerUid);
+function parseStrictUsdDepositAmount(
+  value: unknown,
+  options?: { minCents?: number; maxCents?: number }
+): { ok: true; amount: number; cents: number } | { ok: false; error: string } {
+  const minCents = options?.minCents ?? 100; // $1.00 minimum
+  const maxCents = options?.maxCents ?? 99_999_999; // $999,999.99 Stripe Checkout single-charge limit
 
-  if (!targetUserId || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ error: 'Valid user ID and positive amount are required.' });
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === 'boolean' ||
+    typeof value === 'object' ||
+    (typeof value === 'string' && !value.trim())
+  ) {
+    return { ok: false, error: 'A valid positive finite USD deposit amount is required.' };
   }
 
-  // Check account freeze status
-  const userDocSnap = await adminFirestore.collection('users').doc(targetUserId).get();
-  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
-  if (userData.status === 'frozen') {
-    return res.status(403).json({
-      error: 'Your account is currently restricted/frozen. New deposits are disabled. Please contact compliance support.',
-    });
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num) || num <= 0) {
+    return { ok: false, error: 'Deposit amount must be a positive finite USD amount.' };
   }
 
-  try {
-    const result = await executeServerDeposit({
-      userId: targetUserId,
-      amount: Number(amount),
-      method: method || 'CARD',
-      destinationAccountType: destinationAccountType || 'CHECKING',
-      providerPaymentId,
-      referenceNumber,
-      metadata,
-    });
+  const cents = Math.round(num * 100);
+  if (!Number.isSafeInteger(cents) || Math.abs(num * 100 - cents) > 1e-6) {
+    return { ok: false, error: 'Deposit amount must have at most 2 decimal places.' };
+  }
+  if (cents < minCents) {
+    return { ok: false, error: `Minimum deposit amount is $${(minCents / 100).toFixed(2)} USD.` };
+  }
+  if (cents > maxCents) {
+    return { ok: false, error: `Maximum single deposit amount is $${(maxCents / 100).toFixed(2)} USD.` };
+  }
 
-    if (!result.success) {
-      return res.status(400).json({ error: result.error });
-    }
+  return { ok: true, amount: Number((cents / 100).toFixed(2)), cents };
+}
 
-    // Mirror to memory db for local consistency
+function sanitizeCheckoutOrigin(rawOrigin: unknown, fallbackPort: number): string {
+  const candidate = typeof rawOrigin === 'string' ? rawOrigin.trim() : '';
+  if (candidate) {
     try {
-      db.processDeposit({
-        userId: targetUserId,
-        amount: Number(amount),
-        method: method || 'CARD',
-        destinationAccountType: destinationAccountType || 'CHECKING',
-        providerPaymentId: result.transaction?.referenceNumber || providerPaymentId,
-        metadata,
-      });
+      const parsed = new URL(candidate);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        return parsed.origin;
+      }
     } catch {}
-
-    return res.json({
-      success: true,
-      transaction: result.transaction,
-      balanceMetrics: result.balanceMetrics,
-      isDuplicate: result.isDuplicate,
-    });
-  } catch (err: any) {
-    console.error('[POST /api/deposits/create] Uncaught error:', err);
-    return res.status(500).json({ error: err?.message || 'Server failed to process deposit.' });
   }
-});
+  return `http://localhost:${fallbackPort}`;
+}
+
+export interface VerifiedStripeCheckoutSession {
+  ok: true;
+  sessionId: string;
+  userId: string;
+  amount: number;
+  amountTotalCents: number;
+  currency: 'usd';
+  paymentStatus: 'paid';
+  destinationAccountType: 'CHECKING' | 'SAVINGS';
+}
+
+export function verifyPaidStripeCheckoutSession(
+  session: any
+):
+  | VerifiedStripeCheckoutSession
+  | { ok: false; errorCode: string; error: string; paymentStatus?: string } {
+  if (!session || typeof session !== 'object') {
+    return { ok: false, errorCode: 'INVALID_STRIPE_SESSION', error: 'Invalid Stripe checkout session payload.' };
+  }
+
+  const sessionId = typeof session.id === 'string' ? session.id.trim() : '';
+  if (!sessionId) {
+    return { ok: false, errorCode: 'MISSING_SESSION_ID', error: 'Stripe checkout session ID is missing.' };
+  }
+
+  if (session.mode !== undefined && session.mode !== null && session.mode !== 'payment') {
+    return {
+      ok: false,
+      errorCode: 'UNSUPPORTED_SESSION_MODE',
+      error: `Unsupported Stripe session mode '${String(session.mode)}'.`,
+    };
+  }
+
+  const paymentStatus = typeof session.payment_status === 'string' ? session.payment_status.trim() : '';
+  if (!paymentStatus) {
+    return {
+      ok: false,
+      errorCode: 'MISSING_PAYMENT_STATUS',
+      error: 'Stripe checkout session is missing payment_status.',
+    };
+  }
+  if (paymentStatus !== 'paid') {
+    return {
+      ok: false,
+      paymentStatus,
+      errorCode: 'PAYMENT_NOT_PAID',
+      error: `Stripe payment not settled (payment_status: ${paymentStatus}).`,
+    };
+  }
+
+  const currency = typeof session.currency === 'string' ? session.currency.trim().toLowerCase() : '';
+  if (currency !== 'usd') {
+    return {
+      ok: false,
+      errorCode: 'UNSUPPORTED_CURRENCY',
+      error: `Unsupported deposit currency '${currency || 'missing'}'. Only USD settlements are accepted.`,
+    };
+  }
+
+  const amountTotal = session.amount_total;
+  if (
+    typeof amountTotal !== 'number' ||
+    !Number.isInteger(amountTotal) ||
+    !Number.isSafeInteger(amountTotal) ||
+    amountTotal <= 0
+  ) {
+    return {
+      ok: false,
+      errorCode: 'INVALID_AMOUNT_TOTAL',
+      error: 'Stripe checkout session is missing a valid positive integer amount_total in cents.',
+    };
+  }
+
+  const meta = session.metadata && typeof session.metadata === 'object' ? session.metadata : {};
+  if (meta.amount !== undefined && meta.amount !== null && String(meta.amount).trim() !== '') {
+    const metaNum = Number(meta.amount);
+    if (!Number.isFinite(metaNum) || metaNum <= 0 || Math.round(metaNum * 100) !== amountTotal) {
+      return {
+        ok: false,
+        errorCode: 'METADATA_AMOUNT_MISMATCH',
+        error: 'Stripe session metadata amount does not match authoritative settled amount_total.',
+      };
+    }
+  }
+
+  const clientRefId = typeof session.client_reference_id === 'string' ? session.client_reference_id.trim() : '';
+  const metaUserId = typeof meta.userId === 'string' ? meta.userId.trim() : '';
+  if (clientRefId && metaUserId && clientRefId !== metaUserId) {
+    return {
+      ok: false,
+      errorCode: 'CUSTOMER_IDENTITY_MISMATCH',
+      error: 'Stripe session customer identity mismatch between client_reference_id and metadata.userId.',
+    };
+  }
+  const userId = clientRefId || metaUserId;
+  if (!userId) {
+    return {
+      ok: false,
+      errorCode: 'MISSING_CUSTOMER_IDENTITY',
+      error: 'Stripe checkout session is missing customer identity.',
+    };
+  }
+
+  const rawDest = typeof meta.destinationAccountType === 'string' ? meta.destinationAccountType.trim() : '';
+  if (rawDest && rawDest !== 'CHECKING' && rawDest !== 'SAVINGS') {
+    return {
+      ok: false,
+      errorCode: 'INVALID_DESTINATION_ACCOUNT',
+      error: 'Stripe checkout session contains an invalid destination account type.',
+    };
+  }
+
+  return {
+    ok: true,
+    sessionId,
+    userId,
+    amount: Number((amountTotal / 100).toFixed(2)),
+    amountTotalCents: amountTotal,
+    currency: 'usd',
+    paymentStatus: 'paid',
+    destinationAccountType: rawDest === 'SAVINGS' ? 'SAVINGS' : 'CHECKING',
+  };
+}
+
+export interface DirectDepositDeps {
+  isStripeConfiguredFn?: typeof isStripeConfigured;
+}
+
+export async function handleDirectDepositCreate(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: DirectDepositDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'Authentication required. Please sign in to initiate a deposit.',
+    });
+  }
+
+  const requestedUserId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+  if (requestedUserId && requestedUserId !== callerUid) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'FORBIDDEN_USER_MISMATCH',
+      error: 'Unauthorized: Cannot initiate deposits for another customer account.',
+    });
+  }
+
+  const stripeReady = deps?.isStripeConfiguredFn ? deps.isStripeConfiguredFn() : isStripeConfigured();
+  if (!stripeReady) {
+    return res.status(503).json({
+      success: false,
+      configured: false,
+      errorCode: 'DEPOSIT_GATEWAY_UNAVAILABLE',
+      error: 'Verified payment gateway is currently unavailable. Direct unverified deposits are permanently disabled.',
+    });
+  }
+
+  return res.status(403).json({
+    success: false,
+    errorCode: 'PAYMENT_VERIFICATION_REQUIRED',
+    error: 'Direct client-supplied deposits are permanently disabled. Deposits require a verified Stripe Checkout settlement.',
+  });
+}
+
+app.post('/api/deposits/create', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleDirectDepositCreate(req, res)
+);
 
 // --- STRIPE INTEGRATION (DEPOSITS) ---
-app.post('/api/stripe/create-checkout-session', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { userId: reqUserId, amount, destinationAccountType, origin: clientOrigin } = req.body;
-  const callerUid = req.auth?.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (reqUserId || callerUid);
+export interface CreateStripeCheckoutDeps {
+  getStripeFn?: typeof getStripe;
+  isAdminFn?: typeof isCallerAdministrator;
+  getUserDocFn?: (uid: string) => Promise<Record<string, any> | null>;
+}
 
-  if (!targetUserId || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ error: 'Valid user ID and deposit amount are required.' });
+export async function handleCreateStripeCheckoutSession(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: CreateStripeCheckoutDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'Authentication required. Please sign in to initialize Stripe Checkout.',
+    });
+  }
+
+  const reqUserId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
+  const isCallerAdmin = deps?.isAdminFn
+    ? await deps.isAdminFn(callerUid, req.auth?.email, req.auth)
+    : await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+
+  if (reqUserId && reqUserId !== callerUid && !isCallerAdmin) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'FORBIDDEN_USER_MISMATCH',
+      error: 'Unauthorized: Cannot initialize a checkout session for another customer account.',
+    });
+  }
+
+  const targetUserId = isCallerAdmin && reqUserId ? reqUserId : callerUid;
+
+  if (req.body?.currency !== undefined && String(req.body.currency).trim().toLowerCase() !== 'usd') {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'UNSUPPORTED_CURRENCY',
+      error: 'Only USD deposits are supported.',
+    });
+  }
+
+  const rawDest = req.body?.destinationAccountType;
+  if (rawDest !== undefined && rawDest !== 'CHECKING' && rawDest !== 'SAVINGS') {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'INVALID_DESTINATION_ACCOUNT',
+      error: 'Destination account type must be CHECKING or SAVINGS.',
+    });
+  }
+  const destinationAccountType: 'CHECKING' | 'SAVINGS' = rawDest === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
+
+  const parsedAmount = parseStrictUsdDepositAmount(req.body?.amount);
+  if ('error' in parsedAmount) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'INVALID_DEPOSIT_AMOUNT',
+      error: parsedAmount.error,
+    });
   }
 
   // Check account freeze status before generating checkout session
-  const userDocSnap = await adminFirestore.collection('users').doc(targetUserId).get();
-  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  let userData: Record<string, any> = {};
+  if (deps?.getUserDocFn) {
+    userData = (await deps.getUserDocFn(targetUserId)) || {};
+  } else {
+    const userDocSnap = await adminFirestore.collection('users').doc(targetUserId).get();
+    userData = userDocSnap.exists ? userDocSnap.data()! : {};
+  }
+
   if (userData.status === 'frozen') {
     return res.status(403).json({
+      success: false,
+      errorCode: 'ACCOUNT_FROZEN',
       error: 'Your account is currently restricted/frozen. New deposits are disabled. Please contact compliance support.',
     });
   }
 
-  const numAmount = Number(amount);
-  const stripe = getStripe();
-
+  const stripe = deps?.getStripeFn ? deps.getStripeFn() : getStripe();
   if (!stripe) {
-    return res.status(200).json({
+    return res.status(503).json({
       success: false,
       configured: false,
-      error: 'Stripe Secret Key is not configured on this server. Please set STRIPE_SECRET_KEY in your environment variables.',
+      errorCode: 'STRIPE_NOT_CONFIGURED',
+      error: 'Stripe payment gateway is not configured on this server. Verified settlement is required.',
     });
   }
 
   try {
-    const origin = clientOrigin || req.headers.origin || `http://localhost:${PORT}`;
-    const user = db.users.get(targetUserId);
+    const origin = sanitizeCheckoutOrigin(req.body?.origin || req.headers?.origin, PORT);
+    const cachedUser = db.users.get(targetUserId);
+    const customerEmail = userData.email || cachedUser?.email;
+    const customerAccNum = userData.permanentAccountNumber || cachedUser?.permanentAccountNumber || '';
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -1490,27 +1737,27 @@ app.post('/api/stripe/create-checkout-session', optionalFirebaseAuth, async (req
               name: 'Monvera Premier Account Deposit',
               description: `Direct liquid balance deposit to ${
                 destinationAccountType === 'SAVINGS' ? 'Treasury Savings' : 'Premier Checking'
-              } account (${user?.permanentAccountNumber ? `•••• ${user.permanentAccountNumber.slice(-4)}` : 'Institutional'})`,
+              } account (${customerAccNum ? `•••• ${String(customerAccNum).slice(-4)}` : 'Institutional'})`,
             },
-            unit_amount: Math.round(numAmount * 100),
+            unit_amount: parsedAmount.cents,
           },
           quantity: 1,
         },
       ],
       mode: 'payment',
-      customer_email: user?.email,
+      customer_email: customerEmail,
       client_reference_id: targetUserId,
       metadata: {
         userId: targetUserId,
-        amount: String(numAmount),
-        destinationAccountType: destinationAccountType || 'CHECKING',
-        customerAccountNumber: user?.permanentAccountNumber || '',
+        amount: String(parsedAmount.amount),
+        destinationAccountType,
+        customerAccountNumber: customerAccNum,
       },
-      success_url: `${origin}/?deposit_status=success&session_id={CHECKOUT_SESSION_ID}&amount=${numAmount}`,
+      success_url: `${origin}/?deposit_status=success&session_id={CHECKOUT_SESSION_ID}&amount=${parsedAmount.amount}`,
       cancel_url: `${origin}/?deposit_status=cancelled`,
     });
 
-    res.json({
+    return res.json({
       success: true,
       configured: true,
       url: session.url,
@@ -1518,12 +1765,16 @@ app.post('/api/stripe/create-checkout-session', optionalFirebaseAuth, async (req
     });
   } catch (stripeErr: any) {
     console.error('[Stripe] Checkout Session Creation Error:', stripeErr);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: stripeErr.message || 'Failed to initialize Stripe Checkout Session.',
     });
   }
-});
+}
+
+app.post('/api/stripe/create-checkout-session', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleCreateStripeCheckoutSession(req, res)
+);
 
 // Stripe Webhook handler (strict fail-closed signature verification; authoritative executeServerDeposit ledger)
 export interface StripeWebhookDeps {
@@ -1578,62 +1829,86 @@ export async function handleStripeWebhook(
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Process verified checkout.session.completed payments via authoritative Firestore ledger
-  if (event?.type === 'checkout.session.completed') {
+  // Non-credit failure/expiration events must never settle funds
+  if (
+    event?.type === 'checkout.session.async_payment_failed' ||
+    event?.type === 'checkout.session.expired' ||
+    event?.type === 'payment_intent.payment_failed'
+  ) {
+    return res.json({ received: true, credited: false, eventType: event.type });
+  }
+
+  // Process verified paid checkout session payments via authoritative Firestore ledger
+  if (event?.type === 'checkout.session.completed' || event?.type === 'checkout.session.async_payment_succeeded') {
     const session = event.data?.object || {};
-    const sessionId = typeof session.id === 'string' ? session.id.trim() : '';
-    const userId = session.client_reference_id || session.metadata?.userId;
-    const amountStr = session.metadata?.amount;
-    const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
-    const destinationAccountType: 'CHECKING' | 'SAVINGS' =
-      session.metadata?.destinationAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
-    const isPaidSession = !session.payment_status || session.payment_status === 'paid';
 
-    if (sessionId && userId && Number.isFinite(amount) && amount > 0 && isPaidSession) {
-      const providerPaymentId = `STRIPE-${sessionId}`;
-      console.log(`[Stripe Webhook] Crediting verified deposit (${providerPaymentId}) of $${amount} for user ${userId}`);
-      const depResult = await executeDepositFn({
-        userId,
-        amount,
-        method: 'CARD',
-        destinationAccountType,
-        providerPaymentId,
-        referenceNumber: providerPaymentId,
-        metadata: {
-          stripeSessionId: sessionId,
-          stripeEventId: event.id,
-          stripePaymentStatus: session.payment_status,
-          currency: session.currency,
-        },
+    // Unpaid async checkout completions must not be credited
+    if (session.payment_status === 'unpaid' || session.payment_status === 'no_payment_required') {
+      return res.json({
+        received: true,
+        credited: false,
+        paymentStatus: session.payment_status,
       });
+    }
 
-      if (!depResult.success) {
-        console.error(`[Stripe Webhook] Authoritative deposit failed for ${providerPaymentId}:`, depResult.error);
-        return res.status(500).json({
-          received: false,
-          errorCode: 'STRIPE_DEPOSIT_SETTLEMENT_FAILED',
-          error: depResult.error || 'Failed to settle verified Stripe deposit.',
-        });
-      }
+    const verified = verifyPaidStripeCheckoutSession(session);
+    if ('error' in verified) {
+      console.warn(`[Stripe Webhook] Rejected settlement verification (${verified.errorCode}): ${verified.error}`);
+      return res.status(400).json({
+        received: false,
+        credited: false,
+        errorCode: verified.errorCode,
+        error: verified.error,
+      });
+    }
 
-      // Mirror authoritative committed transaction to in-memory cache only on first non-duplicate settlement
-      if (!depResult.isDuplicate && depResult.transaction) {
-        try {
-          const committedTx = depResult.transaction;
-          const alreadyMirrored = db.transactions.some(
-            (t) =>
-              t.id === committedTx.id ||
-              t.referenceNumber === committedTx.referenceNumber ||
-              t.paymentProviderRef === providerPaymentId
-          );
-          if (!alreadyMirrored) {
-            db.transactions.unshift(committedTx);
-          }
-          if (depResult.balanceMetrics?.accounts) {
-            depResult.balanceMetrics.accounts.forEach((acc) => db.accounts.set(acc.id, acc));
-          }
-        } catch {}
-      }
+    const providerPaymentId = `STRIPE-${verified.sessionId}`;
+    console.log(
+      `[Stripe Webhook] Crediting verified deposit (${providerPaymentId}) of $${verified.amount} for user ${verified.userId}`
+    );
+    const depResult = await executeDepositFn({
+      userId: verified.userId,
+      amount: verified.amount,
+      method: 'CARD',
+      destinationAccountType: verified.destinationAccountType,
+      providerPaymentId,
+      referenceNumber: providerPaymentId,
+      allowFrozenSettlement: true,
+      metadata: {
+        stripeSessionId: verified.sessionId,
+        stripeEventId: event.id,
+        stripePaymentStatus: verified.paymentStatus,
+        stripeAmountTotalCents: verified.amountTotalCents,
+        currency: verified.currency,
+      },
+    });
+
+    if (!depResult.success) {
+      console.error(`[Stripe Webhook] Authoritative deposit failed for ${providerPaymentId}:`, depResult.error);
+      return res.status(500).json({
+        received: false,
+        errorCode: 'STRIPE_DEPOSIT_SETTLEMENT_FAILED',
+        error: depResult.error || 'Failed to settle verified Stripe deposit.',
+      });
+    }
+
+    // Mirror authoritative committed transaction to in-memory cache only on first non-duplicate settlement
+    if (!depResult.isDuplicate && depResult.transaction) {
+      try {
+        const committedTx = depResult.transaction;
+        const alreadyMirrored = db.transactions.some(
+          (t) =>
+            t.id === committedTx.id ||
+            t.referenceNumber === committedTx.referenceNumber ||
+            t.paymentProviderRef === providerPaymentId
+        );
+        if (!alreadyMirrored) {
+          db.transactions.unshift(committedTx);
+        }
+        if (depResult.balanceMetrics?.accounts) {
+          depResult.balanceMetrics.accounts.forEach((acc) => db.accounts.set(acc.id, acc));
+        }
+      } catch {}
     }
   }
 
@@ -1674,18 +1949,30 @@ app.post('/api/webhooks/incoming', (req: Request, res: Response) => {
   });
 });
 
-// Sandbox Webhook Simulator for instant testing
-app.post('/api/webhooks/test-simulate', (req: Request, res: Response) => {
-  const { userId, amount, eventType } = req.body;
+// Sandbox Webhook Simulator for non-production admin testing only (never touches Firestore)
+export function handleWebhookTestSimulate(req: AuthenticatedRequest, res: Response) {
+  if (process.env.NODE_ENV === 'production' || process.env.VERCEL === '1') {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'SIMULATOR_DISABLED_IN_PRODUCTION',
+      error: 'Sandbox webhook simulator is permanently disabled in production environments.',
+    });
+  }
+
+  const { userId, amount, eventType } = req.body || {};
   const targetUser = userId ? db.users.get(userId) : Array.from(db.users.values())[0];
   if (!targetUser) {
     return res.status(400).json({ error: 'No customer account found for webhook simulation.' });
   }
 
-  const depositAmount = Number(amount) || 100.0;
+  const parsedAmount = parseStrictUsdDepositAmount(amount ?? 100.0, { minCents: 1 });
+  if ('error' in parsedAmount) {
+    return res.status(400).json({ error: parsedAmount.error });
+  }
+
   const depResult = db.processDeposit({
     userId: targetUser.id,
-    amount: depositAmount,
+    amount: parsedAmount.amount,
     method: 'CARD',
     destinationAccountType: 'CHECKING',
     providerPaymentId: `SIM-WH-${Date.now()}`,
@@ -1696,124 +1983,219 @@ app.post('/api/webhooks/test-simulate', (req: Request, res: Response) => {
     },
   });
 
-  res.json({
+  return res.json({
     success: true,
     message: `Simulated webhook event '${eventType || 'checkout.session.completed'}' processed successfully.`,
     depositResult: depResult,
     balanceMetrics: db.getUserBalanceMetrics(targetUser.id),
   });
-});
+}
+
+app.post('/api/webhooks/test-simulate', requireAdminAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleWebhookTestSimulate(req, res)
+);
+
+export interface StripeSessionConfirmationDeps {
+  getStripeFn?: typeof getStripe;
+  executeDepositFn?: typeof executeServerDeposit;
+  isAdminFn?: typeof isCallerAdministrator;
+}
 
 // Confirm session callback endpoint for client return
-const handleStripeSessionConfirmation = async (req: AuthenticatedRequest, res: Response) => {
-  const sessionId = ((req.query.session_id || req.body?.session_id || req.body?.sessionId) as string)?.trim();
-  if (!sessionId) {
-    return res.status(400).json({ success: false, error: 'Session ID is required.' });
+export async function handleStripeSessionConfirmation(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: StripeSessionConfirmationDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'Authentication required to confirm a Stripe deposit session.',
+    });
   }
 
-  const stripe = getStripe();
-  if (!stripe) {
-    return res.status(400).json({ success: false, error: 'Stripe is not configured on this server.' });
+  const rawSessionId = req.query?.session_id || req.body?.session_id || req.body?.sessionId;
+  const sessionId = typeof rawSessionId === 'string' ? rawSessionId.trim() : '';
+  if (!sessionId) {
+    return res.status(400).json({ success: false, errorCode: 'MISSING_SESSION_ID', error: 'Session ID is required.' });
   }
+
+  const stripe = deps?.getStripeFn ? deps.getStripeFn() : getStripe();
+  if (!stripe) {
+    return res.status(503).json({
+      success: false,
+      configured: false,
+      errorCode: 'STRIPE_NOT_CONFIGURED',
+      error: 'Stripe is not configured on this server.',
+    });
+  }
+
+  const executeDepositFn = deps?.executeDepositFn || executeServerDeposit;
 
   try {
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-    if (session.payment_status === 'paid') {
-      const targetUserId = session.client_reference_id || session.metadata?.userId;
-      const amountStr = session.metadata?.amount;
-      const amount = amountStr ? parseFloat(amountStr) : (session.amount_total ? session.amount_total / 100 : 0);
-      const destinationAccountType: 'CHECKING' | 'SAVINGS' = session.metadata?.destinationAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
+    const session: any = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session || typeof session !== 'object') {
+      return res.status(400).json({ success: false, errorCode: 'INVALID_STRIPE_SESSION', error: 'Invalid Stripe session.' });
+    }
 
-      if (!targetUserId || isNaN(amount) || amount <= 0) {
-        return res.status(400).json({ success: false, error: 'Invalid Stripe session: missing customer identity or deposit amount.' });
-      }
-
-      // Authorization verification: if caller is authenticated, ensure caller matches target customer or is admin
-      const callerUid = req.auth?.uid;
-      const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-      if (callerUid && callerUid !== targetUserId && !isCallerAdmin) {
-        const sessionOwner = session.client_reference_id || session.metadata?.userId;
-        if (sessionOwner !== targetUserId) {
-          return res.status(403).json({ success: false, error: 'Unauthorized: This checkout session belongs to another customer account.' });
-        }
-      }
-
-      // Authoritative Firestore deposit settlement
-      const result = await executeServerDeposit({
-        userId: targetUserId,
-        amount,
-        method: 'CARD',
-        destinationAccountType,
-        providerPaymentId: `STRIPE-${session.id}`,
-        metadata: {
-          stripeSessionId: session.id,
-          stripePaymentStatus: session.payment_status,
-          currency: session.currency,
-          checkoutCompletedAt: new Date().toISOString(),
-        },
-      });
-
-      if (!result.success) {
-        return res.status(400).json({ success: false, error: result.error });
-      }
-
-      // Mirror to memory db only for non-authoritative local cache consistency
-      try {
-        db.processDeposit({
-          userId: targetUserId,
-          amount,
-          method: 'CARD',
-          destinationAccountType,
-          providerPaymentId: `STRIPE-${session.id}`,
-          metadata: {
-            stripeSessionId: session.id,
-            stripePaymentStatus: session.payment_status,
-          },
-        });
-      } catch {}
-
-      return res.json({
-        success: true,
-        transaction: result.transaction,
-        balanceMetrics: result.balanceMetrics,
-        isDuplicate: result.isDuplicate,
+    // Verify customer identity ownership strictly against verified authenticated caller
+    const clientRefId = typeof session.client_reference_id === 'string' ? session.client_reference_id.trim() : '';
+    const metaUserId = typeof session.metadata?.userId === 'string' ? session.metadata.userId.trim() : '';
+    if (clientRefId && metaUserId && clientRefId !== metaUserId) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'CUSTOMER_IDENTITY_MISMATCH',
+        error: 'Stripe session customer identity mismatch.',
       });
     }
 
-    return res.json({ success: false, status: session.payment_status, error: `Payment not completed (status: ${session.payment_status})` });
+    const sessionOwner = clientRefId || metaUserId;
+    if (!sessionOwner) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'MISSING_CUSTOMER_IDENTITY',
+        error: 'Invalid Stripe session: missing customer identity.',
+      });
+    }
+
+    const isCallerAdmin = deps?.isAdminFn
+      ? await deps.isAdminFn(callerUid, req.auth?.email, req.auth)
+      : await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+
+    if (callerUid !== sessionOwner && !isCallerAdmin) {
+      return res.status(403).json({
+        success: false,
+        errorCode: 'FORBIDDEN_SESSION_OWNER',
+        error: 'Unauthorized: This checkout session belongs to another customer account.',
+      });
+    }
+
+    const verified = verifyPaidStripeCheckoutSession(session);
+    if ('error' in verified) {
+      if (verified.errorCode === 'PAYMENT_NOT_PAID' || verified.errorCode === 'MISSING_PAYMENT_STATUS') {
+        return res.status(400).json({
+          success: false,
+          status: verified.paymentStatus || 'unknown',
+          errorCode: verified.errorCode,
+          error: verified.error,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        errorCode: verified.errorCode,
+        error: verified.error,
+      });
+    }
+
+    const providerPaymentId = `STRIPE-${verified.sessionId}`;
+
+    // Authoritative Firestore deposit settlement
+    const result = await executeDepositFn({
+      userId: verified.userId,
+      amount: verified.amount,
+      method: 'CARD',
+      destinationAccountType: verified.destinationAccountType,
+      providerPaymentId,
+      referenceNumber: providerPaymentId,
+      allowFrozenSettlement: true,
+      metadata: {
+        stripeSessionId: verified.sessionId,
+        stripePaymentStatus: verified.paymentStatus,
+        stripeAmountTotalCents: verified.amountTotalCents,
+        currency: verified.currency,
+        checkoutCompletedAt: new Date().toISOString(),
+      },
+    });
+
+    if (!result.success) {
+      return res.status(400).json({ success: false, error: result.error });
+    }
+
+    // Mirror authoritative committed transaction to in-memory cache only on first non-duplicate settlement
+    if (!result.isDuplicate && result.transaction) {
+      try {
+        const committedTx = result.transaction;
+        const alreadyMirrored = db.transactions.some(
+          (t) =>
+            t.id === committedTx.id ||
+            t.referenceNumber === committedTx.referenceNumber ||
+            t.paymentProviderRef === providerPaymentId
+        );
+        if (!alreadyMirrored) {
+          db.transactions.unshift(committedTx);
+        }
+        if (result.balanceMetrics?.accounts) {
+          result.balanceMetrics.accounts.forEach((acc) => db.accounts.set(acc.id, acc));
+        }
+      } catch {}
+    }
+
+    return res.json({
+      success: true,
+      transaction: result.transaction,
+      balanceMetrics: result.balanceMetrics,
+      isDuplicate: result.isDuplicate,
+    });
   } catch (err: any) {
     console.error('[/api/stripe/confirm-session] Error verifying Stripe session:', err);
     return res.status(500).json({ success: false, error: err.message || 'Failed to verify session' });
   }
-};
+}
 
-app.get('/api/stripe/confirm-session', optionalFirebaseAuth, handleStripeSessionConfirmation);
-app.post('/api/stripe/confirm-session', optionalFirebaseAuth, handleStripeSessionConfirmation);
+app.get('/api/stripe/confirm-session', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleStripeSessionConfirmation(req, res)
+);
+app.post('/api/stripe/confirm-session', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleStripeSessionConfirmation(req, res)
+);
 
 // --- $1,000 NEW USER WELCOME REWARD ENDPOINTS ---
-// Customer endpoint: retrieves customer's authoritative reward status and cumulative verified deposits
-app.get('/api/rewards/welcome/:userId', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { userId } = req.params;
-  const callerUid = req.auth?.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
+export interface WelcomeRewardHandlerDeps {
+  evaluateRewardFn?: typeof evaluateAndProcessWelcomeReward;
+  isAdminFn?: typeof isCallerAdministrator;
+}
 
+// Customer endpoint: retrieves customer's authoritative reward status and cumulative verified deposits
+export async function handleGetWelcomeReward(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: WelcomeRewardHandlerDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
+    return res.status(401).json({ error: 'Authentication required to access Welcome Reward status.' });
+  }
+
+  const userId = typeof req.params?.userId === 'string' ? req.params.userId.trim() : '';
   if (!userId) {
     return res.status(400).json({ error: 'User ID is required.' });
   }
 
-  // Authorization check: only account owner or verified admin can query user's reward details
-  if (callerUid && callerUid !== userId && !isCallerAdmin) {
+  const adminSessionToken =
+    (req.headers?.['x-admin-session'] as string | undefined) || req.auth?.adminSessionToken;
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const isCallerAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, adminSessionToken);
+
+  // Strict authorization check: only account owner or verified admin can query/evaluate user's reward details
+  if (callerUid !== userId && !isCallerAdmin) {
     return res.status(403).json({ error: 'FORBIDDEN: You can only view reward status for your own account.' });
   }
 
+  const evaluateRewardFn = deps?.evaluateRewardFn || evaluateAndProcessWelcomeReward;
   try {
-    const rewardInfo = await evaluateAndProcessWelcomeReward(userId);
+    const rewardInfo = await evaluateRewardFn(userId);
     return res.json({ success: true, reward: rewardInfo });
   } catch (err: any) {
     console.error(`[GET /api/rewards/welcome/${userId}] Error:`, err);
     return res.status(500).json({ error: err?.message || 'Failed to evaluate Welcome Reward.' });
   }
-});
+}
+
+app.get('/api/rewards/welcome/:userId', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleGetWelcomeReward(req, res)
+);
 
 // Administrator endpoint: retrieves all customer welcome reward records and aggregate stats
 app.get('/api/admin/rewards/welcome', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
@@ -1935,28 +2317,69 @@ app.post('/api/withdrawals/wire-check', requireFirebaseAuth, async (req: Authent
   }
 });
 
-// Administrator endpoint: retrieves all customer withdrawal support records
-app.get('/api/admin/withdrawal-support-records', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+export interface WithdrawalSupportRecordsHandlerDeps {
+  getRecordsFn?: typeof getAllWithdrawalSupportRecordsAdmin;
+  isAdminFn?: typeof isCallerAdministrator;
+  verifySessionFn?: typeof verifyAdminSessionToken;
+}
+
+export async function handleGetWithdrawalSupportRecords(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: WithdrawalSupportRecordsHandlerDeps
+) {
   const callerUid = req.auth?.uid;
-  let isAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-  const queryAdminSession = (req.query.adminSession as string) || (req.headers['x-admin-session'] as string);
-  if (!isAdmin && queryAdminSession) {
-    const verified = verifyAdminSessionToken(queryAdminSession);
-    if (verified.valid) isAdmin = true;
+  if (!callerUid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'UNAUTHORIZED: Authentication required to access withdrawal support records.',
+    });
   }
 
-  if (!isAdmin && isFirebaseAdminConfigured()) {
-    return res.status(403).json({ error: 'FORBIDDEN: Administrative privileges required to access withdrawal support records.' });
+  const rawHeaderSession = req.headers?.['x-admin-session'];
+  const effectiveSessionToken =
+    rawHeaderSession !== undefined
+      ? (Array.isArray(rawHeaderSession) ? rawHeaderSession[0] : rawHeaderSession)?.trim() || ''
+      : req.auth?.adminSessionToken;
+
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const verifySessionFn = deps?.verifySessionFn || verifyAdminSessionToken;
+
+  const sessionCheck = verifySessionFn(effectiveSessionToken, callerUid, req.auth?.email);
+  if (!sessionCheck.valid) {
+    const isExpired = sessionCheck.reason === 'Admin session expired';
+    return res.status(401).json({
+      success: false,
+      errorCode: 'ADMIN_SESSION_INVALID',
+      sessionExpired: isExpired,
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Valid non-expired administrator session is required.'}`,
+    });
+  }
+
+  const isAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, effectiveSessionToken);
+  if (!isAdmin) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'FORBIDDEN',
+      error: 'FORBIDDEN: Administrative privileges required to access withdrawal support records.',
+    });
   }
 
   try {
-    const records = await getAllWithdrawalSupportRecordsAdmin();
+    const getRecordsFn = deps?.getRecordsFn || getAllWithdrawalSupportRecordsAdmin;
+    const records = await getRecordsFn();
     return res.json({ success: true, records });
   } catch (err: any) {
     console.error('[GET /api/admin/withdrawal-support-records] Error:', err);
     return res.status(500).json({ error: err?.message || 'Failed to retrieve withdrawal support records.' });
   }
-});
+}
+
+// Administrator endpoint: retrieves all customer withdrawal support records
+app.get('/api/admin/withdrawal-support-records', requireAdminAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleGetWithdrawalSupportRecords(req, res)
+);
 
 // --- MANUAL BANK ACCOUNT LINKING & ADMINISTRATIVE APPROVAL ---
 
@@ -2319,33 +2742,102 @@ app.post('/api/admin/card-activations/:id/reject', requireAdminAuth, async (req:
   return res.json({ success: true, request: result.request });
 });
 
+export interface ReverseWithdrawalHandlerDeps {
+  firestore?: typeof adminFirestore;
+  reverseFirestoreWithdrawalFn?: typeof reverseServerFirestoreWithdrawal;
+  isAdminFn?: typeof isCallerAdministrator;
+  memoryDb?: Pick<typeof db, 'transactions' | 'reverseWithdrawal' | 'getUserBalanceMetrics'>;
+}
+
 // Reverse pending withdrawal
-app.post('/api/withdrawals/reverse', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { transactionId, userId: reqUserId } = req.body;
+export async function handleReverseWithdrawal(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: ReverseWithdrawalHandlerDeps
+) {
   const callerUid = req.auth?.uid;
-  if (!transactionId) {
+  if (!callerUid) {
+    return res.status(401).json({ error: 'Authentication required to reverse a withdrawal.' });
+  }
+
+  const { transactionId, userId: reqUserId } = req.body || {};
+  const cleanTxId = typeof transactionId === 'string' ? transactionId.trim() : '';
+  if (!cleanTxId) {
     return res.status(400).json({ error: 'Transaction ID is required.' });
   }
 
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-  const targetUserId = (callerUid && !isCallerAdmin) ? callerUid : (reqUserId || callerUid);
+  const adminSessionToken =
+    (req.headers?.['x-admin-session'] as string | undefined) || req.auth?.adminSessionToken;
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const isCallerAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, adminSessionToken);
 
-  // Attempt server-authoritative Firestore reversal
-  const fsResult = await reverseServerFirestoreWithdrawal(transactionId, targetUserId);
+  const cleanReqUserId = typeof reqUserId === 'string' && reqUserId.trim() ? reqUserId.trim() : undefined;
+  if (!isCallerAdmin && cleanReqUserId && cleanReqUserId !== callerUid) {
+    return res.status(403).json({
+      error: 'FORBIDDEN: You are not authorized to reverse another customer\'s withdrawal.',
+    });
+  }
+
+  const targetUserId = isCallerAdmin ? cleanReqUserId : callerUid;
+  const fsReverseFn = deps?.reverseFirestoreWithdrawalFn || reverseServerFirestoreWithdrawal;
+
+  // Attempt server-authoritative Firestore reversal with explicit ownership enforcement
+  const fsResult = await fsReverseFn(cleanTxId, targetUserId, {
+    ...(deps?.firestore ? { firestore: deps.firestore } : {}),
+    isAuthorizedAdmin: isCallerAdmin,
+  });
+
   if (fsResult.success) {
     return res.json({ success: true, transaction: fsResult.transaction, balanceMetrics: fsResult.balanceMetrics });
   }
 
-  // Fall back to memory store if transaction only existed in memory
-  const result = db.reverseWithdrawal(transactionId);
+  if (fsResult.error?.startsWith('FORBIDDEN')) {
+    return res.status(403).json({ error: fsResult.error });
+  }
+  if (fsResult.error?.startsWith('UNAUTHORIZED')) {
+    return res.status(401).json({ error: fsResult.error });
+  }
+
+  // Only consider in-memory fallback when transaction was not found in Firestore (never on state/auth failure)
+  if (fsResult.error && fsResult.error !== 'Transaction not found in Firestore.') {
+    return res.status(400).json({ error: fsResult.error });
+  }
+
+  const memStore = deps?.memoryDb || db;
+  const memTx = memStore.transactions.find(
+    (t) => t.referenceNumber === cleanTxId || t.id === cleanTxId
+  );
+  if (!memTx) {
+    return res.status(400).json({ error: fsResult.error || 'Transaction not found.' });
+  }
+
+  const memOwnerUid = String(memTx.userId || memTx.senderUserId || '').trim();
+  if (!memOwnerUid) {
+    return res.status(403).json({ error: 'FORBIDDEN: Could not verify withdrawal owner.' });
+  }
+  if (!isCallerAdmin && memOwnerUid !== callerUid) {
+    return res.status(403).json({
+      error: 'FORBIDDEN: You are not authorized to reverse another customer\'s withdrawal.',
+    });
+  }
+  if (isCallerAdmin && cleanReqUserId && memOwnerUid !== cleanReqUserId) {
+    return res.status(403).json({
+      error: 'FORBIDDEN: Pending withdrawal does not belong to the specified customer.',
+    });
+  }
+
+  const result = memStore.reverseWithdrawal(cleanTxId);
   if (!result.success) {
     return res.status(400).json({ error: fsResult.error || result.error });
   }
 
-  const effectiveUserId = targetUserId || result.transaction?.userId || 'usr_eleanor';
-  const metrics = db.getUserBalanceMetrics(effectiveUserId);
-  res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
-});
+  const metrics = memStore.getUserBalanceMetrics(memOwnerUid);
+  return res.json({ success: true, transaction: result.transaction, balanceMetrics: metrics });
+}
+
+app.post('/api/withdrawals/reverse', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleReverseWithdrawal(req, res)
+);
 
 // Targeted 30-minute withdrawal reversal scheduler
 if (!process.env.VERCEL) {
@@ -2379,6 +2871,14 @@ if (!process.env.VERCEL) {
       console.error('[Auto-Reversal] Reconciliation check error:', e?.message || e);
     }
   }, 10 * 60 * 1000);
+
+  // Stage 3D-C1: Durable notification outbox worker (Railway-only, strictly default-OFF)
+  if (
+    process.env.NOTIFICATION_WORKER_ENABLED === 'true' &&
+    process.env.DISABLE_OUTBOUND_NOTIFICATIONS !== 'true'
+  ) {
+    startNotificationOutboxWorker();
+  }
 }
 
 // --- TRANSACTIONS EXPLORER ---
@@ -2641,42 +3141,87 @@ app.get('/api/investments', optionalFirebaseAuth, async (req: AuthenticatedReque
   }
 });
 
-app.post('/api/investments/create', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { termDays, amount, userAccountNumber, clientRequestId, fallbackUser } = req.body;
-  const callerUid = req.auth?.uid;
-  const isCallerAdmin = await isCallerAdministrator(callerUid, req.auth?.email, req.auth);
-  const userId = (callerUid && !isCallerAdmin) ? callerUid : (req.auth?.uid || req.body.userId);
+export interface CreateInvestmentHandlerDeps {
+  firestore?: typeof adminFirestore;
+  createInvestmentFn?: typeof executeServerInvestmentCreation;
+  isAdminFn?: typeof isCallerAdministrator;
+  memoryDb?: Pick<typeof db, 'createTermInvestment'>;
+}
 
+export async function handleCreateInvestment(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: CreateInvestmentHandlerDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
+    return res.status(401).json({ error: 'Authentication required to create a term investment.' });
+  }
+
+  const { termDays, amount, userAccountNumber, clientRequestId, fallbackUser, userId: reqUserId } = req.body || {};
+  const adminSessionToken =
+    (req.headers?.['x-admin-session'] as string | undefined) || req.auth?.adminSessionToken;
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const isCallerAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, adminSessionToken);
+
+  const cleanReqUserId = typeof reqUserId === 'string' && reqUserId.trim() ? reqUserId.trim() : undefined;
+  if (!isCallerAdmin && cleanReqUserId && cleanReqUserId !== callerUid) {
+    return res.status(403).json({
+      error: 'FORBIDDEN: You are not authorized to create term investments for another customer.',
+    });
+  }
+
+  const userId = isCallerAdmin && cleanReqUserId ? cleanReqUserId : callerUid;
   if (!userId || !termDays || !amount) {
     return res.status(400).json({ error: 'User ID, term duration, and amount are required.' });
   }
 
+  const fs = deps?.firestore || adminFirestore;
   // Check account freeze status before investment creation
-  const userDocSnap = await adminFirestore.collection('users').doc(userId).get();
-  const userData = userDocSnap.exists ? userDocSnap.data()! : {};
-  if (userData.status === 'frozen') {
-    return res.status(403).json({
-      error: 'Your account is currently restricted/frozen. New investments are disabled while the account is frozen. Please contact compliance support.',
-    });
+  try {
+    const userDocSnap = await fs.collection('users').doc(userId).get();
+    const userData = userDocSnap.exists ? userDocSnap.data()! : {};
+    if (userData.status === 'frozen') {
+      return res.status(403).json({
+        error: 'Your account is currently restricted/frozen. New investments are disabled while the account is frozen. Please contact compliance support.',
+      });
+    }
+  } catch (err: any) {
+    console.error('[/api/investments/create] Failed to verify user status:', err);
+    return res.status(500).json({ error: 'Unable to verify customer account status.' });
   }
 
+  const createInvestmentFn = deps?.createInvestmentFn || executeServerInvestmentCreation;
+  const memStore = deps?.memoryDb || db;
+
   try {
-    const result = await executeServerInvestmentCreation({
-      userId,
-      termDays: Number(termDays) as InvestmentTermDays,
-      amount: Number(amount),
-      clientRequestId,
-      userAccountNumber,
-      fallbackUser,
-    });
+    const result = await createInvestmentFn(
+      {
+        userId,
+        authenticatedUid: callerUid,
+        isAuthorizedAdmin: isCallerAdmin,
+        termDays: Number(termDays) as InvestmentTermDays,
+        amount: Number(amount),
+        clientRequestId,
+        userAccountNumber,
+        fallbackUser,
+      },
+      deps?.firestore ? { firestore: deps.firestore } : undefined
+    );
 
     if (!result.success) {
-      return res.status(400).json({ error: result.error });
+      const statusCode =
+        result.errorCode === 'FORBIDDEN' || result.error?.includes('FORBIDDEN')
+          ? 403
+          : result.errorCode === 'UNAUTHORIZED'
+            ? 401
+            : 400;
+      return res.status(statusCode).json({ error: result.error });
     }
 
     // Mirror to in-memory db for local sync
     try {
-      db.createTermInvestment({
+      memStore.createTermInvestment({
         userId,
         termDays: Number(termDays) as InvestmentTermDays,
         amount: Number(amount),
@@ -2690,30 +3235,75 @@ app.post('/api/investments/create', optionalFirebaseAuth, async (req: Authentica
     console.error('[/api/investments/create] Error:', err);
     return res.status(500).json({ error: err?.message || 'Server error creating term investment.' });
   }
-});
+}
+
+app.post('/api/investments/create', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleCreateInvestment(req, res)
+);
+
+export interface MatureInvestmentHandlerDeps {
+  firestore?: typeof adminFirestore;
+  matureInvestmentFn?: typeof executeServerInvestmentMaturity;
+  isAdminFn?: typeof isCallerAdministrator;
+  memoryDb?: Pick<typeof db, 'matureInvestment'>;
+}
 
 // Settlement of Matured Term Investment
-app.post('/api/investments/:id/mature', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
-  const { id } = req.params;
-  const userId = req.auth?.uid || req.body.userId;
-
-  if (!userId) {
+export async function handleMatureInvestment(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: MatureInvestmentHandlerDeps
+) {
+  const callerUid = req.auth?.uid;
+  if (!callerUid) {
     return res.status(401).json({ error: 'Authentication required to settle investment.' });
   }
 
-  try {
-    const result = await executeServerInvestmentMaturity({
-      investmentId: id,
-      userId,
+  const id = typeof req.params?.id === 'string' ? req.params.id.trim() : '';
+  if (!id) {
+    return res.status(400).json({ error: 'Investment ID is required.' });
+  }
+
+  const adminSessionToken =
+    (req.headers?.['x-admin-session'] as string | undefined) || req.auth?.adminSessionToken;
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const isCallerAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, adminSessionToken);
+
+  const cleanReqUserId = typeof req.body?.userId === 'string' && req.body.userId.trim() ? req.body.userId.trim() : undefined;
+  if (!isCallerAdmin && cleanReqUserId && cleanReqUserId !== callerUid) {
+    return res.status(403).json({
+      error: 'FORBIDDEN: You are not authorized to settle another customer\'s investment.',
     });
+  }
+
+  const targetUserId = isCallerAdmin ? (cleanReqUserId || '') : callerUid;
+  const matureInvestmentFn = deps?.matureInvestmentFn || executeServerInvestmentMaturity;
+  const memStore = deps?.memoryDb || db;
+
+  try {
+    const result = await matureInvestmentFn(
+      {
+        investmentId: id,
+        userId: targetUserId,
+        authenticatedUid: callerUid,
+        isAuthorizedAdmin: isCallerAdmin,
+      },
+      deps?.firestore ? { firestore: deps.firestore } : undefined
+    );
 
     if (!result.success) {
-      return res.status(400).json({ error: result.error });
+      const statusCode =
+        result.errorCode === 'FORBIDDEN' || result.error?.includes('FORBIDDEN')
+          ? 403
+          : result.errorCode === 'UNAUTHORIZED'
+            ? 401
+            : 400;
+      return res.status(statusCode).json({ error: result.error });
     }
 
     // Mirror to in-memory db for local sync
     try {
-      db.matureInvestment(id);
+      memStore.matureInvestment(id);
     } catch {}
 
     return res.json(result);
@@ -2721,7 +3311,11 @@ app.post('/api/investments/:id/mature', optionalFirebaseAuth, async (req: Authen
     console.error('[/api/investments/:id/mature] Error:', err);
     return res.status(500).json({ error: err?.message || 'Server error settling term investment.' });
   }
-});
+}
+
+app.post('/api/investments/:id/mature', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleMatureInvestment(req, res)
+);
 
 // --- CARDS ---
 app.get('/api/cards', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
@@ -2938,10 +3532,9 @@ app.post('/api/cards/:id/update-limits', optionalFirebaseAuth, async (req: Authe
 // --- NOTIFICATIONS & SECURITY ---
 app.get('/api/notifications', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   const requestedUserId = (req.query.userId as string | undefined)?.trim();
   const accountNumber = (req.query.accountNumber as string | undefined)?.trim();
@@ -3030,10 +3623,9 @@ app.get('/api/notifications', optionalFirebaseAuth, async (req: AuthenticatedReq
 
 app.post('/api/notifications/read', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   const { notificationId, userId: bodyUserId } = req.body || {};
   if (!notificationId || !bodyUserId) {
@@ -3070,10 +3662,9 @@ app.post('/api/notifications/read', optionalFirebaseAuth, async (req: Authentica
 
 app.post('/api/notifications/read-all', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   const { userId: bodyUserId } = req.body || {};
   if (!bodyUserId && !callerUid) {
@@ -3123,10 +3714,9 @@ app.post('/api/support/reply', optionalFirebaseAuth, async (req: AuthenticatedRe
   }
 
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   if (!callerUid && !isCallerAdmin) {
     return res.status(401).json({ error: 'UNAUTHORIZED: Authentication required to reply to support tickets.' });
@@ -4384,36 +4974,14 @@ app.post('/api/admin/transfer', requireAdminAuth, async (req: AuthenticatedReque
       isDuplicate: result.isDuplicate || false,
     });
 
-    // Asynchronously dispatch multi-channel notification strictly from committed COMPLETED non-duplicate Firestore transaction
-    if (
-      isFirebaseAdminConfigured() &&
-      !result.isDuplicate &&
-      result.transaction &&
-      result.transaction.status === 'COMPLETED'
-    ) {
-      const committedTx = result.transaction;
-      const authoritativeRecipientUid = committedTx.recipientUserId
-        ? String(committedTx.recipientUserId).trim()
-        : '';
-      if (authoritativeRecipientUid) {
-        fetchAuthoritativeCustomerContact(authoritativeRecipientUid)
-          .then((recipientContact) => {
-            const events = buildTrustedTransferDispatchEvents(committedTx, result.isDuplicate, {
-              mode: 'ADMIN_TRANSFER',
-              recipientMetrics: result.targetBalanceMetrics,
-              recipientContact,
-            });
-            return Promise.all(
-              events.map((evt) =>
-                serverNotificationDispatcher.dispatch(evt).catch((err) =>
-                  console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err)
-                )
-              )
-            );
-          })
-          .catch((err) => console.warn('[ServerDispatcher] Admin transfer contact lookup note:', err?.message || err));
-      }
-    }
+    // Asynchronous multi-channel alerts (solely handled by durable outbox worker when enabled;
+    // direct dispatch runs only when the worker is disabled)
+    dispatchOutboxBackedTransferDirectIfWorkerDisabled({
+      mode: 'ADMIN_TRANSFER',
+      transaction: result.transaction,
+      isDuplicate: result.isDuplicate,
+      recipientMetrics: result.targetBalanceMetrics,
+    }).catch((err) => console.warn('[ServerDispatcher] Admin transfer dispatch note:', err?.message || err));
   } catch (err: any) {
     console.error('[POST /api/admin/transfer] Error:', err);
     return res.status(500).json({ error: err?.message || 'Server error processing administrative transfer.' });
@@ -5029,10 +5597,9 @@ app.post('/api/loans/repay', optionalFirebaseAuth, async (req: AuthenticatedRequ
 // --- SUPPORT CHAT LIVE PERSISTENCE ---
 app.get('/api/support/messages', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   if (!callerUid && !isCallerAdmin) {
     return res.status(401).json({ error: 'UNAUTHORIZED: Authentication is required to access support messages.' });
@@ -5089,10 +5656,9 @@ app.get('/api/support/messages', optionalFirebaseAuth, async (req: Authenticated
 
 app.post('/api/support/messages', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   if (!callerUid && !isCallerAdmin) {
     return res.status(401).json({ error: 'UNAUTHORIZED: Authentication is required to send support messages.' });
@@ -5132,10 +5698,9 @@ app.post('/api/support/messages', optionalFirebaseAuth, async (req: Authenticate
 
 app.post('/api/support/messages/read', optionalFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
   const callerUid = req.auth?.uid;
-  const adminSess = verifyAdminSessionToken(req.headers['x-admin-session'] as string);
-  const isCallerAdmin =
-    adminSess.valid ||
-    (callerUid ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth) : false);
+  const isCallerAdmin = callerUid
+    ? await isCallerAdministrator(callerUid, req.auth?.email, req.auth, req.headers['x-admin-session'] as string | undefined)
+    : false;
 
   if (!callerUid && !isCallerAdmin) {
     return res.status(401).json({ error: 'UNAUTHORIZED: Authentication is required to update support message read status.' });
@@ -5217,6 +5782,95 @@ async function startServer() {
 
 if (!process.env.VERCEL) {
   startServer();
+}
+
+export async function dispatchOutboxBackedTransferDirectIfWorkerDisabled(
+  params: {
+    mode: 'MONVERA_C2C' | 'ADMIN_TRANSFER';
+    transaction: any;
+    isDuplicate?: boolean;
+    authenticatedSenderUid?: string;
+    senderMetrics?: any;
+    recipientMetrics?: any;
+  },
+  deps?: {
+    isAdminConfigured?: () => boolean;
+    dispatcher?: Pick<typeof serverNotificationDispatcher, 'dispatch'>;
+    fetchContact?: (uid: string) => Promise<{ email?: string; phone?: string }>;
+  }
+): Promise<{
+  dispatched: boolean;
+  dispatchedCount: number;
+  skippedReason?:
+    | 'OUTBOX_WORKER_ACTIVE'
+    | 'ADMIN_NOT_CONFIGURED'
+    | 'OUTBOUND_DISABLED'
+    | 'DUPLICATE_OR_INCOMPLETE'
+    | 'NOT_ALLOWLISTED';
+}> {
+  if (isNotificationWorkerEnabled()) {
+    return { dispatched: false, dispatchedCount: 0, skippedReason: 'OUTBOX_WORKER_ACTIVE' };
+  }
+
+  const adminOk = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+  if (!adminOk) {
+    return { dispatched: false, dispatchedCount: 0, skippedReason: 'ADMIN_NOT_CONFIGURED' };
+  }
+
+  if (isOutboundNotificationsDisabled()) {
+    return { dispatched: false, dispatchedCount: 0, skippedReason: 'OUTBOUND_DISABLED' };
+  }
+
+  const committedTx = params.transaction;
+  if (params.isDuplicate || !committedTx || committedTx.status !== 'COMPLETED') {
+    return { dispatched: false, dispatchedCount: 0, skippedReason: 'DUPLICATE_OR_INCOMPLETE' };
+  }
+
+  const allowlist = parseNotificationAllowlistUids();
+  if (params.mode === 'MONVERA_C2C') {
+    if (!areTransferParticipantsAllowlisted(committedTx, allowlist)) {
+      return { dispatched: false, dispatchedCount: 0, skippedReason: 'NOT_ALLOWLISTED' };
+    }
+  } else {
+    const authoritativeRecipientUid = committedTx.recipientUserId
+      ? String(committedTx.recipientUserId).trim()
+      : '';
+    if (!authoritativeRecipientUid || !isUidAllowlisted(authoritativeRecipientUid, allowlist)) {
+      return { dispatched: false, dispatchedCount: 0, skippedReason: 'NOT_ALLOWLISTED' };
+    }
+  }
+
+  const contactLookup = deps?.fetchContact || fetchAuthoritativeCustomerContact;
+  const activeDispatcher = deps?.dispatcher || serverNotificationDispatcher;
+  const recipientUid = committedTx.recipientUserId ? String(committedTx.recipientUserId).trim() : '';
+  const senderUid =
+    params.mode === 'MONVERA_C2C' && committedTx.senderUserId
+      ? String(committedTx.senderUserId).trim()
+      : '';
+
+  const [recipientContact, senderContact] = await Promise.all([
+    recipientUid ? contactLookup(recipientUid) : Promise.resolve({}),
+    senderUid ? contactLookup(senderUid) : Promise.resolve({}),
+  ]);
+
+  const events = buildTrustedTransferDispatchEvents(committedTx, params.isDuplicate, {
+    mode: params.mode,
+    authenticatedSenderUid: params.authenticatedSenderUid,
+    senderMetrics: params.senderMetrics,
+    recipientMetrics: params.recipientMetrics,
+    senderContact,
+    recipientContact,
+  });
+
+  await Promise.all(
+    events.map((evt) =>
+      activeDispatcher.dispatch(evt).catch((err) =>
+        console.warn('[ServerDispatcher] Transfer dispatch note:', err?.message || err)
+      )
+    )
+  );
+
+  return { dispatched: events.length > 0, dispatchedCount: events.length };
 }
 
 export default app;

@@ -28,13 +28,194 @@ export type TransactionNotificationLifecycleStage = 'INITIATED' | 'REVERSED' | '
  */
 export function buildTransactionLifecycleEventKey(
   transactionId: string,
-  stage: TransactionNotificationLifecycleStage
+  stage: TransactionNotificationLifecycleStage | 'COMPLETED'
 ): string {
   const cleanTxId = String(transactionId || '').trim();
   if (!cleanTxId) {
     throw new Error('transactionId is required to build a transaction lifecycle event key.');
   }
   return `${cleanTxId}:${stage}`;
+}
+
+export function isOutboundNotificationsDisabled(): boolean {
+  return process.env.DISABLE_OUTBOUND_NOTIFICATIONS === 'true';
+}
+
+export type NotificationAllowlistResolution =
+  | {
+      allowed: true;
+      mode: 'RESTRICTED';
+      allowlist: Set<string>;
+    }
+  | {
+      allowed: true;
+      mode: 'OPEN';
+      allowlist: null;
+    }
+  | {
+      allowed: false;
+      mode: 'INVALID';
+      allowlist: null;
+      reason: string;
+    };
+
+export interface ResolveAllowlistPolicyOptions {
+  allowlistUidsRaw?: string;
+  allowlistModeRaw?: string;
+  requireRestrictedOrExplicitOpen?: boolean;
+}
+
+function isValidAllowlistUidToken(uid: string): boolean {
+  if (!uid || uid.length > 128) return false;
+  if (uid === '.' || uid === '..') return false;
+  if (/[\s/\\]/.test(uid)) return false;
+  return true;
+}
+
+/**
+ * Resolves the active notification allowlist policy.
+ * - Unrestricted mode (`mode: 'OPEN'`, `allowlist: null`) activates ONLY when
+ *   `NOTIFICATION_ALLOWLIST_MODE === 'OPEN'` strictly (or in legacy worker-disabled
+ *   mode when no allowlist is configured).
+ * - When `requireRestrictedOrExplicitOpen` is true (e.g., while `NOTIFICATION_WORKER_ENABLED === 'true'`),
+ *   missing, empty, whitespace-only, comma-only, or malformed `NOTIFICATION_ALLOWLIST_UIDS` fails closed.
+ */
+export function resolveNotificationAllowlistPolicy(
+  options: ResolveAllowlistPolicyOptions = {}
+): NotificationAllowlistResolution {
+  const effectiveMode =
+    options.allowlistModeRaw !== undefined
+      ? options.allowlistModeRaw
+      : process.env.NOTIFICATION_ALLOWLIST_MODE;
+  if (effectiveMode === 'OPEN') {
+    return {
+      allowed: true,
+      mode: 'OPEN',
+      allowlist: null,
+    };
+  }
+
+  const effectiveRaw =
+    options.allowlistUidsRaw !== undefined
+      ? options.allowlistUidsRaw
+      : process.env.NOTIFICATION_ALLOWLIST_UIDS;
+  const requireRestricted =
+    options.requireRestrictedOrExplicitOpen ??
+    process.env.NOTIFICATION_WORKER_ENABLED === 'true';
+
+  if (effectiveRaw === undefined || effectiveRaw === null) {
+    if (requireRestricted) {
+      return {
+        allowed: false,
+        mode: 'INVALID',
+        allowlist: null,
+        reason: 'NOTIFICATION_ALLOWLIST_UIDS is not configured and NOTIFICATION_ALLOWLIST_MODE is not OPEN.',
+      };
+    }
+    return {
+      allowed: true,
+      mode: 'OPEN',
+      allowlist: null,
+    };
+  }
+
+  const trimmed = String(effectiveRaw).trim();
+  if (!trimmed) {
+    if (requireRestricted) {
+      return {
+        allowed: false,
+        mode: 'INVALID',
+        allowlist: null,
+        reason: 'NOTIFICATION_ALLOWLIST_UIDS is empty or whitespace-only and NOTIFICATION_ALLOWLIST_MODE is not OPEN.',
+      };
+    }
+    return {
+      allowed: true,
+      mode: 'OPEN',
+      allowlist: null,
+    };
+  }
+
+  const uids = trimmed
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (uids.length === 0) {
+    if (requireRestricted) {
+      return {
+        allowed: false,
+        mode: 'INVALID',
+        allowlist: null,
+        reason: 'NOTIFICATION_ALLOWLIST_UIDS contains no valid UID entries.',
+      };
+    }
+    return {
+      allowed: true,
+      mode: 'OPEN',
+      allowlist: null,
+    };
+  }
+
+  if (uids.some((uid) => !isValidAllowlistUidToken(uid))) {
+    if (requireRestricted) {
+      return {
+        allowed: false,
+        mode: 'INVALID',
+        allowlist: null,
+        reason: 'NOTIFICATION_ALLOWLIST_UIDS contains malformed UID entries.',
+      };
+    }
+    return {
+      allowed: false,
+      mode: 'INVALID',
+      allowlist: null,
+      reason: 'NOTIFICATION_ALLOWLIST_UIDS contains malformed UID entries.',
+    };
+  }
+
+  return {
+    allowed: true,
+    mode: 'RESTRICTED',
+    allowlist: new Set(uids),
+  };
+}
+
+export function parseNotificationAllowlistUids(
+  raw?: string,
+  options?: { allowlistModeRaw?: string }
+): Set<string> | null {
+  const policy = resolveNotificationAllowlistPolicy({
+    allowlistUidsRaw: raw,
+    allowlistModeRaw: options?.allowlistModeRaw,
+    requireRestrictedOrExplicitOpen: process.env.NOTIFICATION_WORKER_ENABLED === 'true',
+  });
+  if (!policy.allowed) {
+    // Empty Set causes isUidAllowlisted() / areTransferParticipantsAllowlisted() to fail closed.
+    return new Set<string>();
+  }
+  return policy.allowlist;
+}
+
+export function isUidAllowlisted(
+  userId: string | undefined | null,
+  allowlist: Set<string> | null
+): boolean {
+  if (!allowlist) return true;
+  const cleanUid = typeof userId === 'string' ? userId.trim() : '';
+  return Boolean(cleanUid) && allowlist.has(cleanUid);
+}
+
+export function areTransferParticipantsAllowlisted(
+  tx: Pick<Transaction, 'senderUserId' | 'recipientUserId'> | null | undefined,
+  allowlist: Set<string> | null
+): boolean {
+  if (!allowlist) return true;
+  if (!tx) return false;
+  return (
+    isUidAllowlisted(tx.senderUserId, allowlist) &&
+    isUidAllowlisted(tx.recipientUserId, allowlist)
+  );
 }
 
 function resolveAuthoritativeAccountMasked(
@@ -99,6 +280,7 @@ export function buildTrustedTransferDispatchEvents(
   if (!transactionId) return [];
   const referenceNumber = String(tx.referenceNumber || transactionId).trim();
   const currency = String(tx.currency || 'USD').trim() || 'USD';
+  const lifecycleEventKey = buildTransactionLifecycleEventKey(transactionId, 'COMPLETED');
 
   const events: DispatchNotificationEvent[] = [];
 
@@ -121,6 +303,7 @@ export function buildTrustedTransferDispatchEvents(
     events.push({
       transactionId,
       referenceNumber,
+      eventKey: lifecycleEventKey,
       type: 'MONEY_RECEIVED',
       userId: recipientUid,
       recipientName,
@@ -148,6 +331,7 @@ export function buildTrustedTransferDispatchEvents(
       events.push({
         transactionId,
         referenceNumber,
+        eventKey: lifecycleEventKey,
         type: 'MONEY_SENT',
         userId: committedSenderUid,
         recipientName,
@@ -243,6 +427,8 @@ export interface DispatchExecutionOptions {
     emailStatus?: string;
   };
   requirePersistentTracking?: boolean;
+  allowlistUids?: Set<string> | null;
+  disableOutbound?: boolean;
 }
 
 export interface StoredDeviceToken {
@@ -862,6 +1048,45 @@ export class ServerNotificationDispatcher {
     event: DispatchNotificationEvent,
     options?: DispatchExecutionOptions
   ): Promise<DispatchResultSummary> {
+    let allowlist: Set<string> | null;
+    if (options?.allowlistUids !== undefined) {
+      allowlist = options.allowlistUids;
+    } else {
+      const policy = resolveNotificationAllowlistPolicy({
+        requireRestrictedOrExplicitOpen: process.env.NOTIFICATION_WORKER_ENABLED === 'true',
+      });
+      if (!policy.allowed) {
+        return {
+          transactionId: event.transactionId,
+          referenceNumber: event.referenceNumber,
+          push: { attempted: false, delivered: false, status: 'SKIPPED_NOT_ALLOWLISTED' },
+          sms: { success: true, delivered: false, status: 'SKIPPED', provider: 'allowlist' },
+          email: { success: true, delivered: false, status: 'SKIPPED', provider: 'allowlist' },
+        };
+      }
+      allowlist = policy.allowlist;
+    }
+
+    if (!isUidAllowlisted(event.userId, allowlist)) {
+      return {
+        transactionId: event.transactionId,
+        referenceNumber: event.referenceNumber,
+        push: { attempted: false, delivered: false, status: 'SKIPPED_NOT_ALLOWLISTED' },
+        sms: { success: true, delivered: false, status: 'SKIPPED', provider: 'allowlist' },
+        email: { success: true, delivered: false, status: 'SKIPPED', provider: 'allowlist' },
+      };
+    }
+
+    if (options?.disableOutbound === true || isOutboundNotificationsDisabled()) {
+      return {
+        transactionId: event.transactionId,
+        referenceNumber: event.referenceNumber,
+        push: { attempted: false, delivered: false, status: 'SKIPPED_KILL_SWITCH' },
+        sms: { success: true, delivered: false, status: 'SKIPPED', provider: 'disabled' },
+        email: { success: true, delivered: false, status: 'SKIPPED', provider: 'disabled' },
+      };
+    }
+
     const category = resolveNotificationCategory(event);
     const dispatchKey = resolveDispatchKey(event);
     const inMemEventKey = `${event.userId}_${dispatchKey}`;
@@ -1001,9 +1226,18 @@ export class ServerNotificationDispatcher {
       pushResult = await this.sendPush(event, category, outboxCtx, requirePersistentTracking);
     }
 
-    // Immediate abort if outbox or dispatch lease was lost during Push
+    // Immediate abort if outbox/dispatch lease was lost or another active invocation holds the dispatch lease
     if (pushResult.status === 'LEASE_LOST') {
       return this.buildLeaseLostSummary(event, pushResult);
+    }
+    if (pushResult.status === 'DUPLICATE_IN_FLIGHT') {
+      return {
+        transactionId: event.transactionId,
+        referenceNumber: event.referenceNumber,
+        push: pushResult,
+        sms: { success: true, delivered: false, status: 'DUPLICATE_IGNORED' },
+        email: { success: true, delivered: false, status: 'DUPLICATE_IGNORED' },
+      };
     }
 
     const supportsSmsTemplate =

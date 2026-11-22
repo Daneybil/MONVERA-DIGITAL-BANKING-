@@ -13,13 +13,7 @@ service cloud.firestore {
       return isSignedIn() && (
         request.auth.token.get('admin', false) == true ||
         request.auth.token.get('role', '') == 'admin' ||
-        request.auth.token.get('role', '') == 'super_admin' ||
-        (
-          request.auth.token.get('email_verified', false) == true && (
-            request.auth.token.get('email', '') == 'daneybil2020@gmail.com' ||
-            request.auth.token.get('email', '') == 'admin@monvera.com'
-          )
-        )
+        request.auth.token.get('role', '') == 'super_admin'
       );
     }
 

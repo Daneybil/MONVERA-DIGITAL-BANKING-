@@ -2175,10 +2175,19 @@ const maskedCardNumber = fullCardNumber;
 export async function reverseServerFirestoreWithdrawal(
   txIdOrRef: string,
   userId?: string,
-  deps?: ServerTransactionDeps
+  deps?: ServerTransactionDeps & { isAuthorizedAdmin?: boolean }
 ): Promise<{ success: boolean; transaction?: Transaction; balanceMetrics?: BalanceMetrics; error?: string }> {
   if (!txIdOrRef) {
     return { success: false, error: 'Transaction ID or reference is required.' };
+  }
+
+  const expectedUserId = typeof userId === 'string' ? userId.trim() : '';
+  const isAuthorizedAdmin = deps?.isAuthorizedAdmin === true;
+  if (!isAuthorizedAdmin && !expectedUserId) {
+    return {
+      success: false,
+      error: 'UNAUTHORIZED: Verified customer user ID is required to reverse a withdrawal.',
+    };
   }
 
   const fs = deps?.firestore || adminFirestore;
@@ -2201,6 +2210,23 @@ export async function reverseServerFirestoreWithdrawal(
   }
 
   const existingTx = initialSnap.data() as Transaction;
+  const initialOwnerUid = String(existingTx.userId || existingTx.senderUserId || '').trim();
+  if (!initialOwnerUid) {
+    return { success: false, error: 'Could not determine customer ID for withdrawal reversal.' };
+  }
+  if (!isAuthorizedAdmin && initialOwnerUid !== expectedUserId) {
+    return {
+      success: false,
+      error: 'FORBIDDEN: You are not authorized to reverse another customer\'s withdrawal.',
+    };
+  }
+  if (isAuthorizedAdmin && expectedUserId && initialOwnerUid !== expectedUserId) {
+    return {
+      success: false,
+      error: 'FORBIDDEN: Pending withdrawal does not belong to the specified customer.',
+    };
+  }
+
   if (existingTx.type !== 'WITHDRAWAL') {
     return { success: false, error: `Transaction type ${existingTx.type} is not a withdrawal.` };
   }
@@ -2211,11 +2237,7 @@ export async function reverseServerFirestoreWithdrawal(
     return { success: false, error: `Transaction status is ${existingTx.status}, not PENDING.` };
   }
 
-  const effectiveUserId = existingTx.userId || existingTx.senderUserId || userId;
-  if (!effectiveUserId) {
-    return { success: false, error: 'Could not determine customer ID for withdrawal reversal.' };
-  }
-
+  const effectiveUserId = initialOwnerUid;
   const accRef = fs.collection('accounts').doc(effectiveUserId);
   let finalReversedTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
@@ -2229,6 +2251,19 @@ export async function reverseServerFirestoreWithdrawal(
         throw new Error('TX_NOT_FOUND');
       }
       const tData = txSnap.data() as Transaction;
+      const liveOwnerUid = String(tData.userId || tData.senderUserId || '').trim();
+      if (!liveOwnerUid) {
+        throw new Error('UNAUTHORIZED: Transaction has no valid owner.');
+      }
+      if (!isAuthorizedAdmin && liveOwnerUid !== expectedUserId) {
+        throw new Error('FORBIDDEN: Transaction ownership mismatch.');
+      }
+      if (isAuthorizedAdmin && expectedUserId && liveOwnerUid !== expectedUserId) {
+        throw new Error('FORBIDDEN: Transaction does not belong to the specified customer.');
+      }
+      if (tData.type !== 'WITHDRAWAL') {
+        throw new Error(`INVALID_TYPE: Transaction type ${tData.type} is not a withdrawal.`);
+      }
       if (tData.status !== 'PENDING' || tData.metadata?.isReversed) {
         finalReversedTx = tData;
         return;
@@ -2237,6 +2272,10 @@ export async function reverseServerFirestoreWithdrawal(
       const accSnap = await transaction.get(accRef);
       if (!accSnap.exists) {
         throw new Error(`Account record for ${effectiveUserId} not found.`);
+      }
+      const accCheckData = accSnap.data()!;
+      if (accCheckData.userId && accCheckData.userId !== liveOwnerUid) {
+        throw new Error('FORBIDDEN: Account ownership verification failed.');
       }
 
       const supRef = tData.id ? fs.collection('withdrawal_support_records').doc(tData.id) : null;
@@ -2910,11 +2949,32 @@ export async function executeServerDeposit(
   deps?: ServerTransactionDeps
 ): Promise<DepositResult> {
   const { userId, amount, method = 'CARD', destinationAccountType = 'CHECKING', providerPaymentId, referenceNumber, metadata } = params;
-  const depositAmount = Number(amount);
+  const cleanUserId = typeof userId === 'string' ? userId.trim() : '';
+  const rawAmount = typeof amount === 'number' ? amount : Number(amount);
 
-  if (!userId || isNaN(depositAmount) || depositAmount <= 0) {
-    return { success: false, error: 'Valid user ID and a positive deposit amount are required.' };
+  if (
+    !cleanUserId ||
+    typeof amount === 'boolean' ||
+    amount === null ||
+    amount === undefined ||
+    !Number.isFinite(rawAmount) ||
+    rawAmount <= 0
+  ) {
+    return { success: false, error: 'Valid user ID and a positive finite deposit amount are required.' };
   }
+
+  const amountCents = Math.round(rawAmount * 100);
+  if (
+    amountCents < 1 ||
+    !Number.isSafeInteger(amountCents) ||
+    Math.abs(rawAmount * 100 - amountCents) > 1e-6
+  ) {
+    return {
+      success: false,
+      error: 'Deposit amount must be a valid positive USD amount with at most 2 decimal places.',
+    };
+  }
+  const depositAmount = Number((amountCents / 100).toFixed(2));
 
   const fs = deps?.firestore || adminFirestore;
 
@@ -2923,7 +2983,7 @@ export async function executeServerDeposit(
   let userName = 'Monvera Client';
   let isUserFrozen = false;
   try {
-    const uSnap = await fs.collection('users').doc(userId).get();
+    const uSnap = await fs.collection('users').doc(cleanUserId).get();
     if (uSnap.exists) {
       const ud = uSnap.data()!;
       if (ud.status === 'frozen') {
@@ -2936,18 +2996,26 @@ export async function executeServerDeposit(
     }
   } catch {}
 
-  // Enforce deposit restriction for frozen accounts unless it is an existing verified settlement
-  if (isUserFrozen && !providerPaymentId?.startsWith('STRIPE-') && !params.allowFrozenSettlement) {
+  // Enforce deposit restriction for frozen accounts unless explicitly authorized for an already-settled payment
+  if (isUserFrozen && params.allowFrozenSettlement !== true) {
     return {
       success: false,
       error: 'Your account is currently restricted/frozen. New deposits are disabled. Please contact compliance support.',
     };
   }
 
-  const finalRef = referenceNumber || providerPaymentId || `MV-DEP-${Math.floor(100000000 + Math.random() * 900000000)}`;
-  const txId = `tx_dep_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-  const accRef = fs.collection('accounts').doc(userId);
+  const cleanProviderId = typeof providerPaymentId === 'string' ? providerPaymentId.trim() : '';
+  const cleanRefInput = typeof referenceNumber === 'string' ? referenceNumber.trim() : '';
+  const finalRef = cleanRefInput || cleanProviderId || `MV-DEP-${Math.floor(100000000 + Math.random() * 900000000)}`;
+  const idempKey = cleanProviderId
+    ? crypto.createHash('sha256').update(cleanProviderId).digest('hex')
+    : '';
+  const txId = idempKey
+    ? `tx_dep_${idempKey.slice(0, 20)}`
+    : `tx_dep_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+  const accRef = fs.collection('accounts').doc(cleanUserId);
   const txRef = fs.collection('transactions').doc(txId);
+  const idempRef = idempKey ? fs.collection('deposit_idempotency').doc(idempKey) : null;
 
   const isChecking = destinationAccountType !== 'SAVINGS';
   const targetAccountType = isChecking ? 'CHECKING' : 'SAVINGS';
@@ -2968,7 +3036,57 @@ export async function executeServerDeposit(
 
   try {
     await fs.runTransaction(async (transaction) => {
-      // 1. Check idempotency: if referenceNumber or providerPaymentId has already settled
+      // 1a. Check deterministic deposit_idempotency lock doc FIRST when providerPaymentId is provided
+      if (idempRef) {
+        const idempSnap = await transaction.get(idempRef);
+        if (idempSnap.exists) {
+          const idempData = idempSnap.data()!;
+          const existingTxId =
+            typeof idempData.transactionId === 'string' && idempData.transactionId
+              ? idempData.transactionId
+              : txId;
+          const existingTxSnap = await transaction.get(fs.collection('transactions').doc(existingTxId));
+          const aSnap = await transaction.get(accRef);
+          isDuplicate = true;
+          if (existingTxSnap.exists) {
+            finalTx = existingTxSnap.data() as Transaction;
+          } else {
+            finalTx = {
+              id: existingTxId,
+              referenceNumber: idempData.referenceNumber || finalRef,
+              type: 'DEPOSIT',
+              amount: Number(idempData.amount ?? depositAmount),
+              currency: 'USD',
+              status: 'COMPLETED',
+              userId: idempData.userId || cleanUserId,
+              recipientUserId: idempData.userId || cleanUserId,
+              fee: 0.0,
+              description: `Deposit to ${isChecking ? 'Premier Checking' : 'High-Yield Treasury'} via ${methodLabel}`,
+              category: 'Deposits',
+              paymentProviderRef: cleanProviderId,
+              createdAt: idempData.createdAt || new Date().toISOString(),
+              completedAt: idempData.createdAt || new Date().toISOString(),
+            };
+          }
+          if (aSnap.exists) {
+            const ad = aSnap.data()!;
+            finalMetrics = {
+              checkingBalance: Number(ad.checkingBalance ?? 0),
+              savingsBalance: Number(ad.savingsBalance ?? 0),
+              investedBalance: Number(ad.investedBalance ?? 0),
+              accruedEarnings: Number(ad.accruedEarnings ?? 0),
+              totalBalance: Number(ad.totalBalance ?? 0),
+              availableBalance: Number(ad.availableBalance ?? ad.checkingBalance ?? 0),
+              pendingBalance: Number(ad.pendingBalance ?? 0),
+              loanBalance: Number(ad.loanBalance ?? 0),
+              accounts: ad.accounts || [],
+            };
+          }
+          return;
+        }
+      }
+
+      // 1b. Legacy idempotency check by referenceNumber or paymentProviderRef for historical transactions
       const existingRefQuery = await transaction.get(
         fs.collection('transactions').where('referenceNumber', '==', finalRef).limit(1)
       );
@@ -2997,9 +3115,9 @@ export async function executeServerDeposit(
         }
       }
 
-      if (providerPaymentId) {
+      if (cleanProviderId) {
         const existingProviderQuery = await transaction.get(
-          fs.collection('transactions').where('paymentProviderRef', '==', providerPaymentId).limit(1)
+          fs.collection('transactions').where('paymentProviderRef', '==', cleanProviderId).limit(1)
         );
         if (!existingProviderQuery.empty) {
           const existingTx = existingProviderQuery.docs[0].data() as Transaction;
@@ -3063,7 +3181,7 @@ export async function executeServerDeposit(
             }
             return a;
           })
-        : buildDefaultAccounts(userId, newChecking, newSavings, currentInvested, userAcc);
+        : buildDefaultAccounts(cleanUserId, newChecking, newSavings, currentInvested, userAcc);
 
       finalMetrics = {
         checkingBalance: newChecking,
@@ -3088,17 +3206,17 @@ export async function executeServerDeposit(
         amount: depositAmount,
         currency: 'USD',
         status: 'COMPLETED',
-        userId,
+        userId: cleanUserId,
         senderUserId: undefined,
-        recipientUserId: userId,
+        recipientUserId: cleanUserId,
         recipientAccountNumber: targetAccountNumber,
-        senderAccountNumber: providerPaymentId || 'EXTERNAL_GATEWAY',
+        senderAccountNumber: cleanProviderId || 'EXTERNAL_GATEWAY',
         recipientName: userName,
         senderName: methodLabel || 'Direct Deposit Gateway',
         fee: 0.0,
         description: `Deposit to ${targetAccountName} via ${methodLabel}`,
         category: 'Deposits',
-        paymentProviderRef: providerPaymentId || finalRef,
+        paymentProviderRef: cleanProviderId || finalRef,
         createdAt: nowIso,
         completedAt: nowIso,
         metadata: {
@@ -3116,7 +3234,7 @@ export async function executeServerDeposit(
       // Transaction read-phase: prepare settled deposit outbox record strictly BEFORE any writes
       const depositOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
         {
-          userId,
+          userId: cleanUserId,
           transactionId: finalTx.id,
           referenceNumber: finalTx.referenceNumber,
           eventKey: `${finalTx.id}:COMPLETED`,
@@ -3140,15 +3258,26 @@ export async function executeServerDeposit(
       transaction.set(
         accRef,
         {
-          userId,
+          userId: cleanUserId,
           ...finalMetrics,
           updatedAt: nowIso,
         },
         { merge: true }
       );
 
-      // Atomic commit: create permanent deposit ledger transaction & durable notification outbox record
+      // Atomic commit: create permanent deposit ledger transaction, idempotency lock, & outbox record
       transaction.set(txRef, finalTx, { merge: true });
+      if (idempRef) {
+        transaction.set(idempRef, {
+          id: idempKey,
+          providerPaymentId: cleanProviderId,
+          referenceNumber: finalRef,
+          transactionId: finalTx.id,
+          userId: cleanUserId,
+          amount: depositAmount,
+          createdAt: nowIso,
+        });
+      }
       outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(transaction, depositOutboxBatch);
     });
     if (finalTx && !isDuplicate) {
@@ -4586,6 +4715,8 @@ export async function executeServerLoanRepayment(
 
 export interface InvestmentCreationParams {
   userId: string;
+  authenticatedUid?: string;
+  isAuthorizedAdmin?: boolean;
   termDays: InvestmentTermDays;
   amount: number;
   clientRequestId?: string;
@@ -4601,6 +4732,7 @@ export interface InvestmentCreationResult {
   notification?: NotificationItem;
   isDuplicate?: boolean;
   error?: string;
+  errorCode?: string;
 }
 
 /**
@@ -4610,16 +4742,39 @@ export async function executeServerInvestmentCreation(
   params: InvestmentCreationParams,
   deps?: ServerTransactionDeps
 ): Promise<InvestmentCreationResult> {
-  const { userId, termDays, amount, clientRequestId, userAccountNumber, fallbackUser } = params;
+  const {
+    userId,
+    authenticatedUid,
+    isAuthorizedAdmin = false,
+    termDays,
+    amount,
+    clientRequestId,
+    userAccountNumber,
+    fallbackUser,
+  } = params;
 
-  if (!userId) {
-    return { success: false, error: 'Customer user ID is required.' };
+  const cleanUserId = typeof userId === 'string' ? userId.trim() : '';
+  if (!cleanUserId) {
+    return { success: false, errorCode: 'UNAUTHORIZED', error: 'UNAUTHORIZED: Customer user ID is required.' };
+  }
+  if (authenticatedUid !== undefined) {
+    const cleanAuthUid = String(authenticatedUid || '').trim();
+    if (!cleanAuthUid) {
+      return { success: false, errorCode: 'UNAUTHORIZED', error: 'UNAUTHORIZED: Valid authenticated customer UID is required.' };
+    }
+    if (!isAuthorizedAdmin && cleanUserId !== cleanAuthUid) {
+      return {
+        success: false,
+        errorCode: 'FORBIDDEN',
+        error: 'FORBIDDEN: You are not authorized to create term investments for another customer.',
+      };
+    }
   }
 
   const fs = deps?.firestore || adminFirestore;
 
   // Check account freeze status before creating investment
-  const userDocSnap = await fs.collection('users').doc(userId).get();
+  const userDocSnap = await fs.collection('users').doc(cleanUserId).get();
   const userData = userDocSnap.exists ? userDocSnap.data()! : {};
   if (userData.status === 'frozen') {
     return {
@@ -4638,7 +4793,7 @@ export async function executeServerInvestmentCreation(
   }
 
   const principal = Number(amount);
-  if (isNaN(principal) || principal < 100) {
+  if (!Number.isFinite(principal) || principal < 100) {
     return { success: false, error: 'Minimum term investment amount is $100.00.' };
   }
 
@@ -4648,17 +4803,22 @@ export async function executeServerInvestmentCreation(
   const expectedMaturityValue = Number((principal + expectedYield).toFixed(2));
   const maturityIso = new Date(Date.now() + numDays * 24 * 60 * 60 * 1000).toISOString();
 
-  const refKey = clientRequestId || `MV-INV-${userId}-${numDays}-${Math.round(principal * 100)}-${Date.now()}`;
-  const cleanInvKeyRaw = refKey.replace(/[^a-zA-Z0-9_-]/g, '');
-  const stableInvSuffix =
-    clientRequestId && cleanInvKeyRaw
-      ? (cleanInvKeyRaw.length <= 48 ? cleanInvKeyRaw : crypto.createHash('sha256').update(refKey).digest('hex').slice(0, 16))
-      : `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
+  const cleanClientReqId = typeof clientRequestId === 'string' ? clientRequestId.trim() : '';
+  const refKey = cleanClientReqId || `MV-INV-${cleanUserId}-${numDays}-${Math.round(principal * 100)}-${Date.now()}`;
+  const scopedIdempHash = cleanClientReqId
+    ? crypto.createHash('sha256').update(`${cleanUserId}\0${cleanClientReqId}`).digest('hex')
+    : '';
+  const stableInvSuffix = scopedIdempHash
+    ? scopedIdempHash.slice(0, 20)
+    : `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 7)}`;
   const invId = `inv_${stableInvSuffix}`;
   const txId = `tx_inv_${stableInvSuffix}`;
-  const cleanInvKey = cleanInvKeyRaw || crypto.createHash('sha256').update(refKey).digest('hex').slice(0, 24);
-  const notifId = `notif_inv_${cleanInvKey}_${userId}`;
-  const accRef = fs.collection('accounts').doc(userId);
+  const cleanInvKey = scopedIdempHash
+    ? scopedIdempHash.slice(0, 24)
+    : crypto.createHash('sha256').update(refKey).digest('hex').slice(0, 24);
+  const notifId = `notif_inv_${cleanInvKey}_${cleanUserId}`;
+  const accRef = fs.collection('accounts').doc(cleanUserId);
+  const idempRef = scopedIdempHash ? fs.collection('investment_idempotency').doc(scopedIdempHash) : null;
 
   let finalInvestment: InvestmentPlan | null = null;
   let finalTx: Transaction | null = null;
@@ -4676,20 +4836,56 @@ export async function executeServerInvestmentCreation(
       finalNotif = null;
       outboxWriteResult = null;
 
-      // 1. Idempotency check: if clientRequestId was provided, check existing transaction
-      if (clientRequestId) {
+      // 1. User-scoped idempotency check (prevents global collisions across different customers)
+      if (idempRef && cleanClientReqId) {
+        const idempSnap = await transaction.get(idempRef);
+        if (idempSnap.exists) {
+          const idempData = idempSnap.data()!;
+          if (idempData.userId === cleanUserId) {
+            isDuplicate = true;
+            const existingInvRef = fs.collection('investments').doc(String(idempData.investmentId || invId));
+            const existingTxRef = fs.collection('transactions').doc(String(idempData.transactionId || txId));
+            const [existingInvSnap, existingTxSnap, accSnap] = await Promise.all([
+              transaction.get(existingInvRef),
+              transaction.get(existingTxRef),
+              transaction.get(accRef),
+            ]);
+            if (existingInvSnap.exists) finalInvestment = existingInvSnap.data() as InvestmentPlan;
+            if (existingTxSnap.exists) finalTx = existingTxSnap.data() as Transaction;
+            if (accSnap.exists) {
+              const ad = accSnap.data()!;
+              finalMetrics = {
+                checkingBalance: Number(ad.checkingBalance ?? 0),
+                savingsBalance: Number(ad.savingsBalance ?? 0),
+                investedBalance: Number(ad.investedBalance ?? 0),
+                accruedEarnings: Number(ad.accruedEarnings ?? 0),
+                totalBalance: Number(ad.totalBalance ?? 0),
+                availableBalance: Number(ad.availableBalance ?? ad.checkingBalance ?? 0),
+                pendingBalance: Number(ad.pendingBalance ?? 0),
+                loanBalance: Number(ad.loanBalance ?? 0),
+                accounts: ad.accounts || [],
+              };
+            }
+            return;
+          }
+        }
+
         const existingTxQuery = await transaction.get(
-          fs.collection('transactions').where('referenceNumber', '==', clientRequestId).limit(1)
+          fs
+            .collection('transactions')
+            .where('userId', '==', cleanUserId)
+            .where('referenceNumber', '==', cleanClientReqId)
+            .limit(1)
         );
         if (!existingTxQuery.empty) {
           const existingTx = existingTxQuery.docs[0].data() as Transaction;
-          if (existingTx.status === 'COMPLETED') {
+          if (existingTx.status === 'COMPLETED' && existingTx.userId === cleanUserId) {
             isDuplicate = true;
             finalTx = existingTx;
             const existingInvId = existingTx.metadata?.investmentId;
             if (existingInvId) {
               const invSnap = await transaction.get(fs.collection('investments').doc(existingInvId));
-              if (invSnap.exists) {
+              if (invSnap.exists && (invSnap.data() as InvestmentPlan).userId === cleanUserId) {
                 finalInvestment = invSnap.data() as InvestmentPlan;
               }
             }
@@ -4713,13 +4909,19 @@ export async function executeServerInvestmentCreation(
         }
       }
 
-      // 2. Read authoritative accounts/{userId}
+      // 2. Read authoritative accounts/{userId} & verify account ownership inside transaction
       const accSnap = await transaction.get(accRef);
       if (!accSnap.exists) {
         throw new Error('ACCOUNT_NOT_FOUND: User account record not found in Firestore.');
       }
 
       const ad = accSnap.data()!;
+      if (ad.userId && ad.userId !== cleanUserId) {
+        throw new Error('FORBIDDEN: Account ownership verification failed.');
+      }
+      if (authenticatedUid !== undefined && !isAuthorizedAdmin && cleanUserId !== String(authenticatedUid).trim()) {
+        throw new Error('FORBIDDEN: Customer authentication ownership mismatch.');
+      }
       const currentChecking = Number(ad.checkingBalance ?? ad.availableBalance ?? 0);
       const currentSavings = Number(ad.savingsBalance ?? ad.savings ?? 0);
       const currentInvested = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
@@ -4901,7 +5103,7 @@ export async function executeServerInvestmentCreation(
       transaction.set(
         accRef,
         {
-          userId,
+          userId: cleanUserId,
           ...finalMetrics,
           updatedAt: nowIso,
         },
@@ -4911,8 +5113,19 @@ export async function executeServerInvestmentCreation(
       // 6. Atomically create investment document
       transaction.set(invRef, finalInvestment, { merge: true });
 
-      // 7. Atomically commit ledger transaction
+      // 7. Atomically commit ledger transaction & user-scoped idempotency record
       transaction.set(txRef, finalTx, { merge: true });
+      if (idempRef) {
+        transaction.set(idempRef, {
+          userId: cleanUserId,
+          clientRequestId: cleanClientReqId,
+          investmentId: invId,
+          transactionId: txId,
+          amount: principal,
+          termDays: numDays,
+          createdAt: nowIso,
+        });
+      }
 
       // 8. Atomically commit deterministic notification & durable notification outbox record
       transaction.set(notifRef, finalNotif, { merge: true });
@@ -4936,9 +5149,11 @@ export async function executeServerInvestmentCreation(
     return { success: false, error: 'Term investment creation completed without returning plan.' };
   } catch (err: any) {
     const errMsg = err?.message || String(err);
+    const codeMatch = errMsg.match(/^([A-Z_]+):\s*/);
     console.error('[executeServerInvestmentCreation] Error:', errMsg);
     return {
       success: false,
+      errorCode: codeMatch ? codeMatch[1] : undefined,
       error: errMsg.replace(/^[A-Z_]+:\s*/, ''),
     };
   }
@@ -4947,6 +5162,8 @@ export async function executeServerInvestmentCreation(
 export interface InvestmentMaturityParams {
   investmentId: string;
   userId: string;
+  authenticatedUid?: string;
+  isAuthorizedAdmin?: boolean;
 }
 
 export interface InvestmentMaturityResult {
@@ -4957,6 +5174,7 @@ export interface InvestmentMaturityResult {
   payoutAmount?: number;
   isDuplicate?: boolean;
   error?: string;
+  errorCode?: string;
 }
 
 /**
@@ -4966,15 +5184,30 @@ export async function executeServerInvestmentMaturity(
   params: InvestmentMaturityParams,
   deps?: ServerTransactionDeps
 ): Promise<InvestmentMaturityResult> {
-  const { investmentId, userId } = params;
+  const { investmentId, userId, authenticatedUid, isAuthorizedAdmin = false } = params;
+  const cleanInvestmentId = typeof investmentId === 'string' ? investmentId.trim() : '';
+  const cleanUserId = typeof userId === 'string' ? userId.trim() : '';
 
-  if (!investmentId || !userId) {
+  if (!cleanInvestmentId || (!isAuthorizedAdmin && !cleanUserId)) {
     return { success: false, error: 'Investment ID and User ID are required.' };
   }
 
+  if (authenticatedUid !== undefined) {
+    const cleanAuthUid = String(authenticatedUid || '').trim();
+    if (!cleanAuthUid) {
+      return { success: false, errorCode: 'UNAUTHORIZED', error: 'UNAUTHORIZED: Valid authenticated customer UID is required.' };
+    }
+    if (!isAuthorizedAdmin && cleanUserId !== cleanAuthUid) {
+      return {
+        success: false,
+        errorCode: 'FORBIDDEN',
+        error: 'FORBIDDEN: You are not authorized to settle another customer\'s investment.',
+      };
+    }
+  }
+
   const fs = deps?.firestore || adminFirestore;
-  const invRef = fs.collection('investments').doc(investmentId);
-  const accRef = fs.collection('accounts').doc(userId);
+  const invRef = fs.collection('investments').doc(cleanInvestmentId);
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
 
@@ -4997,11 +5230,25 @@ export async function executeServerInvestmentMaturity(
       }
 
       const inv = invSnap.data() as InvestmentPlan;
-
-      // 2. Authorization check
-      if (inv.userId !== userId) {
-        throw new Error('UNAUTHORIZED: You are not authorized to settle this investment.');
+      const invOwnerUid = String(inv.userId || '').trim();
+      if (!invOwnerUid) {
+        throw new Error('UNAUTHORIZED: Investment record lacks an authoritative owner.');
       }
+
+      // 2. Strict ownership authorization check inside the transaction
+      if (!isAuthorizedAdmin) {
+        if (invOwnerUid !== cleanUserId) {
+          throw new Error('FORBIDDEN: You are not authorized to settle this investment.');
+        }
+        if (authenticatedUid !== undefined && invOwnerUid !== String(authenticatedUid).trim()) {
+          throw new Error('FORBIDDEN: Authenticated caller does not own this investment.');
+        }
+      } else if (cleanUserId && invOwnerUid !== cleanUserId) {
+        throw new Error('FORBIDDEN: Investment does not belong to the specified customer.');
+      }
+
+      const effectiveOwnerId = invOwnerUid;
+      const accRef = fs.collection('accounts').doc(effectiveOwnerId);
 
       // 3. Repeated maturity check: already paid out
       if (inv.status === 'MATURED') {
@@ -5034,13 +5281,16 @@ export async function executeServerInvestmentMaturity(
         );
       }
 
-      // 5. Read user's account
+      // 5. Read owner's account & verify ownership
       const accSnap = await transaction.get(accRef);
       if (!accSnap.exists) {
         throw new Error('ACCOUNT_NOT_FOUND: User account record not found in Firestore.');
       }
 
       const ad = accSnap.data()!;
+      if (ad.userId && ad.userId !== effectiveOwnerId) {
+        throw new Error('FORBIDDEN: Account ownership verification failed.');
+      }
       const currentChecking = Number(ad.checkingBalance ?? ad.availableBalance ?? 0);
       const currentSavings = Number(ad.savingsBalance ?? ad.savings ?? 0);
       const currentInvested = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
@@ -5063,7 +5313,7 @@ export async function executeServerInvestmentMaturity(
           return a;
         });
       } else {
-        accountsList = buildDefaultAccounts(userId, newChecking, currentSavings, newInvested, userAcc);
+        accountsList = buildDefaultAccounts(effectiveOwnerId, newChecking, currentSavings, newInvested, userAcc);
       }
 
       finalMetrics = {
@@ -5088,7 +5338,7 @@ export async function executeServerInvestmentMaturity(
       const txRef = fs.collection('transactions').doc(txId);
       finalTx = {
         id: txId,
-        userId,
+        userId: effectiveOwnerId,
         type: 'TRANSFER',
         category: 'Investments',
         amount: payoutTotal,
@@ -5102,22 +5352,22 @@ export async function executeServerInvestmentMaturity(
         senderAccountNumber: 'MVB-INV-001',
         recipientName: 'Account Holder',
         recipientAccountNumber: userAcc,
-        referenceNumber: `MV-MAT-${investmentId}`,
+        referenceNumber: `MV-MAT-${cleanInvestmentId}`,
         createdAt: nowIso,
         completedAt: nowIso,
         metadata: {
-          investmentId,
+          investmentId: cleanInvestmentId,
           principal: inv.amount,
           yield: inv.expectedYield,
           payoutAmount: payoutTotal,
         },
       };
 
-      const notifId = `notif_mat_${investmentId}_${userId}`;
+      const notifId = `notif_mat_${cleanInvestmentId}_${effectiveOwnerId}`;
       const notifRef = fs.collection('notifications').doc(notifId);
       const notifItem: NotificationItem = {
         id: notifId,
-        userId,
+        userId: effectiveOwnerId,
         title: 'Investment Matured & Settled',
         message: `Your ${inv.termDays}-Day term investment matured! +$${payoutTotal.toLocaleString('en-US', {
           minimumFractionDigits: 2,
@@ -5126,9 +5376,9 @@ export async function executeServerInvestmentMaturity(
         severity: 'success',
         read: false,
         createdAt: nowIso,
-        referenceId: `MV-MAT-${investmentId}`,
+        referenceId: `MV-MAT-${cleanInvestmentId}`,
         actionView: 'investments',
-        actionRecordId: investmentId,
+        actionRecordId: cleanInvestmentId,
         metadata: {
           category: 'INVESTMENT',
           eventType: 'INVESTMENT_MATURED',
@@ -5138,7 +5388,7 @@ export async function executeServerInvestmentMaturity(
           amount: payoutTotal,
           currency: 'USD',
           status: 'MATURED',
-          referenceNumber: `MV-MAT-${investmentId}`,
+          referenceNumber: `MV-MAT-${cleanInvestmentId}`,
           date: nowIso,
         },
       };
@@ -5146,7 +5396,7 @@ export async function executeServerInvestmentMaturity(
       // Transaction read-phase: prepare INVESTMENT maturity outbox record strictly BEFORE any writes
       const maturityOutboxBatch = await prepareNotificationOutboxBatch(transaction, fs, [
         {
-          userId,
+          userId: effectiveOwnerId,
           transactionId: finalTx.id,
           referenceNumber: finalTx.referenceNumber,
           eventKey: `${finalTx.id}:COMPLETED`,
@@ -5168,7 +5418,7 @@ export async function executeServerInvestmentMaturity(
       transaction.set(
         accRef,
         {
-          userId,
+          userId: effectiveOwnerId,
           ...finalMetrics,
           updatedAt: nowIso,
         },
@@ -5203,9 +5453,11 @@ export async function executeServerInvestmentMaturity(
     return { success: false, error: 'Investment settlement completed without returning record.' };
   } catch (err: any) {
     const errMsg = err?.message || String(err);
+    const codeMatch = errMsg.match(/^([A-Z_]+):\s*/);
     console.error('[executeServerInvestmentMaturity] Error:', errMsg);
     return {
       success: false,
+      errorCode: codeMatch ? codeMatch[1] : undefined,
       error: errMsg.replace(/^[A-Z_]+:\s*/, ''),
     };
   }

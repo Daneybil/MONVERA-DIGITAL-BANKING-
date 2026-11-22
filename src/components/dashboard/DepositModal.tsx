@@ -68,48 +68,12 @@ export const DepositModal: React.FC = () => {
         return;
       }
 
-      // If Stripe secret key is not yet set in environment, handle graceful fallback deposit
       if (stripeRes.configured === false) {
-        const providerPaymentId = `CARD-STRIPE-DEMO-${Math.floor(100000 + Math.random() * 900000)}`;
-        const res = await api.createDeposit({
-          userId: currentUser.id,
-          amount: numAmount,
-          method: 'CARD',
-          destinationAccountType: destinationAccount,
-          providerPaymentId,
-          metadata: {
-            gateway: 'Stripe',
-            info: 'Demo card deposit - please add STRIPE_SECRET_KEY to Railway for live Stripe redirection',
-          },
-        });
-
-        if (res.success && res.transaction) {
-          setIsSuccess(true);
-          setPaymentRef(res.transaction.referenceNumber);
-          await refreshBalance();
-          await refreshNotifications();
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(
-              new CustomEvent('monvera_transaction_created', {
-                detail: { userId: currentUser.id, transaction: res.transaction },
-              })
-            );
-            if (res.balanceMetrics) {
-              window.dispatchEvent(
-                new CustomEvent('monvera_balance_updated', {
-                  detail: { userId: currentUser.id, balanceMetrics: res.balanceMetrics },
-                })
-              );
-            }
-          }
-          confetti({
-            particleCount: 80,
-            spread: 70,
-            origin: { y: 0.6 },
-            colors: ['#059669', '#10b981', '#0f172a', '#3b82f6'],
-          });
-          return;
-        }
+        setErrorMessage(
+          stripeRes.error ||
+            'Card deposit checkout is currently unavailable. Deposits require verified Stripe payment settlement.'
+        );
+        return;
       }
 
       setErrorMessage(stripeRes.error || "We couldn't initialize Stripe checkout. Please try again.");

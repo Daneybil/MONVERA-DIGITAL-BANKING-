@@ -57,6 +57,91 @@ interface AdminCustomerDetailsModalProps {
   onRefreshData?: () => Promise<void>;
 }
 
+export interface AdminTransactionClassification {
+  isInternalTransfer: boolean;
+  isCredit: boolean;
+  flowKind: 'INTERNAL' | 'CREDIT' | 'DEBIT';
+  sourceAccountLabel: string;
+  destAccountLabel: string;
+}
+
+export function classifyAdminCustomerTransaction(
+  tx: Transaction,
+  customerId?: string | null
+): AdminTransactionClassification {
+  const meta = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : undefined;
+  const metaSource = String(meta?.sourceAccountType || '').toUpperCase();
+  const metaDest = String(meta?.destinationAccountType || '').toUpperCase();
+  const desc = (tx.description || '').toLowerCase();
+
+  const isSameUserTransfer = Boolean(
+    tx.senderUserId && tx.recipientUserId && tx.senderUserId === tx.recipientUserId
+  );
+  const isAdminTransferCredit = Boolean(
+    meta?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+      tx.senderAccountNumber === '1000000001' ||
+      tx.senderName?.includes('Bennett Johnson')
+  );
+  const isLoanOrDisbursement =
+    meta?.isLoanDisbursement === true ||
+    meta?.disbursementType === 'LOAN_DISBURSEMENT' ||
+    Boolean(meta?.loanId) ||
+    desc.includes('loan') ||
+    desc.includes('disburs');
+  const hasInternalAccountPair =
+    (metaSource === 'CHECKING' && metaDest === 'SAVINGS') ||
+    (metaSource === 'SAVINGS' && metaDest === 'CHECKING');
+
+  const isExplicitInternal =
+    meta?.isInternalTransfer !== false &&
+    (meta?.isInternalTransfer === true || meta?.transferScope === 'INTERNAL_ACCOUNT_TRANSFER') &&
+    (!tx.senderUserId || !tx.recipientUserId || isSameUserTransfer) &&
+    (tx.type === 'TRANSFER' || !tx.type);
+
+  const isPairVerifiedInternal =
+    meta?.isInternalTransfer !== false &&
+    tx.type === 'TRANSFER' &&
+    isSameUserTransfer &&
+    hasInternalAccountPair &&
+    !isAdminTransferCredit &&
+    !isLoanOrDisbursement;
+
+  const isInternalTransfer = isExplicitInternal || isPairVerifiedInternal;
+
+  const inferredSavingsToChecking =
+    metaSource === 'SAVINGS' ||
+    (!metaSource && (desc.includes('savings to checking') || desc.includes('sav to chk')));
+  const sourceAccountLabel = inferredSavingsToChecking ? 'High-Yield Savings' : 'Checking';
+  const destAccountLabel =
+    metaDest === 'CHECKING' || (!metaDest && inferredSavingsToChecking)
+      ? 'Checking'
+      : 'High-Yield Savings';
+
+  if (isInternalTransfer) {
+    return {
+      isInternalTransfer: true,
+      isCredit: false,
+      flowKind: 'INTERNAL',
+      sourceAccountLabel,
+      destAccountLabel,
+    };
+  }
+
+  const isCredit = Boolean(
+    (customerId && tx.recipientUserId === customerId) ||
+      tx.type === 'DEPOSIT' ||
+      tx.type === 'ADMIN_DEVELOPMENT_FUNDING'
+  );
+
+  return {
+    isInternalTransfer: false,
+    isCredit,
+    flowKind: isCredit ? 'CREDIT' : 'DEBIT',
+    sourceAccountLabel,
+    destAccountLabel,
+  };
+}
+
 export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps> = ({
   customer,
   isOpen,
@@ -132,8 +217,16 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
     (t) => t.senderUserId === customer.id || t.recipientUserId === customer.id
   );
 
-  const deposits = userTxs.filter((t) => t.category === 'Deposits' || t.type === 'DEPOSIT');
-  const withdrawals = userTxs.filter((t) => t.category === 'Withdrawals' || t.type === 'WITHDRAWAL');
+  const deposits = userTxs.filter(
+    (t) =>
+      !classifyAdminCustomerTransaction(t, customer.id).isInternalTransfer &&
+      (t.category === 'Deposits' || t.type === 'DEPOSIT')
+  );
+  const withdrawals = userTxs.filter(
+    (t) =>
+      !classifyAdminCustomerTransaction(t, customer.id).isInternalTransfer &&
+      (t.category === 'Withdrawals' || t.type === 'WITHDRAWAL')
+  );
 
   const metrics = customer.balanceMetrics || {
     checkingBalance: 0,
@@ -398,7 +491,12 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-sm">
                       {userTxs.map((tx) => {
-                        const isCredit = tx.recipientUserId === customer.id || tx.type === 'DEPOSIT' || tx.type === 'ADMIN_DEVELOPMENT_FUNDING';
+                        const {
+                          isInternalTransfer,
+                          isCredit,
+                          sourceAccountLabel,
+                          destAccountLabel,
+                        } = classifyAdminCustomerTransaction(tx, customer.id);
                         return (
                           <tr key={tx.id} className="hover:bg-slate-50/80">
                             <td className="p-4 text-slate-700 font-bold whitespace-nowrap">
@@ -411,13 +509,30 @@ export const AdminCustomerDetailsModal: React.FC<AdminCustomerDetailsModalProps>
                             </td>
                             <td className="p-4 font-mono font-bold text-slate-900">{tx.referenceNumber}</td>
                             <td className="p-4">
-                              <span className="px-2.5 py-1 rounded-lg bg-slate-100 font-extrabold text-xs text-slate-800">
-                                {tx.type}
+                              <span
+                                className={`px-2.5 py-1 rounded-lg font-extrabold text-xs ${
+                                  isInternalTransfer
+                                    ? 'bg-sky-50 text-sky-800 border border-sky-200'
+                                    : 'bg-slate-100 text-slate-800'
+                                }`}
+                              >
+                                {isInternalTransfer ? 'INTERNAL TRANSFER' : tx.type}
                               </span>
                             </td>
-                            <td className="p-4 text-slate-950 font-bold max-w-xs truncate">{tx.description}</td>
-                            <td className={`p-4 text-right font-mono font-black text-base whitespace-nowrap ${isCredit ? 'text-emerald-700' : 'text-slate-950'}`}>
-                              {isCredit ? '+' : '-'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                            <td className="p-4 text-slate-950 font-bold max-w-xs">
+                              <div className="truncate">{tx.description}</div>
+                              {isInternalTransfer && (
+                                <div className="text-[11px] text-sky-700 font-semibold mt-0.5">
+                                  {sourceAccountLabel} → {destAccountLabel}
+                                </div>
+                              )}
+                            </td>
+                            <td
+                              className={`p-4 text-right font-mono font-black text-base whitespace-nowrap ${
+                                isInternalTransfer ? 'text-slate-950' : isCredit ? 'text-emerald-700' : 'text-slate-950'
+                              }`}
+                            >
+                              {isInternalTransfer ? '' : isCredit ? '+' : '-'}${tx.amount.toLocaleString('en-US', { minimumFractionDigits: 2 })}
                             </td>
                             <td className="p-4 text-center">
                               <span

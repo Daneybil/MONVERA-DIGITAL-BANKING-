@@ -112,6 +112,27 @@ function isLoanDisbursementTransaction(docId: string, tx: Record<string, any>): 
   return false;
 }
 
+function isUnverifiedOrDemoDepositTransaction(docId: string, tx: Record<string, any>): boolean {
+  const ref = String(tx.referenceNumber || docId || '').trim();
+  const provRef = String(tx.paymentProviderRef || '').trim();
+  const meta = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : {};
+
+  if (
+    ref.startsWith('CARD-STRIPE-DEMO-') ||
+    provRef.startsWith('CARD-STRIPE-DEMO-') ||
+    ref.startsWith('SIM-WH-') ||
+    provRef.startsWith('SIM-WH-')
+  ) {
+    return true;
+  }
+
+  if (meta.isDemo === true || meta.isSimulation === true || meta.unverified === true) {
+    return true;
+  }
+
+  return false;
+}
+
 function aggregateQualifyingUsdDeposits(
   entries: Iterable<{ id: string; data: Record<string, any> }>
 ): AggregatedDepositsResult {
@@ -134,11 +155,13 @@ function aggregateQualifyingUsdDeposits(
     // - USD deposits only
     // - No reward credits / transfers / withdrawals
     // - No loan disbursements (including transactions recorded with type: 'DEPOSIT')
+    // - No demo / simulated / explicitly unverified markers
     if (!Number.isFinite(amt) || amt <= 0) continue;
     if (meta.isReversed === true || tx.status === 'REVERSED') continue;
     if (tx.currency && String(tx.currency).trim().toUpperCase() !== 'USD') continue;
     if (tx.category === 'Rewards' || tx.type === 'WELCOME_REWARD') continue;
     if (isLoanDisbursementTransaction(docId, tx)) continue;
+    if (isUnverifiedOrDemoDepositTransaction(docId, tx)) continue;
 
     // Deduplication check
     if (provRef && seenPaymentRefs.has(provRef)) continue;

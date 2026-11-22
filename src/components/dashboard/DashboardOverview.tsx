@@ -16,6 +16,7 @@ import {
   Zap,
   ArrowUpRight,
   ArrowDownLeft,
+  ArrowRightLeft,
   Clock,
   CheckCircle2,
   Copy,
@@ -35,6 +36,121 @@ import { KycBanner } from '../kyc/KycBanner';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { firestoreSync } from '../../services/firestoreSync';
 import { WelcomeRewardCard } from './WelcomeRewardCard';
+
+export interface OverviewTransactionClassification {
+  isInternalTransfer: boolean;
+  isCredit: boolean;
+  flowKind: 'INTERNAL' | 'CREDIT' | 'DEBIT';
+  sourceAccountLabel: string;
+  destAccountLabel: string;
+}
+
+export function classifyOverviewTransaction(
+  tx: Transaction,
+  userId?: string | null,
+  effectiveUid?: string | null,
+  userPermanentAccountNumber?: string | null
+): OverviewTransactionClassification {
+  const userAccClean = (userPermanentAccountNumber || '').replace(/[-\s]/g, '');
+  const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
+  const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
+
+  const isRecipient = Boolean(
+    (effectiveUid && tx.recipientUserId === effectiveUid) ||
+      (!tx.recipientUserId && effectiveUid && tx.userId === effectiveUid) ||
+      (userId && tx.recipientUserId === userId) ||
+      (!tx.recipientUserId && userId && tx.userId === userId) ||
+      (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean)
+  );
+
+  const isSender = Boolean(
+    (effectiveUid && tx.senderUserId === effectiveUid && tx.recipientUserId !== effectiveUid) ||
+      (userId && tx.senderUserId === userId && tx.recipientUserId !== userId) ||
+      (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean)
+  );
+
+  const isAdminTransferCredit = Boolean(
+    (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
+      tx.senderAccountNumber === '1000000001' ||
+      tx.senderName?.includes('Bennett Johnson')) &&
+      (isRecipient ||
+        (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
+        (userId && (tx.userId === userId || tx.recipientUserId === userId)))
+  );
+
+  const meta = tx.metadata && typeof tx.metadata === 'object' ? tx.metadata : undefined;
+  const metaSource = String(meta?.sourceAccountType || '').toUpperCase();
+  const metaDest = String(meta?.destinationAccountType || '').toUpperCase();
+  const desc = (tx.description || '').toLowerCase();
+
+  const isSameUserTransfer = Boolean(
+    tx.senderUserId && tx.recipientUserId && tx.senderUserId === tx.recipientUserId
+  );
+  const isLoanOrDisbursement =
+    meta?.isLoanDisbursement === true ||
+    meta?.disbursementType === 'LOAN_DISBURSEMENT' ||
+    Boolean(meta?.loanId) ||
+    desc.includes('loan') ||
+    desc.includes('disburs');
+  const hasInternalAccountPair =
+    (metaSource === 'CHECKING' && metaDest === 'SAVINGS') ||
+    (metaSource === 'SAVINGS' && metaDest === 'CHECKING');
+
+  const isExplicitInternal =
+    meta?.isInternalTransfer !== false &&
+    (meta?.isInternalTransfer === true || meta?.transferScope === 'INTERNAL_ACCOUNT_TRANSFER') &&
+    (!tx.senderUserId || !tx.recipientUserId || isSameUserTransfer) &&
+    (tx.type === 'TRANSFER' || !tx.type);
+
+  const isPairVerifiedInternal =
+    meta?.isInternalTransfer !== false &&
+    tx.type === 'TRANSFER' &&
+    isSameUserTransfer &&
+    hasInternalAccountPair &&
+    !isAdminTransferCredit &&
+    !isLoanOrDisbursement;
+
+  const isInternalTransfer = isExplicitInternal || isPairVerifiedInternal;
+
+  const inferredSavingsToChecking =
+    metaSource === 'SAVINGS' ||
+    (!metaSource && (desc.includes('savings to checking') || desc.includes('sav to chk')));
+  const sourceAccountLabel = inferredSavingsToChecking ? 'High-Yield Savings' : 'Checking';
+  const destAccountLabel =
+    metaDest === 'CHECKING' || (!metaDest && inferredSavingsToChecking)
+      ? 'Checking'
+      : 'High-Yield Savings';
+
+  if (isInternalTransfer) {
+    return {
+      isInternalTransfer: true,
+      isCredit: false,
+      flowKind: 'INTERNAL',
+      sourceAccountLabel,
+      destAccountLabel,
+    };
+  }
+
+  const isCheckWithdrawalDebit =
+    tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
+  const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
+  const isDeposit =
+    !isCheckWithdrawalDebit &&
+    (tx.type === 'DEPOSIT' ||
+      tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
+      tx.type === 'INVESTMENT_EARNING' ||
+      tx.type === 'INVESTMENT_MATURITY' ||
+      isAdminTransferCredit);
+  const isCredit = isCheckWithdrawalDebit ? false : isIncoming || isDeposit;
+
+  return {
+    isInternalTransfer: false,
+    isCredit,
+    flowKind: isCredit ? 'CREDIT' : 'DEBIT',
+    sourceAccountLabel,
+    destAccountLabel,
+  };
+}
 
 export const DashboardOverview: React.FC = () => {
   const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
@@ -760,41 +876,17 @@ export const DashboardOverview: React.FC = () => {
           ) : (
             <div className="divide-y-2 divide-slate-100">
               {recentTransactions.map((tx) => {
-                const userAccClean = (currentUser?.permanentAccountNumber || '').replace(/[-\s]/g, '');
-                const txRecipAccClean = (tx.recipientAccountNumber || '').replace(/[-\s]/g, '');
-                const txSenderAccClean = (tx.senderAccountNumber || '').replace(/[-\s]/g, '');
-
-                const isRecipient =
-                  (effectiveUid && tx.recipientUserId === effectiveUid) ||
-                  (!tx.recipientUserId && effectiveUid && tx.userId === effectiveUid) ||
-                  tx.recipientUserId === currentUser?.id ||
-                  (!tx.recipientUserId && tx.userId === currentUser?.id) ||
-                  (userAccClean && txRecipAccClean && txRecipAccClean === userAccClean);
-
-                const isSender =
-                  (effectiveUid && tx.senderUserId === effectiveUid && tx.recipientUserId !== effectiveUid) ||
-                  (currentUser?.id && tx.senderUserId === currentUser.id && tx.recipientUserId !== currentUser.id) ||
-                  (userAccClean && txSenderAccClean && txSenderAccClean === userAccClean && txRecipAccClean !== userAccClean);
-
-                const isAdminTransferCredit =
-                  (tx.metadata?.disbursementType === 'ADMINISTRATIVE_TRANSFER' ||
-                   tx.senderAccountNumber === '1000000001' ||
-                   tx.senderName?.includes('Bennett Johnson')) &&
-                  (isRecipient ||
-                   (effectiveUid && (tx.userId === effectiveUid || tx.recipientUserId === effectiveUid)) ||
-                   (currentUser?.id && (tx.userId === currentUser.id || tx.recipientUserId === currentUser.id)));
-
-                const isCheckWithdrawalDebit =
-                  tx.type === 'CHECK_WITHDRAWAL' || tx.type === 'WIRE_CHECK_WITHDRAWAL';
-                const isIncoming = !isCheckWithdrawalDebit && ((isRecipient && !isSender) || isAdminTransferCredit);
-                const isDeposit =
-                  !isCheckWithdrawalDebit &&
-                  (tx.type === 'DEPOSIT' ||
-                    tx.type === 'ADMIN_DEVELOPMENT_FUNDING' ||
-                    tx.type === 'INVESTMENT_EARNING' ||
-                    tx.type === 'INVESTMENT_MATURITY' ||
-                    isAdminTransferCredit);
-                const isCredit = isCheckWithdrawalDebit ? false : (isIncoming || isDeposit);
+                const {
+                  isInternalTransfer,
+                  isCredit,
+                  sourceAccountLabel,
+                  destAccountLabel,
+                } = classifyOverviewTransaction(
+                  tx,
+                  currentUser?.id,
+                  effectiveUid,
+                  currentUser?.permanentAccountNumber
+                );
 
                 const dateObj = new Date(tx.createdAt);
                 const formattedDate = dateObj.toLocaleDateString('en-US', {
@@ -829,12 +921,16 @@ export const DashboardOverview: React.FC = () => {
                     <div className="flex items-start sm:items-center gap-4 min-w-0">
                       <div
                         className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 shadow-sm transition-transform group-hover:scale-105 ${
-                          isCredit
+                          isInternalTransfer
+                            ? 'bg-sky-50 text-sky-700 border-2 border-sky-200'
+                            : isCredit
                             ? 'bg-emerald-100 text-emerald-800 border-2 border-emerald-300'
                             : 'bg-slate-100 text-slate-900 border-2 border-slate-200'
                         }`}
                       >
-                        {isCredit ? (
+                        {isInternalTransfer ? (
+                          <ArrowRightLeft className="w-6 h-6 stroke-[2.5]" />
+                        ) : isCredit ? (
                           <ArrowDownLeft className="w-6 h-6 stroke-[2.5]" />
                         ) : (
                           <ArrowUpRight className="w-6 h-6 stroke-[2.5]" />
@@ -848,18 +944,22 @@ export const DashboardOverview: React.FC = () => {
                           </span>
                           <span
                             className={`text-[11px] font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider ${
-                              isCredit
+                              isInternalTransfer
+                                ? 'bg-sky-100 text-sky-900 border border-sky-300'
+                                : isCredit
                                 ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
                                 : 'bg-slate-200 text-slate-900'
                             }`}
                           >
-                            {isCredit ? 'Credit' : 'Debit'}
+                            {isInternalTransfer ? 'Internal' : isCredit ? 'Credit' : 'Debit'}
                           </span>
                         </div>
 
                         <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-700 font-bold">
                           <span className="text-slate-900">
-                            {tx.type === 'WIRE_CHECK_WITHDRAWAL'
+                            {isInternalTransfer
+                              ? `${sourceAccountLabel} → ${destAccountLabel}`
+                              : tx.type === 'WIRE_CHECK_WITHDRAWAL'
                               ? `Wire Check Withdrawal • ${tx.metadata?.bankName || cleanRecipName || 'Destination Bank'}${tx.metadata?.destinationBankAccountNumberMasked ? ` (${tx.metadata.destinationBankAccountNumberMasked})` : ''}`
                               : tx.type === 'CHECK_WITHDRAWAL'
                               ? `Payee: ${partyName}`
@@ -915,10 +1015,10 @@ export const DashboardOverview: React.FC = () => {
                       <div className="text-left sm:text-right space-y-0.5">
                         <div
                           className={`text-lg sm:text-xl font-black font-mono tracking-tight ${
-                            isCredit ? 'text-emerald-700' : 'text-slate-950'
+                            isInternalTransfer ? 'text-slate-950' : isCredit ? 'text-emerald-700' : 'text-slate-950'
                           }`}
                         >
-                          {isCredit ? '+' : '-'}$
+                          {isInternalTransfer ? '' : isCredit ? '+' : '-'}$
                           {tx.amount.toLocaleString('en-US', {
                             minimumFractionDigits: 2,
                             maximumFractionDigits: 2,

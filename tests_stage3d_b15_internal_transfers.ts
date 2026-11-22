@@ -261,6 +261,8 @@ async function seedCustomer(
     await fsMem.collection('accounts').doc(uid).set({
       userId: opts?.accountOwnerOverride ?? uid,
       permanentAccountNumber: '1045998877',
+      accountTier: 'PRIVATE_WEALTH',
+      customBankMetadata: { advisor: 'Bennett Johnson', kycTier: 3 },
       checkingBalance: checking,
       savingsBalance: savings,
       investedBalance: invested,

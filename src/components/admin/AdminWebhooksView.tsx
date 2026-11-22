@@ -90,9 +90,11 @@ export const AdminWebhooksView: React.FC<AdminWebhooksViewProps> = ({
     setSimLoading(true);
     setSimResult(null);
     try {
+      const { getAuthHeaders } = await import('../../services/api');
+      const headers = await getAuthHeaders();
       const res = await fetch('/api/webhooks/test-simulate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           userId: simUserId,
           amount: parseFloat(simAmount) || 100,
