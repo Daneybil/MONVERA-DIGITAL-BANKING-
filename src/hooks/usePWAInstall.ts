@@ -18,18 +18,22 @@ interface PWAInstallSnapshot {
   wasDismissed: boolean;
   platform: PWAInstallPlatform;
   isIOSSafari: boolean;
+  isDesktopSafari: boolean;
+  isDesktopChromium: boolean;
   isInAppBrowser: boolean;
 }
 
 function detectEnvironment(): Pick<
   PWAInstallSnapshot,
-  'isStandalone' | 'platform' | 'isIOSSafari' | 'isInAppBrowser'
+  'isStandalone' | 'platform' | 'isIOSSafari' | 'isDesktopSafari' | 'isDesktopChromium' | 'isInAppBrowser'
 > {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') {
     return {
       isStandalone: false,
       platform: 'desktop',
       isIOSSafari: false,
+      isDesktopSafari: false,
+      isDesktopChromium: false,
       isInAppBrowser: false,
     };
   }
@@ -58,10 +62,23 @@ function detectEnvironment(): Pick<
     /Safari/i.test(ua) &&
     !/(CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo)/i.test(ua);
 
+  const isDesktopSafari =
+    platform === 'desktop' &&
+    /Macintosh|Mac OS X/i.test(ua) &&
+    /Safari/i.test(ua) &&
+    !/(Chrome|Chromium|Edg|EdgA|OPR|Firefox|FxiOS|Brave|DuckDuckGo)/i.test(ua);
+
+  const isDesktopChromium =
+    platform === 'desktop' &&
+    /(Chrome|Chromium|Edg)\//i.test(ua) &&
+    !/Firefox\//i.test(ua);
+
   return {
     isStandalone,
     platform,
     isIOSSafari,
+    isDesktopSafari,
+    isDesktopChromium,
     isInAppBrowser,
   };
 }
@@ -147,11 +164,20 @@ export interface UsePWAInstallResult {
   isStandalone: boolean;
   isInstalled: boolean;
   isIOSSafari: boolean;
+  isDesktopSafari: boolean;
+  isDesktopChromium: boolean;
   isInAppBrowser: boolean;
   canPromptNatively: boolean;
   wasDismissed: boolean;
   shouldShowInstall: boolean;
   promptInstall: () => Promise<'accepted' | 'dismissed' | 'unavailable'>;
+}
+
+export function evaluatePWAInstallVisibility(params: {
+  isStandalone: boolean;
+  isInstalled: boolean;
+}): boolean {
+  return !(params.isStandalone || params.isInstalled);
 }
 
 export function usePWAInstall(): UsePWAInstallResult {
@@ -195,19 +221,18 @@ export function usePWAInstall(): UsePWAInstallResult {
   }, []);
 
   const canPromptNatively = state.platform !== 'ios' && Boolean(state.deferredPrompt);
-  const alreadyInstalled = state.isStandalone || state.isInstalled;
-
-  // Show on Android (native prompt or manual menu fallback), iOS (Safari Share -> Add to Home Screen),
-  // and Desktop ONLY when the browser exposes a native beforeinstallprompt installation trigger.
-  const shouldShowInstall =
-    !alreadyInstalled &&
-    (state.platform === 'ios' || state.platform === 'android' || canPromptNatively);
+  const shouldShowInstall = evaluatePWAInstallVisibility({
+    isStandalone: state.isStandalone,
+    isInstalled: state.isInstalled,
+  });
 
   return {
     platform: state.platform,
     isStandalone: state.isStandalone,
     isInstalled: state.isInstalled,
     isIOSSafari: state.isIOSSafari,
+    isDesktopSafari: state.isDesktopSafari,
+    isDesktopChromium: state.isDesktopChromium,
     isInAppBrowser: state.isInAppBrowser,
     canPromptNatively,
     wasDismissed: state.wasDismissed,

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
+import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import officeHeroImage from '../../assets/images/monvera_office_hero_1787152640128.jpg';
 import dualCardsLamborghiniImage from '../../assets/images/monvera_cards_lambo_wide_1787576194809.jpg';
 import { ArrowRight, Zap, TrendingUp, CreditCard, ChevronRight, Shield, LayoutDashboard, Sparkles, HelpCircle, Landmark, Star, Lock, Gift } from 'lucide-react';
@@ -152,6 +153,15 @@ export const HeroSection: React.FC = () => {
               <HelpCircle className="w-3.5 h-3.5 text-amber-200 shrink-0" />
               <span>How It Works</span>
             </button>
+          </div>
+
+          {/* Secondary Prominent App Download CTA */}
+          <div id="hero-download-app-wrapper" className="mt-5 w-full max-w-sm sm:max-w-md mx-auto flex flex-col items-center">
+            <PWAInstallButton
+              variant="hero"
+              label="Download Monvera App"
+              sublabel="Enjoy easier access to your banking."
+            />
           </div>
         </div>
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import {
   X,
@@ -25,6 +25,8 @@ import {
 } from 'lucide-react';
 import { NotificationItem } from '../../types';
 import { NotificationSettingsModal } from './NotificationSettingsModal';
+import { pushNotificationService, PushRegistrationResult } from '../../services/pushNotificationService';
+import { firestoreSync } from '../../services/firestoreSync';
 
 interface NotificationsDrawerProps {
   isOpen: boolean;
@@ -33,6 +35,7 @@ interface NotificationsDrawerProps {
 
 export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen, onClose }) => {
   const {
+    currentUser,
     notifications,
     markAllNotificationsAsRead,
     markNotificationAsRead,
@@ -47,6 +50,92 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
   const [isSubmittingReply, setIsSubmittingReply] = useState<Record<string, boolean>>({});
   const [replyErrors, setReplyErrors] = useState<Record<string, string>>({});
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [browserPermission, setBrowserPermission] = useState<'granted' | 'denied' | 'default' | 'unsupported'>('default');
+  const [isDeviceRegistered, setIsDeviceRegistered] = useState(false);
+  const [isEnablingPush, setIsEnablingPush] = useState(false);
+  const [drawerPushFeedback, setDrawerPushFeedback] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+
+  const refreshDevicePushSnapshot = useCallback(() => {
+    const perm: 'granted' | 'denied' | 'default' | 'unsupported' =
+      typeof window !== 'undefined' && 'Notification' in window
+        ? (Notification.permission as any)
+        : 'unsupported';
+    setBrowserPermission(perm);
+
+    const reg = pushNotificationService.getRegistrationState();
+    setIsDeviceRegistered(Boolean(currentUser?.id && perm === 'granted' && reg.token && reg.userId === currentUser.id));
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    refreshDevicePushSnapshot();
+    setDrawerPushFeedback(null);
+
+    const handleStatusUpdated = () => {
+      refreshDevicePushSnapshot();
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_push_status_updated', handleStatusUpdated);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_push_status_updated', handleStatusUpdated);
+      }
+    };
+  }, [isOpen, refreshDevicePushSnapshot]);
+
+  const handleEnablePushFromDrawer = async () => {
+    if (!currentUser?.id || isEnablingPush) return;
+    setDrawerPushFeedback(null);
+    setIsEnablingPush(true);
+    try {
+      const result: PushRegistrationResult = await pushNotificationService.requestPushPermission(currentUser.id);
+      setBrowserPermission(result.status);
+      refreshDevicePushSnapshot();
+
+      if (result.status === 'granted' && result.token && !result.error) {
+        await firestoreSync.saveNotificationPreferences(currentUser.id, { pushEnabled: true }).catch(() => false);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('monvera_push_status_updated', {
+              detail: { userId: currentUser.id, status: 'granted', token: result.token },
+            })
+          );
+        }
+        setDrawerPushFeedback({
+          tone: 'success',
+          text: 'Browser push alerts enabled and registered for this device.',
+        });
+      } else if (result.status === 'denied') {
+        setDrawerPushFeedback({
+          tone: 'error',
+          text: 'Browser permission is blocked. Allow Notifications in your address bar site settings or open Preferences.',
+        });
+      } else if (result.status === 'unsupported') {
+        setDrawerPushFeedback({
+          tone: 'info',
+          text: result.error || 'Push notifications require opening Monvera in a supported browser or Home Screen app.',
+        });
+      } else if (result.status === 'default') {
+        setDrawerPushFeedback({
+          tone: 'info',
+          text: 'Permission prompt was dismissed. Click Enable Push Alerts whenever you are ready.',
+        });
+      } else {
+        setDrawerPushFeedback({
+          tone: 'error',
+          text: result.error || 'Could not register this device yet. Please try again.',
+        });
+      }
+    } catch (err: any) {
+      setDrawerPushFeedback({
+        tone: 'error',
+        text: err?.message || 'Unable to enable push notifications right now.',
+      });
+    } finally {
+      setIsEnablingPush(false);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -267,19 +356,20 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
               </div>
             )}
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
               <button
+                id="drawer-preferences-btn"
                 onClick={() => setShowSettingsModal(true)}
-                className="text-xs font-extrabold text-slate-800 hover:text-slate-950 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border-2 border-slate-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                className="text-xs font-extrabold text-slate-900 hover:text-slate-950 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border-2 border-slate-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
                 title="Notification Preferences"
               >
                 <Sliders className="w-3.5 h-3.5 stroke-[2.5]" />
-                <span className="hidden sm:inline">Preferences</span>
+                <span>Preferences</span>
               </button>
               {!selectedNotification && unreadNotifsCount > 0 && (
                 <button
                   onClick={markAllNotificationsAsRead}
-                  className="text-xs font-extrabold text-sky-950 hover:text-sky-900 px-3.5 py-2 rounded-xl bg-sky-100 hover:bg-sky-200 border-2 border-sky-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
+                  className="text-xs font-extrabold text-sky-950 hover:text-sky-900 px-3 py-2 rounded-xl bg-sky-100 hover:bg-sky-200 border-2 border-sky-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
                 >
                   <CheckCheck className="w-4 h-4 stroke-[2.5]" />
                   <span>Mark all read</span>
@@ -552,11 +642,81 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
             </div>
           ) : (
             /* --- NOTIFICATIONS LIST VIEW --- */
-            filteredNotifications.length === 0 ? (
-              <div className="text-center py-20 space-y-4">
-                <div className="w-16 h-16 rounded-3xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto border-2 border-slate-200 shadow-sm">
-                  <Bell className="w-8 h-8 stroke-[2.5]" />
+            <>
+              {currentUser?.id && !isDeviceRegistered && (
+                <div
+                  id="drawer-enable-push-callout"
+                  className="p-4 rounded-2xl bg-emerald-50 border-2 border-emerald-400 shadow-xs space-y-3"
+                >
+                  <div className="flex items-start gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                      <Bell className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <h4 className="text-sm font-black text-slate-950">
+                        {browserPermission === 'denied'
+                          ? 'Browser Push Alerts Are Blocked'
+                          : browserPermission === 'granted'
+                          ? 'Finish Syncing Device Push Alerts'
+                          : 'Enable Push Alerts on This Device'}
+                      </h4>
+                      <p className="text-xs font-bold text-slate-900 leading-relaxed">
+                        {browserPermission === 'denied'
+                          ? 'Allow Notifications for Monvera in your browser site settings, or open Preferences for channel options.'
+                          : 'Receive instant real-time banners for incoming transfers, deposits, and security alerts directly on this device.'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {drawerPushFeedback && (
+                    <div
+                      className={`p-2.5 rounded-xl text-xs font-bold border ${
+                        drawerPushFeedback.tone === 'success'
+                          ? 'bg-white text-emerald-950 border-emerald-400'
+                          : drawerPushFeedback.tone === 'error'
+                          ? 'bg-rose-50 text-rose-950 border-rose-300'
+                          : 'bg-sky-50 text-sky-950 border-sky-300'
+                      }`}
+                    >
+                      {drawerPushFeedback.text}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      id="drawer-enable-push-btn"
+                      onClick={handleEnablePushFromDrawer}
+                      disabled={isEnablingPush}
+                      className="px-4 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white text-xs font-black flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      <Bell className="w-3.5 h-3.5" />
+                      <span>{isEnablingPush ? 'Enabling Push Alerts...' : 'Enable Push Alerts'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowSettingsModal(true)}
+                      className="px-3.5 py-2 rounded-xl bg-white hover:bg-slate-100 text-slate-950 border-2 border-slate-300 text-xs font-extrabold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      <Sliders className="w-3.5 h-3.5" />
+                      <span>Open Preferences</span>
+                    </button>
+                  </div>
                 </div>
+              )}
+
+              {drawerPushFeedback?.tone === 'success' && isDeviceRegistered && (
+                <div className="p-3 rounded-2xl bg-emerald-50 border-2 border-emerald-300 text-xs font-extrabold text-emerald-950 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                  <span>{drawerPushFeedback.text}</span>
+                </div>
+              )}
+
+              {filteredNotifications.length === 0 ? (
+                <div className="text-center py-20 space-y-4">
+                  <div className="w-16 h-16 rounded-3xl bg-slate-100 text-slate-500 flex items-center justify-center mx-auto border-2 border-slate-200 shadow-sm">
+                    <Bell className="w-8 h-8 stroke-[2.5]" />
+                  </div>
                 <div className="text-lg font-black text-slate-950">No Notifications</div>
                 <p className="text-sm font-bold text-slate-700 max-w-xs mx-auto leading-relaxed">
                   No alerts found under this category. Transaction confirmations, deposits, withdrawals, loans, KYC updates, and account updates will appear here.
@@ -667,7 +827,8 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                   </div>
                 );
               })
-            )
+              )}
+            </>
           )}
         </div>
       </div>

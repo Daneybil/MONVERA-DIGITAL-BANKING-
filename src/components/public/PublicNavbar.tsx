@@ -75,7 +75,7 @@ export const PublicNavbar: React.FC = () => {
       </div>
 
       {/* 2. Main Navigation Bar - Pushed Down Below the Language Selector */}
-      <div className="max-w-7xl mx-auto px-2.5 sm:px-6 lg:px-8 h-16 sm:h-20 flex items-center justify-between gap-1.5 sm:gap-3">
+      <div className="max-w-7xl mx-auto px-1.5 min-[360px]:px-2.5 sm:px-6 xl:px-4 2xl:px-6 h-16 sm:h-20 flex items-center justify-between gap-1 sm:gap-2.5 xl:gap-2 2xl:gap-3">
         {/* Monvera Brand */}
         <div
           className="cursor-pointer flex items-center shrink-0 min-w-0"
@@ -87,19 +87,19 @@ export const PublicNavbar: React.FC = () => {
           <div className="hidden sm:block">
             <MonveraLogo variant="full" size="md" />
           </div>
-          <div className="sm:hidden">
+          <div className="sm:hidden scale-[0.78] -mr-7 min-[360px]:scale-[0.9] min-[360px]:-mr-2 min-[390px]:scale-100 min-[390px]:mr-0 origin-left">
             <MonveraLogo variant="full" size="sm" />
           </div>
         </div>
 
         {/* Desktop Navigation Links */}
-        <nav className="hidden lg:flex items-center gap-8 text-[15px] font-semibold text-slate-700">
+        <nav className="hidden xl:flex items-center xl:gap-3 2xl:gap-6 text-[13px] 2xl:text-[15px] font-semibold text-slate-700">
           {navLinks.map((link) => (
             <button
               key={link.label}
               id={`nav-link-${link.target}`}
               onClick={() => handleNavClick(link.target)}
-              className="hover:text-slate-950 transition-colors duration-150 py-1 cursor-pointer"
+              className="hover:text-slate-950 transition-colors duration-150 py-1 cursor-pointer whitespace-nowrap"
             >
               {link.label}
             </button>
@@ -107,11 +107,17 @@ export const PublicNavbar: React.FC = () => {
         </nav>
 
         {/* Right CTA Actions & Menu Trigger (Both Mobile and Desktop) */}
-        <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
-          <PWAInstallButton variant="navbar" />
+        <div className="flex items-center gap-1 min-[360px]:gap-1.5 sm:gap-2.5 xl:gap-1.5 2xl:gap-2.5 shrink-0">
+          <PWAInstallButton
+            variant="navbar"
+            label="Download Monvera App"
+            mobileLabel="Download App"
+          />
           {currentUser ? (
             <button
               id="navbar-dashboard-btn"
+              aria-label="Dashboard"
+              title="Dashboard"
               onClick={() => {
                 if (currentUser.role === 'super_admin' || currentUser.role === 'admin') {
                   setCurrentView('admin');
@@ -119,23 +125,23 @@ export const PublicNavbar: React.FC = () => {
                   setCurrentView('dashboard');
                 }
               }}
-              className="inline-flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-5 py-2 sm:py-2.5 text-xs sm:text-sm font-extrabold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-xl shadow-xs border border-amber-500/30 transition-all cursor-pointer"
+              className="inline-flex items-center gap-1.5 sm:gap-2 xl:gap-1.5 2xl:gap-2 px-2.5 sm:px-4 xl:px-3 2xl:px-4 py-1.5 sm:py-2 text-xs sm:text-sm xl:text-xs 2xl:text-sm font-extrabold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-xl shadow-xs border border-amber-500/30 transition-all cursor-pointer whitespace-nowrap shrink-0"
             >
-              <LayoutDashboard className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-950" />
-              <span className="hidden xs:inline">Dashboard</span>
+              <LayoutDashboard className="w-3.5 h-3.5 sm:w-4 sm:h-4 xl:w-3.5 xl:h-3.5 2xl:w-4 2xl:h-4 text-slate-950 shrink-0" />
+              <span className="hidden min-[420px]:inline">Dashboard</span>
             </button>
           ) : (
             <button
               id="navbar-signin-btn"
               onClick={() => openModal('auth_login')}
-              className="hidden md:inline-flex items-center gap-1.5 px-4 py-2.5 text-xs sm:text-sm font-bold text-slate-800 hover:text-slate-950 hover:bg-slate-200/60 rounded-xl transition-all cursor-pointer"
+              className="hidden md:inline-flex items-center gap-1.5 px-2.5 xl:px-3 py-2 text-xs 2xl:text-sm font-bold text-slate-800 hover:text-slate-950 hover:bg-slate-200/60 rounded-xl transition-all cursor-pointer whitespace-nowrap shrink-0"
             >
-              <Lock className="w-4 h-4 text-slate-600" />
+              <Lock className="w-3.5 h-3.5 text-slate-600 shrink-0" />
               <span>Sign In</span>
             </button>
           )}
 
-          {/* Get Started CTA Button */}
+          {/* Get Started / My Account CTA Button */}
           <button
             id="get-started-btn-header"
             onClick={() => {
@@ -145,11 +151,11 @@ export const PublicNavbar: React.FC = () => {
                 openModal('auth_prompt');
               }
             }}
-            className="inline-flex items-center gap-1 sm:gap-2 px-2.5 sm:px-6 py-2 sm:py-2.5 text-xs sm:text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98] cursor-pointer"
+            className={`${currentUser ? 'hidden sm:inline-flex' : 'inline-flex'} items-center gap-1 sm:gap-1.5 px-1.5 min-[360px]:px-2 min-[380px]:px-2.5 sm:px-3.5 xl:px-3 2xl:px-5 py-1.5 sm:py-2 text-[11px] min-[380px]:text-xs 2xl:text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md border border-slate-800 transition-all active:scale-[0.98] cursor-pointer whitespace-nowrap shrink-0`}
           >
-            <span className="hidden xs:inline">{currentUser ? 'My Account' : 'Get Started'}</span>
-            <span className="xs:hidden">{currentUser ? 'Account' : 'Start'}</span>
-            <ArrowRight className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-400" />
+            <span className="hidden min-[420px]:inline">{currentUser ? 'My Account' : 'Get Started'}</span>
+            <span className="min-[420px]:hidden">{currentUser ? 'Account' : 'Start'}</span>
+            <ArrowRight className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-emerald-400 shrink-0" />
           </button>
 
           {/* 3 Horizontal Lines Menu Trigger (Visible on BOTH Mobile & Desktop) */}
@@ -157,7 +163,7 @@ export const PublicNavbar: React.FC = () => {
             id="menu-toggle-btn"
             aria-label="Toggle navigation menu"
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-            className="p-2 sm:p-2.5 text-slate-800 bg-slate-100/90 hover:bg-slate-200/90 rounded-xl border border-slate-300/70 shadow-2xs transition-all flex items-center justify-center cursor-pointer active:scale-95"
+            className="p-1.5 min-[380px]:p-2 text-slate-800 bg-slate-100/90 hover:bg-slate-200/90 rounded-xl border border-slate-300/70 shadow-2xs transition-all flex items-center justify-center cursor-pointer active:scale-95 shrink-0"
             title="Menu"
           >
             {mobileMenuOpen ? (
@@ -191,16 +197,20 @@ export const PublicNavbar: React.FC = () => {
                 Monvera Institutional Digital Asset & Treasury Banking
               </div>
               <div className="flex flex-col sm:flex-row items-center gap-2 w-full sm:w-auto">
-                <PWAInstallButton variant="drawer" />
+                <PWAInstallButton variant="drawer" label="Download Monvera App" />
                 <button
                   id="drawer-get-started-btn"
                   onClick={() => {
                     setMobileMenuOpen(false);
-                    openModal('auth_prompt');
+                    if (currentUser) {
+                      setCurrentView('dashboard');
+                    } else {
+                      openModal('auth_prompt');
+                    }
                   }}
                   className="w-full sm:w-auto px-6 py-2.5 text-center text-xs sm:text-sm font-extrabold text-white bg-slate-950 hover:bg-slate-900 rounded-xl shadow-md flex items-center justify-center gap-2 cursor-pointer transition-all"
                 >
-                  <span>Open Account</span>
+                  <span>{currentUser ? 'My Account' : 'Open Account'}</span>
                   <ArrowRight className="w-4 h-4 text-emerald-400" />
                 </button>
               </div>

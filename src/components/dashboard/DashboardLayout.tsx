@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { useAuth, AppView } from '../../context/AuthContext';
 import { MonveraLogo } from '../common/MonveraLogo';
 import { NotificationsDrawer } from './NotificationsDrawer';
+import { NotificationOnboardingModal } from './NotificationOnboardingModal';
+import { NotificationSettingsModal } from './NotificationSettingsModal';
 import { KycStatusAlertModal } from '../kyc/KycStatusAlertModal';
 import { LanguageSelector } from '../common/LanguageSelector';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
@@ -64,6 +66,7 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
   } = useAuth();
 
   const [notifsOpen, setNotifsOpen] = useState(false);
+  const [notifSettingsOpen, setNotifSettingsOpen] = useState(false);
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -131,8 +134,23 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
       {/* --- DESKTOP SIDEBAR --- */}
       <aside className="hidden lg:flex flex-col w-72 bg-slate-900 text-slate-300 border-r border-slate-800 flex-shrink-0 min-h-screen sticky top-0 h-screen z-30">
         {/* Brand Header */}
-        <div className="p-6 border-b border-slate-800/80 flex items-center justify-between">
+        <div className="p-6 border-b border-slate-800/80 flex items-center justify-between gap-2">
           <MonveraLogo variant="full" size="md" isLight={true} />
+          <button
+            id="sidebar-notifications-btn"
+            type="button"
+            onClick={() => setNotifsOpen(true)}
+            className="relative p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white border border-slate-700 transition-colors cursor-pointer shrink-0"
+            title="Open Notification Center"
+            aria-label={`Open Notification Center (${unreadNotifsCount} unread)`}
+          >
+            <Bell className="w-4 h-4 text-emerald-400" />
+            {unreadNotifsCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 bg-emerald-500 text-slate-950 text-[10px] font-black font-mono tabular-nums rounded-full flex items-center justify-center border-2 border-slate-900">
+                {unreadNotifsCount > 99 ? '99+' : unreadNotifsCount}
+              </span>
+            )}
+          </button>
         </div>
 
         {/* Account Balance Widget */}
@@ -487,13 +505,22 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
             {/* Notification Bell */}
             <button
               id="header-notifications-btn"
+              type="button"
               onClick={() => setNotifsOpen(true)}
-              className="relative p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300/80 transition-colors cursor-pointer"
+              className={`relative inline-flex items-center gap-1.5 px-2.5 sm:px-3.5 py-2 sm:py-2.5 rounded-xl border transition-all cursor-pointer shrink-0 ${
+                unreadNotifsCount > 0
+                  ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-950 border-emerald-400 shadow-xs'
+                  : 'bg-white hover:bg-slate-100 text-slate-900 border-slate-300 shadow-2xs'
+              }`}
               title="Notifications"
+              aria-label={`Notifications (${unreadNotifsCount} unread)`}
             >
-              <Bell className="w-4 h-4" />
+              <Bell className={`w-4 h-4 ${unreadNotifsCount > 0 ? 'text-emerald-700' : 'text-slate-700'}`} />
+              <span className="hidden sm:inline text-xs font-extrabold whitespace-nowrap">
+                Alerts
+              </span>
               {unreadNotifsCount > 0 && (
-                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 bg-emerald-600 text-white text-[10px] font-black rounded-full flex items-center justify-center border-2 border-white shadow-xs">
+                <span className="inline-flex items-center justify-center min-w-[20px] h-[20px] px-1.5 bg-emerald-600 text-white text-[10px] font-black font-mono tabular-nums rounded-full shadow-2xs">
                   {unreadNotifsCount > 99 ? '99+' : unreadNotifsCount}
                 </span>
               )}
@@ -873,6 +900,15 @@ export const DashboardLayout: React.FC<DashboardLayoutProps> = ({ children }) =>
 
       {/* Notifications Drawer */}
       <NotificationsDrawer isOpen={notifsOpen} onClose={() => setNotifsOpen(false)} />
+
+      {/* Direct Notification Settings Modal (accessible directly without entering notification history) */}
+      <NotificationSettingsModal isOpen={notifSettingsOpen} onClose={() => setNotifSettingsOpen(false)} />
+
+      {/* Automatic Push Notification Onboarding Invitation */}
+      <NotificationOnboardingModal
+        suppress={Boolean(activeModal || notifsOpen || mobileMenuOpen || notifSettingsOpen)}
+        onOpenNotificationSettings={() => setNotifSettingsOpen(true)}
+      />
 
       {/* KYC Adjudication Status Pop-up Alert */}
       <KycStatusAlertModal />

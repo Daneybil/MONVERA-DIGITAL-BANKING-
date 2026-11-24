@@ -39,17 +39,26 @@ export const NotificationSettingsModal: React.FC<NotificationSettingsModalProps>
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [pushStatus, setPushStatus] = useState<'granted' | 'denied' | 'default' | 'unsupported'>('default');
+  const [isDeviceRegistered, setIsDeviceRegistered] = useState<boolean>(false);
   const [pushMessage, setPushMessage] = useState<string | null>(null);
+  const [pushMessageTone, setPushMessageTone] = useState<'info' | 'success' | 'error'>('info');
 
-  // Check initial browser push permission state
-  useEffect(() => {
-    if (!isOpen) return;
-
+  const syncPushStatusSnapshot = (uid?: string) => {
     if (typeof window !== 'undefined' && 'Notification' in window) {
       setPushStatus(Notification.permission as any);
     } else {
       setPushStatus('unsupported');
     }
+    const reg = pushNotificationService.getRegistrationState();
+    setIsDeviceRegistered(Boolean(uid && reg.token && reg.userId === uid));
+  };
+
+  // Check initial browser push permission state and synchronize on onboarding/device changes
+  useEffect(() => {
+    if (!isOpen) return;
+
+    syncPushStatusSnapshot(currentUser?.id);
+    setPushMessage(null);
 
     if (currentUser?.id) {
       setIsLoading(true);
@@ -60,6 +69,28 @@ export const NotificationSettingsModal: React.FC<NotificationSettingsModalProps>
         })
         .finally(() => setIsLoading(false));
     }
+
+    const handleStatusUpdated = (event: Event) => {
+      const detail = (event as CustomEvent)?.detail;
+      if (!currentUser?.id || !detail?.userId || detail.userId === currentUser.id) {
+        syncPushStatusSnapshot(currentUser?.id);
+        if (currentUser?.id) {
+          firestoreSync
+            .getNotificationPreferences(currentUser.id)
+            .then((prefs) => setPreferences(prefs))
+            .catch(() => {});
+        }
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('monvera_push_status_updated', handleStatusUpdated);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('monvera_push_status_updated', handleStatusUpdated);
+      }
+    };
   }, [isOpen, currentUser?.id]);
 
   if (!isOpen) return null;
@@ -92,15 +123,37 @@ export const NotificationSettingsModal: React.FC<NotificationSettingsModalProps>
 
     const result: PushRegistrationResult = await pushNotificationService.requestPushPermission(currentUser.id);
     setPushStatus(result.status);
+    syncPushStatusSnapshot(currentUser.id);
 
-    if (result.status === 'granted') {
+    if (result.status === 'granted' && result.token && !result.error) {
+      setPushMessageTone('success');
       setPushMessage('Browser push notifications enabled and linked to your Monvera account.');
       setPreferences((prev) => ({ ...prev, pushEnabled: true }));
       await firestoreSync.saveNotificationPreferences(currentUser.id, { pushEnabled: true });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('monvera_push_status_updated', {
+            detail: { userId: currentUser.id, status: 'granted', token: result.token },
+          })
+        );
+      }
+    } else if (result.status === 'granted') {
+      setPushMessageTone('error');
+      setPushMessage(
+        result.error ||
+          'Browser permission was granted, but this device could not register for push yet. Please try again.'
+      );
     } else if (result.status === 'denied') {
-      setPushMessage('Notification permission was blocked in your browser settings. Please click the lock icon in your address bar to enable.');
+      setPushMessageTone('error');
+      setPushMessage(
+        'Notification permission was blocked in your browser settings. Please click the lock icon in your address bar to enable.'
+      );
+    } else if (result.status === 'default') {
+      setPushMessageTone('info');
+      setPushMessage('Browser notification prompt was dismissed. Click Enable Browser Push whenever you are ready.');
     } else if (result.status === 'unsupported') {
-      setPushMessage('Web Push is not supported in this browser or iframe container.');
+      setPushMessageTone('info');
+      setPushMessage(result.error || 'Web Push is not supported in this browser or iframe container.');
     }
   };
 
@@ -170,18 +223,26 @@ export const NotificationSettingsModal: React.FC<NotificationSettingsModalProps>
                       <Bell className="w-5 h-5" />
                     </div>
                     <div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-sm font-black text-slate-900">Push Notifications (FCM / Web Push)</span>
                         <span
                           className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-md ${
-                            pushStatus === 'granted'
+                            pushStatus === 'granted' && isDeviceRegistered
                               ? 'bg-emerald-100 text-emerald-800'
+                              : pushStatus === 'granted'
+                              ? 'bg-amber-100 text-amber-800'
                               : pushStatus === 'denied'
                               ? 'bg-rose-100 text-rose-800'
                               : 'bg-slate-100 text-slate-700'
                           }`}
                         >
-                          {pushStatus === 'granted' ? 'Browser Permitted' : pushStatus === 'denied' ? 'Blocked in Browser' : 'Requires Permission'}
+                          {pushStatus === 'granted' && isDeviceRegistered
+                            ? 'Device Registered'
+                            : pushStatus === 'granted'
+                            ? 'Browser Permitted · Sync Needed'
+                            : pushStatus === 'denied'
+                            ? 'Blocked in Browser'
+                            : 'Requires Permission'}
                         </span>
                       </div>
                       <div className="text-xs text-slate-600 mt-0.5">
@@ -206,23 +267,43 @@ export const NotificationSettingsModal: React.FC<NotificationSettingsModalProps>
                 </div>
 
                 {/* Push Registration Action */}
-                {pushStatus !== 'granted' && (
+                {(pushStatus !== 'granted' || !isDeviceRegistered) && (
                   <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-3">
-                    <span className="text-xs text-slate-500 font-medium">Device push requires active browser permission:</span>
+                    <span className="text-xs text-slate-500 font-medium">
+                      {pushStatus === 'granted'
+                        ? 'Complete push device sync for this browser:'
+                        : 'Device push requires active browser permission:'}
+                    </span>
                     <button
                       type="button"
                       onClick={handleRequestPushPermission}
-                      className="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white cursor-pointer transition-colors flex items-center gap-1"
+                      className="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white cursor-pointer transition-colors flex items-center gap-1 shrink-0"
                     >
                       <Bell className="w-3.5 h-3.5" />
-                      <span>Enable Browser Push</span>
+                      <span>{pushStatus === 'granted' ? 'Sync This Device' : 'Enable Browser Push'}</span>
                     </button>
                   </div>
                 )}
 
                 {pushMessage && (
-                  <div className="p-2.5 rounded-lg bg-sky-50 text-sky-900 text-xs font-medium flex items-center gap-2 border border-sky-200">
-                    <AlertCircle className="w-4 h-4 shrink-0 text-sky-700" />
+                  <div
+                    className={`p-2.5 rounded-lg text-xs font-medium flex items-center gap-2 border ${
+                      pushMessageTone === 'success'
+                        ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                        : pushMessageTone === 'error'
+                        ? 'bg-rose-50 text-rose-900 border-rose-200'
+                        : 'bg-sky-50 text-sky-900 border-sky-200'
+                    }`}
+                  >
+                    <AlertCircle
+                      className={`w-4 h-4 shrink-0 ${
+                        pushMessageTone === 'success'
+                          ? 'text-emerald-700'
+                          : pushMessageTone === 'error'
+                          ? 'text-rose-700'
+                          : 'text-sky-700'
+                      }`}
+                    />
                     <span>{pushMessage}</span>
                   </div>
                 )}
