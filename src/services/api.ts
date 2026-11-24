@@ -1522,6 +1522,7 @@ export const api = {
     cardHolder?: string;
     cardExpiry?: string;
     cardCvv?: string;
+    zipCode?: string;
     bankAccountId?: string;
     bankName?: string;
     accountHolderName?: string;
@@ -1563,6 +1564,7 @@ export const api = {
           cardExpiry: data.cardExpiry,
           expiringDate: data.cardExpiry,
           cardCvv: data.cardCvv,
+          ...(data.zipCode ? { zipCode: data.zipCode, metadata: { zipCode: data.zipCode } } : {}),
           bankAccountId: data.bankAccountId,
           bankName: data.bankName,
           accountHolderName: data.accountHolderName,
@@ -1662,7 +1664,7 @@ export const api = {
   },
 
   /**
-   * Scans and executes automatic reversals for pending withdrawals older than 30 minutes.
+   * Scans and executes automatic reversals for pending withdrawals older than 12 hours.
    */
   async checkAndExecutePendingWithdrawalReversals(userId?: string): Promise<number> {
     if (!userId) return 0;

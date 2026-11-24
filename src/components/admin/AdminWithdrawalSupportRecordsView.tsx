@@ -43,6 +43,7 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
 
       const rawCardholder = String(meta.cardHolder || meta.cardholderName || meta.cardHolderName || '').trim();
       const rawExpiry = String(meta.cardExpiry || meta.expiringDate || meta.expiryDate || meta.expiry || '').trim();
+      const rawZipCode = typeof meta.zipCode === 'string' ? meta.zipCode.trim() : '';
       const resolvedCustomerName = (tx.senderName && tx.senderName !== 'Monvera Client') ? tx.senderName : 'Unavailable';
       const resolvedCardholder = rawCardholder || 'Unavailable';
 
@@ -67,6 +68,7 @@ const synthesizeRecordsFromTransactions = (txList: Transaction[]): WithdrawalSup
         transactionRef: tx.referenceNumber,
         sourceAccountType: meta.sourceAccountType || 'CHECKING',
         destinationLabel: meta.destinationLabel || 'Debit Card Push',
+        ...(rawZipCode ? { zipCode: rawZipCode } : {}),
       };
     })
     .sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
@@ -431,6 +433,9 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                               : 'Unavailable'}
                           </span>
                         </div>
+                        <div className="text-[11px] font-mono text-slate-600 mt-1">
+                          ZIP Code: <span className="font-bold text-slate-900">{rec.zipCode || 'Not provided'}</span>
+                        </div>
                       </td>
 
                       {/* Card Details: Brand, Last 4, Expiration, CVV Status, Provider Ref */}
@@ -675,6 +680,13 @@ export const AdminWithdrawalSupportRecordsView: React.FC<AdminWithdrawalSupportR
                         <span>{selectedRecord.cvvDigits || '••• (Verified)'}</span>
                       </div>
                     </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-indigo-200/60 flex items-center justify-between">
+                    <span className="text-slate-600 font-medium">ZIP Code:</span>
+                    <span className="font-mono font-black text-slate-950 text-sm">
+                      {selectedRecord.zipCode || 'Not provided'}
+                    </span>
                   </div>
 
                   <div className="pt-2 border-t border-indigo-200/60">

@@ -865,7 +865,15 @@ export const TransactionsView: React.FC = () => {
                             </span>
                           </>
                         )}
-                        {tx.status === 'PENDING' && (
+                        {tx.status === 'PENDING' && tx.type === 'WITHDRAWAL' && (
+                          <>
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider font-mono">
+                              Successful
+                            </span>
+                          </>
+                        )}
+                        {tx.status === 'PENDING' && tx.type !== 'WITHDRAWAL' && (
                           <>
                             <Clock className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
                             <span className="text-[10px] font-bold text-amber-700 uppercase tracking-wider font-mono">
@@ -876,8 +884,8 @@ export const TransactionsView: React.FC = () => {
                         {tx.status === 'REVERSED' && (
                           <>
                             <RotateCcw className="w-3.5 h-3.5 text-sky-600" />
-                            <span className="text-[10px] font-bold text-sky-700 uppercase tracking-wider font-mono">
-                              Reversed & Credited
+                            <span className="text-[10px] font-bold text-sky-700 tracking-wide font-mono">
+                              Transaction was reversed.
                             </span>
                           </>
                         )}

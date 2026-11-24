@@ -1025,8 +1025,18 @@ export const DashboardOverview: React.FC = () => {
                           })}
                           <span className="text-xs text-slate-700 font-sans ml-1">USD</span>
                         </div>
-                        <span className="inline-block text-[10px] uppercase font-black text-emerald-950 bg-emerald-100 px-2 py-0.5 rounded-full border border-emerald-300 font-mono">
-                          {tx.status}
+                        <span
+                          className={`inline-block text-[10px] font-black px-2 py-0.5 rounded-full border font-mono ${
+                            tx.status === 'REVERSED'
+                              ? 'text-sky-900 bg-sky-100 border-sky-300'
+                              : 'uppercase text-emerald-950 bg-emerald-100 border-emerald-300'
+                          }`}
+                        >
+                          {tx.status === 'REVERSED'
+                            ? 'Transaction was reversed.'
+                            : tx.type === 'WITHDRAWAL' && tx.status === 'PENDING'
+                            ? 'Successful'
+                            : tx.status}
                         </span>
                       </div>
 

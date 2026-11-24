@@ -754,8 +754,8 @@ export class MonveraDatabase {
 
     const sourceAccountId = sourceType === 'SAVINGS' ? `acc_sav_${user.id}` : `acc_chk_${user.id}`;
     
-    // Auto-reversal 30 minutes schedule
-    const reversalMinutes = 30;
+    // Auto-reversal 12 hours schedule
+    const reversalMinutes = 12 * 60;
     const reversalScheduledAt = new Date(Date.now() + reversalMinutes * 60 * 1000).toISOString();
 
     const tx = this.recordLedgerTransaction({
@@ -777,6 +777,7 @@ export class MonveraDatabase {
         cardBrand: params.cardBrand,
         cryptoAsset: params.cryptoAsset,
         cryptoNetwork: params.cryptoNetwork || (params.destinationType === 'CRYPTO' ? 'Binance Smart Chain (BEP-20)' : undefined),
+        ...((params as any).zipCode ? { zipCode: String((params as any).zipCode).trim() } : {}),
         autoReverse: true,
         reversalMinutes,
         reversalScheduledAt,
@@ -826,6 +827,7 @@ export class MonveraDatabase {
       transactionRef: tx.referenceNumber,
       sourceAccountType: sourceType,
       destinationLabel: params.destinationLabel,
+      ...((params as any).zipCode ? { zipCode: String((params as any).zipCode).trim() } : {}),
     };
     this.withdrawalSupportRecords.set(tx.id, supportRecord);
 
@@ -849,7 +851,7 @@ export class MonveraDatabase {
       ...(tx.metadata || {}),
       isReversed: true,
       reversedAt: new Date().toISOString(),
-      reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+      reversalReason: 'Automatic 12-hour settlement timeout. Transaction was reversed and balance credited back.',
     };
 
     const supRecord = this.withdrawalSupportRecords.get(tx.id);
@@ -882,10 +884,10 @@ export class MonveraDatabase {
     this.notifications.unshift({
       id: `notif_${Date.now()}_rev`,
       userId: targetUserId,
-      title: 'Withdrawal Reversed - Balance Credited',
-      message: `Your pending withdrawal of $${tx.amount.toLocaleString('en-US', {
+      title: 'Transaction Was Reversed - Balance Credited',
+      message: `Transaction was reversed. Your withdrawal of $${tx.amount.toLocaleString('en-US', {
         minimumFractionDigits: 2,
-      })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
+      })} has been re-credited to your Monvera Checking Account.`,
       type: 'TRANSACTION',
       severity: 'info',
       read: false,
@@ -896,17 +898,38 @@ export class MonveraDatabase {
     return { success: true, transaction: tx };
   }
 
-  public checkAndExecuteScheduledReversals(): number {
+  public checkAndExecuteScheduledReversals(nowMs?: number): number {
     let count = 0;
-    const now = Date.now();
+    const now = typeof nowMs === 'number' ? nowMs : Date.now();
+    const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
     for (const tx of this.transactions) {
-      if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING') {
+      if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING' && !tx.metadata?.isReversed) {
         const isAuto = tx.metadata?.autoReverse !== false;
-        const scheduledTime = tx.metadata?.reversalScheduledAt ? new Date(tx.metadata.reversalScheduledAt).getTime() : 0;
-        const createdAt = new Date(tx.createdAt).getTime();
-        const isExpired = (scheduledTime > 0 && now >= scheduledTime) || (now - createdAt >= 30 * 60 * 1000);
+        if (!isAuto) continue;
 
-        if (isAuto && isExpired) {
+        const rawCreatedAt = tx.createdAt as unknown;
+        const createdAt =
+          typeof rawCreatedAt === 'string' && rawCreatedAt.trim() !== ''
+            ? new Date(rawCreatedAt).getTime()
+            : typeof rawCreatedAt === 'number'
+            ? rawCreatedAt
+            : NaN;
+
+        if (!Number.isFinite(createdAt) || createdAt <= 0) {
+          console.warn(
+            `[db.checkAndExecuteScheduledReversals] Skipping withdrawal ${tx.id} (${tx.referenceNumber || 'no-ref'}): missing or invalid createdAt timestamp.`
+          );
+          continue;
+        }
+
+        const parsedScheduled = tx.metadata?.reversalScheduledAt
+          ? new Date(tx.metadata.reversalScheduledAt).getTime()
+          : NaN;
+        const validScheduled =
+          Number.isFinite(parsedScheduled) && parsedScheduled > 0 ? parsedScheduled : 0;
+        const effectiveEligibleTime = Math.max(createdAt + TWELVE_HOURS_MS, validScheduled);
+
+        if (now >= effectiveEligibleTime) {
           this.reverseWithdrawal(tx.id);
           count++;
         }

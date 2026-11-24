@@ -168,6 +168,7 @@ export const AdminWithdrawalsView: React.FC<AdminWithdrawalsViewProps> = ({
                         {wth.metadata && (
                           <div className="text-[11px] text-slate-500 font-mono mt-0.5">
                             Dest: {wth.metadata.destinationLabel || 'External Account'} • {wth.metadata.accountOrIbanMasked || '••••'}
+                            {wth.metadata.zipCode ? ` • ZIP: ${wth.metadata.zipCode}` : ''}
                           </div>
                         )}
                       </td>

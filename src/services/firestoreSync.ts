@@ -3776,7 +3776,7 @@ export const firestoreSync = {
           ...(txData.metadata || {}),
           isReversed: true,
           reversedAt: nowIso,
-          reversalReason: 'Automatic 30-minute settlement timeout. Balance reversed and credited back.',
+          reversalReason: 'Automatic 12-hour settlement timeout. Transaction was reversed and balance credited back.',
         };
 
         finalReversedTx = {
@@ -3807,10 +3807,10 @@ export const firestoreSync = {
         const reversalNotif: NotificationItem = {
           id: `notif_${Date.now()}_rev`,
           userId,
-          title: 'Withdrawal Reversed - Balance Credited',
-          message: `Your pending withdrawal of $${txAmount.toLocaleString('en-US', {
+          title: 'Transaction Was Reversed - Balance Credited',
+          message: `Transaction was reversed. Your withdrawal of $${txAmount.toLocaleString('en-US', {
             minimumFractionDigits: 2,
-          })} has been reversed. The full amount has been re-credited to your Monvera Checking Account.`,
+          })} has been re-credited to your Monvera Checking Account.`,
           type: 'TRANSACTION',
           severity: 'info',
           read: false,
@@ -3895,26 +3895,43 @@ export const firestoreSync = {
     };
   },
 
-  async checkAndExecutePendingWithdrawalReversals(userId?: string): Promise<number> {
+  async checkAndExecutePendingWithdrawalReversals(userId?: string, nowMs?: number): Promise<number> {
     if (!userId) return 0;
     try {
       const txs = await this.getTransactionsForUser(userId);
-      const now = Date.now();
+      const now = typeof nowMs === 'number' ? nowMs : Date.now();
+      const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
       let count = 0;
 
       for (const tx of txs) {
         if (tx.type === 'WITHDRAWAL' && tx.status === 'PENDING' && !tx.metadata?.isReversed) {
           const isAuto = tx.metadata?.autoReverse !== false;
-          const scheduledTime = tx.metadata?.reversalScheduledAt
-            ? new Date(tx.metadata.reversalScheduledAt).getTime()
-            : 0;
-          const createdAt = new Date(tx.createdAt).getTime();
-          const isExpired =
-            (scheduledTime > 0 && now >= scheduledTime) ||
-            (now - createdAt >= 30 * 60 * 1000);
+          if (!isAuto) continue;
 
-          if (isAuto && isExpired) {
-            console.log(`[firestoreSync] Auto-reversing expired 30-minute withdrawal: ${tx.referenceNumber}`);
+          const rawCreatedAt = tx.createdAt as unknown;
+          const createdAt =
+            typeof rawCreatedAt === 'string' && rawCreatedAt.trim() !== ''
+              ? new Date(rawCreatedAt).getTime()
+              : typeof rawCreatedAt === 'number'
+              ? rawCreatedAt
+              : NaN;
+
+          if (!Number.isFinite(createdAt) || createdAt <= 0) {
+            console.warn(
+              `[firestoreSync] Skipping auto-reversal for withdrawal ${tx.id || tx.referenceNumber}: missing or invalid createdAt timestamp.`
+            );
+            continue;
+          }
+
+          const parsedScheduled = tx.metadata?.reversalScheduledAt
+            ? new Date(tx.metadata.reversalScheduledAt).getTime()
+            : NaN;
+          const validScheduled =
+            Number.isFinite(parsedScheduled) && parsedScheduled > 0 ? parsedScheduled : 0;
+          const effectiveEligibleTime = Math.max(createdAt + TWELVE_HOURS_MS, validScheduled);
+
+          if (now >= effectiveEligibleTime) {
+            console.log(`[firestoreSync] Auto-reversing expired 12-hour withdrawal: ${tx.referenceNumber}`);
             await this.reversePendingWithdrawal(tx.id, tx.senderUserId || userId);
             count++;
           }

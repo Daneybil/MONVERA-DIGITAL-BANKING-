@@ -48,6 +48,7 @@ export const WithdrawModal: React.FC = () => {
   const [cardHolder, setCardHolder] = useState('');
   const [cardExpiry, setCardExpiry] = useState('');
   const [cardCvv, setCardCvv] = useState('');
+  const [zipCode, setZipCode] = useState('');
 
   // Bank Account & Linking states
   const [linkedBankAccounts, setLinkedBankAccounts] = useState<LinkedBankAccountApplication[]>([]);
@@ -373,6 +374,11 @@ export const WithdrawModal: React.FC = () => {
       setErrorMessage('Please provide the 3-digit CVV / security code on the back of your card.');
       return;
     }
+    const cleanZipCode = zipCode.trim();
+    if (!cleanZipCode || !/^[A-Za-z0-9\s-]{3,12}$/.test(cleanZipCode)) {
+      setErrorMessage('Please provide a valid billing ZIP code for your debit card.');
+      return;
+    }
 
     setErrorMessage(null);
     setIsProcessing(true);
@@ -393,6 +399,7 @@ export const WithdrawModal: React.FC = () => {
         cardHolder: cardHolder.trim() || currentUser.kycFullName || `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim(),
         cardExpiry: cardExpiry.trim(),
         cardCvv: cardCvv.trim(),
+        zipCode: cleanZipCode,
         userAccountNumber: currentUser.permanentAccountNumber,
         fallbackBalances: balanceMetrics || undefined,
         fallbackUser: {
@@ -705,6 +712,7 @@ export const WithdrawModal: React.FC = () => {
     setCardNumber('');
     setCardExpiry('');
     setCardCvv('');
+    setZipCode('');
     setBankAccountNumber('');
     setBankSwiftBic('');
     setBankIban('');
@@ -1182,6 +1190,22 @@ export const WithdrawModal: React.FC = () => {
                           className="w-full px-4 py-3 text-sm font-mono rounded-xl border-2 border-slate-300 focus:ring-2 focus:ring-indigo-500 bg-white font-bold"
                         />
                       </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                        ZIP Code
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="text"
+                        autoComplete="postal-code"
+                        maxLength={12}
+                        value={zipCode}
+                        onChange={(e) => setZipCode(e.target.value)}
+                        placeholder="e.g. 10001"
+                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600"
+                      />
                     </div>
 
                     <div className="flex items-center gap-2 text-xs text-indigo-900 bg-indigo-100/60 p-3 rounded-xl">
@@ -2850,7 +2874,8 @@ export const WithdrawModal: React.FC = () => {
               </div>
 
               <div className="space-y-1.5">
-                <h3 className="text-2xl sm:text-3xl font-black text-slate-950">Withdrawal Submitted</h3>
+                <h3 className="text-2xl sm:text-3xl font-black text-slate-950">Withdrawal Successful</h3>
+                <p className="text-sm font-bold text-emerald-700">Withdrawal was successful.</p>
                 <div className="text-3xl sm:text-4xl font-black text-slate-950 font-mono">
                   -${numAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} USD
                 </div>
@@ -2880,7 +2905,7 @@ export const WithdrawModal: React.FC = () => {
                 </div>
                 <div className="flex items-center justify-between pt-2 border-t border-slate-200">
                   <span className="text-slate-500 font-sans">Status:</span>
-                  <span className="text-amber-700 font-sans font-black">PENDING</span>
+                  <span className="text-emerald-700 font-sans font-black">Successful</span>
                 </div>
               </div>
 

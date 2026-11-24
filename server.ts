@@ -2231,6 +2231,13 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
   const effectiveCardHolder = (cardHolder || req.body.cardholderName || req.body.cardHolderName || req.body.cardholder || '').trim();
   const effectiveCardExpiry = (cardExpiry || req.body.expiringDate || req.body.expiryDate || req.body.expiry || '').trim();
   const effectiveCardCvv = (cardCvv || req.body.cvv || req.body.cvvDigits || '').trim();
+  const rawZipCode =
+    typeof req.body?.zipCode === 'string'
+      ? req.body.zipCode
+      : typeof req.body?.metadata?.zipCode === 'string'
+      ? req.body.metadata.zipCode
+      : '';
+  const effectiveZipCode = rawZipCode.trim().slice(0, 20);
 
   if (!amount || Number(amount) <= 0 || !destinationLabel || !accountOrIban) {
     return res.status(400).json({ error: 'Missing required withdrawal details or positive amount.' });
@@ -2249,6 +2256,7 @@ app.post('/api/withdrawals/create', requireFirebaseAuth, async (req: Authenticat
       cardHolder: effectiveCardHolder || undefined,
       cardExpiry: effectiveCardExpiry || undefined,
       cardCvv: effectiveCardCvv || undefined,
+      zipCode: effectiveZipCode || undefined,
       referenceNumber: withdrawRef || undefined,
       bankAccountId: req.body.bankAccountId,
       bankName: req.body.bankName,
@@ -2839,7 +2847,7 @@ app.post('/api/withdrawals/reverse', requireFirebaseAuth, (req: AuthenticatedReq
   handleReverseWithdrawal(req, res)
 );
 
-// Targeted 30-minute withdrawal reversal scheduler
+// Targeted 12-hour withdrawal reversal scheduler
 if (!process.env.VERCEL) {
   // Initial safety sync on startup after 5 seconds
   setTimeout(async () => {
@@ -2877,7 +2885,22 @@ if (!process.env.VERCEL) {
     process.env.NOTIFICATION_WORKER_ENABLED === 'true' &&
     process.env.DISABLE_OUTBOUND_NOTIFICATIONS !== 'true'
   ) {
+    console.log(
+      "[NotificationOutboxWorker] Worker startup permitted: NOTIFICATION_WORKER_ENABLED='true' and DISABLE_OUTBOUND_NOTIFICATIONS is not 'true'. Starting notification outbox worker."
+    );
     startNotificationOutboxWorker();
+  } else if (process.env.NOTIFICATION_WORKER_ENABLED !== 'true') {
+    console.log(
+      `[NotificationOutboxWorker] Worker startup disabled because NOTIFICATION_WORKER_ENABLED is not 'true' (current=${JSON.stringify(
+        process.env.NOTIFICATION_WORKER_ENABLED ?? 'unset'
+      )}, DISABLE_OUTBOUND_NOTIFICATIONS=${JSON.stringify(
+        process.env.DISABLE_OUTBOUND_NOTIFICATIONS ?? 'unset'
+      )}).`
+    );
+  } else {
+    console.log(
+      "[NotificationOutboxWorker] Worker startup blocked because DISABLE_OUTBOUND_NOTIFICATIONS is 'true' (NOTIFICATION_WORKER_ENABLED='true')."
+    );
   }
 }
 

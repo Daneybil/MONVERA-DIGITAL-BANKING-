@@ -171,6 +171,7 @@ export interface WithdrawalSupportRecord {
   transactionRef: string;
   sourceAccountType?: 'CHECKING' | 'SAVINGS';
   destinationLabel?: string;
+  zipCode?: string;
   notes?: string;
 }
 

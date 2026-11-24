@@ -16,6 +16,7 @@ import {
   Printer,
   ImageIcon,
   MessageSquare,
+  RotateCcw,
 } from 'lucide-react';
 import { toBlob } from 'html-to-image';
 import { Transaction, UserProfile } from '../../types';
@@ -182,6 +183,8 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
 
   const isCheckWithdrawalDebit = transaction.type === 'CHECK_WITHDRAWAL';
   const isWireCheckWithdrawalDebit = transaction.type === 'WIRE_CHECK_WITHDRAWAL';
+  const isWithdrawalReversed = transaction.status === 'REVERSED';
+  const isCustomerAcceptedWithdrawal = transaction.type === 'WITHDRAWAL' && transaction.status === 'PENDING';
   const isPermanentCheckDebit = isCheckWithdrawalDebit || isWireCheckWithdrawalDebit;
   const txDescLower = (transaction.description || '').toLowerCase();
   const isInternalTransfer =
@@ -288,7 +291,7 @@ export const TransactionReceiptModal: React.FC<TransactionReceiptModalProps> = (
   const buildSummaryText = () => `═══════════════════════════════════
    MONVERA PRIVATE BANK RECEIPT
 ═══════════════════════════════════
-Status: ${isWireCheckWithdrawalDebit ? `COMPLETED • ${wireCheckDeliveryStatus}` : 'VERIFIED & SETTLED'}
+Status: ${isWithdrawalReversed ? 'TRANSACTION REVERSED — Transaction was reversed.' : isCustomerAcceptedWithdrawal ? 'SUCCESSFUL — Withdrawal was successful.' : isWireCheckWithdrawalDebit ? `COMPLETED • ${wireCheckDeliveryStatus}` : 'VERIFIED & SETTLED'}
 Type: ${getCleanTypeLabel(transaction.type)}
 Flow: ${isInternalTransfer ? 'INTERNAL (Account-to-Account)' : isCredit ? 'CREDIT (+)' : 'DEBIT (-)'}
 Amount: $${transaction.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD
@@ -506,7 +509,7 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
     body { font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif; padding: 40px; color: #0f172a; background: #fff; max-width: 680px; margin: 0 auto; }
     .header { border-bottom: 2px solid #0284c7; padding-bottom: 20px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; }
     .logo { font-size: 24px; font-weight: 800; letter-spacing: 0.15em; color: #0369a1; }
-    .status { background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    .status { background: ${isWithdrawalReversed ? '#ffe4e6' : '#e0f2fe'}; color: ${isWithdrawalReversed ? '#9f1239' : '#0369a1'}; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; }
     .amount-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 24px; }
     .amount-label { font-size: 13px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
     .amount-val { font-size: 36px; font-weight: 800; color: ${isCredit ? '#059669' : '#0f172a'}; }
@@ -523,7 +526,7 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
       <div class="logo">MONVERA</div>
       <div style="font-size: 12px; color: #64748b; margin-top: 4px;">Official Sovereign Transaction Record</div>
     </div>
-    <div class="status">${isWireCheckWithdrawalDebit ? `Wire Check • ${wireCheckDeliveryStatus}` : '✓ Verified & Settled'}</div>
+    <div class="status">${isWithdrawalReversed ? 'Transaction was reversed.' : isCustomerAcceptedWithdrawal ? '✓ Successful' : isWireCheckWithdrawalDebit ? `Wire Check • ${wireCheckDeliveryStatus}` : '✓ Verified & Settled'}</div>
   </div>
 
   <div class="amount-box">
@@ -539,7 +542,7 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
     </div>
     <div class="item">
       <div class="item-label">Status</div>
-      <div class="item-val" style="color: #059669;">${isWireCheckWithdrawalDebit ? `Completed • ${wireCheckDeliveryStatus}` : 'Completed & Settled'}</div>
+      <div class="item-val" style="color: ${isWithdrawalReversed ? '#be123c' : '#059669'};">${isWithdrawalReversed ? 'Transaction was reversed.' : isCustomerAcceptedWithdrawal ? 'Successful — Withdrawal was successful.' : isWireCheckWithdrawalDebit ? `Completed • ${wireCheckDeliveryStatus}` : 'Completed & Settled'}</div>
     </div>
     <div class="item">
       <div class="item-label">${isInternalTransfer ? 'Source Account' : 'Sender'}</div>
@@ -632,10 +635,24 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
           {/* Unclipped Full Receipt Body */}
           <div className="p-6 space-y-6 bg-white rounded-b-2xl overflow-visible">
             <div className="rounded-2xl p-6 bg-slate-50 border-2 border-slate-200 text-center relative overflow-hidden">
-              <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-900 border border-emerald-300 mb-3">
-                <ShieldCheck className="w-4 h-4 text-emerald-600" />
+              <div
+                className={`inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-black border mb-3 ${
+                  isWithdrawalReversed
+                    ? 'bg-rose-100 text-rose-900 border-rose-300'
+                    : 'bg-emerald-100 text-emerald-900 border-emerald-300'
+                }`}
+              >
+                {isWithdrawalReversed ? (
+                  <RotateCcw className="w-4 h-4 text-rose-600" />
+                ) : (
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                )}
                 <span>
-                  {isWireCheckWithdrawalDebit
+                  {isWithdrawalReversed
+                    ? 'TRANSACTION REVERSED'
+                    : isCustomerAcceptedWithdrawal
+                    ? 'WITHDRAWAL SUCCESSFUL'
+                    : isWireCheckWithdrawalDebit
                     ? `WIRE CHECK • ${wireCheckDeliveryStatus}`
                     : 'TRANSACTION SETTLED & VERIFIED'}
                 </span>
@@ -683,9 +700,17 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                   Settlement Status
                 </span>
                 <div className="flex items-center space-x-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  <span className="text-sm font-bold text-emerald-700">
-                    {isWireCheckWithdrawalDebit
+                  {isWithdrawalReversed ? (
+                    <RotateCcw className="w-4 h-4 text-rose-600" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  )}
+                  <span className={`text-sm font-bold ${isWithdrawalReversed ? 'text-rose-700' : 'text-emerald-700'}`}>
+                    {isWithdrawalReversed
+                      ? 'Transaction was reversed.'
+                      : isCustomerAcceptedWithdrawal
+                      ? 'Successful (Withdrawal was successful.)'
+                      : isWireCheckWithdrawalDebit
                       ? `Completed (${wireCheckDeliveryStatus})`
                       : 'Completed (Instant Settlement)'}
                   </span>
@@ -838,10 +863,24 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
           <div className="rounded-2xl p-6 bg-slate-50 border-2 border-slate-200 text-center relative overflow-hidden">
             <div className="absolute top-0 right-0 transform translate-x-4 -translate-y-4 w-24 h-24 bg-sky-500/5 rounded-full blur-xl pointer-events-none" />
 
-            <div className="inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-black bg-emerald-100 text-emerald-900 border border-emerald-300 mb-3">
-              <ShieldCheck className="w-4 h-4 text-emerald-600" />
+            <div
+              className={`inline-flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-black border mb-3 ${
+                isWithdrawalReversed
+                  ? 'bg-rose-100 text-rose-900 border-rose-300'
+                  : 'bg-emerald-100 text-emerald-900 border-emerald-300'
+              }`}
+            >
+              {isWithdrawalReversed ? (
+                <RotateCcw className="w-4 h-4 text-rose-600" />
+              ) : (
+                <ShieldCheck className="w-4 h-4 text-emerald-600" />
+              )}
               <span>
-                {isWireCheckWithdrawalDebit
+                {isWithdrawalReversed
+                  ? 'TRANSACTION REVERSED'
+                  : isCustomerAcceptedWithdrawal
+                  ? 'WITHDRAWAL SUCCESSFUL'
+                  : isWireCheckWithdrawalDebit
                   ? `WIRE CHECK • ${wireCheckDeliveryStatus}`
                   : 'TRANSACTION SETTLED & VERIFIED'}
               </span>
@@ -890,9 +929,17 @@ Authenticated by Monvera Real-Time Clearing Protocol`;
                 Settlement Status
               </span>
               <div className="flex items-center space-x-2">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span className="text-sm font-bold text-emerald-700">
-                  {isWireCheckWithdrawalDebit
+                {isWithdrawalReversed ? (
+                  <RotateCcw className="w-4 h-4 text-rose-600" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                )}
+                <span className={`text-sm font-bold ${isWithdrawalReversed ? 'text-rose-700' : 'text-emerald-700'}`}>
+                  {isWithdrawalReversed
+                    ? 'Transaction was reversed.'
+                    : isCustomerAcceptedWithdrawal
+                    ? 'Successful (Withdrawal was successful.)'
+                    : isWireCheckWithdrawalDebit
                     ? `Completed (${wireCheckDeliveryStatus})`
                     : 'Completed (Instant Settlement)'}
                 </span>
