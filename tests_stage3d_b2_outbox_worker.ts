@@ -40,6 +40,7 @@ import {
   executeServerInternalTransfer,
   executeServerTransfer,
 } from './server/firestoreTransactions';
+import { createAdminSessionToken } from './server/authMiddleware';
 
 // ---------------------------------------------------------------------------
 // Strict Firestore-Faithful In-Memory Harness
@@ -2194,8 +2195,165 @@ async function runTests() {
     console.log('[PASS] 19. L-1 Transient checkpoint read failure preserves checkpoint, retries cleanly, and resumes anti-starvation progress');
   }
 
+  // -------------------------------------------------------------------------
+  // TEST 20 (Admin Test Outbox SYSTEM Event): Worker Compatibility, Single FCM, & Dispatch-Log Idempotency
+  // -------------------------------------------------------------------------
   restoreTestEnv();
-  console.log('\nALL STAGE 3D-C1 / 3D-C1.2 DURABLE OUTBOX WORKER TESTS PASSED (19/19) — ZERO LIVE FIREBASE WRITES OR OUTBOUND SENDS.');
+  {
+    // Temporarily prevent server.ts auto-listen during import, then clear VERCEL before running worker ticks
+    process.env.VERCEL = '1';
+    const { handleAdminTestOutboxNotification } = await import('./server');
+    configureTestProvidersEnv();
+
+    process.env.ADMIN_UIDS = 'uid_admin_ops';
+    process.env.ADMIN_EMAILS = 'ops.admin@monvera.test';
+    process.env.ADMIN_PASSWORD = 'Stage3dB2AdminTestSecret!2026';
+    process.env.NOTIFICATION_OUTBOX_MIN_CREATED_AT = '2026-04-10T00:00:00.000Z';
+    process.env.NOTIFICATION_ALLOWLIST_UIDS = 'uid_systest_1,uid_systest_2';
+
+    const adminSession = createAdminSessionToken('uid_admin_ops', 'ops.admin@monvera.test')!;
+    const fsMem = new StrictInMemoryFirestore();
+    await seedCustomerForNotifications(fsMem, 'uid_systest_1', {
+      checkingBalance: 2500,
+      savingsBalance: 1000,
+      withToken: true,
+    });
+    assert.strictEqual((await fsMem.collection('transactions').get()).size, 0, 'No transactions doc required');
+
+    const enqueueNowMs = Date.parse('2026-04-15T10:00:00.000Z');
+    const mockRes: any = {
+      statusCode: 200,
+      body: undefined as any,
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload: any) {
+        this.body = payload;
+        return this;
+      },
+    };
+
+    await handleAdminTestOutboxNotification(
+      {
+        auth: { uid: 'uid_admin_ops', email: 'ops.admin@monvera.test', email_verified: true },
+        headers: { 'x-admin-session': adminSession },
+        body: { targetUserId: 'uid_systest_1', idempotencyKey: 'worker-smoke-01' },
+      } as any,
+      mockRes,
+      {
+        firestore: fsMem as any,
+        isFirebaseAdminConfiguredFn: () => true,
+        nowFn: () => enqueueNowMs,
+      }
+    );
+
+    assert.strictEqual(mockRes.statusCode, 200);
+    assert.strictEqual(mockRes.body.success, true);
+    assert.strictEqual(mockRes.body.isDuplicate, false);
+    const outboxId: string = mockRes.body.outboxId;
+    assert.strictEqual((await fsMem.collection('transactions').get()).size, 0);
+
+    // Run existing NotificationOutboxWorker tick with mocked FCM
+    const { dispatcher, counters, mockFetch } = createIsolatedDispatcherAndEnv(fsMem);
+    globalThis.fetch = mockFetch as any;
+
+    const tick1 = await runNotificationOutboxWorkerTick({
+      firestore: fsMem as unknown as Firestore,
+      dispatcher,
+      checkpointId: 'systest_ckpt',
+      nowFn: () => Date.parse('2026-04-15T10:01:00.000Z'),
+    });
+
+    assert.strictEqual(tick1.executed, true);
+    assert.strictEqual(tick1.claimedCount, 1);
+    assert.strictEqual(tick1.dispatchedCount, 1);
+    assert.strictEqual(counters.pushCalls, 1, 'Mocked FCM must be called once for verified token');
+    assert.strictEqual(counters.smsCalls, 0);
+    assert.strictEqual(counters.emailCalls, 0);
+
+    const outboxAfter = (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(outboxId).get()).data()!;
+    assert.strictEqual(outboxAfter.status, 'DISPATCHED');
+    assert.strictEqual(outboxAfter.pushStatus, 'SENT');
+    assert.strictEqual(outboxAfter.smsStatus, 'UNCONFIGURED_PROVIDER');
+    assert.strictEqual(outboxAfter.emailStatus, 'UNCONFIGURED_PROVIDER');
+    assert.strictEqual(outboxAfter.failureClassification, 'NONE');
+
+    const dispatchKey = resolveDispatchKey({
+      transactionId: outboxAfter.transactionId,
+      referenceNumber: outboxAfter.referenceNumber,
+      eventKey: outboxAfter.eventKey,
+      type: outboxAfter.dispatchType,
+    });
+    const dispatchLog = (
+      await fsMem
+        .collection('notification_dispatch_logs')
+        .doc(computeDispatchLogId('uid_systest_1', dispatchKey))
+        .get()
+    ).data()!;
+    assert.strictEqual(dispatchLog.pushStatus, 'SENT');
+
+    // Duplicate admin submission after DISPATCHED preserves DISPATCHED record untouched & does not trigger extra send
+    const dupRes: any = {
+      statusCode: 200,
+      body: undefined as any,
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload: any) {
+        this.body = payload;
+        return this;
+      },
+    };
+    await handleAdminTestOutboxNotification(
+      {
+        auth: { uid: 'uid_admin_ops', email: 'ops.admin@monvera.test', email_verified: true },
+        headers: { 'x-admin-session': adminSession },
+        body: { targetUserId: 'uid_systest_1', idempotencyKey: 'worker-smoke-01' },
+      } as any,
+      dupRes,
+      {
+        firestore: fsMem as any,
+        isFirebaseAdminConfiguredFn: () => true,
+        nowFn: () => enqueueNowMs + 120_000,
+      }
+    );
+    assert.strictEqual(dupRes.statusCode, 200);
+    assert.strictEqual(dupRes.body.isDuplicate, true);
+    assert.strictEqual(
+      (await fsMem.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(outboxId).get()).data()?.status,
+      'DISPATCHED'
+    );
+
+    // Second worker tick and direct dispatcher replay must NOT invoke FCM again
+    const tick2 = await runNotificationOutboxWorkerTick({
+      firestore: fsMem as unknown as Firestore,
+      dispatcher,
+      checkpointId: 'systest_ckpt',
+      nowFn: () => Date.parse('2026-04-15T10:02:00.000Z'),
+    });
+    assert.strictEqual(tick2.claimedCount, 0);
+
+    const replayRes = await dispatcher.dispatch({
+      transactionId: outboxAfter.transactionId,
+      referenceNumber: outboxAfter.referenceNumber,
+      eventKey: outboxAfter.eventKey,
+      type: 'SYSTEM',
+      category: 'SYSTEM',
+      userId: 'uid_systest_1',
+      title: outboxAfter.payload.title,
+      body: outboxAfter.payload.body,
+      actionUrl: outboxAfter.payload.actionUrl,
+    });
+    assert.strictEqual(replayRes.push.status, 'DUPLICATE_IGNORED');
+    assert.strictEqual(counters.pushCalls, 1, 'Dispatch-log idempotency must block duplicate FCM delivery');
+
+    console.log('[PASS] 20. Admin test-outbox SYSTEM event processed by existing worker once with zero transactions doc and terminal DISPATCHED');
+  }
+
+  restoreTestEnv();
+  console.log('\nALL STAGE 3D-C1 / 3D-C1.2 DURABLE OUTBOX WORKER TESTS PASSED (20/20) — ZERO LIVE FIREBASE WRITES OR OUTBOUND SENDS.');
 }
 
 runTests().catch((err) => {

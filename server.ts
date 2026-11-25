@@ -14,7 +14,13 @@ import {
   isOutboundNotificationsDisabled,
   isUidAllowlisted,
   parseNotificationAllowlistUids,
+  resolveNotificationAllowlistPolicy,
 } from './server/services/notificationDispatcher';
+import {
+  computeNotificationOutboxId,
+  prepareNotificationOutboxBatch,
+  writePreparedNotificationOutboxBatchInTransaction,
+} from './server/services/notificationOutbox';
 import {
   isNotificationWorkerEnabled,
   startNotificationOutboxWorker,
@@ -5082,6 +5088,217 @@ app.post('/api/admin/dev-topup', requireAdminAuth, (req: AuthenticatedRequest, r
 app.get('/api/admin/audit-logs', requireAdminAuth, (req: AuthenticatedRequest, res: Response) => {
   res.json({ auditLogs: db.auditLogs });
 });
+
+export interface AdminTestOutboxHandlerDeps {
+  firestore?: typeof adminFirestore;
+  isFirebaseAdminConfiguredFn?: typeof isFirebaseAdminConfigured;
+  isAdminFn?: typeof isCallerAdministrator;
+  verifySessionFn?: typeof verifyAdminSessionToken;
+  resolveAllowlistPolicyFn?: typeof resolveNotificationAllowlistPolicy;
+  nowFn?: () => number;
+}
+
+const ADMIN_TEST_OUTBOX_IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._:-]{1,96}$/;
+const ADMIN_TEST_OUTBOX_TITLE = 'Monvera System Notification Test';
+const ADMIN_TEST_OUTBOX_BODY =
+  'This is an authorized Monvera system notification verification test.';
+const ADMIN_TEST_OUTBOX_ACTION_URL = '/dashboard';
+
+function isValidTargetUid(raw: unknown): raw is string {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) return false;
+  if (trimmed === '.' || trimmed === '..') return false;
+  if (/[\s/\\]/.test(trimmed)) return false;
+  return true;
+}
+
+export async function handleAdminTestOutboxNotification(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps?: AdminTestOutboxHandlerDeps
+) {
+  const callerUid = req.auth?.uid?.trim();
+  if (!callerUid) {
+    return res.status(401).json({
+      success: false,
+      errorCode: 'UNAUTHORIZED',
+      error: 'UNAUTHORIZED: Authentication required to enqueue a system test notification.',
+    });
+  }
+
+  const rawHeaderSession = req.headers?.['x-admin-session'];
+  const effectiveSessionToken =
+    rawHeaderSession !== undefined
+      ? (Array.isArray(rawHeaderSession) ? rawHeaderSession[0] : rawHeaderSession)?.trim() || ''
+      : req.auth?.adminSessionToken;
+
+  const isAdminFn = deps?.isAdminFn || isCallerAdministrator;
+  const verifySessionFn = deps?.verifySessionFn || verifyAdminSessionToken;
+  const isFbConfiguredFn = deps?.isFirebaseAdminConfiguredFn || isFirebaseAdminConfigured;
+  const resolveAllowlistPolicyFn = deps?.resolveAllowlistPolicyFn || resolveNotificationAllowlistPolicy;
+
+  const sessionCheck = verifySessionFn(effectiveSessionToken, callerUid, req.auth?.email);
+  if (!sessionCheck.valid) {
+    const isExpired = sessionCheck.reason === 'Admin session expired';
+    return res.status(401).json({
+      success: false,
+      errorCode: 'ADMIN_SESSION_INVALID',
+      sessionExpired: isExpired,
+      error: `UNAUTHORIZED: ${sessionCheck.reason || 'Valid non-expired administrator session is required.'}`,
+    });
+  }
+
+  const isAdmin = await isAdminFn(callerUid, req.auth?.email, req.auth, effectiveSessionToken);
+  if (!isAdmin) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'FORBIDDEN',
+      error: 'FORBIDDEN: Administrative privileges required to enqueue a system test notification.',
+    });
+  }
+
+  if (deps?.isFirebaseAdminConfiguredFn && !deps.isFirebaseAdminConfiguredFn()) {
+    return res.status(503).json({
+      success: false,
+      errorCode: 'SERVICE_UNAVAILABLE',
+      error: 'SERVICE_UNAVAILABLE: Firebase Admin Firestore is not configured.',
+    });
+  }
+
+  const fs = deps?.firestore || (isFbConfiguredFn() ? adminFirestore : null);
+  if (!fs) {
+    return res.status(503).json({
+      success: false,
+      errorCode: 'SERVICE_UNAVAILABLE',
+      error: 'SERVICE_UNAVAILABLE: Firebase Admin Firestore is not configured.',
+    });
+  }
+
+  const body =
+    req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? (req.body as Record<string, unknown>)
+      : {};
+
+  if (!isValidTargetUid(body.targetUserId)) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'INVALID_TARGET_USER_ID',
+      error: 'A valid targetUserId is required.',
+    });
+  }
+  const targetUserId = body.targetUserId.trim();
+
+  if (
+    typeof body.idempotencyKey !== 'string' ||
+    !ADMIN_TEST_OUTBOX_IDEMPOTENCY_KEY_RE.test(body.idempotencyKey.trim())
+  ) {
+    return res.status(400).json({
+      success: false,
+      errorCode: 'INVALID_IDEMPOTENCY_KEY',
+      error: 'A valid idempotencyKey (1-96 alphanumeric, ., _, :, or - characters) is required.',
+    });
+  }
+  const cleanIdempotencyKey = body.idempotencyKey.trim();
+
+  const allowlistPolicy = resolveAllowlistPolicyFn({
+    requireRestrictedOrExplicitOpen: true,
+  });
+  if (
+    !allowlistPolicy.allowed ||
+    allowlistPolicy.mode !== 'RESTRICTED' ||
+    !allowlistPolicy.allowlist ||
+    allowlistPolicy.allowlist.size === 0
+  ) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'ALLOWLIST_REQUIRED',
+      error: 'FORBIDDEN: Test notifications require restricted NOTIFICATION_ALLOWLIST_UIDS configuration.',
+    });
+  }
+
+  if (!isUidAllowlisted(targetUserId, allowlistPolicy.allowlist)) {
+    return res.status(403).json({
+      success: false,
+      errorCode: 'RECIPIENT_NOT_ALLOWLISTED',
+      error: 'FORBIDDEN: Target recipient is not in NOTIFICATION_ALLOWLIST_UIDS.',
+    });
+  }
+
+  const eventKey = `admin_test_outbox:${cleanIdempotencyKey}`;
+  const syntheticTransactionId = `test_outbox_${cleanIdempotencyKey}`;
+  const syntheticReferenceNumber = `MV-SYSTEST-${cleanIdempotencyKey.slice(0, 32)}`;
+  const expectedOutboxId = computeNotificationOutboxId(targetUserId, eventKey, 'SYSTEM');
+  const nowIso = new Date(deps?.nowFn ? deps.nowFn() : Date.now()).toISOString();
+
+  try {
+    const txResult = await fs.runTransaction(async (tx) => {
+      const batch = await prepareNotificationOutboxBatch(tx, fs, [
+        {
+          userId: targetUserId,
+          transactionId: syntheticTransactionId,
+          referenceNumber: syntheticReferenceNumber,
+          eventKey,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'SYSTEM',
+          category: 'SYSTEM',
+          payload: {
+            title: ADMIN_TEST_OUTBOX_TITLE,
+            body: ADMIN_TEST_OUTBOX_BODY,
+            actionUrl: ADMIN_TEST_OUTBOX_ACTION_URL,
+          },
+          nowIso,
+        },
+      ]);
+
+      if (batch.invalidItems.length > 0) {
+        return { error: batch.invalidItems[0].error };
+      }
+
+      const written = writePreparedNotificationOutboxBatchInTransaction(tx, batch);
+      return {
+        error: null as string | null,
+        outboxId: expectedOutboxId,
+        isDuplicate: written.skippedExistingIds.length > 0,
+        record: written.records[0],
+      };
+    });
+
+    if (txResult.error) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'INVALID_OUTBOX_RECORD',
+        error: txResult.error,
+      });
+    }
+
+    return res.json({
+      success: true,
+      outboxId: txResult.outboxId,
+      eventKey,
+      dispatchType: 'SYSTEM',
+      category: 'SYSTEM',
+      targetUserId,
+      isDuplicate: txResult.isDuplicate,
+      status: txResult.record?.status || 'PENDING',
+      message: txResult.isDuplicate
+        ? 'Duplicate test notification ignored; existing notification_outbox record preserved.'
+        : 'System test notification enqueued to notification_outbox.',
+    });
+  } catch (err: any) {
+    console.error('[POST /api/admin/notifications/test-outbox] Error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Failed to enqueue system test notification.',
+    });
+  }
+}
+
+app.post(
+  '/api/admin/notifications/test-outbox',
+  requireAdminAuth,
+  (req: AuthenticatedRequest, res: Response) => handleAdminTestOutboxNotification(req, res)
+);
 
 // --- ADMIN ISSUED CHECKS WITH PERMANENT CUSTOMER DEBIT ---
 app.get('/api/admin/checks', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {

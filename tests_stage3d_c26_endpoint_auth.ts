@@ -32,7 +32,12 @@ import {
   executeServerInvestmentMaturity,
 } from './server/firestoreTransactions';
 import { evaluateAndProcessWelcomeReward } from './server/welcomeRewardService';
-import { NOTIFICATION_OUTBOX_COLLECTION } from './server/services/notificationOutbox';
+import {
+  NOTIFICATION_OUTBOX_COLLECTION,
+  computeNotificationOutboxId,
+  sanitizeAndValidateOutboxPayload,
+} from './server/services/notificationOutbox';
+import { createAdminSessionToken } from './server/authMiddleware';
 
 // ---------------------------------------------------------------------------
 // Strict Offline In-Memory Firestore Harness (enforces reads-before-writes)
@@ -258,6 +263,7 @@ async function runTests() {
     handleCreateInvestment,
     handleMatureInvestment,
     handleGetWelcomeReward,
+    handleAdminTestOutboxNotification,
   } = await import('./server');
 
   console.log('\n=== STAGE 3D-C2.6: FINANCIAL ENDPOINT AUTH & AUTHZ REGRESSION TESTS ===\n');
@@ -911,6 +917,221 @@ async function runTests() {
     );
 
     console.log('✓ 7. Client API (src/services/api.ts) sends Firebase Auth headers on balance & withdrawal reversal calls');
+  }
+
+  // -------------------------------------------------------------------------
+  // 8. Admin Test Outbox Notification: Recipient Restrictions, Idempotency, DB Isolation & Payload Safety
+  // -------------------------------------------------------------------------
+  {
+    const prevEnv = {
+      ADMIN_UIDS: process.env.ADMIN_UIDS,
+      ADMIN_EMAILS: process.env.ADMIN_EMAILS,
+      ADMIN_PASSWORD: process.env.ADMIN_PASSWORD,
+      NOTIFICATION_ALLOWLIST_UIDS: process.env.NOTIFICATION_ALLOWLIST_UIDS,
+      NOTIFICATION_ALLOWLIST_MODE: process.env.NOTIFICATION_ALLOWLIST_MODE,
+    };
+
+    try {
+      process.env.ADMIN_UIDS = 'uid_admin_ops';
+      process.env.ADMIN_EMAILS = 'ops.admin@monvera.test';
+      process.env.ADMIN_PASSWORD = 'Stage3dC26TestSecret!2026';
+
+      const validAdminSession = createAdminSessionToken('uid_admin_ops', 'ops.admin@monvera.test')!;
+      assert.ok(validAdminSession);
+
+      const memFs = new StrictInMemoryFirestore();
+      await seedCustomer(memFs, 'uid_allowlisted_1', { checkingBalance: 4200, savingsBalance: 800 });
+      await seedCustomer(memFs, 'uid_other_customer', { checkingBalance: 9100, savingsBalance: 1500 });
+
+      // Seed sentinel records in every unrelated collection to guarantee ZERO side effects
+      await memFs.collection('transactions').doc('tx_sentinel').set({ id: 'tx_sentinel', amount: 100, status: 'COMPLETED' });
+      await memFs.collection('kyc_submissions').doc('uid_allowlisted_1').set({ status: 'verified' });
+      await memFs.collection('loans').doc('loan_sentinel').set({ userId: 'uid_allowlisted_1', status: 'ACTIVE' });
+      await memFs.collection('cards').doc('card_sentinel').set({ userId: 'uid_allowlisted_1', status: 'ACTIVE' });
+      await memFs.collection('withdrawal_support_records').doc('wth_sentinel').set({ userId: 'uid_allowlisted_1', status: 'PENDING' });
+      await memFs.collection('wire_check_requests').doc('wire_sentinel').set({ userId: 'uid_allowlisted_1', status: 'PENDING' });
+      await memFs.collection('issued_checks').doc('chk_sentinel').set({ userId: 'uid_allowlisted_1', status: 'ISSUED' });
+      await memFs.collection('notifications').doc('notif_sentinel').set({ userId: 'uid_allowlisted_1', title: 'Existing' });
+      await memFs.collection('notification_dispatch_logs').doc('log_sentinel').set({ userId: 'uid_allowlisted_1', pushStatus: 'SENT' });
+
+      const adminReqBase = {
+        auth: { uid: 'uid_admin_ops', email: 'ops.admin@monvera.test', email_verified: true },
+        headers: { 'x-admin-session': validAdminSession },
+      };
+
+      // 8a. Missing, malformed, or OPEN allowlist -> REJECTED (403), zero outbox writes
+      delete process.env.NOTIFICATION_ALLOWLIST_UIDS;
+      delete process.env.NOTIFICATION_ALLOWLIST_MODE;
+      {
+        const resMissing = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { targetUserId: 'uid_allowlisted_1', idempotencyKey: 'c26-missing-allowlist' } } as any,
+          resMissing,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resMissing.statusCode, 403);
+      }
+
+      process.env.NOTIFICATION_ALLOWLIST_UIDS = 'bad uid/with spaces';
+      {
+        const resMalformed = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { targetUserId: 'uid_allowlisted_1', idempotencyKey: 'c26-bad-allowlist' } } as any,
+          resMalformed,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resMalformed.statusCode, 403);
+      }
+
+      process.env.NOTIFICATION_ALLOWLIST_UIDS = 'uid_allowlisted_1';
+      process.env.NOTIFICATION_ALLOWLIST_MODE = 'OPEN';
+      {
+        const resOpen = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { targetUserId: 'uid_allowlisted_1', idempotencyKey: 'c26-open-mode' } } as any,
+          resOpen,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resOpen.statusCode, 403, 'OPEN mode must be rejected for admin test-outbox endpoint');
+      }
+
+      // 8b. Restricted mode: non-allowlisted UID (including admin's own UID if not allowlisted) -> REJECTED (403)
+      delete process.env.NOTIFICATION_ALLOWLIST_MODE;
+      process.env.NOTIFICATION_ALLOWLIST_UIDS = 'uid_allowlisted_1,uid_allowlisted_2';
+      {
+        const resNonAllowlisted = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { targetUserId: 'uid_other_customer', idempotencyKey: 'c26-non-allow' } } as any,
+          resNonAllowlisted,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resNonAllowlisted.statusCode, 403);
+
+        const resSelfAdmin = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { targetUserId: 'uid_admin_ops', idempotencyKey: 'c26-self-admin' } } as any,
+          resSelfAdmin,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resSelfAdmin.statusCode, 403);
+      }
+
+      // Missing targetUserId (never defaults to admin UID) & invalid idempotencyKey -> 400
+      {
+        const resNoTarget = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { idempotencyKey: 'c26-no-target' } } as any,
+          resNoTarget,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resNoTarget.statusCode, 400);
+
+        const resBadKey = createMockRes();
+        await handleAdminTestOutboxNotification(
+          { ...adminReqBase, body: { targetUserId: 'uid_allowlisted_1', idempotencyKey: 'bad key/slash' } } as any,
+          resBadKey,
+          { firestore: memFs as any, isFirebaseAdminConfiguredFn: () => true }
+        );
+        assert.strictEqual(resBadKey.statusCode, 400);
+      }
+
+      assert.strictEqual((await memFs.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 0);
+
+      // 8c. Allowlisted recipient accepted -> writes ONLY notification_outbox, ignores request overrides, passes sanitizer
+      const fixedNowMs = Date.parse('2026-11-25T01:00:00.000Z');
+      const resCreate = createMockRes();
+      await handleAdminTestOutboxNotification(
+        {
+          ...adminReqBase,
+          body: {
+            targetUserId: 'uid_allowlisted_1',
+            idempotencyKey: 'smoke-001',
+            // Attempted arbitrary overrides must be completely ignored
+            title: 'Injected Title 1234567890',
+            body: 'Account 1088492001 balance $999999',
+            actionUrl: 'https://evil.example.com',
+            dispatchType: 'MONEY_SENT',
+          },
+        } as any,
+        resCreate,
+        {
+          firestore: memFs as any,
+          isFirebaseAdminConfiguredFn: () => true,
+          nowFn: () => fixedNowMs,
+        }
+      );
+      assert.strictEqual(resCreate.statusCode, 200);
+      assert.strictEqual(resCreate.body.success, true);
+      assert.strictEqual(resCreate.body.isDuplicate, false);
+      assert.strictEqual(resCreate.body.dispatchType, 'SYSTEM');
+      assert.strictEqual(resCreate.body.category, 'SYSTEM');
+
+      const expectedEventKey = 'admin_test_outbox:smoke-001';
+      const expectedOutboxId = computeNotificationOutboxId('uid_allowlisted_1', expectedEventKey, 'SYSTEM');
+      assert.strictEqual(resCreate.body.outboxId, expectedOutboxId);
+
+      const outboxCol = await memFs.collection(NOTIFICATION_OUTBOX_COLLECTION).get();
+      assert.strictEqual(outboxCol.size, 1);
+      const createdDoc = (await memFs.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedOutboxId).get()).data()!;
+      assert.strictEqual(createdDoc.userId, 'uid_allowlisted_1');
+      assert.strictEqual(createdDoc.dispatchType, 'SYSTEM');
+      assert.strictEqual(createdDoc.category, 'SYSTEM');
+      assert.strictEqual(createdDoc.lifecycleStage, 'COMPLETED');
+      assert.strictEqual(createdDoc.status, 'PENDING');
+      assert.strictEqual(createdDoc.payload.title, 'Monvera System Notification Test');
+      assert.strictEqual(createdDoc.payload.actionUrl, '/dashboard');
+      assert.strictEqual(createdDoc.payload.amount, undefined);
+      assert.strictEqual(sanitizeAndValidateOutboxPayload(createdDoc.payload).valid, true);
+      assert.strictEqual(memFs.store.get(NOTIFICATION_OUTBOX_COLLECTION)!.get(expectedOutboxId)!.version, 1);
+
+      // 8d. Repeated identical submission -> idempotent duplicate, zero overwrite
+      const resDup = createMockRes();
+      await handleAdminTestOutboxNotification(
+        {
+          ...adminReqBase,
+          body: { targetUserId: 'uid_allowlisted_1', idempotencyKey: 'smoke-001' },
+        } as any,
+        resDup,
+        {
+          firestore: memFs as any,
+          isFirebaseAdminConfiguredFn: () => true,
+          nowFn: () => fixedNowMs + 60_000,
+        }
+      );
+      assert.strictEqual(resDup.statusCode, 200);
+      assert.strictEqual(resDup.body.success, true);
+      assert.strictEqual(resDup.body.isDuplicate, true);
+      assert.strictEqual(resDup.body.outboxId, expectedOutboxId);
+      assert.strictEqual((await memFs.collection(NOTIFICATION_OUTBOX_COLLECTION).get()).size, 1);
+      assert.strictEqual(memFs.store.get(NOTIFICATION_OUTBOX_COLLECTION)!.get(expectedOutboxId)!.version, 1);
+      assert.strictEqual(
+        (await memFs.collection(NOTIFICATION_OUTBOX_COLLECTION).doc(expectedOutboxId).get()).data()!.createdAt,
+        '2026-11-25T01:00:00.000Z',
+        'Existing outbox createdAt must not be overwritten on duplicate submission'
+      );
+
+      // 8e. Database isolation: ZERO writes to any financial, customer, KYC, loan, card, request, or dispatch log collections
+      assert.strictEqual((await memFs.collection('accounts').doc('uid_allowlisted_1').get()).data()!.checkingBalance, 4200);
+      assert.strictEqual((await memFs.collection('accounts').doc('uid_other_customer').get()).data()!.checkingBalance, 9100);
+      assert.strictEqual(memFs.store.get('accounts')!.get('uid_allowlisted_1')!.version, 1);
+      assert.strictEqual(memFs.store.get('users')!.get('uid_allowlisted_1')!.version, 1);
+      assert.strictEqual(memFs.store.get('transactions')!.get('tx_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('kyc_submissions')!.get('uid_allowlisted_1')!.version, 1);
+      assert.strictEqual(memFs.store.get('loans')!.get('loan_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('cards')!.get('card_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('withdrawal_support_records')!.get('wth_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('wire_check_requests')!.get('wire_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('issued_checks')!.get('chk_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('notifications')!.get('notif_sentinel')!.version, 1);
+      assert.strictEqual(memFs.store.get('notification_dispatch_logs')!.get('log_sentinel')!.version, 1);
+
+      console.log('✓ 8. Admin test-outbox endpoint enforces restricted allowlist, idempotency, payload safety, and zero unrelated DB mutations');
+    } finally {
+      Object.entries(prevEnv).forEach(([k, v]) => {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      });
+    }
   }
 
   console.log('\nALL STAGE 3D-C2.6 ENDPOINT AUTHENTICATION & AUTHORIZATION TESTS PASSED.\n');

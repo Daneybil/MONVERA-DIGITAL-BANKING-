@@ -66,7 +66,7 @@ function createExpiredToken(uid: string, email: string, password: string): strin
 
 async function runTests() {
   process.env.VERCEL = '1';
-  const { app, handleGetWithdrawalSupportRecords } = await import('./server');
+  const { app, handleGetWithdrawalSupportRecords, handleAdminTestOutboxNotification } = await import('./server');
 
   const prevEnv = {
     ADMIN_EMAILS: process.env.ADMIN_EMAILS,
@@ -522,6 +522,195 @@ async function runTests() {
         'Notification worker startup must remain gated by default-OFF flags'
       );
       console.log('✓ 5. Notification/support callerUid binding & worker default-OFF guard verified');
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. POST /api/admin/notifications/test-outbox Auth & Fail-Closed Checks
+    // -----------------------------------------------------------------------
+    {
+      process.env.ADMIN_EMAILS = 'ops.admin@monvera.test';
+      process.env.ADMIN_UIDS = 'uid_admin_live';
+      process.env.ADMIN_PASSWORD = 'Stage3dC29TestAdminSecret!2026';
+      process.env.NOTIFICATION_ALLOWLIST_UIDS = 'uid_allowlisted_test';
+      delete process.env.NOTIFICATION_ALLOWLIST_MODE;
+
+      const validSession = createAdminSessionToken('uid_admin_live', 'ops.admin@monvera.test')!;
+
+      // 6a. Unauthenticated loopback & ?adminSession= bypass rejected when Firebase Admin unconfigured
+      delete process.env.FIREBASE_SERVICE_ACCOUNT;
+      delete process.env.FIREBASE_PROJECT_ID;
+      delete process.env.FIREBASE_CLIENT_EMAIL;
+      delete process.env.FIREBASE_PRIVATE_KEY;
+
+      const server = http.createServer(app);
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      const addr = server.address() as any;
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+      try {
+        const unauthRes = await fetch(`${baseUrl}/api/admin/notifications/test-outbox`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetUserId: 'uid_allowlisted_test', idempotencyKey: 'c29-k1' }),
+        });
+        assert(
+          unauthRes.status === 401 || unauthRes.status === 403 || unauthRes.status === 503,
+          `Unauthenticated POST /api/admin/notifications/test-outbox must fail closed, got ${unauthRes.status}`
+        );
+
+        const queryBypassRes = await fetch(
+          `${baseUrl}/api/admin/notifications/test-outbox?adminSession=${encodeURIComponent(validSession)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ targetUserId: 'uid_allowlisted_test', idempotencyKey: 'c29-k1' }),
+          }
+        );
+        assert(
+          queryBypassRes.status === 401 || queryBypassRes.status === 403 || queryBypassRes.status === 503,
+          `Query-string ?adminSession= bypass must be rejected, got ${queryBypassRes.status}`
+        );
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+
+      // 6b. Middleware-level checks (invalid token, customer, missing/expired/mismatched session, unconfigured admin)
+      const mockAuthDeps = {
+        isFirebaseConfiguredFn: () => true,
+        verifyIdTokenFn: async (tok: string) => {
+          if (tok === 'valid_admin_tok') {
+            return { uid: 'uid_admin_live', email: 'ops.admin@monvera.test', email_verified: true };
+          }
+          if (tok === 'valid_cust_tok') {
+            return { uid: 'cust_non_admin', email: 'cust@monvera.test', email_verified: true };
+          }
+          throw new Error('auth/invalid-id-token');
+        },
+      };
+
+      // Invalid Firebase token -> 401
+      {
+        const res = createMockRes();
+        let nextCalled = false;
+        await evaluateRequireAdminAuth(
+          { headers: { authorization: 'Bearer bad_tok', 'x-admin-session': validSession } } as any,
+          res,
+          () => { nextCalled = true; },
+          mockAuthDeps
+        );
+        assert.strictEqual(nextCalled, false);
+        assert.strictEqual(res.statusCode, 401);
+      }
+
+      // Non-admin Firebase user -> 403
+      {
+        const res = createMockRes();
+        let nextCalled = false;
+        await evaluateRequireAdminAuth(
+          { headers: { authorization: 'Bearer valid_cust_tok', 'x-admin-session': validSession } } as any,
+          res,
+          () => { nextCalled = true; },
+          mockAuthDeps
+        );
+        assert.strictEqual(nextCalled, false);
+        assert.strictEqual(res.statusCode, 403);
+      }
+
+      // Expired admin session -> 401
+      {
+        const expiredSess = createExpiredToken('uid_admin_live', 'ops.admin@monvera.test', process.env.ADMIN_PASSWORD!);
+        const res = createMockRes();
+        let nextCalled = false;
+        await evaluateRequireAdminAuth(
+          { headers: { authorization: 'Bearer valid_admin_tok', 'x-admin-session': expiredSess } } as any,
+          res,
+          () => { nextCalled = true; },
+          mockAuthDeps
+        );
+        assert.strictEqual(nextCalled, false);
+        assert.strictEqual(res.statusCode, 401);
+      }
+
+      // Unconfigured admin password -> 503
+      {
+        const prevPass = process.env.ADMIN_PASSWORD;
+        delete process.env.ADMIN_PASSWORD;
+        const res = createMockRes();
+        let nextCalled = false;
+        await evaluateRequireAdminAuth(
+          { headers: { authorization: 'Bearer valid_admin_tok', 'x-admin-session': validSession } } as any,
+          res,
+          () => { nextCalled = true; },
+          mockAuthDeps
+        );
+        assert.strictEqual(nextCalled, false);
+        assert.strictEqual(res.statusCode, 503);
+        process.env.ADMIN_PASSWORD = prevPass;
+      }
+
+      // 6c. Handler-level auth & body-spoof protections (zero Firestore writes on rejection)
+      let txCalled = false;
+      const neverWriteFs: any = {
+        runTransaction: async () => {
+          txCalled = true;
+          throw new Error('Firestore must not be written when auth fails');
+        },
+      };
+
+      // Missing auth -> 401
+      {
+        const res = createMockRes();
+        await handleAdminTestOutboxNotification(
+          {
+            headers: {},
+            query: { adminSession: validSession },
+            body: { adminId: 'uid_admin_live', targetUserId: 'uid_allowlisted_test', idempotencyKey: 'c29-k2' },
+          } as any,
+          res,
+          { firestore: neverWriteFs }
+        );
+        assert.strictEqual(res.statusCode, 401);
+        assert.strictEqual(txCalled, false);
+      }
+
+      // Non-admin caller attempting body.adminId spoof with stolen session -> 401 (UID mismatch)
+      {
+        const res = createMockRes();
+        await handleAdminTestOutboxNotification(
+          {
+            auth: { uid: 'cust_non_admin', email: 'cust@monvera.test', email_verified: true },
+            headers: { 'x-admin-session': validSession },
+            body: { adminId: 'uid_admin_live', targetUserId: 'uid_allowlisted_test', idempotencyKey: 'c29-k3' },
+          } as any,
+          res,
+          { firestore: neverWriteFs }
+        );
+        assert.strictEqual(res.statusCode, 401);
+        assert.strictEqual(txCalled, false);
+      }
+
+      // Unconfigured Firebase Admin -> 503 fail closed
+      {
+        const res = createMockRes();
+        await handleAdminTestOutboxNotification(
+          {
+            auth: { uid: 'uid_admin_live', email: 'ops.admin@monvera.test', email_verified: true },
+            headers: { 'x-admin-session': validSession },
+            body: { targetUserId: 'uid_allowlisted_test', idempotencyKey: 'c29-k4' },
+          } as any,
+          res,
+          { isFirebaseAdminConfiguredFn: () => false }
+        );
+        assert.strictEqual(res.statusCode, 503);
+      }
+
+      // Confirm NOTIFICATION_WORKER_MIN_CREATED_AT is never referenced
+      const serverSrc2 = fs.readFileSync(path.resolve('server.ts'), 'utf-8');
+      const workerSrc = fs.readFileSync(path.resolve('server/services/notificationOutboxWorker.ts'), 'utf-8');
+      assert.strictEqual(serverSrc2.includes('NOTIFICATION_WORKER_MIN_CREATED_AT'), false);
+      assert.strictEqual(workerSrc.includes('NOTIFICATION_WORKER_MIN_CREATED_AT'), false);
+
+      console.log('✓ 6. POST /api/admin/notifications/test-outbox enforces fail-closed admin auth & zero unauth writes');
     }
 
     console.log('\nALL STAGE 3D-C2.9 ADMIN AUTH & READINESS REGRESSION TESTS PASSED.\n');
