@@ -1537,6 +1537,13 @@ export function verifyPaidStripeCheckoutSession(
       error: 'Stripe checkout session is missing a valid positive integer amount_total in cents.',
     };
   }
+  if (amountTotal < 100) {
+    return {
+      ok: false,
+      errorCode: 'MINIMUM_DEPOSIT_NOT_MET',
+      error: 'Minimum deposit amount is $1.00 USD.',
+    };
+  }
 
   const meta = session.metadata && typeof session.metadata === 'object' ? session.metadata : {};
   if (meta.amount !== undefined && meta.amount !== null && String(meta.amount).trim() !== '') {
@@ -1971,7 +1978,7 @@ export function handleWebhookTestSimulate(req: AuthenticatedRequest, res: Respon
     return res.status(400).json({ error: 'No customer account found for webhook simulation.' });
   }
 
-  const parsedAmount = parseStrictUsdDepositAmount(amount ?? 100.0, { minCents: 1 });
+  const parsedAmount = parseStrictUsdDepositAmount(amount ?? 100.0);
   if ('error' in parsedAmount) {
     return res.status(400).json({ error: parsedAmount.error });
   }
@@ -4928,12 +4935,18 @@ app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, async (r
       metadata: {
         category: 'TRANSACTION',
         eventType: 'TRANSACTION_STATUS_UPDATED',
+        senderName: updatedTx.senderName || undefined,
+        recipientName: updatedTx.recipientName || undefined,
+        destinationLabel: updatedTx.metadata?.destinationLabel || undefined,
         transactionType: updatedTx.type,
         direction: isCredit ? 'CREDIT' : 'DEBIT',
         amount: Number(updatedTx.amount || 0),
         currency: updatedTx.currency || 'USD',
         status,
         referenceNumber: updatedTx.referenceNumber,
+        ...(typeof reason === 'string' && reason.trim()
+          ? { description: reason.trim(), descriptionProvided: true }
+          : { descriptionProvided: false }),
         reason: reason || undefined,
         date: new Date().toISOString(),
       },

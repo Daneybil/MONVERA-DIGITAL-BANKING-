@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { auth } from '../../services/firebase';
+import { validateUsdDepositAmount, MIN_USD_DEPOSIT_DOLLARS } from '../../utils/depositValidation';
 import confetti from 'canvas-confetti';
 import {
   X,
@@ -34,9 +35,9 @@ export const DepositModal: React.FC = () => {
 
   const handleDepositSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const numAmount = parseFloat(amount);
-    if (isNaN(numAmount) || numAmount <= 0) {
-      setErrorMessage('Please enter a valid deposit amount.');
+    const validation = validateUsdDepositAmount(amount);
+    if ('error' in validation) {
+      setErrorMessage(validation.error);
       return;
     }
 
@@ -58,7 +59,7 @@ export const DepositModal: React.FC = () => {
       // 1. Try Stripe Checkout Session
       const stripeRes = await api.createStripeCheckoutSession({
         userId: currentUser.id,
-        amount: numAmount,
+        amount: validation.amount,
         destinationAccountType: destinationAccount,
       });
 
@@ -94,6 +95,14 @@ export const DepositModal: React.FC = () => {
 
   const checkingAcc = balanceMetrics?.accounts?.find((a) => a.type === 'CHECKING');
   const savingsAcc = balanceMetrics?.accounts?.find((a) => a.type === 'SAVINGS');
+  const parsedPreviewAmount = parseFloat(amount || '0');
+  const formattedPreviewAmount =
+    Number.isFinite(parsedPreviewAmount) && parsedPreviewAmount > 0
+      ? parsedPreviewAmount.toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })
+      : '0.00';
 
   return (
     <div
@@ -242,19 +251,28 @@ export const DepositModal: React.FC = () => {
 
               {/* 3. Amount Input */}
               <div className="space-y-2">
-                <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
-                  3. Enter Deposit Amount (USD)
-                </label>
+                <div className="flex items-center justify-between gap-2">
+                  <label className="block text-xs font-black text-slate-900 uppercase tracking-wider font-mono">
+                    3. Enter Deposit Amount (USD)
+                  </label>
+                  <span id="deposit-minimum-note" className="text-[11px] font-mono font-bold text-emerald-800">
+                    Minimum deposit: $1.00 USD
+                  </span>
+                </div>
                 <div className="relative">
                   <span className="absolute left-5 top-3.5 text-2xl font-black text-slate-400 font-mono">$</span>
                   <input
+                    id="deposit-amount-input"
                     type="number"
                     step="0.01"
-                    min="10"
+                    min={MIN_USD_DEPOSIT_DOLLARS.toFixed(2)}
                     required
-                    placeholder="0.00"
+                    placeholder="1.00"
                     value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
+                    onChange={(e) => {
+                      setAmount(e.target.value);
+                      if (errorMessage) setErrorMessage(null);
+                    }}
                     className="w-full pl-10 pr-4 py-3.5 text-2xl sm:text-3xl font-black font-mono text-slate-950 rounded-2xl border-2 border-slate-300 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 bg-white"
                   />
                 </div>
@@ -287,7 +305,7 @@ export const DepositModal: React.FC = () => {
                     </>
                   ) : (
                     <>
-                      <span>Authorize & Deposit ${parseFloat(amount || '0').toLocaleString()} USD</span>
+                      <span>Authorize & Deposit ${formattedPreviewAmount} USD</span>
                       <ArrowRight className="w-5 h-5 text-white" />
                     </>
                   )}

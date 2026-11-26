@@ -27,15 +27,32 @@ import { NotificationItem } from '../../types';
 import { NotificationSettingsModal } from './NotificationSettingsModal';
 import { pushNotificationService, PushRegistrationResult } from '../../services/pushNotificationService';
 import { firestoreSync } from '../../services/firestoreSync';
+import { MonveraLogo } from '../common/MonveraLogo';
+import { buildTransactionNotificationPresentation } from '../../utils/transactionNotificationFormatter';
 
 interface NotificationsDrawerProps {
   isOpen: boolean;
   onClose: () => void;
+  onBack?: () => void;
 }
 
-export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen, onClose }) => {
+const VIEW_LABELS: Record<string, string> = {
+  dashboard: 'Overview',
+  accounts: 'Accounts',
+  transactions: 'Transactions',
+  investments: 'Investment',
+  cards: 'Card',
+  loans: 'Loans & Credit',
+  business: 'Business Banking',
+  profile: 'Profile',
+  security: 'Profile',
+  admin: 'Admin Console',
+};
+
+export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen, onClose, onBack }) => {
   const {
     currentUser,
+    currentView,
     notifications,
     markAllNotificationsAsRead,
     markNotificationAsRead,
@@ -307,6 +324,17 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
 
   const detailTarget = activeNotification ? resolveNavigationTarget(activeNotification) : null;
   const meta = activeNotification?.metadata;
+  const activePresentation = activeNotification ? buildTransactionNotificationPresentation(activeNotification) : null;
+  const previousScreenLabel = VIEW_LABELS[currentView] || 'Dashboard';
+
+  const handleBackToPreviousSection = () => {
+    setSelectedNotification(null);
+    if (onBack) {
+      onBack();
+    } else {
+      onClose();
+    }
+  };
 
   return (
     <div
@@ -324,69 +352,116 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
         className="w-full max-w-lg bg-white h-full shadow-2xl border-l border-slate-200 flex flex-col animate-slideInRight"
       >
         {/* Header */}
-        <div className="p-5 sm:p-6 border-b-2 border-slate-200 bg-slate-50 flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            {activeNotification ? (
-              <div className="flex items-center gap-3">
+        <div className="p-4 sm:p-6 border-b-2 border-slate-200 bg-slate-50 flex flex-col gap-3.5">
+          {activeNotification ? (
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-3 min-w-0">
                 <button
+                  id="notification-detail-back-btn"
+                  type="button"
                   onClick={() => setSelectedNotification(null)}
-                  className="w-10 h-10 rounded-xl bg-white hover:bg-slate-200 text-slate-900 flex items-center justify-center border-2 border-slate-300 transition-colors shadow-xs cursor-pointer"
+                  className="w-10 h-10 rounded-xl bg-white hover:bg-slate-200 text-slate-900 flex items-center justify-center border-2 border-slate-300 transition-colors shadow-xs cursor-pointer shrink-0"
                   title="Back to all notifications"
+                  aria-label="Back to all notifications"
                 >
                   <ArrowLeft className="w-5 h-5 stroke-[2.5]" />
                 </button>
-                <div>
-                  <h3 className="font-extrabold text-slate-950 text-xl tracking-tight">Notification Details</h3>
-                  <p className="text-xs font-extrabold text-slate-700 font-mono">
+                <div className="min-w-0">
+                  <h3 className="font-extrabold text-slate-950 text-lg sm:text-xl tracking-tight truncate">Notification Details</h3>
+                  <p className="text-xs font-extrabold text-slate-700 font-mono truncate">
                     ID: {activeNotification.id.slice(0, 18)}
                   </p>
                 </div>
               </div>
-            ) : (
-              <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-2xl bg-slate-950 text-sky-400 flex items-center justify-center shadow-md">
-                  <Bell className="w-6 h-6 stroke-[2.5]" />
+
+              <div className="flex items-center justify-end gap-2 shrink-0">
+                <button
+                  id="drawer-preferences-btn"
+                  type="button"
+                  onClick={() => setShowSettingsModal(true)}
+                  className="text-xs font-extrabold text-slate-900 hover:text-slate-950 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border-2 border-slate-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
+                  title="Notification Preferences"
+                >
+                  <Sliders className="w-3.5 h-3.5 stroke-[2.5]" />
+                  <span className="hidden sm:inline">Preferences</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedNotification(null);
+                    onClose();
+                  }}
+                  className="w-10 h-10 rounded-xl bg-white hover:bg-slate-200 text-slate-900 flex items-center justify-center border-2 border-slate-300 transition-colors cursor-pointer"
+                  title="Close"
+                  aria-label="Close Notification Center"
+                >
+                  <X className="w-5 h-5 stroke-[2.5]" />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Top Navigation Bar with Accessible Back Button */}
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  id="notifications-back-btn"
+                  type="button"
+                  onClick={handleBackToPreviousSection}
+                  aria-label={`Back to ${previousScreenLabel}`}
+                  title={`Back to ${previousScreenLabel}`}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white hover:bg-slate-200 text-slate-900 border-2 border-slate-300 text-xs font-extrabold transition-colors shadow-xs cursor-pointer shrink-0 whitespace-nowrap"
+                >
+                  <ArrowLeft className="w-4 h-4 stroke-[2.5]" />
+                  <span>Back</span>
+                </button>
+
+                <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
+                  <button
+                    id="drawer-preferences-btn"
+                    type="button"
+                    onClick={() => setShowSettingsModal(true)}
+                    className="text-xs font-extrabold text-slate-900 hover:text-slate-950 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border-2 border-slate-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
+                    title="Notification Preferences"
+                  >
+                    <Sliders className="w-3.5 h-3.5 stroke-[2.5]" />
+                    <span>Preferences</span>
+                  </button>
+                  {unreadNotifsCount > 0 && (
+                    <button
+                      type="button"
+                      onClick={markAllNotificationsAsRead}
+                      className="text-xs font-extrabold text-sky-950 hover:text-sky-900 px-3 py-2 rounded-xl bg-sky-100 hover:bg-sky-200 border-2 border-sky-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
+                    >
+                      <CheckCheck className="w-4 h-4 stroke-[2.5]" />
+                      <span>Mark all read</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleBackToPreviousSection}
+                    className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-white hover:bg-slate-200 text-slate-900 flex items-center justify-center border-2 border-slate-300 transition-colors cursor-pointer"
+                    title="Close"
+                    aria-label="Close Notification Center"
+                  >
+                    <X className="w-5 h-5 stroke-[2.5]" />
+                  </button>
                 </div>
-                <div>
-                  <h3 className="font-extrabold text-slate-950 text-2xl tracking-tight">Notification Center</h3>
-                  <p className="text-sm font-extrabold text-sky-950">
+              </div>
+
+              {/* Title Row */}
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-2xl bg-slate-950 text-sky-400 flex items-center justify-center shadow-md shrink-0">
+                  <Bell className="w-5 h-5 sm:w-6 sm:h-6 stroke-[2.5]" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="font-extrabold text-slate-950 text-xl sm:text-2xl tracking-tight">Notification Center</h3>
+                  <p className="text-xs sm:text-sm font-extrabold text-sky-950">
                     {unreadNotifsCount} unread alert{unreadNotifsCount !== 1 ? 's' : ''} & system updates
                   </p>
                 </div>
               </div>
-            )}
-
-            <div className="flex flex-wrap items-center justify-end gap-2 shrink-0">
-              <button
-                id="drawer-preferences-btn"
-                onClick={() => setShowSettingsModal(true)}
-                className="text-xs font-extrabold text-slate-900 hover:text-slate-950 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 border-2 border-slate-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
-                title="Notification Preferences"
-              >
-                <Sliders className="w-3.5 h-3.5 stroke-[2.5]" />
-                <span>Preferences</span>
-              </button>
-              {!selectedNotification && unreadNotifsCount > 0 && (
-                <button
-                  onClick={markAllNotificationsAsRead}
-                  className="text-xs font-extrabold text-sky-950 hover:text-sky-900 px-3 py-2 rounded-xl bg-sky-100 hover:bg-sky-200 border-2 border-sky-300 transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
-                >
-                  <CheckCheck className="w-4 h-4 stroke-[2.5]" />
-                  <span>Mark all read</span>
-                </button>
-              )}
-              <button
-                onClick={() => {
-                  setSelectedNotification(null);
-                  onClose();
-                }}
-                className="w-10 h-10 rounded-xl bg-white hover:bg-slate-200 text-slate-900 flex items-center justify-center border-2 border-slate-300 transition-colors cursor-pointer"
-                title="Close"
-              >
-                <X className="w-5 h-5 stroke-[2.5]" />
-              </button>
-            </div>
-          </div>
+            </>
+          )}
 
           {/* Filter Tabs (Only shown in list mode) */}
           {!selectedNotification && (
@@ -420,127 +495,313 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
           {activeNotification ? (
             /* --- DETAIL VIEW OF SPECIFIC NOTIFICATION --- */
             <div className="space-y-5 animate-fadeIn">
-              {/* Top Banner Card */}
-              <div className="p-6 rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-sky-950 text-white space-y-4 shadow-xl border-2 border-slate-800">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3.5">
-                    <div
-                      className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 ${
-                        activeNotification.type === 'SECURITY'
-                          ? 'bg-sky-500/30 text-sky-300 border-2 border-sky-400'
-                          : activeNotification.type === 'INVESTMENT'
-                          ? 'bg-emerald-500/30 text-emerald-300 border-2 border-emerald-400'
-                          : activeNotification.severity === 'warning'
-                          ? 'bg-amber-500/30 text-amber-300 border-2 border-amber-400'
-                          : activeNotification.severity === 'error'
-                          ? 'bg-rose-500/30 text-rose-300 border-2 border-rose-400'
-                          : 'bg-white/20 text-white border-2 border-white/30'
-                      }`}
-                    >
-                      {React.createElement(getIcon(activeNotification.type, activeNotification), { className: 'w-6 h-6 stroke-[2.5]' })}
+              {activePresentation?.isFinancialTransaction ? (
+                <>
+                  {/* Monvera-Branded Financial Transaction Notice Card */}
+                  <div
+                    id="notification-branded-tx-card"
+                    className="p-5 sm:p-6 rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-emerald-950 text-white space-y-4 shadow-xl border-2 border-slate-800"
+                  >
+                    <div className="flex items-center justify-between gap-3 pb-3 border-b border-white/15">
+                      <div className="flex flex-col gap-1 min-w-0">
+                        <MonveraLogo variant="full" size="sm" isLight={true} />
+                        <span className="text-[10px] font-mono font-black tracking-[0.2em] uppercase text-emerald-300">
+                          MONVERA DIGITAL BANKING
+                        </span>
+                      </div>
+                      {activePresentation.status && (
+                        <span className="text-[10px] font-mono font-black uppercase px-2.5 py-1 rounded-lg bg-white/10 border border-white/20 text-white shrink-0">
+                          {activePresentation.status}
+                        </span>
+                      )}
                     </div>
-                    <div>
-                      <span className="text-xs font-mono font-black uppercase tracking-wider text-sky-400 block">
-                        {activeNotification.type} NOTIFICATION
-                      </span>
-                      <h4 className="text-lg sm:text-xl font-extrabold text-white leading-tight">
+
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          id="notification-detail-heading"
+                          className={`text-xs font-mono font-black uppercase tracking-widest px-2.5 py-1 rounded-md border ${
+                            activePresentation.direction === 'CREDIT'
+                              ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/40'
+                              : activePresentation.direction === 'INTERNAL'
+                              ? 'bg-sky-500/20 text-sky-300 border-sky-400/40'
+                              : 'bg-rose-500/20 text-rose-300 border-rose-400/40'
+                          }`}
+                        >
+                          {activePresentation.heading}
+                        </span>
+                        <span className="text-xs font-bold text-slate-300">
+                          {activePresentation.transactionLabel}
+                        </span>
+                      </div>
+
+                      {activePresentation.signedAmountFormatted && (
+                        <div
+                          id="notification-detail-amount"
+                          className={`text-2xl sm:text-3xl font-mono font-black tracking-tight ${
+                            activePresentation.direction === 'CREDIT'
+                              ? 'text-emerald-300'
+                              : activePresentation.direction === 'INTERNAL'
+                              ? 'text-sky-200'
+                              : 'text-rose-300'
+                          }`}
+                        >
+                          {activePresentation.signedAmountFormatted}
+                        </div>
+                      )}
+
+                      <h4 className="text-base sm:text-lg font-extrabold text-white leading-snug">
                         {activeNotification.title}
                       </h4>
                     </div>
+
+                    <div className="pt-3 border-t border-white/15 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-100 font-bold">
+                      <span className="flex items-center gap-1.5">
+                        <Clock className="w-4 h-4 text-emerald-300 stroke-[2.5]" />
+                        <span>
+                          {activePresentation.formattedDate} • {activePresentation.formattedTime}
+                        </span>
+                      </span>
+                      <span className="font-mono text-xs font-black bg-white/10 border border-white/20 px-2.5 py-1 rounded-lg text-slate-100">
+                        Ref: {activePresentation.reference}
+                      </span>
+                    </div>
                   </div>
-                </div>
 
-                <div className="pt-3 border-t border-white/20 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-100 font-bold">
-                  <span className="flex items-center gap-2">
-                    <Clock className="w-4 h-4 text-sky-300 stroke-[2.5]" />
-                    <span>
-                      {new Date(activeNotification.createdAt).toLocaleString(undefined, {
-                        dateStyle: 'medium',
-                        timeStyle: 'short',
-                      })}
-                    </span>
-                  </span>
-                  {(meta?.referenceNumber || activeNotification.referenceId) && (
-                    <span className="font-mono text-xs font-black bg-sky-900/80 border border-sky-400 px-3 py-1 rounded-lg text-sky-100">
-                      Ref: {meta?.referenceNumber || activeNotification.referenceId}
-                    </span>
-                  )}
-                </div>
-              </div>
+                  {/* Transaction Notice Explanation */}
+                  <div className="p-5 sm:p-6 rounded-3xl bg-slate-50 border-2 border-slate-200 space-y-2 shadow-xs">
+                    <h5 className="text-xs font-black uppercase tracking-wider text-slate-900">
+                      Transaction Notice
+                    </h5>
+                    <p className="text-sm sm:text-base font-bold text-slate-950 leading-relaxed">
+                      {activeNotification.message?.trim()
+                        ? activeNotification.message
+                        : activePresentation.usedDebitFallbackDescription
+                        ? 'Money transferred'
+                        : activePresentation.transactionLabel}
+                    </p>
+                  </div>
 
-              {/* Complete Notification Message */}
-              <div className="p-6 rounded-3xl bg-slate-50 border-2 border-slate-200 space-y-3 shadow-xs">
-                <h5 className="text-xs font-black uppercase tracking-wider text-slate-900">
-                  Message Details & Notice
-                </h5>
-                <p className="text-base sm:text-lg font-bold text-slate-950 leading-relaxed">
-                  {activeNotification.message}
-                </p>
-              </div>
+                  {/* Structured Financial Transaction Details */}
+                  <div
+                    id="notification-transaction-details-grid"
+                    className="grid grid-cols-1 sm:grid-cols-2 gap-3.5"
+                  >
+                    {activePresentation.senderName && (
+                      <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                        <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                          Sender
+                        </span>
+                        <div className="text-sm font-extrabold text-slate-950">{activePresentation.senderName}</div>
+                      </div>
+                    )}
 
-              {/* Structured Banking Record Metadata */}
-              {meta && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-                  {meta.customerName && (
-                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
-                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Customer Name</span>
-                      <div className="text-sm font-extrabold text-slate-950">{meta.customerName}</div>
-                    </div>
-                  )}
-                  {meta.accountNumberMasked && (
-                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
-                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Account</span>
-                      <div className="text-sm font-mono font-extrabold text-slate-950">{meta.accountNumberMasked}</div>
-                    </div>
-                  )}
-                  {(meta.transactionType || meta.applicationType || meta.requestType) && (
+                    {activePresentation.recipientName && (
+                      <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                        <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                          Recipient
+                        </span>
+                        <div className="text-sm font-extrabold text-slate-950">{activePresentation.recipientName}</div>
+                      </div>
+                    )}
+
+                    {activePresentation.merchantOrDestination &&
+                      activePresentation.merchantOrDestination !== activePresentation.recipientName && (
+                        <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                            Merchant / Destination
+                          </span>
+                          <div className="text-sm font-extrabold text-slate-950">
+                            {activePresentation.merchantOrDestination}
+                          </div>
+                        </div>
+                      )}
+
+                    {activePresentation.accountNumberMasked && (
+                      <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                        <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                          Account
+                        </span>
+                        <div className="text-sm font-mono font-extrabold text-slate-950">
+                          {activePresentation.accountNumberMasked}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
                       <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
-                        {meta.transactionType ? 'Transaction Type' : meta.applicationType ? 'Application Type' : 'Request Type'}
+                        Date
                       </span>
-                      <div className="text-sm font-extrabold text-slate-950">
-                        {meta.transactionType || meta.applicationType || meta.requestType}
+                      <div className="text-sm font-extrabold text-slate-950">{activePresentation.formattedDate}</div>
+                    </div>
+
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                        Time
+                      </span>
+                      <div className="text-sm font-mono font-extrabold text-slate-950">{activePresentation.formattedTime}</div>
+                    </div>
+
+                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                        Reference
+                      </span>
+                      <div className="text-xs font-mono font-extrabold text-slate-950 break-all">
+                        {activePresentation.reference}
                       </div>
                     </div>
-                  )}
-                  {(typeof meta.amount === 'number' || meta.direction) && (
-                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
-                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
-                        {meta.direction ? `${meta.direction} Amount` : 'Amount'}
-                      </span>
+
+                    {activePresentation.signedAmountFormatted && (
+                      <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                        <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                          Amount & Currency
+                        </span>
+                        <div
+                          className={`text-sm font-mono font-black ${
+                            activePresentation.direction === 'CREDIT'
+                              ? 'text-emerald-700'
+                              : activePresentation.direction === 'INTERNAL'
+                              ? 'text-sky-700'
+                              : 'text-rose-700'
+                          }`}
+                        >
+                          {activePresentation.signedAmountFormatted}
+                        </div>
+                      </div>
+                    )}
+
+                    {activePresentation.description && (
                       <div
-                        className={`text-sm font-mono font-black ${
-                          meta.direction === 'CREDIT'
-                            ? 'text-emerald-700'
-                            : meta.direction === 'DEBIT'
-                            ? 'text-rose-700'
-                            : 'text-slate-950'
-                        }`}
+                        id="notification-detail-description"
+                        className="sm:col-span-2 p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs"
                       >
-                        {meta.direction === 'CREDIT' ? '+' : meta.direction === 'DEBIT' ? '-' : ''}
-                        {formatMoney(meta.amount, meta.currency || 'USD') || meta.direction}
+                        <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                          Description
+                        </span>
+                        <div className="text-sm font-extrabold text-slate-950">{activePresentation.description}</div>
+                      </div>
+                    )}
+
+                    {meta?.reason && (
+                      <div className="sm:col-span-2 p-4 rounded-2xl bg-rose-50 border-2 border-rose-200 space-y-1 shadow-xs">
+                        <span className="text-[11px] font-black text-rose-800 uppercase tracking-wider block">
+                          Reason / Review Note
+                        </span>
+                        <div className="text-sm font-bold text-rose-950">{meta.reason}</div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* Top Banner Card (Non-Transaction Alerts: Security, Support, System) */}
+                  <div className="p-6 rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-sky-950 text-white space-y-4 shadow-xl border-2 border-slate-800">
+                    <div className="flex items-center justify-between gap-2 pb-2 border-b border-white/15">
+                      <MonveraLogo variant="short" size="sm" isLight={true} />
+                      <span className="text-[10px] font-mono font-black tracking-wider uppercase text-sky-300">
+                        MONVERA DIGITAL BANKING
+                      </span>
+                    </div>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-3.5">
+                        <div
+                          className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 ${
+                            activeNotification.type === 'SECURITY'
+                              ? 'bg-sky-500/30 text-sky-300 border-2 border-sky-400'
+                              : activeNotification.severity === 'warning'
+                              ? 'bg-amber-500/30 text-amber-300 border-2 border-amber-400'
+                              : activeNotification.severity === 'error'
+                              ? 'bg-rose-500/30 text-rose-300 border-2 border-rose-400'
+                              : 'bg-white/20 text-white border-2 border-white/30'
+                          }`}
+                        >
+                          {React.createElement(getIcon(activeNotification.type, activeNotification), { className: 'w-6 h-6 stroke-[2.5]' })}
+                        </div>
+                        <div>
+                          <span className="text-xs font-mono font-black uppercase tracking-wider text-sky-400 block">
+                            {activeNotification.type} NOTIFICATION
+                          </span>
+                          <h4 className="text-lg sm:text-xl font-extrabold text-white leading-tight">
+                            {activeNotification.title}
+                          </h4>
+                        </div>
                       </div>
                     </div>
-                  )}
-                  {meta.status && (
-                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
-                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Status</span>
-                      <div className="text-sm font-black text-slate-950">{meta.status}</div>
+
+                    <div className="pt-3 border-t border-white/20 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-100 font-bold">
+                      <span className="flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-sky-300 stroke-[2.5]" />
+                        <span>
+                          {new Date(activeNotification.createdAt).toLocaleString(undefined, {
+                            dateStyle: 'medium',
+                            timeStyle: 'short',
+                          })}
+                        </span>
+                      </span>
+                      {(meta?.referenceNumber || activeNotification.referenceId) && (
+                        <span className="font-mono text-xs font-black bg-sky-900/80 border border-sky-400 px-3 py-1 rounded-lg text-sky-100">
+                          Ref: {meta?.referenceNumber || activeNotification.referenceId}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Complete Notification Message */}
+                  <div className="p-6 rounded-3xl bg-slate-50 border-2 border-slate-200 space-y-3 shadow-xs">
+                    <h5 className="text-xs font-black uppercase tracking-wider text-slate-900">
+                      Message Details & Notice
+                    </h5>
+                    <p className="text-base sm:text-lg font-bold text-slate-950 leading-relaxed">
+                      {activeNotification.message}
+                    </p>
+                  </div>
+
+                  {/* Structured Banking Record Metadata */}
+                  {meta && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                      {meta.customerName && (
+                        <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Customer Name</span>
+                          <div className="text-sm font-extrabold text-slate-950">{meta.customerName}</div>
+                        </div>
+                      )}
+                      {meta.accountNumberMasked && (
+                        <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Account</span>
+                          <div className="text-sm font-mono font-extrabold text-slate-950">{meta.accountNumberMasked}</div>
+                        </div>
+                      )}
+                      {(meta.transactionType || meta.applicationType || meta.requestType) && (
+                        <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">
+                            {meta.transactionType ? 'Transaction Type' : meta.applicationType ? 'Application Type' : 'Request Type'}
+                          </span>
+                          <div className="text-sm font-extrabold text-slate-950">
+                            {meta.transactionType || meta.applicationType || meta.requestType}
+                          </div>
+                        </div>
+                      )}
+                      {meta.status && (
+                        <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Status</span>
+                          <div className="text-sm font-black text-slate-950">{meta.status}</div>
+                        </div>
+                      )}
+                      {meta.referenceNumber && (
+                        <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Reference ID</span>
+                          <div className="text-xs font-mono font-extrabold text-slate-950 break-all">{meta.referenceNumber}</div>
+                        </div>
+                      )}
+                      {meta.reason && (
+                        <div className="sm:col-span-2 p-4 rounded-2xl bg-rose-50 border-2 border-rose-200 space-y-1 shadow-xs">
+                          <span className="text-[11px] font-black text-rose-800 uppercase tracking-wider block">Reason / Review Note</span>
+                          <div className="text-sm font-bold text-rose-950">{meta.reason}</div>
+                        </div>
+                      )}
                     </div>
                   )}
-                  {meta.referenceNumber && (
-                    <div className="p-4 rounded-2xl bg-white border-2 border-slate-200 space-y-1 shadow-xs">
-                      <span className="text-[11px] font-black text-slate-600 uppercase tracking-wider block">Reference ID</span>
-                      <div className="text-xs font-mono font-extrabold text-slate-950 break-all">{meta.referenceNumber}</div>
-                    </div>
-                  )}
-                  {meta.reason && (
-                    <div className="sm:col-span-2 p-4 rounded-2xl bg-rose-50 border-2 border-rose-200 space-y-1 shadow-xs">
-                      <span className="text-[11px] font-black text-rose-800 uppercase tracking-wider block">Reason / Review Note</span>
-                      <div className="text-sm font-bold text-rose-950">{meta.reason}</div>
-                    </div>
-                  )}
-                </div>
+                </>
               )}
 
               {/* Metadata Attributes */}
@@ -727,7 +988,10 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                 const Icon = getIcon(n.type, n);
                 const isSupport = n.type === 'SUPPORT';
                 const navTarget = resolveNavigationTarget(n);
-                const amountDisplay = formatMoney(n.metadata?.amount, n.metadata?.currency || 'USD');
+                const itemPresentation = buildTransactionNotificationPresentation(n);
+                const amountDisplay =
+                  itemPresentation.signedAmountFormatted ||
+                  formatMoney(n.metadata?.amount, n.metadata?.currency || 'USD');
 
                 return (
                   <div
@@ -773,32 +1037,62 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
                           </span>
                         </div>
                         <p className="text-sm font-bold text-slate-900 line-clamp-2 leading-relaxed">
-                          {n.message}
+                          {n.message?.trim()
+                            ? n.message
+                            : itemPresentation.usedDebitFallbackDescription
+                            ? 'Money transferred'
+                            : itemPresentation.transactionLabel}
                         </p>
-                        {(amountDisplay || n.metadata?.status || n.metadata?.referenceNumber) && (
+                        {(itemPresentation.isFinancialTransaction || amountDisplay || n.metadata?.status || n.metadata?.referenceNumber) && (
                           <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                            {itemPresentation.isFinancialTransaction && (
+                              <span
+                                className={`text-[10px] font-mono font-black uppercase px-2 py-0.5 rounded-md border ${
+                                  itemPresentation.direction === 'CREDIT'
+                                    ? 'bg-emerald-950 text-emerald-200 border-emerald-700'
+                                    : itemPresentation.direction === 'INTERNAL'
+                                    ? 'bg-sky-950 text-sky-200 border-sky-700'
+                                    : 'bg-rose-950 text-rose-200 border-rose-700'
+                                }`}
+                              >
+                                {itemPresentation.heading}
+                              </span>
+                            )}
                             {amountDisplay && (
                               <span
                                 className={`text-[11px] font-mono font-black px-2 py-0.5 rounded-md border ${
-                                  n.metadata?.direction === 'CREDIT'
+                                  itemPresentation.direction === 'CREDIT'
                                     ? 'bg-emerald-100 text-emerald-900 border-emerald-300'
-                                    : n.metadata?.direction === 'DEBIT'
-                                    ? 'bg-rose-100 text-rose-900 border-rose-300'
-                                    : 'bg-slate-100 text-slate-900 border-slate-300'
+                                    : itemPresentation.direction === 'INTERNAL'
+                                    ? 'bg-sky-100 text-sky-900 border-sky-300'
+                                    : 'bg-rose-100 text-rose-900 border-rose-300'
                                 }`}
                               >
-                                {n.metadata?.direction === 'CREDIT' ? '+' : n.metadata?.direction === 'DEBIT' ? '-' : ''}
                                 {amountDisplay}
                               </span>
                             )}
+                            {itemPresentation.isFinancialTransaction &&
+                              itemPresentation.direction === 'CREDIT' &&
+                              itemPresentation.senderName && (
+                                <span className="text-[10px] font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md">
+                                  From: {itemPresentation.senderName}
+                                </span>
+                              )}
+                            {itemPresentation.isFinancialTransaction &&
+                              itemPresentation.direction === 'DEBIT' &&
+                              itemPresentation.recipientName && (
+                                <span className="text-[10px] font-bold text-slate-700 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md">
+                                  To: {itemPresentation.recipientName}
+                                </span>
+                              )}
                             {n.metadata?.status && (
                               <span className="text-[10px] font-mono font-black uppercase px-2 py-0.5 rounded-md bg-slate-100 text-slate-800 border border-slate-300">
                                 {n.metadata.status}
                               </span>
                             )}
-                            {n.metadata?.referenceNumber && (
+                            {(itemPresentation.reference || n.metadata?.referenceNumber) && (
                               <span className="text-[10px] font-mono font-bold text-slate-600">
-                                Ref: {n.metadata.referenceNumber}
+                                Ref: {itemPresentation.reference}
                               </span>
                             )}
                           </div>

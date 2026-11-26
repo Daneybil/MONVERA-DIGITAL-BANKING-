@@ -464,6 +464,14 @@ export interface NotificationItem {
     category?: string;
     eventType?: string;
     customerName?: string;
+    senderName?: string;
+    recipientName?: string;
+    merchantName?: string;
+    destinationLabel?: string;
+    description?: string;
+    descriptionProvided?: boolean;
+    sourceAccountLabel?: string;
+    destAccountLabel?: string;
     accountNumberMasked?: string;
     transactionType?: string;
     direction?: 'CREDIT' | 'DEBIT';

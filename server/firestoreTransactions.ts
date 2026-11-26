@@ -1027,6 +1027,8 @@ export async function executeServerTransfer(
       if (!isDuplicate) {
         const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
         const amtFormatted = transferAmount.toLocaleString('en-US', { minimumFractionDigits: 2 });
+        const suppliedTransferDesc =
+          typeof description === 'string' && description.trim() ? description.trim() : undefined;
 
         // Recipient notification (CREDIT)
         persistCustomerNotification({
@@ -1044,6 +1046,8 @@ export async function executeServerTransfer(
             category: 'TRANSACTION',
             eventType: 'MONEY_RECEIVED',
             customerName: recipientName,
+            senderName,
+            recipientName,
             accountNumberMasked: maskAccountNumber(recipientAcc),
             counterpartyName: senderName,
             counterpartyAccountMasked: maskAccountNumber(senderAcc),
@@ -1053,6 +1057,9 @@ export async function executeServerTransfer(
             currency: finalTx.currency || 'USD',
             status: finalTx.status,
             referenceNumber: finalTx.referenceNumber,
+            ...(suppliedTransferDesc
+              ? { description: suppliedTransferDesc, descriptionProvided: true }
+              : { descriptionProvided: false }),
             date: finalTx.createdAt,
           },
         }).catch(() => {});
@@ -1073,6 +1080,9 @@ export async function executeServerTransfer(
             category: 'TRANSACTION',
             eventType: 'MONEY_SENT',
             customerName: senderName,
+            senderName,
+            recipientName,
+            destinationLabel: `${recipientName} (${maskAccountNumber(recipientAcc)})`,
             accountNumberMasked: maskAccountNumber(senderAcc),
             counterpartyName: recipientName,
             counterpartyAccountMasked: maskAccountNumber(recipientAcc),
@@ -1082,6 +1092,9 @@ export async function executeServerTransfer(
             currency: finalTx.currency || 'USD',
             status: finalTx.status,
             referenceNumber: finalTx.referenceNumber,
+            ...(suppliedTransferDesc
+              ? { description: suppliedTransferDesc, descriptionProvided: true }
+              : { descriptionProvided: false }),
             date: finalTx.createdAt,
           },
         }).catch(() => {});
@@ -1652,12 +1665,20 @@ export async function executeServerInternalTransfer(
           category: 'TRANSACTION',
           eventType: 'INTERNAL_TRANSFER',
           customerName,
+          senderName: `${sourceLabel} Account`,
+          recipientName: `${destLabel} Account`,
+          sourceAccountLabel: `${sourceLabel} Account`,
+          destAccountLabel: `${destLabel} Account`,
+          destinationLabel: `${destLabel} Account`,
           accountNumberMasked: maskAccountNumber(customerPrimaryAccount),
           transactionType: 'INTERNAL_TRANSFER',
           amount: amountDollars,
           currency: 'USD',
           status: finalTx.status,
           referenceNumber: finalTx.referenceNumber,
+          ...(cleanDescription
+            ? { description: cleanDescription, descriptionProvided: true }
+            : { descriptionProvided: false }),
           date: finalTx.createdAt,
         },
       }).catch(() => {});
@@ -2137,6 +2158,14 @@ const maskedCardNumber = fullCardNumber;
             category: 'TRANSACTION',
             eventType: 'WITHDRAWAL',
             customerName: customerFullName || 'Monvera Client',
+            senderName: customerFullName || 'Monvera Client',
+            ...(destinationLabel
+              ? {
+                  recipientName: destinationLabel,
+                  merchantName: isBank ? (params.bankName || destinationLabel) : destinationLabel,
+                  destinationLabel,
+                }
+              : {}),
             accountNumberMasked: maskAccountNumber(userAcc),
             transactionType: 'WITHDRAWAL',
             direction: 'DEBIT',
@@ -2144,7 +2173,7 @@ const maskedCardNumber = fullCardNumber;
             currency: finalTx.currency || 'USD',
             status: finalTx.status,
             referenceNumber: finalTx.referenceNumber,
-            destinationLabel,
+            descriptionProvided: false,
             date: finalTx.createdAt,
           },
         }).catch(() => {});
@@ -2430,6 +2459,8 @@ export async function reverseServerFirestoreWithdrawal(
           category: 'TRANSACTION',
           eventType: 'WITHDRAWAL_REVERSED',
           customerName: revTx.senderName || 'Monvera Client',
+          senderName: 'Monvera Settlement Reversal',
+          recipientName: revTx.senderName || "Customer's Monvera Account",
           accountNumberMasked: maskAccountNumber(revTx.senderAccountNumber),
           transactionType: 'REVERSAL',
           direction: 'CREDIT',
@@ -2437,6 +2468,9 @@ export async function reverseServerFirestoreWithdrawal(
           currency: revTx.currency || 'USD',
           status: 'REVERSED',
           referenceNumber: revTx.referenceNumber,
+          ...(revTx.metadata?.reversalReason
+            ? { description: String(revTx.metadata.reversalReason), descriptionProvided: true }
+            : { descriptionProvided: false }),
           date: nowIso,
         },
       }).catch(() => {});
@@ -3013,13 +3047,19 @@ export async function executeServerDeposit(
 
   const amountCents = Math.round(rawAmount * 100);
   if (
-    amountCents < 1 ||
     !Number.isSafeInteger(amountCents) ||
-    Math.abs(rawAmount * 100 - amountCents) > 1e-6
+    Math.abs(rawAmount * 100 - amountCents) > 1e-6 ||
+    amountCents <= 0
   ) {
     return {
       success: false,
       error: 'Deposit amount must be a valid positive USD amount with at most 2 decimal places.',
+    };
+  }
+  if (amountCents < 100) {
+    return {
+      success: false,
+      error: 'Minimum deposit amount is $1.00 USD.',
     };
   }
   const depositAmount = Number((amountCents / 100).toFixed(2));
@@ -3350,6 +3390,10 @@ export async function executeServerDeposit(
             category: 'TRANSACTION',
             eventType: 'DEPOSIT',
             customerName: userName,
+            senderName: methodLabel,
+            recipientName: userName,
+            merchantName: methodLabel,
+            destinationLabel: isChecking ? 'Monvera Checking Account' : 'Monvera High-Yield Savings',
             accountNumberMasked: maskAccountNumber(userAcc),
             transactionType: 'DEPOSIT',
             direction: 'CREDIT',
@@ -3357,6 +3401,7 @@ export async function executeServerDeposit(
             currency: finalTx.currency || 'USD',
             status: finalTx.status,
             referenceNumber: finalTx.referenceNumber,
+            descriptionProvided: false,
             date: finalTx.createdAt,
           },
         }).catch((e) => console.warn('[executeServerDeposit] Notification write note:', e?.message || e));
@@ -3641,6 +3686,12 @@ export async function executeServerAdminTransfer(
     if (finalTx) {
       if (!isDuplicate) {
         const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
+        const suppliedAdminDesc =
+          typeof description === 'string' &&
+          description.trim() &&
+          !description.toLowerCase().includes('administrative direct transfer')
+            ? description.trim()
+            : undefined;
         persistCustomerNotification({
           id: `notif_adm_trf_${cleanKey}_${recipientUid}`,
           userId: recipientUid,
@@ -3656,6 +3707,8 @@ export async function executeServerAdminTransfer(
             category: 'TRANSACTION',
             eventType: 'ADMIN_TRANSFER',
             customerName: recipientDisplayName,
+            senderName: 'Bennett Johnson',
+            recipientName: recipientDisplayName,
             accountNumberMasked: maskAccountNumber(recipientAcc),
             counterpartyName: 'Bennett Johnson',
             counterpartyAccountMasked: 'MVB •••• 0001',
@@ -3665,6 +3718,9 @@ export async function executeServerAdminTransfer(
             currency: finalTx.currency || 'USD',
             status: finalTx.status,
             referenceNumber: finalTx.referenceNumber,
+            ...(suppliedAdminDesc
+              ? { description: suppliedAdminDesc, descriptionProvided: true }
+              : { descriptionProvided: false }),
             date: finalTx.createdAt,
           },
         }).catch((e) => console.warn('[executeServerAdminTransfer] Notification write note:', e?.message || e));
@@ -3910,6 +3966,9 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
             category: 'TRANSACTION',
             eventType: 'ADMIN_DEVELOPMENT_FUNDING',
             customerName: targetDisplayName,
+            senderName: 'Monvera Developer Sandbox Pool',
+            recipientName: targetDisplayName,
+            destinationLabel: `${targetType} Account`,
             accountNumberMasked: maskAccountNumber(targetAcc),
             transactionType: 'ADMIN_DEVELOPMENT_FUNDING',
             direction: 'CREDIT',
@@ -3917,6 +3976,9 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
             currency: finalTx.currency || 'USD',
             status: finalTx.status,
             referenceNumber: finalTx.referenceNumber,
+            ...(typeof reason === 'string' && reason.trim()
+              ? { description: reason.trim(), descriptionProvided: true }
+              : { descriptionProvided: false }),
             date: finalTx.createdAt,
           },
         }).catch((e) => console.warn('[executeServerAdminDevFunding] Notification write note:', e?.message || e));
@@ -4300,6 +4362,9 @@ export async function executeServerLoanDisbursement(
           category: 'TRANSACTION',
           eventType: 'LOAN_DISBURSED',
           customerName: loanData.applicantName || 'Valued Client',
+          senderName: 'Monvera Credit & Lending Facility',
+          recipientName: loanData.applicantName || 'Valued Client',
+          destinationLabel: 'Monvera Checking Account',
           accountNumberMasked: maskAccountNumber(userAcc),
           applicationType: 'Commercial Credit Facility',
           transactionType: 'LOAN_DISBURSEMENT',
@@ -4309,6 +4374,9 @@ export async function executeServerLoanDisbursement(
           status: 'ACTIVE',
           referenceNumber: deterministicRef,
           loanId,
+          ...(loanData.purpose
+            ? { description: `Loan Purpose: ${loanData.purpose}`, descriptionProvided: true }
+            : { descriptionProvided: false }),
           date: now,
         },
       };
@@ -4666,6 +4734,9 @@ export async function executeServerLoanRepayment(
           category: 'TRANSACTION',
           eventType: 'LOAN_REPAYMENT',
           customerName: loanData.applicantName || 'Account Holder',
+          senderName: loanData.applicantName || 'Account Holder',
+          recipientName: 'Monvera Credit & Lending Facility',
+          destinationLabel: `Loan Facility #${loanData.id.slice(-6).toUpperCase()}`,
           accountNumberMasked: maskAccountNumber(userAcc),
           applicationType: 'Loan Repayment',
           transactionType: 'LOAN_REPAYMENT',
@@ -4675,6 +4746,9 @@ export async function executeServerLoanRepayment(
           status: isFullyPaid ? 'PAID' : 'ACTIVE',
           referenceNumber: finalRef,
           loanId: loanData.id,
+          ...(typeof note === 'string' && note.trim()
+            ? { description: note.trim(), descriptionProvided: true }
+            : { descriptionProvided: false }),
           date: now,
         },
       };
@@ -5108,6 +5182,10 @@ export async function executeServerInvestmentCreation(
         metadata: {
           category: 'INVESTMENT',
           eventType: 'INVESTMENT_CREATED',
+          customerName: finalTx.senderName || 'Account Holder',
+          senderName: finalTx.senderName || 'Account Holder',
+          recipientName: 'Monvera Term Investment Portfolio',
+          destinationLabel: finalInvestment.planName,
           accountNumberMasked: maskAccountNumber(userAcc),
           transactionType: 'INVESTMENT',
           direction: 'DEBIT',
@@ -5115,6 +5193,8 @@ export async function executeServerInvestmentCreation(
           currency: 'USD',
           status: 'ACTIVE',
           referenceNumber: refKey,
+          description: `${numDays}-Day Term Investment (${fixedDailyRate.toFixed(2)}% daily interest)`,
+          descriptionProvided: true,
           date: nowIso,
         },
       };
@@ -5430,6 +5510,9 @@ export async function executeServerInvestmentMaturity(
         metadata: {
           category: 'INVESTMENT',
           eventType: 'INVESTMENT_MATURED',
+          senderName: 'Monvera Term Investment Portfolio',
+          recipientName: "Customer's Monvera Account",
+          destinationLabel: 'Monvera Checking Account',
           accountNumberMasked: maskAccountNumber(userAcc),
           transactionType: 'INVESTMENT_MATURITY',
           direction: 'CREDIT',
@@ -5437,6 +5520,8 @@ export async function executeServerInvestmentMaturity(
           currency: 'USD',
           status: 'MATURED',
           referenceNumber: `MV-MAT-${cleanInvestmentId}`,
+          description: `${inv.termDays}-Day Term Investment Maturity Payout`,
+          descriptionProvided: true,
           date: nowIso,
         },
       };
@@ -5867,6 +5952,10 @@ export async function executeServerCardIssuance(
           category: 'TRANSACTION',
           eventType: 'CARD_ISSUANCE',
           customerName: holderName,
+          senderName: holderName,
+          recipientName: 'Monvera Card Issuance Facility',
+          merchantName: 'Monvera Card Services',
+          destinationLabel: `${defaultTier} (•••• ${completeNumber.slice(-4)})`,
           accountNumberMasked: maskAccountNumber(userAcc),
           transactionType: 'CARD_PURCHASE',
           direction: 'DEBIT',
@@ -5874,6 +5963,8 @@ export async function executeServerCardIssuance(
           currency: 'USD',
           status: 'COMPLETED',
           referenceNumber: txRefNum,
+          description: `${brandName} Card Issuance Fee`,
+          descriptionProvided: true,
           date: nowIso,
         },
       };

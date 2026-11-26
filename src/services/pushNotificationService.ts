@@ -1,5 +1,12 @@
 import { getMessaging, getToken, onMessage, isSupported, Messaging } from 'firebase/messaging';
 import { app, auth } from './firebase';
+import {
+  normalizePushPayload,
+  buildNotificationNavTargetFromNormalized,
+  PushNotificationDeduplicator,
+  type NormalizedPushNotification,
+  type NotificationNavTarget,
+} from '../utils/pushNotificationPayload';
 
 export interface PushRegistrationResult {
   status: 'granted' | 'denied' | 'default' | 'unsupported';
@@ -17,9 +24,12 @@ export interface PushNotificationServiceDeps {
   acquireFcmTokenFn?: (registration: ServiceWorkerRegistration) => Promise<string | null>;
   getNotificationPermissionFn?: () => NotificationPermission | 'unsupported';
   requestNotificationPermissionFn?: () => Promise<NotificationPermission>;
+  subscribeOnMessageFn?: (handler: (payload: any) => void) => () => void;
+  displayNotificationFn?: (title: string, options?: NotificationOptions) => void;
 }
 
 export class PushNotificationService {
+  private foregroundDeduplicator = new PushNotificationDeduplicator(60_000, 100);
   private messaging: Messaging | null = null;
   private supported: boolean | null = null;
   private serviceWorkerRegistration: ServiceWorkerRegistration | null = null;
@@ -598,63 +608,288 @@ export class PushNotificationService {
     }
   }
 
+  private static readonly CROSS_TAB_OS_DEDUPE_KEY = 'monvera_fg_push_os_claims';
+  private static readonly CROSS_TAB_OS_DEDUPE_WINDOW_MS = 15_000;
+
   /**
-   * Subscribe to foreground push messages while the user has Monvera open
+   * Coordinate across multiple visible same-origin tabs/PWA windows so an FCM
+   * foreground broadcast triggers at most one OS notification per event.
    */
-  public listenToForegroundMessages(onMessageReceived: (payload: any) => void): () => void {
+  private claimCrossTabOsNotification(tag: string, nowMs: number = Date.now()): boolean {
+    const cleanTag = String(tag || '').trim();
+    if (!cleanTag) return true;
+
+    try {
+      if (typeof window === 'undefined' || !window.localStorage) {
+        return true;
+      }
+
+      const raw = window.localStorage.getItem(PushNotificationService.CROSS_TAB_OS_DEDUPE_KEY);
+      const parsed: Record<string, number> = raw ? JSON.parse(raw) || {} : {};
+      const next: Record<string, number> = {};
+
+      for (const [k, ts] of Object.entries(parsed)) {
+        if (typeof ts === 'number' && nowMs - ts < PushNotificationService.CROSS_TAB_OS_DEDUPE_WINDOW_MS) {
+          next[k] = ts;
+        }
+      }
+
+      if (typeof next[cleanTag] === 'number' && nowMs - next[cleanTag] < PushNotificationService.CROSS_TAB_OS_DEDUPE_WINDOW_MS) {
+        return false;
+      }
+
+      next[cleanTag] = nowMs;
+
+      // Bound stored entries so storage stays tiny
+      const entries = Object.entries(next);
+      if (entries.length > 40) {
+        entries.sort((a, b) => a[1] - b[1]);
+        for (const [oldKey] of entries.slice(0, entries.length - 40)) {
+          delete next[oldKey];
+        }
+      }
+
+      window.localStorage.setItem(PushNotificationService.CROSS_TAB_OS_DEDUPE_KEY, JSON.stringify(next));
+    } catch {
+      // Never suppress OS notifications if storage is unavailable or restricted
+    }
+
+    return true;
+  }
+
+  /**
+   * Resolve a ServiceWorkerRegistration capable of calling showNotification()
+   * for foreground OS notification display (required on Android Chrome / installed PWAs).
+   */
+  private async resolveActiveSwRegistrationForDisplay(): Promise<ServiceWorkerRegistration | null> {
+    if (
+      this.serviceWorkerRegistration &&
+      typeof this.serviceWorkerRegistration.showNotification === 'function'
+    ) {
+      return this.serviceWorkerRegistration;
+    }
+
+    if (this.deps.ensureActiveSwFn) {
+      const injectedReg = await this.deps.ensureActiveSwFn().catch(() => null);
+      if (injectedReg && typeof injectedReg.showNotification === 'function') {
+        this.serviceWorkerRegistration = injectedReg;
+        return injectedReg;
+      }
+    }
+
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+      return null;
+    }
+
+    if (typeof window !== 'undefined') {
+      const ensured = await this.ensureActiveServiceWorkerRegistration().catch(() => null);
+      if (ensured && typeof ensured.showNotification === 'function') {
+        return ensured;
+      }
+    }
+
+    try {
+      if (typeof navigator.serviceWorker.getRegistration === 'function') {
+        const reg = await navigator.serviceWorker.getRegistration('/').catch(() => null);
+        if (reg && typeof reg.showNotification === 'function' && (reg.active || !reg.installing)) {
+          this.serviceWorkerRegistration = reg;
+          return reg;
+        }
+      }
+
+      if (navigator.serviceWorker.ready) {
+        const readyReg = await Promise.race([
+          navigator.serviceWorker.ready.catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+        ]);
+        if (readyReg && typeof readyReg.showNotification === 'function') {
+          this.serviceWorkerRegistration = readyReg;
+          return readyReg;
+        }
+      }
+    } catch {
+      // Ignore SW lookup failures
+    }
+
+    return null;
+  }
+
+  /**
+   * Subscribe to foreground push messages while the user has Monvera open.
+   * Deduplicates rapid duplicate deliveries, notifies the in-app listener (toast + balance/drawer sync),
+   * and displays an OS notification via the active ServiceWorkerRegistration when permission is granted
+   * (both when Monvera is open/visible on Android/PWA/desktop and when minimized/hidden).
+   */
+  public listenToForegroundMessages(
+    onMessageReceived: (payload: any, normalized: NormalizedPushNotification) => void
+  ): () => void {
     let unsubscribe: (() => void) | null = null;
+    let disposed = false;
+
+    const handleIncoming = (payload: any) => {
+      if (disposed) return;
+      const normalized = normalizePushPayload(payload);
+      if (!this.foregroundDeduplicator.shouldAccept(normalized.dedupeKey)) {
+        return;
+      }
+
+      onMessageReceived(payload, normalized);
+
+      const browserPerm = this.getBrowserNotificationPermission();
+      if (browserPerm === 'granted') {
+        const tag = normalized.dedupeKey.slice(0, 96);
+        if (!this.claimCrossTabOsNotification(tag)) {
+          return;
+        }
+
+        const options = {
+          body: normalized.body,
+          icon: '/pwa-192x192.png',
+          badge: '/pwa-192x192.png',
+          tag,
+          renotify: false,
+          actions: [
+            {
+              action: 'read_more',
+              title: 'Read More',
+            },
+          ],
+          data: {
+            title: normalized.title,
+            body: normalized.body,
+            url: normalized.url,
+            actionView: normalized.actionView,
+            transactionId: normalized.transactionId,
+            referenceId: normalized.referenceId,
+            direction: normalized.direction,
+            amount: normalized.amount,
+            currency: normalized.currency,
+            description: normalized.description,
+            category: normalized.category,
+            type: normalized.type,
+            timestamp: normalized.timestamp,
+          },
+        } as NotificationOptions;
+
+        void this.displayServiceWorkerNotification(normalized.title, options).catch((err) => {
+          console.warn('[Push] Foreground OS notification display note:', err);
+        });
+      }
+    };
+
+    if (this.deps.subscribeOnMessageFn) {
+      unsubscribe = this.deps.subscribeOnMessageFn(handleIncoming);
+      return () => {
+        disposed = true;
+        if (unsubscribe) unsubscribe();
+      };
+    }
 
     this.init().then((messaging) => {
-      if (!messaging) return;
+      if (!messaging || disposed) return;
       try {
-        unsubscribe = onMessage(messaging, (payload) => {
-          console.log('[Push] Foreground push message received:', payload);
-          onMessageReceived(payload);
-
-          // If window is blurred or document is hidden, show native browser notification
-          if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
-            const title = payload.notification?.title || payload.data?.title || 'Monvera Digital Bank';
-            const body = payload.notification?.body || payload.data?.body || 'New financial activity alert.';
-            this.displayClientNotification(title, {
-              body,
-              icon: '/pwa-192x192.png',
-              tag: payload.data?.referenceId || 'monvera-foreground',
-            });
-          }
-        });
+        unsubscribe = onMessage(messaging, handleIncoming);
       } catch (err) {
         console.warn('[Push] onMessage listener setup note:', err);
       }
     });
 
     return () => {
+      disposed = true;
       if (unsubscribe) unsubscribe();
     };
+  }
+
+  /**
+   * Listen to navigation messages posted by the Service Worker when a user clicks
+   * an OS notification or its "Read More" action button.
+   */
+  public listenToServiceWorkerNavigationMessages(
+    onNavigate: (target: NotificationNavTarget) => void
+  ): () => void {
+    if (typeof window === 'undefined' || !('serviceWorker' in navigator)) {
+      return () => {};
+    }
+
+    const handleSwMessage = (event: MessageEvent) => {
+      const msg = event?.data;
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'MONVERA_PUSH_NAVIGATE' && msg.payload) {
+        onNavigate(msg.payload as NotificationNavTarget);
+        return;
+      }
+
+      if (msg.isFirebaseMessaging && msg.messageType === 'notification-clicked') {
+        const normalized = normalizePushPayload(msg);
+        onNavigate(buildNotificationNavTargetFromNormalized(normalized));
+      }
+    };
+
+    navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+    };
+  }
+
+  /**
+   * Display an OS notification through the active ServiceWorkerRegistration.showNotification API
+   * (with Notification constructor fallback only when no SW registration is available).
+   */
+  public async displayServiceWorkerNotification(
+    title: string,
+    options?: NotificationOptions
+  ): Promise<boolean> {
+    if (this.deps.displayNotificationFn) {
+      this.deps.displayNotificationFn(title, options);
+      return true;
+    }
+
+    if (this.getBrowserNotificationPermission() !== 'granted') {
+      return false;
+    }
+
+    const mergedOptions: NotificationOptions = {
+      icon: '/pwa-192x192.png',
+      badge: '/pwa-192x192.png',
+      ...options,
+    };
+
+    try {
+      const swReg = await this.resolveActiveSwRegistrationForDisplay();
+      if (swReg && typeof swReg.showNotification === 'function') {
+        await swReg.showNotification(title, mergedOptions);
+        return true;
+      }
+
+      if (typeof window !== 'undefined' && 'Notification' in window) {
+        const { actions: _ignoredSwActions, ...windowNotificationOptions } = mergedOptions as NotificationOptions & {
+          actions?: unknown;
+        };
+        const notif = new Notification(title, windowNotificationOptions);
+        notif.onclick = () => {
+          try {
+            window.focus();
+            const normalized = normalizePushPayload({ title, ...options, data: options?.data });
+            const navTarget = buildNotificationNavTargetFromNormalized(normalized);
+            window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: navTarget }));
+          } catch {}
+          notif.close();
+        };
+        return true;
+      }
+    } catch (err) {
+      console.warn('[Push] Direct notification display note:', err);
+    }
+
+    return false;
   }
 
   /**
    * Display a direct browser notification safely if permissions allow
    */
   public displayClientNotification(title: string, options?: NotificationOptions): void {
-    if (typeof window === 'undefined' || !('Notification' in window)) return;
-    if (Notification.permission !== 'granted') return;
-
-    try {
-      if (this.serviceWorkerRegistration && 'showNotification' in this.serviceWorkerRegistration) {
-        this.serviceWorkerRegistration.showNotification(title, {
-          icon: '/pwa-192x192.png',
-          badge: '/pwa-192x192.png',
-          ...options,
-        });
-      } else {
-        new Notification(title, {
-          icon: '/pwa-192x192.png',
-          ...options,
-        });
-      }
-    } catch (err) {
-      console.warn('[Push] Direct notification display note:', err);
-    }
+    void this.displayServiceWorkerNotification(title, options);
   }
 }
 

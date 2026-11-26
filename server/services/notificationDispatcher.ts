@@ -568,17 +568,107 @@ function sanitizePushText(raw: unknown, maxLength: number): string {
     .slice(0, maxLength);
 }
 
-function formatSafePushContent(event: DispatchNotificationEvent): {
+function resolvePublicHttpsAppOrigin(): string | null {
+  const candidates = [
+    process.env.PUBLIC_APP_URL,
+    process.env.FRONTEND_URL,
+    process.env.APP_URL,
+    process.env.VITE_APP_URL,
+  ];
+  for (const raw of candidates) {
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('https://')) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === 'https:') {
+        return parsed.origin;
+      }
+    } catch {
+      // Ignore malformed origin env value
+    }
+  }
+  return null;
+}
+
+function sanitizeQueryIdParam(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/[\x00-\x1f\x7f<>#?&/\s]/g, '')
+    .trim()
+    .slice(0, 96);
+}
+
+function inferPushEventDirection(
+  event: DispatchNotificationEvent,
+  customTitle: string,
+  customBody: string
+): 'DEBIT' | 'CREDIT' | 'INFO' {
+  if (event.type === 'MONEY_SENT') return 'DEBIT';
+  if (event.type === 'MONEY_RECEIVED') return 'CREDIT';
+
+  const eventKeyUpper = String(event.eventKey || '').toUpperCase();
+  const stageUpper = String(event.lifecycleStage || '').toUpperCase();
+  if (stageUpper === 'REVERSED' || eventKeyUpper.endsWith(':REVERSED')) {
+    return 'CREDIT';
+  }
+  if (
+    stageUpper === 'INITIATED' ||
+    stageUpper === 'SUBMITTED' ||
+    eventKeyUpper.endsWith(':INITIATED') ||
+    eventKeyUpper.endsWith(':SUBMITTED')
+  ) {
+    return 'DEBIT';
+  }
+
+  const combined = `${customTitle} ${customBody}`.toLowerCase();
+  if (
+    combined.includes('credited back') ||
+    combined.includes('credited to') ||
+    combined.includes('matured') ||
+    combined.includes('disbursed') ||
+    combined.includes('deposit') ||
+    combined.includes('received') ||
+    combined.includes('welcome reward')
+  ) {
+    return 'CREDIT';
+  }
+  if (
+    combined.includes('withdrawal') ||
+    combined.includes('repayment') ||
+    combined.includes('settled in full') ||
+    combined.includes('card issued') ||
+    combined.includes('check issued') ||
+    combined.includes('wire check') ||
+    combined.includes('investment activated') ||
+    combined.includes('debited')
+  ) {
+    return 'DEBIT';
+  }
+
+  if (event.type === 'INVESTMENT') return 'DEBIT';
+  return 'INFO';
+}
+
+export function formatSafePushContent(event: DispatchNotificationEvent): {
   title: string;
   body: string;
   url: string;
+  actionView: string;
   category: NotificationCategory;
   safeRef: string;
+  transactionId: string;
+  direction: 'DEBIT' | 'CREDIT' | 'INFO';
+  amountString: string;
+  currency: string;
+  description: string;
+  dedupeTag: string;
 } {
   const category = resolveNotificationCategory(event);
   const safeRef = String(event.referenceNumber || event.transactionId || 'MV-ALERT').slice(0, 64);
-  const url = sanitizeActionUrl(event.actionUrl);
+  const safeTxId = sanitizeQueryIdParam(String(event.transactionId || '')) || safeRef;
   const accountLabel = sanitizeAccountLabel(event.accountMasked);
+  const currency = sanitizePushText(event.currency || 'USD', 8).toUpperCase() || 'USD';
 
   const customTitle = sanitizePushText(event.title, 120);
   const customBody = sanitizePushText(event.body, 320);
@@ -587,40 +677,135 @@ function formatSafePushContent(event: DispatchNotificationEvent): {
     typeof event.amount === 'number' && Number.isFinite(event.amount)
       ? `$${event.amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
       : '';
+  const amountString =
+    typeof event.amount === 'number' && Number.isFinite(event.amount)
+      ? event.amount.toFixed(2)
+      : '';
+  const formattedAmtWithCurrency = formattedAmt ? `${formattedAmt} ${currency}` : '';
+
+  const direction = inferPushEventDirection(event, customTitle, customBody);
+
+  // Build deep-link destination URL carrying view + opaque transaction identifiers (zero PII)
+  const sanitizedBaseUrl = sanitizeActionUrl(event.actionUrl);
+  let url = sanitizedBaseUrl;
+  let actionView = 'transactions';
+  try {
+    const parsed = new URL(sanitizedBaseUrl, 'https://monvera.invalid');
+    const existingView = (parsed.searchParams.get('view') || '').trim().toLowerCase();
+    const isTransactionCategory =
+      category === 'TRANSACTION' ||
+      event.type === 'MONEY_SENT' ||
+      event.type === 'MONEY_RECEIVED';
+
+    if (isTransactionCategory) {
+      actionView = 'transactions';
+    } else if (existingView && existingView !== 'dashboard') {
+      actionView = existingView;
+    } else if (category === 'SECURITY') {
+      actionView = 'profile';
+    } else if (category === 'INVESTMENT') {
+      actionView = 'investments';
+    } else {
+      actionView = 'dashboard';
+    }
+
+    parsed.searchParams.set('view', actionView);
+    if (safeTxId && safeTxId !== 'MV-ALERT') {
+      parsed.searchParams.set('transactionId', safeTxId);
+    }
+    if (safeRef && safeRef !== 'MV-ALERT') {
+      const cleanRefParam = sanitizeQueryIdParam(safeRef);
+      if (cleanRefParam) {
+        parsed.searchParams.set('referenceId', cleanRefParam);
+      }
+    }
+    url = `${parsed.pathname}${parsed.search}`.slice(0, 300);
+  } catch {
+    actionView = 'transactions';
+    url = '/dashboard?view=transactions';
+  }
 
   let fallbackTitle = 'Account Alert — Monvera';
-  let fallbackBody = formattedAmt
-    ? `Account activity of ${formattedAmt} on ${accountLabel}. Ref: ${safeRef}.`
+  let fallbackBody = formattedAmtWithCurrency
+    ? `Account activity of ${formattedAmtWithCurrency} on ${accountLabel}. Ref: ${safeRef}.`
     : `New activity recorded on ${accountLabel}. Ref: ${safeRef}.`;
+  let description = customBody || `Account activity on ${accountLabel}`;
+
+  const LEGACY_GENERIC_TRANSFER_TITLES = new Set([
+    'Transfer Sent — Monvera',
+    'Money Received — Monvera',
+    'Deposit Credited — Monvera',
+    'Account Alert — Monvera',
+  ]);
+  const hasExplicitCustomBody = Boolean(customBody);
+  const effectiveCustomTitle =
+    !hasExplicitCustomBody && LEGACY_GENERIC_TRANSFER_TITLES.has(customTitle)
+      ? ''
+      : customTitle;
 
   if (event.type === 'MONEY_RECEIVED') {
-    const sender = (event.senderName || 'Monvera Member').trim().slice(0, 60);
-    fallbackTitle = 'Money Received — Monvera';
-    fallbackBody = formattedAmt
-      ? `You received ${formattedAmt} from ${sender} (${accountLabel}). Ref: ${safeRef}.`
-      : `You received a deposit into ${accountLabel}. Ref: ${safeRef}.`;
+    const sender = sanitizePushText(event.senderName || 'Monvera Member', 60) || 'Monvera Member';
+    const isDirectDeposit = customTitle === 'Deposit Credited — Monvera';
+    const sourceLabel = isDirectDeposit
+      ? `${sender} (${accountLabel})`
+      : `${sender} (${accountLabel})`;
+    description = `From ${sourceLabel}`;
+    fallbackTitle = 'Account Credited';
+    fallbackBody = formattedAmtWithCurrency
+      ? `Your account has received ${formattedAmtWithCurrency} from ${sourceLabel}. Ref: ${safeRef}.`
+      : `Your account has received a credit from ${sourceLabel}. Ref: ${safeRef}.`;
   } else if (event.type === 'MONEY_SENT') {
-    const recipient = (event.recipientName || 'Recipient').trim().slice(0, 60);
-    fallbackTitle = 'Transfer Sent — Monvera';
-    fallbackBody = formattedAmt
-      ? `You sent ${formattedAmt} to ${recipient} from ${accountLabel}. Ref: ${safeRef}.`
-      : `Your transfer from ${accountLabel} was processed. Ref: ${safeRef}.`;
+    const recipient = sanitizePushText(event.recipientName || 'Recipient', 60) || 'Recipient';
+    const transferDesc = `Transfer to ${recipient} (${accountLabel})`;
+    description = transferDesc;
+    fallbackTitle = 'Account Debited';
+    fallbackBody = formattedAmtWithCurrency
+      ? `Your account has been debited ${formattedAmtWithCurrency} for ${transferDesc}. Ref: ${safeRef}.`
+      : `Your account has been debited for ${transferDesc}. Ref: ${safeRef}.`;
   } else if (category === 'SECURITY') {
+    description = customBody || 'Account security update';
     fallbackTitle = 'Security Alert — Monvera';
     fallbackBody = `Important security update on your Monvera profile. Ref: ${safeRef}.`;
   } else if (category === 'INVESTMENT') {
+    description = customBody || `Investment activity (${accountLabel})`;
     fallbackTitle = 'Investment Update — Monvera';
     fallbackBody = formattedAmt
       ? `Investment activity of ${formattedAmt} recorded. Ref: ${safeRef}.`
       : `An update occurred on your Monvera investment portfolio. Ref: ${safeRef}.`;
+  } else if (direction === 'DEBIT') {
+    const debitDesc = customBody || `Account transaction (${accountLabel})`;
+    description = debitDesc;
+    fallbackTitle = 'Account Debited';
+    fallbackBody = formattedAmtWithCurrency
+      ? `Your account has been debited ${formattedAmtWithCurrency} for ${debitDesc}. Ref: ${safeRef}.`
+      : `Your account has been debited for ${debitDesc}. Ref: ${safeRef}.`;
+  } else if (direction === 'CREDIT') {
+    const creditDesc = customBody || `Account credit (${accountLabel})`;
+    description = creditDesc;
+    fallbackTitle = 'Account Credited';
+    fallbackBody = formattedAmtWithCurrency
+      ? `Your account has received ${formattedAmtWithCurrency} from ${creditDesc}. Ref: ${safeRef}.`
+      : `Your account has received a credit from ${creditDesc}. Ref: ${safeRef}.`;
   }
 
+  const dedupeSeed = sanitizePushText(
+    `${event.eventKey || safeTxId || safeRef}_${event.type}_${direction}`,
+    96
+  ).replace(/\s+/g, '_');
+
   return {
-    title: customTitle || fallbackTitle,
+    title: effectiveCustomTitle || fallbackTitle,
     body: customBody || fallbackBody,
     url,
+    actionView,
     category,
     safeRef,
+    transactionId: safeTxId,
+    direction,
+    amountString,
+    currency,
+    description: sanitizePushText(description, 140),
+    dedupeTag: dedupeSeed || safeRef,
   };
 }
 
@@ -1962,6 +2147,11 @@ export class ServerNotificationDispatcher {
       const batchDeliveredIds: string[] = [];
 
       try {
+        const publicHttpsOrigin = resolvePublicHttpsAppOrigin();
+        const webpushFcmOptions = publicHttpsOrigin
+          ? { fcmOptions: { link: new URL(content.url, publicHttpsOrigin).toString() } }
+          : {};
+
         const batchResponse = await messaging.sendEachForMulticast({
           tokens: batch.map((d) => d.token),
           notification: {
@@ -1978,26 +2168,42 @@ export class ServerNotificationDispatcher {
               body: content.body,
               icon: '/pwa-192x192.png',
               badge: '/pwa-192x192.png',
-              tag: content.safeRef,
+              tag: content.dedupeTag,
               renotify: true,
+              actions: [
+                {
+                  action: 'read_more',
+                  title: 'Read More',
+                },
+              ],
               data: {
                 url: content.url,
+                actionView: content.actionView,
+                transactionId: content.transactionId,
                 referenceId: content.safeRef,
                 category: content.category,
+                direction: content.direction,
+                amount: content.amountString,
+                currency: content.currency,
+                description: content.description,
               },
             },
-            fcmOptions: {
-              link: content.url,
-            },
+            ...webpushFcmOptions,
           },
           data: {
             title: content.title,
             body: content.body,
             referenceId: content.safeRef,
-            transactionId: String(event.transactionId || content.safeRef),
+            transactionId: content.transactionId,
             type: String(event.type),
             category: content.category,
+            direction: content.direction,
+            amount: content.amountString,
+            currency: content.currency,
+            description: content.description,
+            actionView: content.actionView,
             url: content.url,
+            eventKey: String(event.eventKey || ''),
             timestamp: nowIso,
           },
         });

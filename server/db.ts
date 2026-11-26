@@ -425,18 +425,44 @@ export class MonveraDatabase {
     });
 
     // Generate notifications for both parties
+    const senderFullName = `${sender.firstName || ''} ${sender.lastName || ''}`.trim() || sender.username || 'Monvera Member';
+    const recipientFullName = `${recipient.firstName || ''} ${recipient.lastName || ''}`.trim() || recipient.username || 'Monvera Recipient';
+    const suppliedTrfDesc = typeof params.description === 'string' && params.description.trim() ? params.description.trim() : undefined;
+    const trfNow = tx.createdAt || new Date().toISOString();
+
     this.notifications.unshift({
       id: `notif_${Date.now()}_s`,
       userId: sender.id,
       title: 'Transfer Sent',
       message: `You transferred $${params.amount.toLocaleString('en-US', {
         minimumFractionDigits: 2,
-      })} to ${recipient.firstName} ${recipient.lastName} (MVB •••• ${recipient.permanentAccountNumber.slice(-4)}).`,
+      })} to ${recipientFullName} (MVB •••• ${recipient.permanentAccountNumber.slice(-4)}).`,
       type: 'TRANSACTION',
       severity: 'info',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: trfNow,
       referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'MONEY_SENT',
+        customerName: senderFullName,
+        senderName: senderFullName,
+        recipientName: recipientFullName,
+        destinationLabel: `${recipientFullName} (MVB •••• ${recipient.permanentAccountNumber.slice(-4)})`,
+        accountNumberMasked: `MVB •••• ${sender.permanentAccountNumber.slice(-4)}`,
+        transactionType: 'TRANSFER',
+        direction: 'DEBIT',
+        amount: params.amount,
+        currency: 'USD',
+        status: 'COMPLETED',
+        referenceNumber: tx.referenceNumber,
+        ...(suppliedTrfDesc
+          ? { description: suppliedTrfDesc, descriptionProvided: true }
+          : { descriptionProvided: false }),
+        date: trfNow,
+      },
     });
 
     this.notifications.unshift({
@@ -445,12 +471,32 @@ export class MonveraDatabase {
       title: 'Money Received',
       message: `Received $${params.amount.toLocaleString('en-US', {
         minimumFractionDigits: 2,
-      })} from ${sender.firstName} ${sender.lastName} (MVB •••• ${sender.permanentAccountNumber.slice(-4)}).`,
+      })} from ${senderFullName} (MVB •••• ${sender.permanentAccountNumber.slice(-4)}).`,
       type: 'TRANSACTION',
       severity: 'success',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: trfNow,
       referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'MONEY_RECEIVED',
+        customerName: recipientFullName,
+        senderName: senderFullName,
+        recipientName: recipientFullName,
+        accountNumberMasked: `MVB •••• ${recipient.permanentAccountNumber.slice(-4)}`,
+        transactionType: 'TRANSFER',
+        direction: 'CREDIT',
+        amount: params.amount,
+        currency: 'USD',
+        status: 'COMPLETED',
+        referenceNumber: tx.referenceNumber,
+        ...(suppliedTrfDesc
+          ? { description: suppliedTrfDesc, descriptionProvided: true }
+          : { descriptionProvided: false }),
+        date: trfNow,
+      },
     });
 
     return { success: true, transaction: tx };
@@ -610,6 +656,12 @@ export class MonveraDatabase {
     });
 
     // Notify recipient
+    const suppliedAdmDesc =
+      typeof params.description === 'string' &&
+      params.description.trim() &&
+      !params.description.toLowerCase().includes('administrative direct transfer')
+        ? params.description.trim()
+        : undefined;
     this.notifications.unshift({
       id: `notif_${Date.now()}_adm_r`,
       userId: targetUser.id,
@@ -622,6 +674,26 @@ export class MonveraDatabase {
       read: false,
       createdAt: txTimestamp,
       referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'ADMIN_TRANSFER',
+        customerName: recipientDisplayName,
+        senderName: 'Bennett Johnson',
+        recipientName: recipientDisplayName,
+        accountNumberMasked: `MVB •••• ${(recipientAcc || '0000').slice(-4)}`,
+        transactionType: 'TRANSFER',
+        direction: 'CREDIT',
+        amount: params.amount,
+        currency: 'USD',
+        status: 'COMPLETED',
+        referenceNumber: tx.referenceNumber,
+        ...(suppliedAdmDesc
+          ? { description: suppliedAdmDesc, descriptionProvided: true }
+          : { descriptionProvided: false }),
+        date: txTimestamp,
+      },
     });
 
     // Audit log
@@ -653,7 +725,19 @@ export class MonveraDatabase {
   }): { success: boolean; transaction?: Transaction; error?: string } {
     const user = this.users.get(params.userId);
     if (!user) return { success: false, error: 'Customer account not found.' };
-    if (params.amount <= 0) return { success: false, error: 'Deposit amount must be greater than $0.00.' };
+    const depositAmountNum = Number(params.amount);
+    const depositCents = Math.round(depositAmountNum * 100);
+    if (
+      !Number.isFinite(depositAmountNum) ||
+      depositAmountNum <= 0 ||
+      !Number.isSafeInteger(depositCents) ||
+      Math.abs(depositAmountNum * 100 - depositCents) > 1e-6
+    ) {
+      return { success: false, error: 'Deposit amount must be a valid positive USD amount with at most 2 decimal places.' };
+    }
+    if (depositCents < 100) {
+      return { success: false, error: 'Minimum deposit amount is $1.00 USD.' };
+    }
 
     const targetType = params.destinationAccountType === 'SAVINGS' ? 'SAVINGS' : 'CHECKING';
     const targetAccountId = targetType === 'SAVINGS' ? `acc_sav_${user.id}` : `acc_chk_${user.id}`;
@@ -686,6 +770,8 @@ export class MonveraDatabase {
       },
     });
 
+    const depUserName = `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.username || 'Monvera Client';
+    const depNow = tx.createdAt || new Date().toISOString();
     this.notifications.unshift({
       id: `notif_${Date.now()}_dep`,
       userId: user.id,
@@ -696,8 +782,28 @@ export class MonveraDatabase {
       type: 'TRANSACTION',
       severity: 'success',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: depNow,
       referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'DEPOSIT',
+        customerName: depUserName,
+        senderName: methodDesc,
+        recipientName: depUserName,
+        merchantName: methodDesc,
+        destinationLabel: `Monvera ${accountName}`,
+        accountNumberMasked: `MVB •••• ${(user.permanentAccountNumber || '0000').slice(-4)}`,
+        transactionType: 'DEPOSIT',
+        direction: 'CREDIT',
+        amount: params.amount,
+        currency: 'USD',
+        status: 'COMPLETED',
+        referenceNumber: tx.referenceNumber,
+        descriptionProvided: false,
+        date: depNow,
+      },
     });
 
     return { success: true, transaction: tx };
@@ -784,6 +890,8 @@ export class MonveraDatabase {
       },
     });
 
+    const wthUserName = `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.username || 'Monvera Client';
+    const wthNow = tx.createdAt || new Date().toISOString();
     this.notifications.unshift({
       id: `notif_${Date.now()}_wth`,
       userId: user.id,
@@ -794,8 +902,32 @@ export class MonveraDatabase {
       type: 'TRANSACTION',
       severity: 'warning',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: wthNow,
       referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'WITHDRAWAL',
+        customerName: wthUserName,
+        senderName: wthUserName,
+        ...(params.destinationLabel
+          ? {
+              recipientName: params.destinationLabel,
+              destinationLabel: params.destinationLabel,
+              merchantName: params.destinationLabel,
+            }
+          : {}),
+        accountNumberMasked: `MVB •••• ${(user.permanentAccountNumber || '0000').slice(-4)}`,
+        transactionType: 'WITHDRAWAL',
+        direction: 'DEBIT',
+        amount: params.amount,
+        currency: 'USD',
+        status: tx.status,
+        referenceNumber: tx.referenceNumber,
+        descriptionProvided: false,
+        date: wthNow,
+      },
     });
 
     // Create persistent withdrawal support record
@@ -881,6 +1013,7 @@ export class MonveraDatabase {
       },
     });
 
+    const revNow = new Date().toISOString();
     this.notifications.unshift({
       id: `notif_${Date.now()}_rev`,
       userId: targetUserId,
@@ -891,8 +1024,26 @@ export class MonveraDatabase {
       type: 'TRANSACTION',
       severity: 'info',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: revNow,
       referenceId: tx.referenceNumber,
+      actionView: 'transactions',
+      actionRecordId: tx.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'WITHDRAWAL_REVERSED',
+        senderName: 'Monvera Settlement Reversal',
+        recipientName: tx.senderName || "Customer's Monvera Account",
+        transactionType: 'REVERSAL',
+        direction: 'CREDIT',
+        amount: tx.amount,
+        currency: tx.currency || 'USD',
+        status: 'REVERSED',
+        referenceNumber: tx.referenceNumber,
+        ...(tx.metadata?.reversalReason
+          ? { description: String(tx.metadata.reversalReason), descriptionProvided: true }
+          : { descriptionProvided: false }),
+        date: revNow,
+      },
     });
 
     return { success: true, transaction: tx };
@@ -1020,6 +1171,7 @@ export class MonveraDatabase {
 
     this.investments.set(invId, plan);
 
+    const invOwnerName = `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.username || 'Account Holder';
     this.notifications.unshift({
       id: `notif_${Date.now()}_inv`,
       userId: user.id,
@@ -1030,7 +1182,28 @@ export class MonveraDatabase {
       type: 'INVESTMENT',
       severity: 'success',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: startDate,
+      referenceId: invId,
+      actionView: 'investments',
+      actionRecordId: invId,
+      metadata: {
+        category: 'INVESTMENT',
+        eventType: 'INVESTMENT_CREATED',
+        customerName: invOwnerName,
+        senderName: invOwnerName,
+        recipientName: 'Monvera Term Investment Portfolio',
+        destinationLabel: plan.planName,
+        accountNumberMasked: `MVB •••• ${(user.permanentAccountNumber || '0000').slice(-4)}`,
+        transactionType: 'INVESTMENT',
+        direction: 'DEBIT',
+        amount: params.amount,
+        currency: 'USD',
+        status: 'ACTIVE',
+        referenceNumber: invId,
+        description: `${params.termDays}-Day Term Investment (${fixedDailyRate.toFixed(2)}% daily interest)`,
+        descriptionProvided: true,
+        date: startDate,
+      },
     });
 
     return { success: true, investment: plan };
@@ -1070,6 +1243,7 @@ export class MonveraDatabase {
       metadata: { investmentId: inv.id, yield: inv.expectedYield },
     });
 
+    const matNow = new Date().toISOString();
     this.notifications.unshift({
       id: `notif_${Date.now()}_mat`,
       userId: inv.userId,
@@ -1080,7 +1254,26 @@ export class MonveraDatabase {
       type: 'INVESTMENT',
       severity: 'success',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: matNow,
+      referenceId: `MV-MAT-${inv.id}`,
+      actionView: 'investments',
+      actionRecordId: inv.id,
+      metadata: {
+        category: 'INVESTMENT',
+        eventType: 'INVESTMENT_MATURED',
+        senderName: 'Monvera Term Investment Portfolio',
+        recipientName: "Customer's Monvera Account",
+        destinationLabel: 'Monvera Checking Account',
+        transactionType: 'INVESTMENT_MATURITY',
+        direction: 'CREDIT',
+        amount: totalReturn,
+        currency: 'USD',
+        status: 'MATURED',
+        referenceNumber: `MV-MAT-${inv.id}`,
+        description: `${inv.termDays}-Day Term Investment Maturity Payout`,
+        descriptionProvided: true,
+        date: matNow,
+      },
     });
 
     return { success: true, investment: inv, payoutAmount: totalReturn };
@@ -1192,6 +1385,7 @@ export class MonveraDatabase {
     this.cards.set(cardId, newCard);
 
     // Instant Notification in Notification Center
+    const cardNow = new Date().toISOString();
     this.notifications.unshift({
       id: `notif_${Date.now()}_card_created`,
       userId: user.id,
@@ -1200,7 +1394,29 @@ export class MonveraDatabase {
       type: 'TRANSACTION',
       severity: 'success',
       read: false,
-      createdAt: new Date().toISOString(),
+      createdAt: cardNow,
+      referenceId: tx.referenceNumber,
+      actionView: 'cards',
+      actionRecordId: newCard.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'CARD_ISSUANCE',
+        customerName: holderName,
+        senderName: holderName,
+        recipientName: 'Monvera Card Issuance Facility',
+        merchantName: 'Monvera Card Services',
+        destinationLabel: `${newCard.cardTier} (•••• ${last4})`,
+        accountNumberMasked: `MVB •••• ${(user.permanentAccountNumber || '0000').slice(-4)}`,
+        transactionType: 'CARD_PURCHASE',
+        direction: 'DEBIT',
+        amount: issuanceFee,
+        currency: 'USD',
+        status: 'COMPLETED',
+        referenceNumber: tx.referenceNumber,
+        description: `${brandName} Card Issuance Fee`,
+        descriptionProvided: true,
+        date: cardNow,
+      },
     });
 
     return {
@@ -2407,6 +2623,27 @@ export class MonveraDatabase {
       read: false,
       createdAt: now,
       referenceId: loan.id,
+      actionView: 'loans',
+      actionRecordId: loan.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'LOAN_DISBURSED',
+        customerName: loan.applicantName || `${user.firstName} ${user.lastName}`.trim() || 'Valued Client',
+        senderName: 'Monvera Credit & Lending Facility',
+        recipientName: loan.applicantName || `${user.firstName} ${user.lastName}`.trim() || 'Valued Client',
+        destinationLabel: 'Monvera Checking Account',
+        accountNumberMasked: `MVB •••• ${(user.permanentAccountNumber || '0000').slice(-4)}`,
+        transactionType: 'LOAN_DISBURSEMENT',
+        direction: 'CREDIT',
+        amount: loan.amount,
+        currency: 'USD',
+        status: 'ACTIVE',
+        referenceNumber: loan.id,
+        ...(loan.purpose
+          ? { description: `Loan Purpose: ${loan.purpose}`, descriptionProvided: true }
+          : { descriptionProvided: false }),
+        date: now,
+      },
     };
     this.notifications.unshift(notifItem);
     if (loan.userId && loan.userId !== user.id) {
@@ -2660,6 +2897,7 @@ export class MonveraDatabase {
     }
 
     // User Notification
+    const borrowerName = loan.applicantName || `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'Account Holder';
     this.notifications.unshift({
       id: `notif_${Date.now()}_repay`,
       userId: user.id,
@@ -2675,7 +2913,28 @@ export class MonveraDatabase {
       severity: 'success',
       read: false,
       createdAt: now,
-      referenceId: loan.id,
+      referenceId: tx.referenceNumber || loan.id,
+      actionView: 'loans',
+      actionRecordId: loan.id,
+      metadata: {
+        category: 'TRANSACTION',
+        eventType: 'LOAN_REPAYMENT',
+        customerName: borrowerName,
+        senderName: borrowerName,
+        recipientName: 'Monvera Credit & Lending Facility',
+        destinationLabel: `Loan Facility #${loan.id.slice(-6).toUpperCase()}`,
+        accountNumberMasked: `MVB •••• ${(user.permanentAccountNumber || '0000').slice(-4)}`,
+        transactionType: 'LOAN_REPAYMENT',
+        direction: 'DEBIT',
+        amount: actualRepay,
+        currency: 'USD',
+        status: newRemaining === 0 ? 'PAID' : 'ACTIVE',
+        referenceNumber: tx.referenceNumber || loan.id,
+        ...(typeof params.note === 'string' && params.note.trim()
+          ? { description: params.note.trim(), descriptionProvided: true }
+          : { descriptionProvided: false }),
+        date: now,
+      },
     });
 
     // Admin Audit Log

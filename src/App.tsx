@@ -35,6 +35,7 @@ import { ReceiveMoneyModal } from './components/dashboard/ReceiveMoneyModal';
 import { DepositModal } from './components/dashboard/DepositModal';
 import { WithdrawModal } from './components/dashboard/WithdrawModal';
 import { WhatsAppSupportChat } from './components/common/WhatsAppSupportChat';
+import { ForegroundPushToast } from './components/common/ForegroundPushToast';
 
 const processedStripeSessions = new Set<string>();
 
@@ -381,6 +382,7 @@ export default function App() {
   return (
     <AuthProvider>
       <AppContent />
+      <ForegroundPushToast />
     </AuthProvider>
   );
 }

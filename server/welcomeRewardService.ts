@@ -559,6 +559,9 @@ export async function evaluateAndProcessWelcomeReward(
             category: 'TRANSACTION',
             eventType: 'WELCOME_REWARD',
             customerName: txOutcome.record.customerName || customerName,
+            senderName: 'Monvera Welcome Rewards',
+            recipientName: txOutcome.record.customerName || customerName,
+            destinationLabel: 'Monvera Checking Account',
             accountNumberMasked: maskAccountNumber(txOutcome.record.permanentAccountNumber || permanentAccountNumber),
             transactionType: 'WELCOME_REWARD',
             direction: 'CREDIT',
@@ -566,6 +569,7 @@ export async function evaluateAndProcessWelcomeReward(
             currency: 'USD',
             status: 'COMPLETED',
             referenceNumber: idempotencyKey,
+            descriptionProvided: false,
             date: txOutcome.record.paidAt || attemptNowIso,
           },
         }).catch((e) => console.warn('[WelcomeReward] Notification error:', e?.message || e));

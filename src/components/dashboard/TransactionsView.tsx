@@ -146,10 +146,51 @@ export function classifyTransactionFlow(
   };
 }
 
+export function resolveAuthorizedTransactionForDeepLink(params: {
+  transactions: Transaction[];
+  refOrId: string;
+  effectiveUid?: string | null;
+  userId?: string | null;
+  userPermanentAccountNumber?: string | null;
+}): Transaction | null {
+  const cleanLookup = String(params.refOrId || '').trim();
+  if (!cleanLookup) return null;
+
+  const uidCandidates = new Set(
+    [params.effectiveUid, params.userId]
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .map((v) => v.trim())
+  );
+  if (uidCandidates.size === 0) return null;
+
+  const userAccClean = String(params.userPermanentAccountNumber || '').replace(/[-\s]/g, '');
+
+  return (
+    params.transactions.find((t) => {
+      const idMatch = t.id === cleanLookup || t.referenceNumber === cleanLookup;
+      if (!idMatch) return false;
+
+      const senderAccClean = String(t.senderAccountNumber || '').replace(/[-\s]/g, '');
+      const recipAccClean = String(t.recipientAccountNumber || '').replace(/[-\s]/g, '');
+      const ownsByUid =
+        (t.userId && uidCandidates.has(t.userId)) ||
+        (t.senderUserId && uidCandidates.has(t.senderUserId)) ||
+        (t.recipientUserId && uidCandidates.has(t.recipientUserId));
+      const ownsByAcc =
+        Boolean(userAccClean) &&
+        (senderAccClean === userAccClean || recipAccClean === userAccClean);
+
+      return Boolean(ownsByUid || ownsByAcc);
+    }) || null
+  );
+}
+
 export const TransactionsView: React.FC = () => {
   const { currentUser, balanceMetrics, lastUpdateTimestamp } = useAuth();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [hasLoadedTransactions, setHasLoadedTransactions] = useState<boolean>(false);
+  const [navWarningNotice, setNavWarningNotice] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [flowFilter, setFlowFilter] = useState<FlowFilter>('ALL');
@@ -172,6 +213,7 @@ export const TransactionsView: React.FC = () => {
       console.error('Failed to fetch transactions:', err);
     } finally {
       setIsLoading(false);
+      setHasLoadedTransactions(true);
     }
   };
 
@@ -197,7 +239,7 @@ export const TransactionsView: React.FC = () => {
   }, [effectiveUid, currentUser, balanceMetrics, lastUpdateTimestamp]);
 
   useEffect(() => {
-    if (!transactions || transactions.length === 0) return;
+    if (!hasLoadedTransactions || !currentUser) return;
     const focusTxFromNav = (rawTarget?: any) => {
       try {
         let target = rawTarget;
@@ -208,13 +250,20 @@ export const TransactionsView: React.FC = () => {
         if (target && target.actionView === 'transactions') {
           const refOrId = target.referenceNumber || target.actionRecordId;
           if (refOrId) {
-            const matched = transactions.find(
-              (t) => t.id === refOrId || t.referenceNumber === refOrId
-            );
+            const matched = resolveAuthorizedTransactionForDeepLink({
+              transactions,
+              refOrId: String(refOrId),
+              effectiveUid,
+              userId: currentUser?.id,
+              userPermanentAccountNumber: currentUser?.permanentAccountNumber,
+            });
             if (matched) {
+              setNavWarningNotice(null);
               setSelectedTxForReceipt(matched);
             } else {
-              setSearchQuery(String(refOrId));
+              setNavWarningNotice(
+                'The referenced transaction could not be found in your account or is unavailable.'
+              );
             }
           }
           if (typeof window !== 'undefined') {
@@ -234,7 +283,7 @@ export const TransactionsView: React.FC = () => {
         window.removeEventListener('monvera_notification_navigate', onNavigate);
       }
     };
-  }, [transactions]);
+  }, [hasLoadedTransactions, transactions, currentUser, effectiveUid]);
 
   if (!currentUser) return null;
 
@@ -469,6 +518,27 @@ export const TransactionsView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Unavailable / Unauthorized Deep-Link Notice */}
+      {navWarningNotice && (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs sm:text-sm"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span className="font-medium">{navWarningNotice}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setNavWarningNotice(null)}
+            className="p-1 rounded-lg text-amber-700 hover:bg-amber-100 transition-colors cursor-pointer shrink-0"
+            aria-label="Dismiss notice"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Summary Volume Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">

@@ -21,6 +21,15 @@ import { doc, setDoc, getDoc, collection, query, where, getDocs } from 'firebase
 import { auth, db } from '../services/firebase';
 import { firestoreSync } from '../services/firestoreSync';
 import { pushNotificationService } from '../services/pushNotificationService';
+import {
+  type NormalizedPushNotification,
+  type NotificationNavTarget,
+  parseNotificationDeepLinkFromUrl,
+  savePendingNotificationNavTarget,
+  readPendingNotificationNavTarget,
+  clearPendingNotificationNavTarget,
+  sanitizePushActionView,
+} from '../utils/pushNotificationPayload';
 import { UserProfile, NotificationItem } from '../types';
 import { api, BalanceMetrics, clearAdminSessionToken } from '../services/api';
 
@@ -132,6 +141,10 @@ interface AuthContextType {
   activeModal: 'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null;
   openModal: (modal: 'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null) => void;
   closeModal: () => void;
+  // Foreground Push Alerts & Deep-Link Navigation
+  foregroundPushNotifications: NormalizedPushNotification[];
+  dismissForegroundPushNotification: (id: string) => void;
+  navigateToNotificationTarget: (target: Partial<NotificationNavTarget>) => void;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -243,6 +256,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState<number>(Date.now());
   const [activeModal, setActiveModal] = useState<'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null>(null);
+  const [foregroundPushNotifications, setForegroundPushNotifications] = useState<NormalizedPushNotification[]>([]);
 
   const setCurrentView = useCallback((view: AppView) => {
     const targetView = (view === 'security' as any) ? 'profile' : view;
@@ -259,6 +273,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch {
       // Safe fallback for restricted iframe contexts
+    }
+  }, []);
+
+  const dismissForegroundPushNotification = useCallback((id: string) => {
+    setForegroundPushNotifications((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
+  const cleanDeepLinkQueryParams = useCallback(() => {
+    try {
+      if (typeof window === 'undefined') return;
+      const params = new URLSearchParams(window.location.search);
+      if (!params.has('view') && !params.has('transactionId') && !params.has('referenceId')) {
+        return;
+      }
+      params.delete('view');
+      params.delete('transactionId');
+      params.delete('referenceId');
+      const nextSearch = params.toString();
+      const nextPath = window.location.pathname.toLowerCase() === '/dashboard' ? '/' : window.location.pathname;
+      window.history.replaceState({}, '', nextPath + (nextSearch ? `?${nextSearch}` : '') + window.location.hash);
+    } catch {
+      // Safe fallback for restricted browser contexts
     }
   }, []);
 
@@ -317,6 +353,46 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const inFlightPushSyncUidRef = React.useRef<string | null>(null);
   const currentUserRef = React.useRef<UserProfile | null>(currentUser);
   currentUserRef.current = currentUser;
+  const pendingUrlDeepLinkRef = React.useRef<NotificationNavTarget | null>(null);
+
+  // Capture cold-start deep-link URL (/dashboard?view=transactions&transactionId=...&referenceId=...) before auth resolves
+  useEffect(() => {
+    if (typeof window === 'undefined' || checkIsAdminPath()) return;
+    const parsedFromUrl = parseNotificationDeepLinkFromUrl(window.location.pathname, window.location.search);
+    if (parsedFromUrl) {
+      pendingUrlDeepLinkRef.current = parsedFromUrl;
+      savePendingNotificationNavTarget(parsedFromUrl);
+    }
+  }, []);
+
+  const navigateToNotificationTarget = useCallback(
+    (rawTarget: Partial<NotificationNavTarget>) => {
+      const targetView = sanitizePushActionView(rawTarget?.actionView, 'transactions');
+      const normalizedTarget: NotificationNavTarget = {
+        notificationId: rawTarget?.notificationId,
+        actionView: targetView,
+        actionRecordId: rawTarget?.actionRecordId || rawTarget?.referenceNumber,
+        referenceNumber: rawTarget?.referenceNumber || rawTarget?.actionRecordId,
+        url: rawTarget?.url,
+        timestamp: Date.now(),
+      };
+
+      savePendingNotificationNavTarget(normalizedTarget);
+
+      if (!currentUserRef.current) {
+        pendingUrlDeepLinkRef.current = normalizedTarget;
+        setCurrentView('login');
+        return;
+      }
+
+      setActiveModal(null);
+      setCurrentView(targetView);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: normalizedTarget }));
+      }
+    },
+    [setCurrentView]
+  );
 
   const refreshBalance = useCallback(async () => {
     const activeUser = currentUserRef.current;
@@ -624,10 +700,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       triggerSessionPushSync();
     };
 
-    // 7. Listen to foreground push notifications while tab is open
-    const unsubPush = pushNotificationService.listenToForegroundMessages(() => {
+    // 7. Listen to foreground push notifications while tab is open & display visible banner/toast
+    const unsubPush = pushNotificationService.listenToForegroundMessages((_rawPayload, normalizedPush) => {
       refreshNotificationsRef.current();
       refreshBalanceRef.current();
+      if (normalizedPush) {
+        setForegroundPushNotifications((prev) => {
+          if (prev.some((item) => item.dedupeKey === normalizedPush.dedupeKey)) {
+            return prev;
+          }
+          return [normalizedPush, ...prev].slice(0, 3);
+        });
+      }
+    });
+
+    const unsubSwNav = pushNotificationService.listenToServiceWorkerNavigationMessages((navTarget) => {
+      navigateToNotificationTarget(navTarget);
     });
 
     // 8. Instant multi-tab / same-window event listener for immediate zero-latency KYC reflection
@@ -766,6 +854,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       unsubLoans();
       unsubNotifications();
       unsubPush();
+      unsubSwNav();
       if (syncChannel) {
         try {
           syncChannel.close();
@@ -1001,6 +1090,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (isMounted) {
               setCurrentUser(resolvedUser);
               cacheUserInDirectory(resolvedUser);
+
+              const pendingNav =
+                pendingUrlDeepLinkRef.current ||
+                (typeof window !== 'undefined' && !checkIsAdminPath()
+                  ? parseNotificationDeepLinkFromUrl(window.location.pathname, window.location.search) ||
+                    readPendingNotificationNavTarget()
+                  : null);
+
+              if (pendingNav && resolvedRole !== 'admin' && resolvedRole !== 'super_admin') {
+                savePendingNotificationNavTarget(pendingNav);
+                pendingUrlDeepLinkRef.current = null;
+                setActiveModal(null);
+                setCurrentView(pendingNav.actionView);
+                cleanDeepLinkQueryParams();
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: pendingNav }));
+                }
+              }
             }
 
             // Load nonessential notifications in background so slow HTTP requests never block session hydration
@@ -1027,6 +1134,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setCurrentUser(null);
           setBalanceMetrics(null);
           setNotifications([]);
+          setForegroundPushNotifications([]);
+
+          const pendingNav =
+            pendingUrlDeepLinkRef.current ||
+            (typeof window !== 'undefined' && !checkIsAdminPath()
+              ? parseNotificationDeepLinkFromUrl(window.location.pathname, window.location.search)
+              : null);
+          if (pendingNav) {
+            pendingUrlDeepLinkRef.current = pendingNav;
+            savePendingNotificationNavTarget(pendingNav);
+            setCurrentView('login');
+          }
         }
       }
 
@@ -1198,7 +1317,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (isUserAdmin || checkIsAdminPath() || options?.isAdminLoginFlow) {
         setCurrentView('admin');
       } else {
-        setCurrentView('dashboard');
+        const pendingNav = pendingUrlDeepLinkRef.current || readPendingNotificationNavTarget();
+        if (pendingNav) {
+          savePendingNotificationNavTarget(pendingNav);
+          pendingUrlDeepLinkRef.current = null;
+          setCurrentView(pendingNav.actionView);
+          cleanDeepLinkQueryParams();
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('monvera_notification_navigate', { detail: pendingNav }));
+          }
+        } else {
+          setCurrentView('dashboard');
+        }
       }
       setActiveModal(null);
       return { ...finalUser, _adminVerification: adminVerification };
@@ -1770,6 +1900,9 @@ const unenrollTotpMfa = async (): Promise<{
       console.error('[Auth SignOut Error]', err);
     }
     clearAdminSessionToken();
+    clearPendingNotificationNavTarget();
+    pendingUrlDeepLinkRef.current = null;
+    setForegroundPushNotifications([]);
     setNotifications([]);
     setCurrentUser(null);
     setBalanceMetrics(null);
@@ -2202,6 +2335,9 @@ const unenrollTotpMfa = async (): Promise<{
         activeModal,
         openModal,
         closeModal,
+        foregroundPushNotifications,
+        dismissForegroundPushNotification,
+        navigateToNotificationTarget,
       }}
     >
       {children}

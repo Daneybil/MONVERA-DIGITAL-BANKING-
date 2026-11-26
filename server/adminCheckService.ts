@@ -1144,6 +1144,9 @@ export async function executeServerAdminCheckWithdrawal(
           category: 'TRANSACTION',
           eventType: 'ADMIN_CHECK_WITHDRAWAL',
           customerName: finalCheck.customerName,
+          senderName: finalCheck.customerName,
+          recipientName: finalCheck.payeeName,
+          destinationLabel: `Check #${finalCheck.checkNumber} — ${finalCheck.payeeName}`,
           accountNumberMasked: maskAccountNumber(finalCheck.customerAccountNumber),
           transactionType: 'CHECK_WITHDRAWAL',
           direction: 'DEBIT',
@@ -1154,6 +1157,8 @@ export async function executeServerAdminCheckWithdrawal(
           checkNumber: finalCheck.checkNumber,
           payeeName: finalCheck.payeeName,
           sourceAccountType,
+          description: `Check #${finalCheck.checkNumber} payable to ${finalCheck.payeeName}`,
+          descriptionProvided: true,
           date: finalCheck.issuedAt,
         },
       });
