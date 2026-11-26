@@ -40,7 +40,10 @@ import {
   clearPendingNotificationNavTarget,
   PushNotificationDeduplicator,
 } from './src/utils/pushNotificationPayload';
-import { resolveAuthorizedTransactionForDeepLink } from './src/components/dashboard/TransactionsView';
+import {
+  resolveAuthorizedTransactionForDeepLink,
+  evaluateTransactionDeepLinkResolution,
+} from './src/components/dashboard/TransactionsView';
 import type { Transaction } from './src/types';
 
 type DocStore = Map<string, Map<string, Record<string, any>>>;
@@ -1049,7 +1052,421 @@ async function runTests() {
     }
   }
 
-  console.log('\nALL PUSH NOTIFICATION REPAIR TESTS (A–K) PASSED SUCCESSFULLY.');
+  // -------------------------------------------------------------------------
+  // TEST L: Targeted Android Push Repair Verification
+  // - Legacy /firebase-messaging-sw.js -> /sw.js transition without unregister()
+  // - Existing waiting /sw.js promotion via SKIP_WAITING
+  // - Delayed SW activation automatic FCM token sync retry on activation/controllerchange
+  // - Prompt foreground onMessage attachment without waiting on slow SW activation
+  // - Android Chrome never calls new Notification(); queues & recovers via SW.showNotification
+  // - TransactionsView Read More race waits for/retries refresh without losing nav target
+  // - vercel.json no-cache headers for /sw.js and /firebase-messaging-sw.js
+  // -------------------------------------------------------------------------
+  {
+    // Helper tiny EventTarget shim for mock ServiceWorker / Registration / navigator.serviceWorker
+    class MiniEventTarget {
+      private listeners = new Map<string, Set<(ev?: any) => void>>();
+      addEventListener(type: string, fn: (ev?: any) => void) {
+        if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+        this.listeners.get(type)!.add(fn);
+      }
+      removeEventListener(type: string, fn: (ev?: any) => void) {
+        this.listeners.get(type)?.delete(fn);
+      }
+      dispatch(type: string, ev?: any) {
+        for (const fn of Array.from(this.listeners.get(type) || [])) {
+          fn(ev);
+        }
+      }
+    }
+
+    const prevWindow = (globalThis as any).window;
+    const prevNavigatorDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    const prevNotification = (globalThis as any).Notification;
+    const prevDoc = (globalThis as any).document;
+
+    try {
+      const origin = 'https://monvera.test';
+      const swContainer = new MiniEventTarget() as any;
+      let unregisterCalls = 0;
+      let postedSkipWaitingTo: string[] = [];
+
+      // Scenario L1: Legacy /firebase-messaging-sw.js active while /sw.js is waiting at root `/`
+      const legacyActiveWorker = Object.assign(new MiniEventTarget(), {
+        scriptURL: `${origin}/firebase-messaging-sw.js`,
+        state: 'activated',
+      });
+      const waitingUnifiedWorker = Object.assign(new MiniEventTarget(), {
+        scriptURL: `${origin}/sw.js`,
+        state: 'installed',
+        postMessage(msg: any) {
+          postedSkipWaitingTo.push(msg?.type);
+          if (msg?.type === 'SKIP_WAITING') {
+            // Simulate safe activation + clients.claim() -> controllerchange
+            setTimeout(() => {
+              waitingUnifiedWorker.state = 'activated';
+              mockReg.waiting = null;
+              mockReg.active = waitingUnifiedWorker;
+              waitingUnifiedWorker.dispatch('statechange');
+              swContainer.dispatch('controllerchange');
+            }, 10);
+          }
+        },
+      });
+      const mockReg: any = Object.assign(new MiniEventTarget(), {
+        scope: `${origin}/`,
+        active: legacyActiveWorker,
+        waiting: waitingUnifiedWorker,
+        installing: null,
+        showNotification: async () => {},
+        unregister: async () => {
+          unregisterCalls += 1;
+          return true;
+        },
+      });
+
+      swContainer.getRegistration = async () => mockReg;
+      swContainer.register = async () => mockReg;
+      swContainer.ready = Promise.resolve(mockReg);
+
+      (globalThis as any).window = {
+        location: { origin },
+        localStorage: new InMemoryStorage(),
+        matchMedia: () => ({ matches: true }),
+      };
+      Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        writable: true,
+        value: {
+          userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36',
+          serviceWorker: swContainer,
+        },
+      });
+      (globalThis as any).Notification = function ForbiddenAndroid() {
+        throw new TypeError('Illegal constructor');
+      };
+
+      const registeredTokens: string[] = [];
+      const svcLegacyUpgrade = new PushNotificationService({
+        isProdFn: () => true,
+        isSupportedFn: async () => true,
+        getCurrentUid: () => 'uid_android_1',
+        getNotificationPermissionFn: () => 'granted',
+        acquireFcmTokenFn: async (reg) => {
+          assert.strictEqual(
+            reg.active?.scriptURL,
+            `${origin}/sw.js`,
+            'FCM token acquisition must wait until /sw.js (not legacy /firebase-messaging-sw.js) is active'
+          );
+          return 'fcm_upgraded_token_1';
+        },
+        postPushEndpoint: async (_endpoint, payload) => {
+          registeredTokens.push(payload.token);
+          return true;
+        },
+      });
+      svcLegacyUpgrade.setServiceWorkerRegistrationPromise(Promise.resolve(mockReg));
+
+      const syncedToken = await svcLegacyUpgrade.syncTokenForUser('uid_android_1');
+      assert.strictEqual(syncedToken, 'fcm_upgraded_token_1');
+      assert.strictEqual(unregisterCalls, 0, 'Legacy SW replacement must NEVER indiscriminately call unregister()');
+      assert.ok(postedSkipWaitingTo.includes('SKIP_WAITING'), 'Waiting /sw.js must be promoted via SKIP_WAITING');
+      assert.deepStrictEqual(registeredTokens, ['fcm_upgraded_token_1']);
+
+      // Scenario L2: Delayed SW activation timeout -> post-activation automatic token sync retry
+      let delayedTimeoutCleared = false;
+      const slowUnifiedWorker: any = Object.assign(new MiniEventTarget(), {
+        scriptURL: `${origin}/sw.js`,
+        state: 'installing',
+        postMessage(msg: any) {
+          if (msg?.type === 'SKIP_WAITING') {
+            slowUnifiedWorker.state = 'activating';
+            slowReg.waiting = null;
+            slowUnifiedWorker.dispatch('statechange');
+          }
+        },
+      });
+      const slowReg: any = Object.assign(new MiniEventTarget(), {
+        scope: `${origin}/`,
+        active: null,
+        waiting: null,
+        installing: slowUnifiedWorker,
+        showNotification: async () => {},
+      });
+      swContainer.getRegistration = async () => slowReg;
+      swContainer.register = async () => slowReg;
+
+      const retriedTokens: string[] = [];
+      const svcDelayedRetry = new PushNotificationService({
+        isProdFn: () => true,
+        swActivationTimeoutMs: 20,
+        isSupportedFn: async () => true,
+        getCurrentUid: () => 'uid_android_delay',
+        getNotificationPermissionFn: () => 'granted',
+        acquireFcmTokenFn: async (reg) => {
+          assert.strictEqual(reg.active?.scriptURL, `${origin}/sw.js`);
+          return 'fcm_delayed_retry_token_2';
+        },
+        postPushEndpoint: async (_endpoint, payload) => {
+          retriedTokens.push(payload.token);
+          return true;
+        },
+      });
+      svcDelayedRetry.setServiceWorkerRegistrationPromise(Promise.resolve(slowReg));
+
+      // Initial sync times out at 20ms while /sw.js is still installing -> returns null safely without blocking
+      const initialSync = await svcDelayedRetry.syncTokenForUser('uid_android_delay');
+      assert.strictEqual(initialSync, null);
+      assert.strictEqual(retriedTokens.length, 0);
+
+      // Now 35ms later /sw.js finishes activating and takes control
+      slowUnifiedWorker.state = 'activated';
+      slowReg.installing = null;
+      slowReg.active = slowUnifiedWorker;
+      slowUnifiedWorker.dispatch('statechange');
+      swContainer.dispatch('controllerchange');
+
+      await new Promise((r) => setTimeout(r, 30));
+      assert.deepStrictEqual(
+        retriedTokens,
+        ['fcm_delayed_retry_token_2'],
+        'Token sync must automatically retry once delayed /sw.js activates'
+      );
+
+      // Scenario L3: Foreground init() does NOT block on slow SW activation
+      let resolveSlowSw!: (reg: any) => void;
+      const slowSwPromise = new Promise<ServiceWorkerRegistration | null>((resolve) => {
+        resolveSlowSw = resolve;
+      });
+      const svcPromptInit = new PushNotificationService({
+        isProdFn: () => true,
+        isSupportedFn: async () => true,
+        ensureActiveSwFn: () => slowSwPromise,
+        initMessagingFn: () => ({ mockMessaging: true } as any),
+      });
+      const initResult = await Promise.race([
+        svcPromptInit.init(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 25)),
+      ]);
+      assert.ok(
+        initResult && (initResult as any).mockMessaging === true,
+        'init() must return Messaging promptly without blocking on slow SW activation'
+      );
+
+      // Scenario L4: Android Chrome temporary SW unavailability -> NEVER calls new Notification(), recovers via SW.showNotification()
+      (globalThis as any).document = { hidden: false };
+      const recoveredSwNotifs: Array<{ title: string; options: any }> = [];
+      let swReadyForDisplay = false;
+      const recoveredSwReg: any = Object.assign(new MiniEventTarget(), {
+        scope: `${origin}/`,
+        active: { state: 'activated', scriptURL: `${origin}/sw.js` },
+        showNotification: async (title: string, options?: NotificationOptions) => {
+          recoveredSwNotifs.push({ title, options });
+        },
+      });
+      swContainer.getRegistration = async () => (swReadyForDisplay ? recoveredSwReg : { scope: `${origin}/`, active: null, installing: { scriptURL: `${origin}/sw.js`, state: 'installing' } });
+      swContainer.ready = new Promise((resolve) => {
+        setTimeout(() => {
+          swReadyForDisplay = true;
+          resolve(recoveredSwReg);
+        }, 40);
+      });
+
+      let fgHandler: ((p: any) => void) | null = null;
+      const fgToastCalls: any[] = [];
+      let newNotificationCalled = false;
+      (globalThis as any).Notification = function ForbiddenAndroidFallback() {
+        newNotificationCalled = true;
+        throw new TypeError('Illegal constructor');
+      };
+
+      const svcAndroidRecovery = new PushNotificationService({
+        isProdFn: () => true,
+        swActivationTimeoutMs: 25,
+        isSupportedFn: async () => true,
+        getCurrentUid: () => 'uid_android_fg',
+        getNotificationPermissionFn: () => 'granted',
+        subscribeOnMessageFn: (h) => {
+          fgHandler = h;
+          return () => {};
+        },
+      });
+      const unsubAndroidFg = svcAndroidRecovery.listenToForegroundMessages((_raw, norm) => {
+        fgToastCalls.push(norm);
+      });
+      assert.ok(fgHandler);
+
+      // Push arrives while SW is temporarily still installing
+      fgHandler!({
+        fcmMessageId: 'fcm_android_recover_debit',
+        notification: {
+          title: 'Account Debited',
+          body: 'Your account has been debited $175.00 USD for Wire Transfer. Ref: MV-AND-REC-1.',
+        },
+        data: {
+          direction: 'DEBIT',
+          amount: '175.00',
+          currency: 'USD',
+          description: 'Wire Transfer',
+          transactionId: 'tx_and_rec_1',
+          referenceId: 'MV-AND-REC-1',
+          actionView: 'transactions',
+          url: '/dashboard?view=transactions&transactionId=tx_and_rec_1&referenceId=MV-AND-REC-1',
+          eventKey: 'tx_and_rec_1:COMPLETED',
+        },
+      });
+
+      // Toast fires immediately; new Notification() is NEVER called; once ready resolves at 40ms, SW showNotification recovers once
+      assert.strictEqual(fgToastCalls.length, 1);
+      assert.strictEqual(newNotificationCalled, false, 'Android Chrome / PWA must NEVER call new Notification()');
+      await new Promise((r) => setTimeout(r, 70));
+      assert.strictEqual(newNotificationCalled, false);
+      assert.strictEqual(recoveredSwNotifs.length, 1, 'Deferred recovery must display exactly 1 OS notification via SW');
+      assert.strictEqual(recoveredSwNotifs[0].title, 'Account Debited');
+      assert.strictEqual(recoveredSwNotifs[0].options.actions[0].action, 'read_more');
+      assert.strictEqual(recoveredSwNotifs[0].options.data.amount, '175.00');
+      assert.strictEqual(recoveredSwNotifs[0].options.data.currency, 'USD');
+      assert.strictEqual(recoveredSwNotifs[0].options.data.direction, 'DEBIT');
+      assert.strictEqual(recoveredSwNotifs[0].options.data.description, 'Wire Transfer');
+      assert.strictEqual(recoveredSwNotifs[0].options.data.referenceId, 'MV-AND-REC-1');
+      assert.strictEqual(recoveredSwNotifs[0].options.data.transactionId, 'tx_and_rec_1');
+
+      // Resolve slowSwPromise so no dangling open handle
+      resolveSlowSw(recoveredSwReg);
+      unsubAndroidFg();
+      delayedTimeoutCleared = true;
+      assert.ok(delayedTimeoutCleared);
+
+      // Scenario L5: TransactionsView Read More race during mounted refresh & post-refresh retry
+      const oldTx: Transaction = {
+        id: 'tx_old_1',
+        referenceNumber: 'MV-OLD-1',
+        type: 'DEPOSIT',
+        status: 'COMPLETED',
+        amount: 50,
+        currency: 'USD',
+        userId: 'uid_race_user',
+        fee: 0,
+        category: 'Deposits',
+        createdAt: new Date().toISOString(),
+        description: 'Prior deposit',
+      };
+      const freshTx: Transaction = {
+        id: 'tx_fresh_push_2',
+        referenceNumber: 'MV-FRESH-2',
+        type: 'TRANSFER',
+        status: 'COMPLETED',
+        amount: 420,
+        currency: 'USD',
+        userId: 'uid_race_user',
+        senderUserId: 'uid_race_user',
+        recipientUserId: 'uid_other',
+        fee: 0,
+        category: 'Transfers',
+        createdAt: new Date().toISOString(),
+        description: 'Fresh transfer',
+      };
+      const navTarget = {
+        actionView: 'transactions',
+        actionRecordId: 'tx_fresh_push_2',
+        referenceNumber: 'MV-FRESH-2',
+      };
+
+      // Step 1: Mounted TransactionsView has stale [oldTx] while refresh is currently in flight
+      const stepInFlight = evaluateTransactionDeepLinkResolution({
+        target: navTarget,
+        transactions: [oldTx],
+        effectiveUid: 'uid_race_user',
+        userId: 'uid_race_user',
+        isRefreshing: true,
+        hasLoadedTransactions: true,
+        alreadyRetriedRefOrId: null,
+      });
+      assert.strictEqual(stepInFlight.status, 'wait_in_flight');
+      assert.strictEqual(stepInFlight.shouldShowWarning, false);
+      assert.strictEqual(stepInFlight.shouldClearStorage, false);
+
+      // Step 2: In-flight refresh resolved slightly before backend commit was visible -> triggers one fresh retry
+      const stepRetry = evaluateTransactionDeepLinkResolution({
+        target: navTarget,
+        transactions: [oldTx],
+        effectiveUid: 'uid_race_user',
+        userId: 'uid_race_user',
+        isRefreshing: false,
+        hasLoadedTransactions: true,
+        alreadyRetriedRefOrId: null,
+      });
+      assert.strictEqual(stepRetry.status, 'retry_refresh');
+      assert.strictEqual(stepRetry.shouldShowWarning, false);
+      assert.strictEqual(stepRetry.shouldClearStorage, false);
+
+      // Step 3: Retry refresh returns freshTx -> matches & opens receipt modal cleanly
+      const stepMatched = evaluateTransactionDeepLinkResolution({
+        target: navTarget,
+        transactions: [oldTx, freshTx],
+        effectiveUid: 'uid_race_user',
+        userId: 'uid_race_user',
+        isRefreshing: false,
+        hasLoadedTransactions: true,
+        alreadyRetriedRefOrId: 'MV-FRESH-2',
+      });
+      assert.strictEqual(stepMatched.status, 'matched');
+      if (stepMatched.status === 'matched') {
+        assert.strictEqual(stepMatched.transaction.id, 'tx_fresh_push_2');
+      }
+      assert.strictEqual(stepMatched.shouldShowWarning, false);
+      assert.strictEqual(stepMatched.shouldClearStorage, true);
+
+      // Step 4: Unauthorized foreign transaction still blocked AFTER retry
+      const foreignTx: Transaction = { ...freshTx, id: 'tx_foreign_x', referenceNumber: 'MV-FOR-X', userId: 'uid_stranger', senderUserId: 'uid_stranger', recipientUserId: 'uid_stranger2' };
+      const stepUnauth = evaluateTransactionDeepLinkResolution({
+        target: { actionView: 'transactions', actionRecordId: 'tx_foreign_x', referenceNumber: 'MV-FOR-X' },
+        transactions: [oldTx, foreignTx],
+        effectiveUid: 'uid_race_user',
+        userId: 'uid_race_user',
+        isRefreshing: false,
+        hasLoadedTransactions: true,
+        alreadyRetriedRefOrId: 'MV-FOR-X',
+      });
+      assert.strictEqual(stepUnauth.status, 'not_found');
+      assert.strictEqual(stepUnauth.shouldShowWarning, true);
+      assert.strictEqual(stepUnauth.shouldClearStorage, true);
+
+      // Scenario L6: Source checks on src/sw.ts, src/main.tsx, and vercel.json
+      const swSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/sw.ts'), 'utf8');
+      assert.ok(swSrc.includes("self.addEventListener('install'"));
+      assert.ok(swSrc.includes("self.addEventListener('activate'"));
+      assert.ok(swSrc.includes('self.clients.claim()'));
+      assert.ok(swSrc.includes('self.skipWaiting()'));
+
+      const mainSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/main.tsx'), 'utf8');
+      assert.ok(mainSrc.includes('promoteWaitingUnifiedServiceWorker'));
+      assert.ok(mainSrc.includes("type: 'SKIP_WAITING'"));
+
+      const vercelCfg = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'vercel.json'), 'utf8'));
+      const headerMap = new Map<string, any>(
+        (vercelCfg.headers || []).map((h: any) => [h.source, h.headers])
+      );
+      for (const swPathRoute of ['/sw.js', '/firebase-messaging-sw.js']) {
+        const hdrs = headerMap.get(swPathRoute);
+        assert.ok(Array.isArray(hdrs), `vercel.json must define headers for ${swPathRoute}`);
+        const cc = hdrs.find((x: any) => String(x.key).toLowerCase() === 'cache-control');
+        assert.ok(cc && String(cc.value).includes('no-cache') && String(cc.value).includes('must-revalidate'));
+      }
+      assert.strictEqual(vercelCfg.rewrites?.length, 3, 'Existing vercel.json rewrites must remain untouched');
+
+      console.log('✓ Test L (Targeted Android Repair): Legacy SW upgrade, waiting promotion, delayed token retry, non-blocking foreground attach, Android deferred SW recovery, TransactionsView race fix, and vercel.json headers verified');
+    } finally {
+      (globalThis as any).window = prevWindow;
+      if (prevNavigatorDesc) {
+        Object.defineProperty(globalThis, 'navigator', prevNavigatorDesc);
+      }
+      (globalThis as any).Notification = prevNotification;
+      (globalThis as any).document = prevDoc;
+    }
+  }
+
+  console.log('\nALL PUSH NOTIFICATION REPAIR TESTS (A–L) PASSED SUCCESSFULLY.');
 }
 
 runTests().catch((err) => {

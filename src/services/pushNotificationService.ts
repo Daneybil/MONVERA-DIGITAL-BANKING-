@@ -26,6 +26,9 @@ export interface PushNotificationServiceDeps {
   requestNotificationPermissionFn?: () => Promise<NotificationPermission>;
   subscribeOnMessageFn?: (handler: (payload: any) => void) => () => void;
   displayNotificationFn?: (title: string, options?: NotificationOptions) => void;
+  initMessagingFn?: () => Messaging | null;
+  isProdFn?: () => boolean;
+  swActivationTimeoutMs?: number;
 }
 
 export class PushNotificationService {
@@ -39,12 +42,26 @@ export class PushNotificationService {
   private registeredUserId: string | null = null;
   private inFlightSyncPromise: Promise<string | null> | null = null;
   private inFlightSyncUid: string | null = null;
+  private pendingTokenSyncUserId: string | null = null;
+  private controllerChangeAttached = false;
+  private watchedRecoveryRegistrations = new WeakSet<ServiceWorkerRegistration>();
+  private pendingOsNotifications = new Map<
+    string,
+    { title: string; options: NotificationOptions; enqueuedAt: number }
+  >();
+  private osRecoveryInFlight = false;
   private deps: PushNotificationServiceDeps;
   private static readonly SW_ACTIVATION_TIMEOUT_MS = 12000;
   private static readonly PUSH_UNREGISTER_TIMEOUT_MS = 3000;
+  private static readonly PENDING_OS_NOTIFICATION_TTL_MS = 5 * 60_000;
 
   constructor(deps: PushNotificationServiceDeps = {}) {
     this.deps = deps;
+  }
+
+  private isProdEnv(): boolean {
+    if (this.deps.isProdFn) return this.deps.isProdFn();
+    return Boolean((import.meta as any).env?.PROD);
   }
 
   public getRegistrationState(): { token: string | null; userId: string | null } {
@@ -121,12 +138,130 @@ export class PushNotificationService {
    */
   public setServiceWorkerRegistrationPromise(promise: Promise<ServiceWorkerRegistration | null>): void {
     this.serviceWorkerRegistrationPromise = promise;
+    this.setupControllerChangeListener();
+  }
+
+  private isTargetUnifiedWorker(worker: ServiceWorker | null | undefined): worker is ServiceWorker {
+    if (!worker) return false;
+    if (!this.isProdEnv()) return true;
+    return typeof worker.scriptURL === 'string' && worker.scriptURL.endsWith('/sw.js');
+  }
+
+  private promoteWaitingWorker(registration: ServiceWorkerRegistration | null | undefined): boolean {
+    if (!registration?.waiting) return false;
+    if (!this.isTargetUnifiedWorker(registration.waiting)) return false;
+    try {
+      registration.waiting.postMessage({ type: 'SKIP_WAITING' });
+      return true;
+    } catch (err) {
+      console.warn('[Push] Failed to promote waiting service worker:', err);
+      return false;
+    }
+  }
+
+  private setupControllerChangeListener(): void {
+    if (this.controllerChangeAttached) return;
+    if (
+      typeof window === 'undefined' ||
+      typeof navigator === 'undefined' ||
+      !('serviceWorker' in navigator) ||
+      typeof navigator.serviceWorker?.addEventListener !== 'function'
+    ) {
+      return;
+    }
+    this.controllerChangeAttached = true;
+
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (typeof navigator.serviceWorker.getRegistration !== 'function') return;
+      void navigator.serviceWorker
+        .getRegistration('/')
+        .then((reg) => {
+          if (
+            reg &&
+            this.isValidRootRegistration(reg) &&
+            reg.active &&
+            reg.active.state === 'activated' &&
+            this.isTargetUnifiedWorker(reg.active)
+          ) {
+            void this.onServiceWorkerActivated(reg);
+          }
+        })
+        .catch(() => {});
+    });
+  }
+
+  private async onServiceWorkerActivated(registration: ServiceWorkerRegistration): Promise<void> {
+    this.serviceWorkerRegistration = registration;
+    await this.flushPendingOsNotifications(registration);
+
+    const retryUid = this.pendingTokenSyncUserId;
+    if (retryUid && this.getBrowserNotificationPermission() === 'granted') {
+      void this.syncTokenForUser(retryUid);
+    }
+  }
+
+  private attachBackgroundActivationRecovery(registration: ServiceWorkerRegistration): void {
+    if (this.watchedRecoveryRegistrations.has(registration)) return;
+    this.watchedRecoveryRegistrations.add(registration);
+
+    const trackedSet = new Set<ServiceWorker>();
+    const cleanup = () => {
+      for (const worker of trackedSet) {
+        worker.removeEventListener('statechange', handleState);
+      }
+      trackedSet.clear();
+      if (typeof registration.removeEventListener === 'function') {
+        registration.removeEventListener('updatefound', handleUpdateFound);
+      }
+    };
+
+    const checkAndRecover = () => {
+      if (
+        registration.active &&
+        registration.active.state === 'activated' &&
+        this.isTargetUnifiedWorker(registration.active)
+      ) {
+        cleanup();
+        void this.onServiceWorkerActivated(registration);
+        return true;
+      }
+      this.promoteWaitingWorker(registration);
+      return false;
+    };
+
+    const handleState = () => {
+      checkAndRecover();
+    };
+
+    const trackWorker = (worker: ServiceWorker | null | undefined) => {
+      if (!worker || !this.isTargetUnifiedWorker(worker) || trackedSet.has(worker)) return;
+      trackedSet.add(worker);
+      if (typeof worker.addEventListener === 'function') {
+        worker.addEventListener('statechange', handleState);
+      }
+    };
+
+    const handleUpdateFound = () => {
+      trackWorker(registration.installing);
+      trackWorker(registration.waiting);
+      checkAndRecover();
+    };
+
+    trackWorker(registration.installing);
+    trackWorker(registration.waiting);
+    if (typeof registration.addEventListener === 'function') {
+      registration.addEventListener('updatefound', handleUpdateFound);
+    }
+    checkAndRecover();
   }
 
   /**
-   * Validate that a registration matches the expected Monvera root scope and environment worker script
+   * Validate that a registration matches the expected Monvera root scope and environment worker script.
+   * Permits a root registration actively transitioning from legacy /firebase-messaging-sw.js to /sw.js.
    */
-  private isValidRootRegistration(registration: ServiceWorkerRegistration | null | undefined): registration is ServiceWorkerRegistration {
+  private isValidRootRegistration(
+    registration: ServiceWorkerRegistration | null | undefined
+  ): registration is ServiceWorkerRegistration {
     if (!registration || typeof window === 'undefined') return false;
     const expectedScope = `${window.location.origin}/`;
     if (registration.scope !== expectedScope) {
@@ -134,14 +269,16 @@ export class PushNotificationService {
       return false;
     }
 
-    if (import.meta.env.PROD) {
-      const scriptUrl =
-        registration.active?.scriptURL ||
-        registration.waiting?.scriptURL ||
-        registration.installing?.scriptURL ||
-        '';
-      if (scriptUrl && !scriptUrl.endsWith('/sw.js')) {
-        console.warn('[Push] Ignoring non-unified service worker registration in production:', scriptUrl);
+    if (this.isProdEnv()) {
+      const workers = [registration.active, registration.waiting, registration.installing].filter(
+        (w): w is ServiceWorker => Boolean(w)
+      );
+      const hasUnifiedWorker = workers.some((w) => this.isTargetUnifiedWorker(w));
+      if (workers.length > 0 && !hasUnifiedWorker) {
+        console.warn(
+          '[Push] Ignoring non-unified service worker registration in production:',
+          workers[0].scriptURL
+        );
         return false;
       }
     }
@@ -150,17 +287,30 @@ export class PushNotificationService {
   }
 
   /**
-   * Wait (with a bounded timeout) until a registered service worker becomes activated
+   * Wait (with a bounded timeout) until a target service worker becomes activated
    */
   private waitForRegistrationActivation(
     registration: ServiceWorkerRegistration,
-    timeoutMs: number = PushNotificationService.SW_ACTIVATION_TIMEOUT_MS
+    timeoutMs: number = this.deps.swActivationTimeoutMs ?? PushNotificationService.SW_ACTIVATION_TIMEOUT_MS
   ): Promise<ServiceWorkerRegistration | null> {
-    if (registration.active && registration.active.state === 'activated') {
+    if (
+      registration.active &&
+      registration.active.state === 'activated' &&
+      this.isTargetUnifiedWorker(registration.active)
+    ) {
       return Promise.resolve(registration);
     }
 
-    const candidate = registration.active || registration.waiting || registration.installing;
+    this.promoteWaitingWorker(registration);
+
+    const candidate =
+      [registration.installing, registration.waiting, registration.active].find((w) =>
+        this.isTargetUnifiedWorker(w)
+      ) ||
+      registration.waiting ||
+      registration.installing ||
+      registration.active;
+
     if (!candidate) {
       console.warn('[Push] Service worker registration has no installing, waiting, or active worker.');
       return Promise.resolve(null);
@@ -177,11 +327,13 @@ export class PushNotificationService {
 
       const cleanup = () => {
         clearTimeout(timeoutId);
-        if (trackedWorker) {
+        if (trackedWorker && typeof trackedWorker.removeEventListener === 'function') {
           trackedWorker.removeEventListener('statechange', handleStateChange);
           trackedWorker = null;
         }
-        registration.removeEventListener('updatefound', handleUpdateFound);
+        if (typeof registration.removeEventListener === 'function') {
+          registration.removeEventListener('updatefound', handleUpdateFound);
+        }
       };
 
       const finish = (result: ServiceWorkerRegistration | null, diagnostic?: string) => {
@@ -195,48 +347,79 @@ export class PushNotificationService {
       };
 
       const checkActive = () => {
-        if (registration.active && registration.active.state === 'activated') {
+        if (
+          registration.active &&
+          registration.active.state === 'activated' &&
+          this.isTargetUnifiedWorker(registration.active)
+        ) {
           finish(registration);
           return true;
         }
         return false;
       };
 
+      const attachToWorker = (worker: ServiceWorker | null | undefined) => {
+        if (!worker || worker === trackedWorker) return;
+        if (trackedWorker && typeof trackedWorker.removeEventListener === 'function') {
+          trackedWorker.removeEventListener('statechange', handleStateChange);
+        }
+        trackedWorker = worker;
+        if (typeof trackedWorker.addEventListener === 'function') {
+          trackedWorker.addEventListener('statechange', handleStateChange);
+        }
+      };
+
       const handleStateChange = () => {
         if (checkActive()) return;
 
+        this.promoteWaitingWorker(registration);
+
+        if (
+          registration.waiting &&
+          this.isTargetUnifiedWorker(registration.waiting) &&
+          trackedWorker !== registration.waiting
+        ) {
+          attachToWorker(registration.waiting);
+        }
+
         const currentState = trackedWorker?.state;
         if (currentState === 'redundant') {
+          const nextWorker = [registration.installing, registration.waiting, registration.active].find(
+            (w) => this.isTargetUnifiedWorker(w) && w.state !== 'redundant'
+          );
+          if (nextWorker) {
+            attachToWorker(nextWorker);
+            return;
+          }
           if (!registration.active && !registration.waiting && !registration.installing) {
             finish(null, '[Push] Service worker failed activation (state: redundant).');
           }
         }
       };
 
-      const attachToWorker = (worker: ServiceWorker | null) => {
-        if (!worker || worker === trackedWorker) return;
-        if (trackedWorker) {
-          trackedWorker.removeEventListener('statechange', handleStateChange);
-        }
-        trackedWorker = worker;
-        trackedWorker.addEventListener('statechange', handleStateChange);
-      };
-
       const handleUpdateFound = () => {
         if (checkActive()) return;
-        if (registration.installing) {
+        if (registration.installing && this.isTargetUnifiedWorker(registration.installing)) {
           attachToWorker(registration.installing);
         }
       };
 
       const timeoutId = setTimeout(() => {
         if (!checkActive()) {
-          finish(null, `[Push] Timed out after ${timeoutMs}ms waiting for service worker activation; skipping push token sync.`);
+          this.attachBackgroundActivationRecovery(registration);
+          finish(
+            null,
+            `[Push] Timed out after ${timeoutMs}ms waiting for service worker activation; will retry once active.`
+          );
         }
       }, timeoutMs);
 
-      trackedWorker.addEventListener('statechange', handleStateChange);
-      registration.addEventListener('updatefound', handleUpdateFound);
+      if (typeof trackedWorker.addEventListener === 'function') {
+        trackedWorker.addEventListener('statechange', handleStateChange);
+      }
+      if (typeof registration.addEventListener === 'function') {
+        registration.addEventListener('updatefound', handleUpdateFound);
+      }
 
       // Re-check synchronously in case state transitioned between inspection and listener attachment
       checkActive();
@@ -244,17 +427,20 @@ export class PushNotificationService {
   }
 
   /**
-   * Resolve and confirm an activated root ServiceWorkerRegistration (never blocks forever or triggers legacy fallback)
+   * Resolve and confirm an activated root ServiceWorkerRegistration (never blocks forever or leaves waiting stuck)
    */
   private async ensureActiveServiceWorkerRegistration(): Promise<ServiceWorkerRegistration | null> {
     if (typeof window === 'undefined' || !('serviceWorker' in navigator)) {
       return null;
     }
 
+    this.setupControllerChangeListener();
+
     if (
       this.serviceWorkerRegistration &&
       this.isValidRootRegistration(this.serviceWorkerRegistration) &&
-      this.serviceWorkerRegistration.active?.state === 'activated'
+      this.serviceWorkerRegistration.active?.state === 'activated' &&
+      this.isTargetUnifiedWorker(this.serviceWorkerRegistration.active)
     ) {
       return this.serviceWorkerRegistration;
     }
@@ -274,19 +460,24 @@ export class PushNotificationService {
           });
         }
 
-        if (!registration && import.meta.env.PROD) {
-          const existingReg = await navigator.serviceWorker.getRegistration('/');
-          if (this.isValidRootRegistration(existingReg)) {
-            registration = existingReg;
-          } else {
-            registration = await navigator.serviceWorker
-              .register('/sw.js', { scope: '/' })
-              .catch((err) => {
-                console.warn('[Push] Production /sw.js registration unavailable:', err);
-                return null;
-              });
+        if (this.isProdEnv()) {
+          if (!this.isValidRootRegistration(registration)) {
+            const existingReg =
+              typeof navigator.serviceWorker.getRegistration === 'function'
+                ? await navigator.serviceWorker.getRegistration('/').catch(() => null)
+                : null;
+            if (this.isValidRootRegistration(existingReg)) {
+              registration = existingReg;
+            } else {
+              registration = await navigator.serviceWorker
+                .register('/sw.js', { scope: '/' })
+                .catch((err) => {
+                  console.warn('[Push] Production /sw.js registration unavailable:', err);
+                  return null;
+                });
+            }
           }
-        } else if (!registration && !import.meta.env.PROD) {
+        } else if (!registration) {
           // Development mode uses Vite middleware without bundled dist/sw.js
           registration = await navigator.serviceWorker
             .register('/firebase-messaging-sw.js', { scope: '/' })
@@ -297,12 +488,14 @@ export class PushNotificationService {
         }
 
         if (!this.isValidRootRegistration(registration)) {
-          console.warn('[Push] Valid root service worker registration unavailable; push token sync skipped.');
+          console.warn('[Push] Valid root service worker registration unavailable; push token sync deferred.');
           return null;
         }
 
+        this.promoteWaitingWorker(registration);
+
         const activeReg = await this.waitForRegistrationActivation(registration);
-        if (!activeReg || !activeReg.active) {
+        if (!activeReg || !activeReg.active || !this.isTargetUnifiedWorker(activeReg.active)) {
           return null;
         }
 
@@ -313,7 +506,10 @@ export class PushNotificationService {
         console.warn('[Push] Error confirming active service worker:', err);
         return null;
       } finally {
-        if (!this.serviceWorkerRegistration?.active) {
+        if (
+          !this.serviceWorkerRegistration?.active ||
+          !this.isTargetUnifiedWorker(this.serviceWorkerRegistration.active)
+        ) {
           this.activeRegistrationPromise = null;
         }
       }
@@ -360,16 +556,27 @@ export class PushNotificationService {
   }
 
   /**
-   * Initialize service worker and Firebase messaging instance
+   * Initialize Firebase messaging instance promptly and warm up service worker readiness
+   * in the background so foreground onMessage attaches without waiting for SW activation.
    */
   public async init(): Promise<Messaging | null> {
     const isSup = await this.checkSupport();
     if (!isSup) return null;
 
+    this.setupControllerChangeListener();
+
     try {
-      await (this.deps.ensureActiveSwFn
+      const warmupSw = this.deps.ensureActiveSwFn
         ? this.deps.ensureActiveSwFn()
-        : this.ensureActiveServiceWorkerRegistration());
+        : this.ensureActiveServiceWorkerRegistration();
+      void Promise.resolve(warmupSw).catch(() => null);
+
+      if (this.deps.initMessagingFn) {
+        if (!this.messaging) {
+          this.messaging = this.deps.initMessagingFn();
+        }
+        return this.messaging;
+      }
 
       if (this.deps.acquireFcmTokenFn) {
         return {} as Messaging;
@@ -411,6 +618,10 @@ export class PushNotificationService {
         return { status: permissionResult as 'denied' | 'default' };
       }
 
+      if (userId) {
+        this.pendingTokenSyncUserId = userId;
+      }
+
       const messaging = await this.init();
       if (!messaging) {
         return { status: 'unsupported', error: 'Messaging engine unavailable.' };
@@ -420,7 +631,7 @@ export class PushNotificationService {
         ? await this.deps.ensureActiveSwFn()
         : await this.ensureActiveServiceWorkerRegistration();
       if (!activeRegistration || (!this.deps.ensureActiveSwFn && !activeRegistration.active)) {
-        console.warn('[Push] Skipping requestPushPermission getToken: no active service worker registration.');
+        console.warn('[Push] Skipping requestPushPermission getToken: no active service worker registration yet.');
         return {
           status: 'unsupported',
           error: 'Notification service worker is not active yet. Please try again momentarily.',
@@ -463,6 +674,9 @@ export class PushNotificationService {
     if (!userId) return null;
     if (this.getBrowserNotificationPermission() !== 'granted') return null;
 
+    this.pendingTokenSyncUserId = userId;
+    this.setupControllerChangeListener();
+
     if (this.inFlightSyncPromise && this.inFlightSyncUid === userId) {
       return this.inFlightSyncPromise;
     }
@@ -476,7 +690,7 @@ export class PushNotificationService {
           ? await this.deps.ensureActiveSwFn()
           : await this.ensureActiveServiceWorkerRegistration();
         if (!activeRegistration || (!this.deps.ensureActiveSwFn && !activeRegistration.active)) {
-          console.warn('[Push] Skipping syncTokenForUser getToken: no active service worker registration.');
+          console.warn('[Push] Deferring syncTokenForUser getToken until service worker activation completes.');
           return null;
         }
 
@@ -532,6 +746,9 @@ export class PushNotificationService {
       if (ok) {
         this.currentToken = token;
         this.registeredUserId = userId;
+        if (this.pendingTokenSyncUserId === userId) {
+          this.pendingTokenSyncUserId = null;
+        }
         console.log('[Push] Token registered via authenticated push service for user:', userId);
         return true;
       }
@@ -558,6 +775,8 @@ export class PushNotificationService {
     const tokenToClear = this.currentToken;
     this.currentToken = null;
     this.registeredUserId = null;
+    this.pendingTokenSyncUserId = null;
+    this.pendingOsNotifications.clear();
 
     if (!this.getCurrentAuthUid()) return;
 
@@ -657,21 +876,107 @@ export class PushNotificationService {
     return true;
   }
 
+  private isServiceWorkerRequiredEnvironment(): boolean {
+    if (typeof navigator !== 'undefined') {
+      const nav = navigator as Navigator & { standalone?: boolean };
+      if (Boolean((nav as any).serviceWorker)) return true;
+      if (/android/i.test(nav.userAgent || '')) return true;
+      if (nav.standalone === true) return true;
+    }
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      try {
+        if (window.matchMedia('(display-mode: standalone)').matches) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  private isSwRegistrationUsableForShowNotification(
+    reg: ServiceWorkerRegistration | null | undefined
+  ): reg is ServiceWorkerRegistration {
+    if (!reg || typeof reg.showNotification !== 'function') return false;
+    if (reg.active) {
+      if (reg.active.state && reg.active.state !== 'activated') return false;
+      return this.isTargetUnifiedWorker(reg.active);
+    }
+    return false;
+  }
+
+  private enqueuePendingOsNotification(title: string, options: NotificationOptions): void {
+    const key = String(options.tag || title || 'monvera-alert').trim();
+    if (!key) return;
+    if (this.pendingOsNotifications.has(key)) return;
+
+    this.pendingOsNotifications.set(key, {
+      title,
+      options,
+      enqueuedAt: Date.now(),
+    });
+
+    if (this.pendingOsNotifications.size > 20) {
+      const oldestKey = this.pendingOsNotifications.keys().next().value;
+      if (oldestKey) {
+        this.pendingOsNotifications.delete(oldestKey);
+      }
+    }
+  }
+
+  private async flushPendingOsNotifications(swReg: ServiceWorkerRegistration): Promise<void> {
+    if (!this.isSwRegistrationUsableForShowNotification(swReg)) return;
+    if (this.pendingOsNotifications.size === 0) return;
+    if (this.getBrowserNotificationPermission() !== 'granted') {
+      this.pendingOsNotifications.clear();
+      return;
+    }
+
+    const now = Date.now();
+    const items = Array.from(this.pendingOsNotifications.entries());
+    for (const [key, item] of items) {
+      if (now - item.enqueuedAt > PushNotificationService.PENDING_OS_NOTIFICATION_TTL_MS) {
+        this.pendingOsNotifications.delete(key);
+        continue;
+      }
+      this.pendingOsNotifications.delete(key);
+      try {
+        await swReg.showNotification(item.title, item.options);
+      } catch (err) {
+        this.pendingOsNotifications.set(key, item);
+        console.warn('[Push] Deferred OS notification retry failed:', err);
+        break;
+      }
+    }
+  }
+
+  private schedulePendingOsNotificationRecovery(): void {
+    if (this.osRecoveryInFlight || this.pendingOsNotifications.size === 0) return;
+    this.osRecoveryInFlight = true;
+
+    void (async () => {
+      try {
+        const swReg = await this.resolveActiveSwRegistrationForDisplay();
+        if (swReg) {
+          await this.flushPendingOsNotifications(swReg);
+        }
+      } catch {
+        // Retry will still trigger on controllerchange or background activation recovery
+      } finally {
+        this.osRecoveryInFlight = false;
+      }
+    })();
+  }
+
   /**
    * Resolve a ServiceWorkerRegistration capable of calling showNotification()
    * for foreground OS notification display (required on Android Chrome / installed PWAs).
    */
   private async resolveActiveSwRegistrationForDisplay(): Promise<ServiceWorkerRegistration | null> {
-    if (
-      this.serviceWorkerRegistration &&
-      typeof this.serviceWorkerRegistration.showNotification === 'function'
-    ) {
+    if (this.isSwRegistrationUsableForShowNotification(this.serviceWorkerRegistration)) {
       return this.serviceWorkerRegistration;
     }
 
     if (this.deps.ensureActiveSwFn) {
       const injectedReg = await this.deps.ensureActiveSwFn().catch(() => null);
-      if (injectedReg && typeof injectedReg.showNotification === 'function') {
+      if (this.isSwRegistrationUsableForShowNotification(injectedReg)) {
         this.serviceWorkerRegistration = injectedReg;
         return injectedReg;
       }
@@ -681,28 +986,32 @@ export class PushNotificationService {
       return null;
     }
 
+    try {
+      if (typeof navigator.serviceWorker.getRegistration === 'function') {
+        const reg = await navigator.serviceWorker.getRegistration('/').catch(() => null);
+        if (this.isSwRegistrationUsableForShowNotification(reg)) {
+          this.serviceWorkerRegistration = reg;
+          return reg;
+        }
+      }
+    } catch {
+      // Fall through to full activation check
+    }
+
     if (typeof window !== 'undefined') {
       const ensured = await this.ensureActiveServiceWorkerRegistration().catch(() => null);
-      if (ensured && typeof ensured.showNotification === 'function') {
+      if (this.isSwRegistrationUsableForShowNotification(ensured)) {
         return ensured;
       }
     }
 
     try {
-      if (typeof navigator.serviceWorker.getRegistration === 'function') {
-        const reg = await navigator.serviceWorker.getRegistration('/').catch(() => null);
-        if (reg && typeof reg.showNotification === 'function' && (reg.active || !reg.installing)) {
-          this.serviceWorkerRegistration = reg;
-          return reg;
-        }
-      }
-
       if (navigator.serviceWorker.ready) {
         const readyReg = await Promise.race([
           navigator.serviceWorker.ready.catch(() => null),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
         ]);
-        if (readyReg && typeof readyReg.showNotification === 'function') {
+        if (this.isSwRegistrationUsableForShowNotification(readyReg)) {
           this.serviceWorkerRegistration = readyReg;
           return readyReg;
         }
@@ -716,15 +1025,17 @@ export class PushNotificationService {
 
   /**
    * Subscribe to foreground push messages while the user has Monvera open.
-   * Deduplicates rapid duplicate deliveries, notifies the in-app listener (toast + balance/drawer sync),
-   * and displays an OS notification via the active ServiceWorkerRegistration when permission is granted
-   * (both when Monvera is open/visible on Android/PWA/desktop and when minimized/hidden).
+   * Attaches Firebase onMessage promptly without blocking on SW activation,
+   * deduplicates rapid duplicate deliveries, notifies the in-app listener (toast + balance/drawer sync),
+   * and displays an OS notification via the active ServiceWorkerRegistration when permission is granted.
    */
   public listenToForegroundMessages(
     onMessageReceived: (payload: any, normalized: NormalizedPushNotification) => void
   ): () => void {
     let unsubscribe: (() => void) | null = null;
     let disposed = false;
+
+    this.setupControllerChangeListener();
 
     const handleIncoming = (payload: any) => {
       if (disposed) return;
@@ -833,8 +1144,9 @@ export class PushNotificationService {
   }
 
   /**
-   * Display an OS notification through the active ServiceWorkerRegistration.showNotification API
-   * (with Notification constructor fallback only when no SW registration is available).
+   * Display an OS notification exclusively through ServiceWorkerRegistration.showNotification
+   * on Android Chrome / installed PWAs / SW-capable browsers. Never falls back to `new Notification()`
+   * in SW-capable or Android/PWA environments; queues and retries safely once SW activation completes.
    */
   public async displayServiceWorkerNotification(
     title: string,
@@ -855,11 +1167,23 @@ export class PushNotificationService {
       ...options,
     };
 
+    const tagKey = String(mergedOptions.tag || title || 'monvera-alert').trim();
+
     try {
       const swReg = await this.resolveActiveSwRegistrationForDisplay();
       if (swReg && typeof swReg.showNotification === 'function') {
         await swReg.showNotification(title, mergedOptions);
+        this.pendingOsNotifications.delete(tagKey);
         return true;
+      }
+
+      if (this.isServiceWorkerRequiredEnvironment()) {
+        this.enqueuePendingOsNotification(title, mergedOptions);
+        this.schedulePendingOsNotificationRecovery();
+        console.warn(
+          '[Push] Active service worker registration unavailable; queued foreground OS notification for post-activation display.'
+        );
+        return false;
       }
 
       if (typeof window !== 'undefined' && 'Notification' in window) {
@@ -879,7 +1203,11 @@ export class PushNotificationService {
         return true;
       }
     } catch (err) {
-      console.warn('[Push] Direct notification display note:', err);
+      if (this.isServiceWorkerRequiredEnvironment()) {
+        this.enqueuePendingOsNotification(title, mergedOptions);
+        this.schedulePendingOsNotificationRecovery();
+      }
+      console.warn('[Push] Direct SW notification display note:', err);
     }
 
     return false;

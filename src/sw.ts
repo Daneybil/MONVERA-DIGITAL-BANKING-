@@ -63,10 +63,27 @@ const navigationRoute = new NavigationRoute(navigationHandler, {
 });
 registerRoute(navigationRoute);
 
-// --- 4. PROMPT-CONTROLLED UPDATE ACTIVATION (NO FORCED MID-SESSION SKIPWAITING) ---
+// --- 4. SAFE LIFECYCLE ACTIVATION & CONTROLLER TAKEOVER ---
+// Automatically promote only on fresh install or when replacing a legacy non-/sw.js worker
+// (e.g., /firebase-messaging-sw.js). Existing /sw.js sessions promote via controlled SKIP_WAITING.
+self.addEventListener('install', () => {
+  const activeScriptUrl = self.registration?.active?.scriptURL || '';
+  const isFreshOrLegacyUpgrade = !activeScriptUrl || !activeScriptUrl.endsWith('/sw.js');
+  if (isFreshOrLegacyUpgrade) {
+    void self.skipWaiting();
+  }
+});
+
+self.addEventListener('activate', (event: ExtendableEvent) => {
+  event.waitUntil(self.clients.claim());
+});
+
 self.addEventListener('message', (event: ExtendableMessageEvent) => {
   if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
+    const skipPromise = self.skipWaiting();
+    if (typeof event.waitUntil === 'function') {
+      event.waitUntil(skipPromise);
+    }
   }
 });
 

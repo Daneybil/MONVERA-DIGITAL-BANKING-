@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
 import { firestoreSync } from '../../services/firestoreSync';
@@ -185,6 +185,115 @@ export function resolveAuthorizedTransactionForDeepLink(params: {
   );
 }
 
+export type TransactionDeepLinkResolution =
+  | {
+      status: 'matched';
+      transaction: Transaction;
+      shouldClearStorage: true;
+      shouldShowWarning: false;
+      shouldTriggerRefresh: false;
+    }
+  | {
+      status: 'wait_in_flight';
+      shouldClearStorage: false;
+      shouldShowWarning: false;
+      shouldTriggerRefresh: false;
+    }
+  | {
+      status: 'retry_refresh';
+      refOrId: string;
+      shouldClearStorage: false;
+      shouldShowWarning: false;
+      shouldTriggerRefresh: true;
+    }
+  | {
+      status: 'not_found';
+      shouldClearStorage: true;
+      shouldShowWarning: true;
+      shouldTriggerRefresh: false;
+    }
+  | {
+      status: 'ignore';
+      shouldClearStorage: boolean;
+      shouldShowWarning: false;
+      shouldTriggerRefresh: false;
+    };
+
+export function evaluateTransactionDeepLinkResolution(params: {
+  target: any;
+  transactions: Transaction[];
+  effectiveUid?: string | null;
+  userId?: string | null;
+  userPermanentAccountNumber?: string | null;
+  isRefreshing: boolean;
+  hasLoadedTransactions: boolean;
+  alreadyRetriedRefOrId: string | null;
+}): TransactionDeepLinkResolution {
+  const { target } = params;
+  if (!target || target.actionView !== 'transactions') {
+    return {
+      status: 'ignore',
+      shouldClearStorage: false,
+      shouldShowWarning: false,
+      shouldTriggerRefresh: false,
+    };
+  }
+
+  const refOrId = String(target.referenceNumber || target.actionRecordId || '').trim();
+  if (!refOrId) {
+    return {
+      status: 'ignore',
+      shouldClearStorage: true,
+      shouldShowWarning: false,
+      shouldTriggerRefresh: false,
+    };
+  }
+
+  const matched = resolveAuthorizedTransactionForDeepLink({
+    transactions: params.transactions,
+    refOrId,
+    effectiveUid: params.effectiveUid,
+    userId: params.userId,
+    userPermanentAccountNumber: params.userPermanentAccountNumber,
+  });
+
+  if (matched) {
+    return {
+      status: 'matched',
+      transaction: matched,
+      shouldClearStorage: true,
+      shouldShowWarning: false,
+      shouldTriggerRefresh: false,
+    };
+  }
+
+  if (!params.hasLoadedTransactions || params.isRefreshing) {
+    return {
+      status: 'wait_in_flight',
+      shouldClearStorage: false,
+      shouldShowWarning: false,
+      shouldTriggerRefresh: false,
+    };
+  }
+
+  if (params.alreadyRetriedRefOrId !== refOrId) {
+    return {
+      status: 'retry_refresh',
+      refOrId,
+      shouldClearStorage: false,
+      shouldShowWarning: false,
+      shouldTriggerRefresh: true,
+    };
+  }
+
+  return {
+    status: 'not_found',
+    shouldClearStorage: true,
+    shouldShowWarning: true,
+    shouldTriggerRefresh: false,
+  };
+}
+
 export const TransactionsView: React.FC = () => {
   const { currentUser, balanceMetrics, lastUpdateTimestamp } = useAuth();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -200,31 +309,43 @@ export const TransactionsView: React.FC = () => {
   const [selectedTxForReceipt, setSelectedTxForReceipt] = useState<Transaction | null>(null);
   const [showFilterDrawer, setShowFilterDrawer] = useState(false);
 
+  const inFlightFetchCountRef = useRef<number>(0);
+  const fetchSeqRef = useRef<number>(0);
+  const pendingNavTargetRef = useRef<any | null>(null);
+  const retriedTargetKeyRef = useRef<string | null>(null);
+
   const effectiveUid = auth.currentUser?.uid || currentUser?.id;
 
-  const fetchTransactions = async () => {
+  const fetchTransactions = useCallback(async () => {
     if (!effectiveUid && !currentUser) return;
+    const seq = ++fetchSeqRef.current;
+    inFlightFetchCountRef.current += 1;
     setIsLoading(true);
     try {
       // Authoritative single-path transaction retrieval
       const res = await api.getTransactions({ userId: effectiveUid || currentUser?.id });
-      setTransactions(res.transactions || []);
+      if (seq === fetchSeqRef.current) {
+        setTransactions(res.transactions || []);
+      }
     } catch (err) {
       console.error('Failed to fetch transactions:', err);
     } finally {
-      setIsLoading(false);
+      inFlightFetchCountRef.current = Math.max(0, inFlightFetchCountRef.current - 1);
+      if (inFlightFetchCountRef.current === 0) {
+        setIsLoading(false);
+      }
       setHasLoadedTransactions(true);
     }
-  };
+  }, [effectiveUid, currentUser]);
 
   useEffect(() => {
-    fetchTransactions();
+    void fetchTransactions();
 
     const handleTxCreated = (e: any) => {
       const detail = e?.detail;
       if (!detail) return;
       if (!detail.userId || detail.userId === effectiveUid || detail.userId === currentUser?.id) {
-        fetchTransactions();
+        void fetchTransactions();
       }
     };
 
@@ -236,45 +357,95 @@ export const TransactionsView: React.FC = () => {
         window.removeEventListener('monvera_transaction_created', handleTxCreated);
       }
     };
-  }, [effectiveUid, currentUser, balanceMetrics, lastUpdateTimestamp]);
+  }, [fetchTransactions, effectiveUid, currentUser, balanceMetrics, lastUpdateTimestamp]);
 
-  useEffect(() => {
-    if (!hasLoadedTransactions || !currentUser) return;
-    const focusTxFromNav = (rawTarget?: any) => {
+  const focusTxFromNav = useCallback(
+    (rawTarget?: any, isNewNavigationEvent: boolean = false) => {
+      if (!currentUser) return;
       try {
         let target = rawTarget;
-        if (!target && typeof window !== 'undefined') {
-          const saved = sessionStorage.getItem('monvera_notification_nav_target');
-          if (saved) target = JSON.parse(saved);
-        }
         if (target && target.actionView === 'transactions') {
-          const refOrId = target.referenceNumber || target.actionRecordId;
-          if (refOrId) {
-            const matched = resolveAuthorizedTransactionForDeepLink({
-              transactions,
-              refOrId: String(refOrId),
-              effectiveUid,
-              userId: currentUser?.id,
-              userPermanentAccountNumber: currentUser?.permanentAccountNumber,
-            });
-            if (matched) {
-              setNavWarningNotice(null);
-              setSelectedTxForReceipt(matched);
-            } else {
-              setNavWarningNotice(
-                'The referenced transaction could not be found in your account or is unavailable.'
-              );
+          pendingNavTargetRef.current = target;
+          if (isNewNavigationEvent) {
+            retriedTargetKeyRef.current = null;
+          }
+          if (typeof window !== 'undefined') {
+            try {
+              sessionStorage.setItem('monvera_notification_nav_target', JSON.stringify(target));
+            } catch {}
+          }
+        } else if (!target) {
+          target = pendingNavTargetRef.current;
+          if (!target && typeof window !== 'undefined') {
+            const saved = sessionStorage.getItem('monvera_notification_nav_target');
+            if (saved) {
+              target = JSON.parse(saved);
+              pendingNavTargetRef.current = target;
             }
           }
+        }
+
+        const resolution = evaluateTransactionDeepLinkResolution({
+          target,
+          transactions,
+          effectiveUid,
+          userId: currentUser?.id,
+          userPermanentAccountNumber: currentUser?.permanentAccountNumber,
+          isRefreshing: isLoading || inFlightFetchCountRef.current > 0,
+          hasLoadedTransactions,
+          alreadyRetriedRefOrId: retriedTargetKeyRef.current,
+        });
+
+        if (resolution.status === 'matched') {
+          setNavWarningNotice(null);
+          setSelectedTxForReceipt(resolution.transaction);
+          pendingNavTargetRef.current = null;
+          retriedTargetKeyRef.current = null;
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem('monvera_notification_nav_target');
+          }
+          return;
+        }
+
+        if (resolution.status === 'wait_in_flight') {
+          return;
+        }
+
+        if (resolution.status === 'retry_refresh') {
+          retriedTargetKeyRef.current = resolution.refOrId;
+          void fetchTransactions();
+          return;
+        }
+
+        if (resolution.status === 'not_found') {
+          setNavWarningNotice(
+            'The referenced transaction could not be found in your account or is unavailable.'
+          );
+          pendingNavTargetRef.current = null;
+          retriedTargetKeyRef.current = null;
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem('monvera_notification_nav_target');
+          }
+          return;
+        }
+
+        if (resolution.shouldClearStorage) {
+          pendingNavTargetRef.current = null;
+          retriedTargetKeyRef.current = null;
           if (typeof window !== 'undefined') {
             sessionStorage.removeItem('monvera_notification_nav_target');
           }
         }
       } catch {}
-    };
+    },
+    [currentUser, transactions, effectiveUid, isLoading, hasLoadedTransactions, fetchTransactions]
+  );
+
+  useEffect(() => {
+    if (!currentUser) return;
 
     focusTxFromNav();
-    const onNavigate = (e: any) => focusTxFromNav(e?.detail);
+    const onNavigate = (e: any) => focusTxFromNav(e?.detail, true);
     if (typeof window !== 'undefined') {
       window.addEventListener('monvera_notification_navigate', onNavigate);
     }
@@ -283,7 +454,7 @@ export const TransactionsView: React.FC = () => {
         window.removeEventListener('monvera_notification_navigate', onNavigate);
       }
     };
-  }, [hasLoadedTransactions, transactions, currentUser, effectiveUid]);
+  }, [currentUser, focusTxFromNav]);
 
   if (!currentUser) return null;
 
