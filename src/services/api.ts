@@ -124,6 +124,7 @@ export interface AdminSessionVerificationResult {
 let inflightAdminVerifyPromise: Promise<AdminSessionVerificationResult> | null = null;
 let inflightAdminVerifyKey: string | null = null;
 let lastVerifiedAdminCache: { key: string; result: AdminSessionVerificationResult; verifiedAt: number } | null = null;
+const inflightBackendBalanceRequests = new Map<string, Promise<BalanceMetrics | null>>();
 
 export function invalidateAdminVerificationCache(): void {
   inflightAdminVerifyPromise = null;
@@ -1168,77 +1169,117 @@ export const api = {
     }
   },
 
-  async getBalanceMetrics(userId: string, userAccountNumber?: string): Promise<BalanceMetrics | null> {
-    let zeroFirestoreFallback: BalanceMetrics | null = null;
+  async getBalanceMetrics(
+    userId: string,
+    userAccountNumber?: string,
+    options?: {
+      skipFirestore?: boolean;
+      firestoreReadFn?: (
+        uid: string,
+        accountNumber?: string
+      ) => Promise<BalanceMetrics | null>;
+      fetchFn?: (endpoint: string, init?: RequestInit) => Promise<Response>;
+      getAuthHeadersFn?: (forceRefresh?: boolean) => Promise<Record<string, string>>;
+    }
+  ): Promise<BalanceMetrics | null> {
+    if (!userId) return null;
 
-    // 1. Check permanent Firestore record / immutable ledger first for highest durability
-    try {
-      const firestoreMetrics = await firestoreSync.getAccountBalances(userId, userAccountNumber);
-      if (firestoreMetrics && firestoreMetrics.accounts && firestoreMetrics.accounts.length > 0) {
-        if (hasAnyPositiveBalance(firestoreMetrics) || userAccountNumber) {
+    // 1. Check permanent Firestore record first only when it holds an authoritative positive balance.
+    // Never treat an empty/zero client UID document as authoritative without backend verification,
+    // because customer security rules deny direct client reads of accounts/{permanentAccountNumber}.
+    if (!options?.skipFirestore) {
+      try {
+        const readFirestore = options?.firestoreReadFn || firestoreSync.getAccountBalances.bind(firestoreSync);
+        const firestoreMetrics = await readFirestore(userId, userAccountNumber);
+        if (
+          firestoreMetrics &&
+          firestoreMetrics.accounts &&
+          firestoreMetrics.accounts.length > 0 &&
+          hasAnyPositiveBalance(firestoreMetrics)
+        ) {
           return firestoreMetrics;
         }
-        // Client didn't have userAccountNumber to check legacy accounts/{permanentAccountNumber};
-        // consult /api/accounts/balance which verifies users/{userId} and checks legacy fallback safely.
-        zeroFirestoreFallback = firestoreMetrics;
+      } catch {
+        // Continue to authenticated backend API fallback
       }
-    } catch {
-      // Continue to API check
     }
 
-    // 2. Fetch from backend API
-    try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(`/api/accounts/balance?userId=${encodeURIComponent(userId)}`, {
-        headers,
-      });
-      if (res.ok) {
-        const data = await parseJsonResponse<BalanceMetrics>(res, null as any);
-        if (data && (typeof data.checkingBalance === 'number' || typeof data.totalBalance === 'number')) {
-          if (!Array.isArray(data.accounts) || data.accounts.length === 0) {
-            data.accounts = [
-              {
-                id: `acc_chk_${userId}`,
-                userId,
-                type: 'CHECKING',
-                accountNumber: userAccountNumber || '1000000000',
-                routingNumber: '021000021',
-                currency: 'USD',
-                balance: Number(data.checkingBalance ?? 0),
-                availableBalance: Number(data.availableBalance ?? data.checkingBalance ?? 0),
-                investedBalance: 0,
-                pendingBalance: 0,
-                interestRateAPY: 1.25,
-                status: 'ACTIVE',
-                nickname: 'Monvera Premier Checking',
-              },
-              {
-                id: `acc_sav_${userId}`,
-                userId,
-                type: 'SAVINGS',
-                accountNumber: userAccountNumber && userAccountNumber.length >= 7 ? `10${userAccountNumber.slice(2, -3)}991` : '1000000991',
-                routingNumber: '021000021',
-                currency: 'USD',
-                balance: Number(data.savingsBalance ?? 0),
-                availableBalance: Number(data.savingsBalance ?? 0),
-                investedBalance: 0,
-                pendingBalance: 0,
-                interestRateAPY: 4.85,
-                status: 'ACTIVE',
-                nickname: 'Monvera High-Yield Treasury',
-              },
-            ];
+    // 2. Fetch from authenticated backend API (single-flight deduplicated per userId)
+    const existingInflight = inflightBackendBalanceRequests.get(userId);
+    if (existingInflight) {
+      return existingInflight;
+    }
+
+    const requestPromise = (async (): Promise<BalanceMetrics | null> => {
+      try {
+        const buildHeaders = options?.getAuthHeadersFn || getAuthHeaders;
+        const res = await fetchWithFreshAuthRetry(
+          `/api/accounts/balance?userId=${encodeURIComponent(userId)}`,
+          buildHeaders,
+          undefined,
+          {
+            fetchFn: options?.fetchFn || fetchWithSameOriginFallback,
+            hasAuthenticatedUser: () => Boolean(options?.getAuthHeadersFn || auth?.currentUser),
           }
-          return data;
-        }
-      }
-    } catch {
-      // Backend unavailable
-    }
+        );
 
-    // 3. Only return genuine $0 if accounts/{userId} was directly verified without upstream error;
-    // NEVER fabricate 0 balance metrics when upstream is rate-limited or temporarily unavailable.
-    return zeroFirestoreFallback;
+        if (res.ok) {
+          const data = await parseJsonResponse<BalanceMetrics>(res, null as any);
+          if (data && (typeof data.checkingBalance === 'number' || typeof data.totalBalance === 'number')) {
+            if (!Array.isArray(data.accounts) || data.accounts.length === 0) {
+              data.accounts = [
+                {
+                  id: `acc_chk_${userId}`,
+                  userId,
+                  type: 'CHECKING',
+                  accountNumber: userAccountNumber || '1000000000',
+                  routingNumber: '021000021',
+                  currency: 'USD',
+                  balance: Number(data.checkingBalance ?? 0),
+                  availableBalance: Number(data.availableBalance ?? data.checkingBalance ?? 0),
+                  investedBalance: 0,
+                  pendingBalance: 0,
+                  interestRateAPY: 1.25,
+                  status: 'ACTIVE',
+                  nickname: 'Monvera Premier Checking',
+                },
+                {
+                  id: `acc_sav_${userId}`,
+                  userId,
+                  type: 'SAVINGS',
+                  accountNumber:
+                    userAccountNumber && userAccountNumber.length >= 7
+                      ? `10${userAccountNumber.slice(2, -3)}991`
+                      : '1000000991',
+                  routingNumber: '021000021',
+                  currency: 'USD',
+                  balance: Number(data.savingsBalance ?? 0),
+                  availableBalance: Number(data.savingsBalance ?? 0),
+                  investedBalance: 0,
+                  pendingBalance: 0,
+                  interestRateAPY: 4.85,
+                  status: 'ACTIVE',
+                  nickname: 'Monvera High-Yield Treasury',
+                },
+              ];
+            }
+            return data;
+          }
+        }
+      } catch {
+        // Backend unavailable
+      }
+      return null;
+    })();
+
+    inflightBackendBalanceRequests.set(userId, requestPromise);
+    try {
+      return await requestPromise;
+    } finally {
+      if (inflightBackendBalanceRequests.get(userId) === requestPromise) {
+        inflightBackendBalanceRequests.delete(userId);
+      }
+    }
   },
 
   async lookupRecipient(

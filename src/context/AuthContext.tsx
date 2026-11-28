@@ -275,9 +275,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const balanceOwnerUidRef = React.useRef<string | null>(null);
   const isBalanceCachedRef = React.useRef<boolean>(isBalanceCached);
   isBalanceCachedRef.current = isBalanceCached;
+  const lastLiveBalanceConfirmedRef = React.useRef<{ uid: string; at: number } | null>(null);
 
   const applyLiveBalanceMetrics = useCallback((uid: string, metrics: BalanceMetrics) => {
     balanceOwnerUidRef.current = uid;
+    lastLiveBalanceConfirmedRef.current = { uid, at: Date.now() };
     const syncedAt = new Date().toISOString();
     setBalanceMetrics(metrics);
     setIsBalanceCached(false);
@@ -310,6 +312,51 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setBalanceSyncError(errorMessage);
     }
   }, []);
+
+  const resolveLiveOrCachedBalance = useCallback(
+    async (
+      uid: string,
+      accountNumber?: string,
+      email?: string,
+      preFetchedFsMetrics?: BalanceMetrics | null,
+      options?: { checkMounted?: () => boolean; errorMessage?: string }
+    ) => {
+      const isStillMounted = () => (options?.checkMounted ? options.checkMounted() : true);
+      if (!uid || !isStillMounted()) return;
+
+      const fsMetrics =
+        preFetchedFsMetrics !== undefined
+          ? preFetchedFsMetrics
+          : await firestoreSync.getAccountBalances(uid, accountNumber, email).catch(() => null);
+
+      if (!isStillMounted()) return;
+
+      if (fsMetrics && hasAnyPositiveBalance(fsMetrics)) {
+        applyLiveBalanceMetrics(uid, fsMetrics);
+        return;
+      }
+
+      // Never treat a zero/empty client UID record as authoritative live data without
+      // authenticated backend confirmation, since customer rules block direct legacy client reads.
+      const backendMetrics = await api
+        .getBalanceMetrics(uid, accountNumber, { skipFirestore: true })
+        .catch(() => null);
+
+      if (!isStillMounted()) return;
+
+      if (backendMetrics) {
+        applyLiveBalanceMetrics(uid, backendMetrics);
+        return;
+      }
+
+      hydrateCachedBalanceIfNeeded(
+        uid,
+        options?.errorMessage ||
+          'Temporarily unable to verify live ledger balance — displaying cached balance while reconnecting.'
+      );
+    },
+    [applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]
+  );
 
   const setCurrentView = useCallback((view: AppView) => {
     const targetView = (view === 'security' as any) ? 'profile' : view;
@@ -458,28 +505,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const promise = (async () => {
       try {
-        // 1. Retrieve verified balances directly from permanent Firestore ledger (with verified legacy fallback)
-        const fsMetrics = await firestoreSync.getAccountBalances(
+        await resolveLiveOrCachedBalance(
           effectiveUid,
           activeUser?.permanentAccountNumber,
-          activeUser?.email
-        );
-        if (fsMetrics) {
-          applyLiveBalanceMetrics(effectiveUid, fsMetrics);
-          return;
-        }
-
-        // 2. Fetch backend metrics if Firestore client is initializing or rate-limited
-        const metrics = await api.getBalanceMetrics(effectiveUid, activeUser?.permanentAccountNumber);
-        if (metrics) {
-          applyLiveBalanceMetrics(effectiveUid, metrics);
-          return;
-        }
-
-        // 3. Both reads failed/returned null: preserve last known cached balance and mark as cached
-        hydrateCachedBalanceIfNeeded(
-          effectiveUid,
-          'Temporarily unable to refresh live balance — displaying cached balance while reconnecting.'
+          activeUser?.email,
+          undefined,
+          {
+            errorMessage: 'Temporarily unable to refresh live balance — displaying cached balance while reconnecting.',
+          }
         );
       } catch (err) {
         console.error('Failed to refresh balance:', err);
@@ -497,7 +530,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     inflightBalancePromiseRef.current = promise;
     return promise;
-  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, resolveLiveOrCachedBalance, hydrateCachedBalanceIfNeeded]);
 
   const refreshNotifications = useCallback(async () => {
     const activeUser = currentUserRef.current;
@@ -625,7 +658,48 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           'Live balance stream interrupted — showing cached balance while reconnecting.'
         );
       },
-      currentUserRef.current?.email
+      currentUserRef.current?.email,
+      () => {
+        // When legacy path returns permission-denied and accounts/{uid} is zero/missing:
+        // avoid duplicate requests if startup auth hydration just verified live balance or refresh is in-flight.
+        const recentConfirm = lastLiveBalanceConfirmedRef.current;
+        if (
+          !isBalanceCachedRef.current &&
+          balanceMetricsRef.current &&
+          balanceOwnerUidRef.current === effectiveUid &&
+          recentConfirm &&
+          recentConfirm.uid === effectiveUid &&
+          Date.now() - recentConfirm.at < 3000
+        ) {
+          return;
+        }
+        if (inflightBalancePromiseRef.current) {
+          return;
+        }
+        api
+          .getBalanceMetrics(
+            effectiveUid,
+            currentUserRef.current?.permanentAccountNumber,
+            { skipFirestore: true }
+          )
+          .then((backendMetrics) => {
+            if (backendMetrics) {
+              applyLiveBalanceMetrics(effectiveUid, backendMetrics);
+              setLastUpdateTimestamp(Date.now());
+            } else {
+              hydrateCachedBalanceIfNeeded(
+                effectiveUid,
+                'Temporarily unable to verify live ledger balance — displaying cached balance while reconnecting.'
+              );
+            }
+          })
+          .catch(() => {
+            hydrateCachedBalanceIfNeeded(
+              effectiveUid,
+              'Temporarily unable to verify live ledger balance — displaying cached balance while reconnecting.'
+            );
+          });
+      }
     );
 
     // 2. Real-time Firestore profile listener under users/{effectiveUid} for instant KYC status reflection & frozen enforcement
@@ -1023,25 +1097,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setCurrentUser(resolvedUser);
         cacheUserInDirectory(resolvedUser);
 
-        // Fetch verified balance metrics from Firestore ledger first, then authenticated REST balance endpoint
-        const fsMetrics = await firestoreSync.getAccountBalances(
+        // Fetch verified positive Firestore ledger first, or fall back to authenticated REST balance endpoint
+        await resolveLiveOrCachedBalance(
           resolvedUser.id,
           resolvedUser.permanentAccountNumber,
-          resolvedUser.email
-        );
-        if (fsMetrics) {
-          applyLiveBalanceMetrics(resolvedUser.id, fsMetrics);
-        } else {
-          const apiMetrics = await api.getBalanceMetrics(resolvedUser.id, resolvedUser.permanentAccountNumber);
-          if (apiMetrics) {
-            applyLiveBalanceMetrics(resolvedUser.id, apiMetrics);
-          } else {
-            hydrateCachedBalanceIfNeeded(
-              resolvedUser.id,
-              'Temporarily unable to verify live ledger — showing cached balance if available.'
-            );
+          resolvedUser.email,
+          undefined,
+          {
+            errorMessage: 'Temporarily unable to verify live ledger — showing cached balance if available.',
           }
-        }
+        );
         const notifRes = await api.getNotifications(resolvedUser.id);
         if (notifRes.notifications) setNotifications(notifRes.notifications);
       }
@@ -1054,7 +1119,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } finally {
       setIsLoading(false);
     }
-  }, [applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
+  }, [resolveLiveOrCachedBalance, hydrateCachedBalanceIfNeeded]);
 
   // Firebase Auth State Listener & Initial Setup
   useEffect(() => {
@@ -1166,23 +1231,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (isZeroOrMissing && resolvedUser.permanentAccountNumber && resolvedUser.permanentAccountNumber !== '0000000000') {
               fsMetrics = await firestoreSync
                 .getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber, resolvedUser.email)
-                .catch(() => fsMetrics);
+                .catch(() => null);
             }
 
-            if (fsMetrics && isMounted) {
-              applyLiveBalanceMetrics(resolvedUser.id, fsMetrics);
-            } else if (isMounted) {
-              const apiMetrics = await api
-                .getBalanceMetrics(resolvedUser.id, resolvedUser.permanentAccountNumber)
-                .catch(() => null);
-              if (apiMetrics && isMounted) {
-                applyLiveBalanceMetrics(resolvedUser.id, apiMetrics);
-              } else if (isMounted) {
-                hydrateCachedBalanceIfNeeded(
-                  resolvedUser.id,
-                  'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.'
-                );
-              }
+            if (isMounted) {
+              await resolveLiveOrCachedBalance(
+                resolvedUser.id,
+                resolvedUser.permanentAccountNumber,
+                resolvedUser.email,
+                fsMetrics,
+                {
+                  checkMounted: () => isMounted,
+                  errorMessage: 'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.',
+                }
+              );
             }
 
             if (isMounted) {
@@ -1235,6 +1297,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         syncedPushUidRef.current = null;
         inFlightPushSyncUidRef.current = null;
         balanceOwnerUidRef.current = null;
+        lastLiveBalanceConfirmedRef.current = null;
         if (isMounted) {
           setCurrentUser(null);
           setBalanceMetrics(null);
@@ -1264,7 +1327,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isMounted = false;
       unsubscribe();
     };
-  }, [fetchUsers, applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
+  }, [fetchUsers, applyLiveBalanceMetrics, resolveLiveOrCachedBalance, hydrateCachedBalanceIfNeeded]);
 
   /**
    * Internal session hydrator that completes profile synchronization,
@@ -1379,7 +1442,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         twoFactorEnabled: isMfaEnrolled || userProfile.twoFactorEnabled,
       };
 
-      // 2. Resolve authoritative account balances (only run legacy accountNumber/API fallback if parallel primary read returned missing/zero)
+      // 2. Resolve authoritative account balances: never accept zero-valued client UID record as authoritative
+      // without verifying legacy/backend via /api/accounts/balance
       let finalMetricsToSet = initialFsMetrics;
       const isZeroOrMissing = !finalMetricsToSet || !hasAnyPositiveBalance(finalMetricsToSet);
 
@@ -1387,32 +1451,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const legacyMetrics = await firestoreSync
           .getAccountBalances(uid, finalUser.permanentAccountNumber, finalUser.email)
           .catch(() => null);
-        if (legacyMetrics && (!finalMetricsToSet || hasAnyPositiveBalance(legacyMetrics))) {
+        if (legacyMetrics && hasAnyPositiveBalance(legacyMetrics)) {
           finalMetricsToSet = legacyMetrics;
         }
       }
 
-      if (!finalMetricsToSet) {
-        // Resilient fallback to authenticated backend API if Firestore accounts doc is unavailable/initializing
-        try {
-          const backendMetrics = await api.getBalanceMetrics(uid, finalUser.permanentAccountNumber);
-          if (backendMetrics && (typeof backendMetrics.checkingBalance === 'number' || typeof backendMetrics.totalBalance === 'number')) {
-            finalMetricsToSet = backendMetrics;
-          }
-        } catch (backendBalanceErr) {
-          console.warn('[Auth] Authoritative backend balance fetch note:', backendBalanceErr);
+      await resolveLiveOrCachedBalance(
+        uid,
+        finalUser.permanentAccountNumber,
+        finalUser.email,
+        finalMetricsToSet,
+        {
+          errorMessage: 'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.',
         }
-      }
-
-      if (finalMetricsToSet) {
-        applyLiveBalanceMetrics(uid, finalMetricsToSet);
-      } else {
-        hydrateCachedBalanceIfNeeded(
-          uid,
-          'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.'
-        );
-        console.warn(`[Auth] Authoritative account ledger document accounts/${uid} was not found. Financial records preserved.`);
-      }
+      );
 
       // Commit resolved user & navigation view cleanly once balances are ready
       setCurrentUser(finalUser);

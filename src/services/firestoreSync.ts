@@ -21,6 +21,8 @@ import {
   selectAuthoritativeAccountDocData,
   normalizeBalanceMetricsFromDoc,
   createAccountSnapshotCoordinator,
+  resolveClientAccountBalanceRead,
+  isFirestorePermissionDeniedError,
 } from '../utils/balancePersistence';
 
 // Double-investment prevention lock for concurrent clicks/requests
@@ -986,64 +988,37 @@ export const firestoreSync = {
   /**
    * Fetch permanent user account balances from Firestore: accounts/{userId}
    * with verified fallback to legacy accounts/{userAccountNumber} when primary UID ledger is missing or zero.
-   * Strictly reads authoritative account documents. Zero loan queries, zero transaction scans.
+   * When accounts/{userId} is zero/missing and reading accounts/{userAccountNumber} is blocked by security rules
+   * (permission-denied) or fails transiently, returns null so callers consult authenticated /api/accounts/balance.
    */
   async getAccountBalances(
     userId: string,
     userAccountNumber?: string,
-    userEmail?: string
+    userEmail?: string,
+    deps?: {
+      readAccountDoc?: (docId: string) => Promise<{ exists: boolean; data: Record<string, any> | null }>;
+    }
   ): Promise<BalanceMetrics | null> {
     if (!userId) return null;
-    if (!db) return null;
+    if (!db && !deps?.readAccountDoc) return null;
     const path = `accounts/${userId}`;
-    try {
-      const accRef = doc(db, 'accounts', userId);
-      const snap = await getDoc(accRef);
-      const uidExists = snap.exists();
-      const uidData = uidExists ? snap.data() : null;
-
-      let legacyExists = false;
-      let legacyData: Record<string, any> | null = null;
-      let legacyTransientError = false;
-      const cleanAcc = sanitizeAccountNumber(userAccountNumber);
-
-      if ((!uidExists || !hasAnyPositiveBalance(uidData)) && cleanAcc && cleanAcc !== userId) {
-        try {
-          const legacyRef = doc(db, 'accounts', cleanAcc);
-          const legacySnap = await getDoc(legacyRef);
-          if (legacySnap.exists()) {
-            legacyExists = true;
-            legacyData = legacySnap.data();
-          }
-        } catch (legacyErr: any) {
-          const code = legacyErr?.code || '';
-          const isPermissionDenied =
-            code === 'permission-denied' || String(legacyErr?.message || '').includes('permission-denied');
-          if (!isPermissionDenied) {
-            legacyTransientError = true;
-          }
-        }
-      }
-
-      if (legacyTransientError && !hasAnyPositiveBalance(uidData)) {
-        return null;
-      }
-
-      const selection = selectAuthoritativeAccountDocData({
-        uid: userId,
-        uidExists,
-        uidData,
-        legacyAccNumber: cleanAcc || undefined,
-        legacyExists,
-        legacyData,
-        userEmail,
+    const readAccountDoc =
+      deps?.readAccountDoc ||
+      (async (docId: string) => {
+        const snap = await getDoc(doc(db, 'accounts', docId));
+        return {
+          exists: snap.exists(),
+          data: snap.exists() ? snap.data() : null,
+        };
       });
 
-      if (selection.source !== 'none' && selection.data) {
-        return normalizeBalanceMetricsFromDoc(userId, selection.data, cleanAcc || userAccountNumber);
-      }
-
-      return null;
+    try {
+      return await resolveClientAccountBalanceRead({
+        userId,
+        userAccountNumber,
+        userEmail,
+        readAccountDoc,
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.GET, path);
       return null;
@@ -1541,14 +1516,15 @@ export const firestoreSync = {
    * Real-time listener for a user's account balances under accounts/{userId}
    * and (if applicable) legacy accounts/{userAccountNumber}.
    * Uses the same authoritative selection rule as getAccountBalances so an empty or zero-valued
-   * accounts/{userId} document never overwrites a valid owned legacy balance.
+   * accounts/{userId} document never overwrites a valid owned legacy balance or emits $0 on permission-denied.
    */
   subscribeToAccountBalances(
     userId: string,
     userAccountNumber: string | undefined,
     onUpdate: (metrics: BalanceMetrics) => void,
     onError?: (error: unknown) => void,
-    userEmail?: string
+    userEmail?: string,
+    onBackendFallback?: () => void
   ): () => void {
     if (!userId || !db) return () => {};
     try {
@@ -1559,6 +1535,7 @@ export const firestoreSync = {
         userEmail,
         onUpdate,
         onError,
+        onLegacyPermissionDenied: onBackendFallback,
       });
 
       const accRef = doc(db, 'accounts', userId);
@@ -1582,7 +1559,9 @@ export const firestoreSync = {
             coordinator.onLegacySnapshot(snap.exists(), snap.exists() ? snap.data() : null);
           },
           (err) => {
-            console.warn('[Firestore] Legacy account balances listener note:', err);
+            if (!isFirestorePermissionDeniedError(err)) {
+              console.warn('[Firestore] Legacy account balances listener note:', err);
+            }
             coordinator.onLegacyError(err);
           }
         );

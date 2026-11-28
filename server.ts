@@ -4247,19 +4247,41 @@ export async function handleGetAdminOverview(
     let pendingTransactionsCount = 0;
     let failedTransactionsCount = 0;
 
-    const realUserIds = new Set<string>();
+    const accountsMap = new Map<string, Record<string, any>>();
+    accountsSnap.forEach((doc) => {
+      accountsMap.set(doc.id, doc.data() || {});
+    });
+
+    const realUsers: Array<{ id: string; permanentAccountNumber?: string; email?: string }> = [];
     usersSnap.forEach((doc) => {
       const d = doc.data() || {};
       if (!isFakeAccount({ id: doc.id, ...d })) {
-        realUserIds.add(doc.id);
+        realUsers.push({
+          id: doc.id,
+          permanentAccountNumber: d.permanentAccountNumber || d.accountNumber,
+          email: d.email,
+        });
       }
     });
 
-    const totalCustomers = realUserIds.size;
+    const totalCustomers = realUsers.length;
 
-    accountsSnap.forEach((doc) => {
-      if (realUserIds.has(doc.id)) {
-        const ad = doc.data() || {};
+    for (const ru of realUsers) {
+      const cleanAcc = sanitizeAccountNumber(ru.permanentAccountNumber);
+      const uidData = accountsMap.get(ru.id) || null;
+      const legacyData = cleanAcc && cleanAcc !== ru.id ? accountsMap.get(cleanAcc) || null : null;
+      const selection = selectAuthoritativeAccountDocData({
+        uid: ru.id,
+        uidExists: Boolean(uidData),
+        uidData,
+        legacyAccNumber: cleanAcc || undefined,
+        legacyExists: Boolean(legacyData),
+        legacyData,
+        userEmail: ru.email,
+      });
+
+      if (selection.source !== 'none' && selection.data) {
+        const ad = selection.data;
         const chk = Number(ad.checkingBalance ?? 0);
         const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
         const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
@@ -4272,7 +4294,7 @@ export async function handleGetAdminOverview(
           activeAccounts += 2;
         }
       }
-    });
+    }
 
     txSnap.forEach((doc) => {
       const tx = doc.data() || {};
@@ -4375,8 +4397,19 @@ export async function handleGetAdminCustomers(
     const userMap = new Map<string, any>();
 
     for (const fu of firestoreUsers) {
-      const cleanAcc = (fu.permanentAccountNumber || '').replace(/[-\s]/g, '');
-      const ad = accountsMap.get(fu.id) || (cleanAcc ? accountsMap.get(cleanAcc) : null);
+      const cleanAcc = sanitizeAccountNumber(fu.permanentAccountNumber || fu.accountNumber);
+      const uidData = accountsMap.get(fu.id) || null;
+      const legacyData = cleanAcc && cleanAcc !== fu.id ? accountsMap.get(cleanAcc) || null : null;
+      const selection = selectAuthoritativeAccountDocData({
+        uid: fu.id,
+        uidExists: Boolean(uidData),
+        uidData,
+        legacyAccNumber: cleanAcc || undefined,
+        legacyExists: Boolean(legacyData),
+        legacyData,
+        userEmail: fu.email,
+      });
+      const ad = selection.data;
       let balanceMetrics: any;
       if (ad) {
         balanceMetrics = resolveCustomerPreviewBalanceMetrics(ad, {

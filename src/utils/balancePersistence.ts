@@ -14,6 +14,16 @@ export interface SnapshotCoordinatorState {
   legacyExists: boolean;
   legacyData: Record<string, any> | null;
   legacyErrored: boolean;
+  legacyPermissionDenied: boolean;
+}
+
+export function isFirestorePermissionDeniedError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') {
+    return typeof err === 'string' && err.toLowerCase().includes('permission-denied');
+  }
+  const code = String((err as any)?.code || '').toLowerCase();
+  const msg = String((err as any)?.message || '').toLowerCase();
+  return code === 'permission-denied' || code === '7' || msg.includes('permission-denied') || msg.includes('missing or insufficient permissions');
 }
 
 /**
@@ -259,7 +269,7 @@ export function normalizeBalanceMetricsFromDoc(
 /**
  * Pure two-stream coordinator for real-time balance listeners (`accounts/{uid}` and optional `accounts/{permanentAccountNumber}`).
  * Prevents an empty/zero `accounts/{uid}` snapshot from emitting $0 over a valid legacy balance or firing a $0 flicker
- * before the legacy listener finishes its initial snapshot.
+ * before the legacy listener finishes its initial snapshot or when client security rules deny reading legacy accounts directly.
  */
 export function createAccountSnapshotCoordinator(params: {
   uid: string;
@@ -267,9 +277,11 @@ export function createAccountSnapshotCoordinator(params: {
   userEmail?: string | null;
   onUpdate: (metrics: BalanceMetrics) => void;
   onError?: (err: unknown) => void;
+  onLegacyPermissionDenied?: () => void;
 }) {
   const cleanAcc = sanitizeAccountNumber(params.legacyAccNumber);
   const hasLegacyPath = Boolean(cleanAcc && cleanAcc !== params.uid);
+  let lastFallbackSignature: string | null = null;
 
   const state: SnapshotCoordinatorState = {
     uidReceived: false,
@@ -280,24 +292,58 @@ export function createAccountSnapshotCoordinator(params: {
     legacyExists: false,
     legacyData: null,
     legacyErrored: false,
+    legacyPermissionDenied: false,
+  };
+
+  const buildUidFallbackSignature = () => {
+    if (!state.uidExists || !state.uidData) return 'missing';
+    return JSON.stringify({
+      c: Number(state.uidData.checkingBalance ?? 0),
+      s: Number(state.uidData.savingsBalance ?? state.uidData.savings ?? 0),
+      i: Number(state.uidData.investedBalance ?? state.uidData.investmentBalance ?? 0),
+      a: Number(state.uidData.accruedEarnings ?? 0),
+      t: Number(state.uidData.totalBalance ?? 0),
+      av: Number(state.uidData.availableBalance ?? 0),
+      p: Number(state.uidData.pendingBalance ?? 0),
+      u: state.uidData.updatedAt ?? null,
+    });
   };
 
   const evaluateAndEmit = () => {
     const uidHasPositive = hasAnyPositiveBalance(state.uidData);
 
+    if (uidHasPositive && state.uidData) {
+      lastFallbackSignature = null;
+      params.onUpdate(normalizeBalanceMetricsFromDoc(params.uid, state.uidData, cleanAcc || undefined));
+      return;
+    }
+
     // Wait until both streams have settled their initial read unless accounts/{uid} already holds a positive balance.
-    if (!uidHasPositive) {
-      if (!state.uidReceived || !state.legacyReceived) {
-        return;
+    if (!state.uidReceived || !state.legacyReceived) {
+      return;
+    }
+
+    // If UID stream errored and legacy has no positive balance, hold without emitting $0.
+    if (state.uidErrored && !hasAnyPositiveBalance(state.legacyData)) {
+      return;
+    }
+
+    // Under customer Firestore security rules, reading accounts/{permanentAccountNumber} directly fails with permission-denied.
+    // Never interpret permission-denied as proof that no legacy balance exists, and never emit an unverified $0 UID snapshot.
+    // Request authenticated backend fallback instead and preserve cached/verified balances until resolved.
+    if (hasLegacyPath && state.legacyPermissionDenied) {
+      const sig = buildUidFallbackSignature();
+      if (lastFallbackSignature !== sig) {
+        lastFallbackSignature = sig;
+        params.onLegacyPermissionDenied?.();
       }
-      // If UID doc is missing or all-zero AND the legacy stream errored transiently (not permission-denied/not-found),
-      // do NOT emit an unverified $0 that could overwrite cached balance displays.
-      if (state.legacyErrored && (!state.uidExists || !uidHasPositive)) {
-        return;
-      }
-      if (state.uidErrored && !hasAnyPositiveBalance(state.legacyData)) {
-        return;
-      }
+      return;
+    }
+
+    // If UID doc is missing or all-zero AND the legacy stream errored transiently,
+    // do NOT emit an unverified $0 that could overwrite cached balance displays.
+    if (state.legacyErrored && (!state.uidExists || !uidHasPositive)) {
+      return;
     }
 
     const selection = selectAuthoritativeAccountDocData({
@@ -332,24 +378,84 @@ export function createAccountSnapshotCoordinator(params: {
     onLegacySnapshot(exists: boolean, data: Record<string, any> | null | undefined) {
       state.legacyReceived = true;
       state.legacyErrored = false;
+      state.legacyPermissionDenied = false;
       state.legacyExists = exists;
       state.legacyData = exists && data ? data : null;
       evaluateAndEmit();
     },
     onLegacyError(err: unknown) {
       state.legacyReceived = true;
-      const errCode = (err as any)?.code || '';
-      const isPermissionDenied =
-        errCode === 'permission-denied' || String((err as any)?.message || '').includes('permission-denied');
-      // permission-denied on an unused/unowned legacy path should not block a valid UID doc;
-      // transient errors (unavailable, resource-exhausted) block emitting $0 from an empty UID doc.
+      const isPermissionDenied = isFirestorePermissionDeniedError(err);
       state.legacyErrored = !isPermissionDenied;
+      state.legacyPermissionDenied = isPermissionDenied;
       evaluateAndEmit();
-      if (!isPermissionDenied || (!state.uidExists && !hasAnyPositiveBalance(state.uidData))) {
+      if (!isPermissionDenied) {
         params.onError?.(err);
       }
     },
   };
+}
+
+/**
+ * Pure client-side balance resolution helper shared by firestoreSync.getAccountBalances.
+ * Ensures permission-denied or transient errors on the legacy path never convert an unverified $0 UID doc
+ * into an authoritative live result; returns null so callers consult authenticated /api/accounts/balance.
+ */
+export async function resolveClientAccountBalanceRead(params: {
+  userId: string;
+  userAccountNumber?: string;
+  userEmail?: string;
+  readAccountDoc: (docId: string) => Promise<{ exists: boolean; data: Record<string, any> | null }>;
+}): Promise<BalanceMetrics | null> {
+  const { userId, userAccountNumber, userEmail, readAccountDoc } = params;
+  if (!userId) return null;
+
+  const uidSnap = await readAccountDoc(userId);
+  const uidExists = uidSnap.exists;
+  const uidData = uidExists ? uidSnap.data : null;
+
+  if (uidExists && uidData && hasAnyPositiveBalance(uidData)) {
+    return normalizeBalanceMetricsFromDoc(userId, uidData, sanitizeAccountNumber(userAccountNumber) || userAccountNumber);
+  }
+
+  let legacyExists = false;
+  let legacyData: Record<string, any> | null = null;
+  let legacyBlockedOrErrored = false;
+  const cleanAcc = sanitizeAccountNumber(userAccountNumber);
+
+  if (cleanAcc && cleanAcc !== userId) {
+    try {
+      const legacySnap = await readAccountDoc(cleanAcc);
+      if (legacySnap.exists) {
+        legacyExists = true;
+        legacyData = legacySnap.data;
+      }
+    } catch {
+      // Both permission-denied and transient errors mean client cannot verify legacy balance:
+      // do NOT fall back to returning an unverified $0 UID record as authoritative.
+      legacyBlockedOrErrored = true;
+    }
+  }
+
+  if (legacyBlockedOrErrored) {
+    return null;
+  }
+
+  const selection = selectAuthoritativeAccountDocData({
+    uid: userId,
+    uidExists,
+    uidData,
+    legacyAccNumber: cleanAcc || undefined,
+    legacyExists,
+    legacyData,
+    userEmail,
+  });
+
+  if (selection.source !== 'none' && selection.data) {
+    return normalizeBalanceMetricsFromDoc(userId, selection.data, cleanAcc || userAccountNumber);
+  }
+
+  return null;
 }
 
 /**
