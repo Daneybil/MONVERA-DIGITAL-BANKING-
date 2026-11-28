@@ -122,12 +122,17 @@ export function inferPushDirection(raw: {
   if (eventKey.endsWith(':REVERSED')) return 'CREDIT';
 
   const text = `${String(raw.title || '')} ${String(raw.body || '')}`.toLowerCase();
+  if (text.includes('internal account transfer') || text.includes('transferred from')) {
+    return 'INFO';
+  }
   if (
     text.includes('account debited') ||
     text.includes('has been debited') ||
     text.includes('withdrawal') ||
     text.includes('repayment') ||
+    text.includes('settled in full') ||
     text.includes('fee was debited') ||
+    text.includes('card issued') ||
     text.includes('you sent') ||
     text.includes('check issued') ||
     text.includes('wire check') ||
@@ -140,6 +145,7 @@ export function inferPushDirection(raw: {
     text.includes('has received') ||
     text.includes('credited back') ||
     text.includes('credited to') ||
+    text.includes('liquidity credited') ||
     text.includes('you received') ||
     text.includes('deposit') ||
     text.includes('matured') ||

@@ -4951,6 +4951,59 @@ app.post('/api/admin/transactions/:id/update-status', requireAdminAuth, async (r
         date: new Date().toISOString(),
       },
     });
+
+    if (isFirebaseAdminConfigured() && updatedTx.id) {
+      try {
+        const txAmt = Number(updatedTx.amount || 0);
+        const safeRef = String(updatedTx.referenceNumber || updatedTx.id).trim();
+        const statusStage = status === 'REVERSED' ? 'REVERSED' : 'COMPLETED';
+        const statusTitle =
+          status === 'FAILED'
+            ? 'Transaction Failed — Monvera'
+            : status === 'REVERSED'
+              ? 'Transaction Reversed — Monvera'
+              : 'Transaction Completed — Monvera';
+        const safeReason =
+          typeof reason === 'string' && reason.trim()
+            ? reason.replace(/\b\d{8,}\b/g, '••••').trim().slice(0, 120)
+            : '';
+        const statusAmtStr = Number.isFinite(txAmt) && txAmt > 0
+          ? `$${txAmt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${updatedTx.currency || 'USD'}`
+          : '';
+        const statusBody = statusAmtStr
+          ? `Your transaction (${statusAmtStr}) status is now ${status}.${safeReason ? ` ${safeReason}` : ''}`
+          : `Your transaction status is now ${status}.${safeReason ? ` ${safeReason}` : ''}`;
+
+        await adminFirestore.runTransaction(async (tx) => {
+          const outboxBatch = await prepareNotificationOutboxBatch(tx, adminFirestore, [
+            {
+              userId: String(targetCustomerUid),
+              transactionId: String(updatedTx.id),
+              referenceNumber: safeRef,
+              eventKey: `${String(updatedTx.id)}:STATUS_${status}`,
+              lifecycleStage: statusStage,
+              dispatchType: 'TRANSACTION',
+              category: 'TRANSACTION',
+              nowIso: new Date().toISOString(),
+              payload: {
+                title: statusTitle,
+                body: statusBody.slice(0, 320),
+                description: (safeReason || `Transaction status updated to ${status}`).slice(0, 140),
+                direction: isCredit ? 'CREDIT' : 'DEBIT',
+                actionUrl: '/dashboard?view=transactions',
+                ...(Number.isFinite(txAmt) && txAmt > 0 ? { amount: txAmt } : {}),
+                currency: String(updatedTx.currency || 'USD').trim() || 'USD',
+              },
+            },
+          ]);
+          if (outboxBatch.invalidItems.length === 0) {
+            writePreparedNotificationOutboxBatchInTransaction(tx, outboxBatch);
+          }
+        });
+      } catch (outboxErr: any) {
+        console.warn('[/api/admin/transactions/:id/update-status] Outbox enqueue note:', outboxErr?.message || outboxErr);
+      }
+    }
   }
 
   res.json(result);

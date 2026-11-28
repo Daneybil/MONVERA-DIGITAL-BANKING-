@@ -195,6 +195,24 @@ const firebaseConfig = {
 const firebaseApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const messaging = getMessaging(firebaseApp);
 
+async function showSwNotificationSafely(
+  title: string,
+  options: NotificationOptions
+): Promise<void> {
+  try {
+    await self.registration.showNotification(title, options);
+  } catch (err) {
+    const { actions: _ignoredActions, ...fallbackOptions } = options as NotificationOptions & {
+      actions?: unknown;
+    };
+    if ('actions' in options) {
+      await self.registration.showNotification(title, fallbackOptions);
+      return;
+    }
+    throw err;
+  }
+}
+
 // Background push notification receiver (preserves data-only messages without duplicating auto-shown notification payloads)
 onBackgroundMessage(messaging, (payload) => {
   // Firebase SDK automatically renders notifications containing a top-level `notification` object.
@@ -228,7 +246,7 @@ onBackgroundMessage(messaging, (payload) => {
     },
   } as NotificationOptions;
 
-  return self.registration.showNotification(normalized.title, notificationOptions);
+  return showSwNotificationSafely(normalized.title, notificationOptions);
 });
 
 // Resilient native push event listener fallback strictly for non-FCM messages
@@ -242,7 +260,7 @@ self.addEventListener('push', (event: PushEvent) => {
     }
     const normalized = normalizePushPayload(payload);
     event.waitUntil(
-      self.registration.showNotification(normalized.title, {
+      showSwNotificationSafely(normalized.title, {
         body: normalized.body,
         icon: '/pwa-192x192.png',
         badge: '/pwa-192x192.png',
@@ -259,6 +277,10 @@ self.addEventListener('push', (event: PushEvent) => {
           actionView: normalized.actionView,
           transactionId: normalized.transactionId,
           referenceId: normalized.referenceId,
+          direction: normalized.direction,
+          amount: normalized.amount,
+          currency: normalized.currency,
+          description: normalized.description,
           timestamp: normalized.timestamp,
         },
       } as NotificationOptions)
@@ -266,7 +288,7 @@ self.addEventListener('push', (event: PushEvent) => {
   } catch {
     // Non-JSON payload
     event.waitUntil(
-      self.registration.showNotification('Monvera Account Alert', {
+      showSwNotificationSafely('Monvera Account Alert', {
         body: event.data.text() || 'New transaction activity.',
         icon: '/pwa-192x192.png',
         badge: '/pwa-192x192.png',

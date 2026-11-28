@@ -781,7 +781,7 @@ async function runTests() {
     });
     assert.strictEqual(confirmedDup.nextStatus, 'DISPATCHED');
 
-    const noTokensOutcome = evaluateOutboxAttemptOutcome({
+    const noTokensRetryOutcome = evaluateOutboxAttemptOutcome({
       outboxRecord: claimedRecord,
       dispatchResult: {
         transactionId: 'tx_dup_1',
@@ -792,9 +792,24 @@ async function runTests() {
       },
       persistentLog: { pushStatus: 'NO_ACTIVE_TOKENS' },
     });
-    assert.strictEqual(noTokensOutcome.nextStatus, 'DISPATCHED');
+    assert.strictEqual(noTokensRetryOutcome.nextStatus, 'FAILED_RETRYABLE');
+    assert.strictEqual(noTokensRetryOutcome.pushStatus, 'NO_ACTIVE_TOKENS');
 
-    console.log('✓ Tests 9–10 passed: DUPLICATE_IGNORED requires persistent confirmation & NO_ACTIVE_TOKENS/DISABLED_BY_USER are terminal');
+    const noTokensExhaustedOutcome = evaluateOutboxAttemptOutcome({
+      outboxRecord: { ...claimedRecord, attemptCount: claimedRecord.maxAttempts },
+      dispatchResult: {
+        transactionId: 'tx_dup_1',
+        referenceNumber: 'MV-DUP-1',
+        push: { attempted: false, delivered: false, status: 'NO_ACTIVE_TOKENS' },
+        sms: { success: true, delivered: false, status: 'DISABLED_BY_USER' },
+        email: { success: true, delivered: false, status: 'DISABLED_BY_USER' },
+      },
+      persistentLog: { pushStatus: 'NO_ACTIVE_TOKENS' },
+    });
+    assert.strictEqual(noTokensExhaustedOutcome.nextStatus, 'DISPATCHED');
+    assert.strictEqual(noTokensExhaustedOutcome.pushStatus, 'NO_ACTIVE_TOKENS');
+
+    console.log('✓ Tests 9–10 passed: DUPLICATE_IGNORED requires persistent confirmation; NO_ACTIVE_TOKENS bounded-retries then settles DISPATCHED; DISABLED_BY_USER is terminal');
   }
 
   // -------------------------------------------------------------------------

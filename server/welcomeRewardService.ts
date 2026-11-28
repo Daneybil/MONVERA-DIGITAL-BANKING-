@@ -511,6 +511,8 @@ export async function evaluateAndProcessWelcomeReward(
             payload: {
               title: 'Welcome Reward Credited — Monvera',
               body: `Congratulations! Your $${rewardAmtFormatted} Monvera Welcome Reward has been credited to ${safeRewardAccountMasked}.`,
+              description: `Monvera Welcome Reward credited to ${safeRewardAccountMasked}`.slice(0, 140),
+              direction: 'CREDIT',
               actionUrl: '/dashboard?view=transactions',
               amount: WELCOME_REWARD_AMOUNT,
               currency: 'USD',

@@ -647,6 +647,9 @@ export class NotificationOutboxWorker {
             if (settled.settled && settled.reason === 'SETTLED_TO_DEAD_LETTER') {
               summary.deadLetteredCount++;
               processedEligible++;
+            } else if (settled.settled && settled.reason === 'SETTLED_NO_ACTIVE_TOKENS') {
+              summary.dispatchedCount++;
+              processedEligible++;
             }
             continue;
           }
@@ -751,6 +754,9 @@ export class NotificationOutboxWorker {
             });
             if (settled.settled && settled.reason === 'SETTLED_TO_DEAD_LETTER') {
               summary.deadLetteredCount++;
+              processedEligible++;
+            } else if (settled.settled && settled.reason === 'SETTLED_NO_ACTIVE_TOKENS') {
+              summary.dispatchedCount++;
               processedEligible++;
             }
             continue;

@@ -28,7 +28,13 @@ import {
   evaluateOutboxAttemptOutcome,
   transitionOutboxAsLeaseOwner,
 } from './server/services/notificationOutbox';
-import { executeServerTransfer } from './server/firestoreTransactions';
+import {
+  executeServerTransfer,
+  executeServerWithdrawal,
+  executeServerDeposit,
+  executeServerInternalTransfer,
+  executeServerCardIssuance,
+} from './server/firestoreTransactions';
 import { persistCustomerNotification } from './server/services/notificationStore';
 import { PushNotificationService } from './src/services/pushNotificationService';
 import {
@@ -1466,7 +1472,460 @@ async function runTests() {
     }
   }
 
-  console.log('\nALL PUSH NOTIFICATION REPAIR TESTS (A–L) PASSED SUCCESSFULLY.');
+  // -------------------------------------------------------------------------
+  // TEST M: End-to-End Withdrawal, Deposit, Internal Transfer, & Card Issuance
+  // - Verifies each event creates notification_outbox -> FCM payload with
+  //   amount, currency, direction, description, reference, Read More URL,
+  //   preserves Mastercard Card Issued & in-app notifications, and zero duplicates.
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new InMemoryFirestore();
+    const uid = 'uid_tx_coverage_m';
+    const pan = '1055667788';
+
+    await fsMem.collection('users').doc(uid).set({
+      id: uid,
+      firstName: 'Nadia',
+      lastName: 'Vance',
+      email: 'nadia@monvera.test',
+      permanentAccountNumber: pan,
+      kycStatus: 'verified',
+      dailyTransactionLimit: 1000000,
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(uid).set({
+      userId: uid,
+      permanentAccountNumber: pan,
+      checkingBalance: 5000,
+      savingsBalance: 1000,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 6000,
+      availableBalance: 5000,
+      pendingBalance: 0,
+      loanBalance: 0,
+    });
+    await registerCustomerPushToken(
+      { uid, token: 'fcm_coverage_m_tok_' + 'm'.repeat(40), platform: 'web' },
+      fsMem as unknown as Firestore
+    );
+
+    const fsDeps = { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true };
+
+    const depRes = await executeServerDeposit(
+      {
+        userId: uid,
+        amount: 350,
+        method: 'CARD',
+        destinationAccountType: 'CHECKING',
+        referenceNumber: 'MV-DEP-M1',
+      },
+      fsDeps
+    );
+    assert.strictEqual(depRes.success, true);
+
+    const wdRes = await executeServerWithdrawal(
+      {
+        userId: uid,
+        amount: 120,
+        destinationType: 'BANK_TRANSFER',
+        destinationLabel: 'Apex Bank ••••9911',
+        accountOrIban: '9911009911',
+        sourceAccountType: 'CHECKING',
+        bankName: 'Apex Bank',
+        referenceNumber: 'MV-WD-M1',
+      },
+      fsDeps
+    );
+    assert.strictEqual(wdRes.success, true);
+
+    const intRes = await executeServerInternalTransfer(
+      {
+        userId: uid,
+        fromAccountType: 'CHECKING',
+        toAccountType: 'SAVINGS',
+        amount: 200,
+        idempotencyKey: 'int_m_1',
+      },
+      fsDeps
+    );
+    assert.strictEqual(intRes.success, true);
+
+    const cardRes = await executeServerCardIssuance(
+      {
+        userId: uid,
+        brand: 'MASTERCARD',
+        cardType: 'VIRTUAL',
+        cardHolderName: 'Nadia Vance',
+        clientRequestId: 'card_m_1',
+      },
+      fsDeps
+    );
+    assert.strictEqual(cardRes.success, true);
+
+    const capturedFcm: any[] = [];
+    const mockMessaging: Partial<Messaging> = {
+      sendEachForMulticast: async (msg: any) => {
+        capturedFcm.push(structuredClone(msg));
+        return {
+          successCount: msg.tokens.length,
+          failureCount: 0,
+          responses: msg.tokens.map((_: string, i: number) => ({
+            success: true,
+            messageId: `fcm_m_${capturedFcm.length}_${i}`,
+          })),
+        };
+      },
+    };
+    const dispatcher = new ServerNotificationDispatcher({
+      firestore: fsMem as unknown as Firestore,
+      messaging: mockMessaging as Messaging,
+      isAdminConfigured: () => true,
+      isMessagingConfigured: () => true,
+      instanceId: 'worker_coverage_m',
+    });
+
+    const expectedOutboxSpecs: Array<{
+      id: string;
+      direction: 'DEBIT' | 'CREDIT' | 'INFO';
+      amount: string;
+      view: string;
+      ref: string;
+    }> = [
+      {
+        id: computeNotificationOutboxId(uid, `${depRes.transaction!.id}:COMPLETED`, 'MONEY_RECEIVED'),
+        direction: 'CREDIT',
+        amount: '350.00',
+        view: 'transactions',
+        ref: 'MV-DEP-M1',
+      },
+      {
+        id: computeNotificationOutboxId(uid, `${wdRes.transaction!.id}:INITIATED`, 'TRANSACTION'),
+        direction: 'DEBIT',
+        amount: '120.00',
+        view: 'transactions',
+        ref: 'MV-WD-M1',
+      },
+      {
+        id: computeNotificationOutboxId(uid, `${intRes.transaction!.id}:COMPLETED`, 'TRANSACTION'),
+        direction: 'INFO',
+        amount: '200.00',
+        view: 'transactions',
+        ref: intRes.transaction!.referenceNumber,
+      },
+      {
+        id: computeNotificationOutboxId(uid, `${cardRes.transaction!.id}:COMPLETED`, 'TRANSACTION'),
+        direction: 'DEBIT',
+        amount: '2.00',
+        view: 'transactions',
+        ref: cardRes.transaction!.referenceNumber,
+      },
+    ];
+
+    for (const spec of expectedOutboxSpecs) {
+      const claim = await claimOutboxLease(fsMem as unknown as Firestore, spec.id, 'w_m');
+      assert.strictEqual(claim.claimed, true, `Outbox claim failed for ${spec.id}`);
+      const evt = buildDispatchEventFromOutboxRecord(claim.record!);
+      const res = await dispatcher.dispatch(evt, buildOutboxDispatchOptions(claim.record!, claim.leaseToken!));
+      assert.strictEqual(res.push.status, 'SENT');
+      const logSnap = await fetchDispatchLogForOutboxRecord(fsMem as unknown as Firestore, claim.record!);
+      const outcome = evaluateOutboxAttemptOutcome({
+        outboxRecord: claim.record!,
+        dispatchResult: res,
+        persistentLog: logSnap,
+      });
+      await transitionOutboxAsLeaseOwner(fsMem as unknown as Firestore, spec.id, claim.leaseToken!, () => ({
+        status: outcome.nextStatus!,
+        pushStatus: outcome.pushStatus,
+        smsStatus: outcome.smsStatus,
+        emailStatus: outcome.emailStatus,
+        failureClassification: outcome.failureClassification,
+        lastError: outcome.lastError,
+        dispatchedAt: outcome.dispatchedAt,
+      }));
+    }
+
+    assert.strictEqual(capturedFcm.length, 4);
+    for (let i = 0; i < expectedOutboxSpecs.length; i++) {
+      const msg = capturedFcm[i];
+      const spec = expectedOutboxSpecs[i];
+      assert.strictEqual(msg.data.direction, spec.direction);
+      assert.strictEqual(msg.data.amount, spec.amount);
+      assert.strictEqual(msg.data.currency, 'USD');
+      assert.strictEqual(msg.data.referenceId, spec.ref);
+      assert.ok(String(msg.data.description || '').length > 0);
+      assert.ok(String(msg.data.url || '').includes(`view=${spec.view}`));
+      assert.ok(String(msg.data.url || '').includes(`referenceId=${spec.ref}`));
+      assert.deepStrictEqual(msg.webpush.notification.actions, [{ action: 'read_more', title: 'Read More' }]);
+    }
+
+    // Card issuance reference title & body remain exact
+    assert.strictEqual(capturedFcm[3].notification.title, 'Mastercard Card Issued — Monvera');
+    assert.ok(capturedFcm[3].notification.body.includes('Your new Mastercard card has been issued.'));
+    assert.ok(capturedFcm[3].notification.body.includes('$2.00 card issuance fee was debited'));
+
+    // In-app notifications collection remains intact alongside outbox push
+    const inAppNotifSnap = await fsMem.collection('notifications').where('userId', '==', uid).get();
+    assert.ok(
+      inAppNotifSnap.docs.some((d) => d.data().actionRecordId === cardRes.card!.id && d.data().title === 'Mastercard Card Issued & Activated'),
+      'In-app card issuance notification must remain intact'
+    );
+
+    console.log('✓ Test M: Deposit, Withdrawal, Internal Transfer, and preserved Card Issuance + in-app notifications verified end-to-end');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST N: Temporarily Missing Device Token Recovery (`NO_ACTIVE_TOKENS` -> `SENT`)
+  // - Verifies missing tokens do not permanently drop recent transactions
+  // - Once user device token registers, bounded retry delivers SENT without duplicates
+  // - Permanently missing tokens still settle cleanly to DISPATCHED at maxAttempts
+  // -------------------------------------------------------------------------
+  {
+    const fsMem = new InMemoryFirestore();
+    const recipUid = 'uid_missing_tok_recip';
+    const senderUid = 'uid_missing_tok_sender';
+
+    await fsMem.collection('users').doc(senderUid).set({
+      id: senderUid,
+      firstName: 'Clara',
+      lastName: 'Oswald',
+      permanentAccountNumber: '1011223344',
+      kycStatus: 'verified',
+      dailyTransactionLimit: 1000000,
+      status: 'active',
+    });
+    await fsMem.collection('users').doc(recipUid).set({
+      id: recipUid,
+      firstName: 'Danny',
+      lastName: 'Pink',
+      permanentAccountNumber: '1099887766',
+      kycStatus: 'verified',
+      dailyTransactionLimit: 1000000,
+      status: 'active',
+    });
+    await fsMem.collection('accounts').doc(senderUid).set({
+      userId: senderUid,
+      permanentAccountNumber: '1011223344',
+      checkingBalance: 2000,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 2000,
+      availableBalance: 2000,
+      pendingBalance: 0,
+    });
+    await fsMem.collection('accounts').doc(recipUid).set({
+      userId: recipUid,
+      permanentAccountNumber: '1099887766',
+      checkingBalance: 100,
+      savingsBalance: 0,
+      investedBalance: 0,
+      accruedEarnings: 0,
+      totalBalance: 100,
+      availableBalance: 100,
+      pendingBalance: 0,
+    });
+
+    const txRes = await executeServerTransfer(
+      {
+        senderUid,
+        recipientIdentifier: '1099887766',
+        amount: 275,
+        description: 'Rent share',
+        referenceNumber: 'MV-NOTOK-REC-1',
+      },
+      { firestore: fsMem as unknown as Firestore, isAdminConfigured: () => true }
+    );
+    assert.strictEqual(txRes.success, true);
+
+    const recipOutboxId = computeNotificationOutboxId(
+      recipUid,
+      `${txRes.transaction!.id}:COMPLETED`,
+      'MONEY_RECEIVED'
+    );
+
+    const sentPayloads: any[] = [];
+    const mockMessaging: Partial<Messaging> = {
+      sendEachForMulticast: async (msg: any) => {
+        sentPayloads.push(structuredClone(msg));
+        return {
+          successCount: msg.tokens.length,
+          failureCount: 0,
+          responses: msg.tokens.map(() => ({ success: true, messageId: 'fcm_recovered_1' })),
+        };
+      },
+    };
+    const dispatcher = new ServerNotificationDispatcher({
+      firestore: fsMem as unknown as Firestore,
+      messaging: mockMessaging as Messaging,
+      isAdminConfigured: () => true,
+      isMessagingConfigured: () => true,
+      instanceId: 'worker_notok_rec',
+    });
+
+    // Attempt 1: recipient has 0 active tokens -> NO_ACTIVE_TOKENS -> stays FAILED_RETRYABLE
+    const claim1 = await claimOutboxLease(fsMem as unknown as Firestore, recipOutboxId, 'w_notok_1');
+    assert.strictEqual(claim1.claimed, true);
+    const res1 = await dispatcher.dispatch(
+      buildDispatchEventFromOutboxRecord(claim1.record!),
+      buildOutboxDispatchOptions(claim1.record!, claim1.leaseToken!)
+    );
+    assert.strictEqual(res1.push.status, 'NO_ACTIVE_TOKENS');
+    const log1 = await fetchDispatchLogForOutboxRecord(fsMem as unknown as Firestore, claim1.record!);
+    const outcome1 = evaluateOutboxAttemptOutcome({
+      outboxRecord: claim1.record!,
+      dispatchResult: res1,
+      persistentLog: log1,
+      nowMs: 1_700_000_000_000,
+    });
+    assert.strictEqual(outcome1.nextStatus, 'FAILED_RETRYABLE');
+    assert.strictEqual(outcome1.pushStatus, 'NO_ACTIVE_TOKENS');
+    assert.strictEqual(sentPayloads.length, 0);
+
+    await transitionOutboxAsLeaseOwner(
+      fsMem as unknown as Firestore,
+      recipOutboxId,
+      claim1.leaseToken!,
+      () => ({
+        status: outcome1.nextStatus!,
+        pushStatus: outcome1.pushStatus,
+        smsStatus: outcome1.smsStatus,
+        emailStatus: outcome1.emailStatus,
+        failureClassification: outcome1.failureClassification,
+        nextAttemptAt: outcome1.nextAttemptAt,
+        lastError: outcome1.lastError,
+        dispatchedAt: outcome1.dispatchedAt,
+      }),
+      1_700_000_000_000
+    );
+
+    // Recipient opens Monvera and registers device token before retry window expires
+    await registerCustomerPushToken(
+      { uid: recipUid, token: 'fcm_recip_late_reg_' + 'z'.repeat(40), platform: 'web' },
+      fsMem as unknown as Firestore
+    );
+
+    // Attempt 2 (after backoff elapsed): recovers and delivers SENT
+    const claim2 = await claimOutboxLease(
+      fsMem as unknown as Firestore,
+      recipOutboxId,
+      'w_notok_2',
+      60_000,
+      1_700_000_020_000
+    );
+    assert.strictEqual(claim2.claimed, true);
+    const res2 = await dispatcher.dispatch(
+      buildDispatchEventFromOutboxRecord(claim2.record!),
+      buildOutboxDispatchOptions(claim2.record!, claim2.leaseToken!, { nowMs: 1_700_000_020_000 })
+    );
+    assert.strictEqual(res2.push.status, 'SENT');
+    const log2 = await fetchDispatchLogForOutboxRecord(fsMem as unknown as Firestore, claim2.record!);
+    const outcome2 = evaluateOutboxAttemptOutcome({
+      outboxRecord: claim2.record!,
+      dispatchResult: res2,
+      persistentLog: log2,
+      nowMs: 1_700_000_020_000,
+    });
+    assert.strictEqual(outcome2.nextStatus, 'DISPATCHED');
+    assert.strictEqual(outcome2.pushStatus, 'SENT');
+    assert.strictEqual(sentPayloads.length, 1);
+    assert.strictEqual(sentPayloads[0].notification.title, 'Account Credited');
+    assert.ok(sentPayloads[0].notification.body.includes('$275.00 USD'));
+    assert.ok(sentPayloads[0].notification.body.includes('Rent share'));
+    assert.ok(sentPayloads[0].notification.body.includes('MV-NOTOK-REC-1'));
+
+    console.log('✓ Test N: Temporarily missing token recovery (NO_ACTIVE_TOKENS -> retry -> SENT) verified');
+  }
+
+  // -------------------------------------------------------------------------
+  // TEST O: iOS/Mobile `NotificationOptions.actions` Compatibility Fallback & Foreground `renotify`
+  // -------------------------------------------------------------------------
+  {
+    const prevWindow = (globalThis as any).window;
+    const prevNavigatorDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    const prevNotification = (globalThis as any).Notification;
+
+    try {
+      const storage = new InMemoryStorage();
+      const shownNotifications: Array<{ title: string; options: any }> = [];
+      let callCount = 0;
+
+      const iosMockReg = {
+        scope: 'https://monvera.example/',
+        active: { scriptURL: 'https://monvera.example/sw.js', state: 'activated' },
+        showNotification: async (title: string, options: any) => {
+          callCount++;
+          // Simulate browser/WebKit rejecting NotificationOptions.actions with TypeError
+          if (options && 'actions' in options) {
+            throw new TypeError("Failed to execute 'showNotification': actions unsupported");
+          }
+          shownNotifications.push({ title, options });
+        },
+      } as unknown as ServiceWorkerRegistration;
+
+      (globalThis as any).Notification = { permission: 'granted' };
+      (globalThis as any).window = {
+        localStorage: storage,
+        matchMedia: () => ({ matches: true }),
+      };
+      Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: {
+          userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X)',
+          serviceWorker: {
+            controller: iosMockReg.active,
+            getRegistration: async () => iosMockReg,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+          },
+        },
+      });
+
+      const svc = new PushNotificationService({
+        ensureActiveSwFn: async () => iosMockReg,
+        getNotificationPermissionFn: () => 'granted',
+        subscribeOnMessageFn: (cb) => {
+          cb({
+            data: {
+              title: 'Account Credited',
+              body: 'Your account has received $95.00 USD. Ref: MV-IOS-1.',
+              direction: 'CREDIT',
+              amount: '95.00',
+              currency: 'USD',
+              transactionId: 'tx_ios_1',
+              referenceId: 'MV-IOS-1',
+              actionView: 'transactions',
+              url: '/dashboard?view=transactions&transactionId=tx_ios_1&referenceId=MV-IOS-1',
+            },
+          });
+          return () => {};
+        },
+      });
+
+      svc.listenToForegroundMessages(() => {});
+      await new Promise((r) => setTimeout(r, 25));
+
+      assert.strictEqual(callCount, 2, 'First showNotification with actions fails, fallback without actions succeeds');
+      assert.strictEqual(shownNotifications.length, 1);
+      assert.strictEqual(shownNotifications[0].title, 'Account Credited');
+      assert.strictEqual(shownNotifications[0].options.renotify, false);
+      assert.strictEqual('actions' in shownNotifications[0].options, false);
+      assert.strictEqual(shownNotifications[0].options.data.referenceId, 'MV-IOS-1');
+
+      const swSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/sw.ts'), 'utf8');
+      assert.ok(swSrc.includes('showSwNotificationSafely'), 'src/sw.ts must guard background showNotification against unsupported actions');
+
+      console.log('✓ Test O: iOS/mobile NotificationOptions.actions fallback and foreground renotify verified');
+    } finally {
+      (globalThis as any).window = prevWindow;
+      if (prevNavigatorDesc) {
+        Object.defineProperty(globalThis, 'navigator', prevNavigatorDesc);
+      }
+      (globalThis as any).Notification = prevNotification;
+    }
+  }
+
+  console.log('\nALL PUSH NOTIFICATION REPAIR TESTS (A–O) PASSED SUCCESSFULLY.');
 }
 
 runTests().catch((err) => {

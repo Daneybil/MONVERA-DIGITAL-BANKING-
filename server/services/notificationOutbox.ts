@@ -134,6 +134,8 @@ export function isValidOutboxTransition(from: OutboxStatus, to: OutboxStatus): b
 export interface MaskedNotificationOutboxPayload {
   title?: string;
   body?: string;
+  description?: string;
+  direction?: 'DEBIT' | 'CREDIT' | 'INFO';
   actionUrl?: string;
   amount?: number;
   currency?: string;
@@ -288,6 +290,24 @@ export function sanitizeAndValidateOutboxPayload(
       };
     }
     out.body = cleanBody;
+  }
+  if (rawPayload.description !== undefined) {
+    const cleanDescription = String(rawPayload.description).trim().slice(0, 140);
+    if (/\b\d{8,}\b/.test(cleanDescription)) {
+      return {
+        valid: false,
+        error: 'INVALID_PAYLOAD: Unmasked 8+ digit numeric identifier is forbidden in outbox description.',
+      };
+    }
+    if (cleanDescription) {
+      out.description = cleanDescription;
+    }
+  }
+  if (rawPayload.direction !== undefined) {
+    const cleanDirection = String(rawPayload.direction).trim().toUpperCase();
+    if (cleanDirection === 'DEBIT' || cleanDirection === 'CREDIT' || cleanDirection === 'INFO') {
+      out.direction = cleanDirection;
+    }
   }
   if (rawPayload.actionUrl !== undefined) {
     out.actionUrl = sanitizeRelativeUrl(String(rawPayload.actionUrl));
@@ -753,6 +773,7 @@ export interface SettleExhaustedOutboxResult {
   settled: boolean;
   reason:
     | 'SETTLED_TO_DEAD_LETTER'
+    | 'SETTLED_NO_ACTIVE_TOKENS'
     | 'ALREADY_DEAD_LETTER'
     | 'ALREADY_DISPATCHED'
     | 'NOT_FOUND'
@@ -824,6 +845,28 @@ export async function settleExhaustedOutboxRecord(
       return { settled: false, reason: 'NOT_EXHAUSTED', record: current };
     }
 
+    if (
+      current.pushStatus === 'NO_ACTIVE_TOKENS' &&
+      current.smsStatus !== 'FAILED_RETRYABLE' &&
+      current.emailStatus !== 'FAILED_RETRYABLE' &&
+      current.smsStatus !== 'PENDING' &&
+      current.emailStatus !== 'PENDING'
+    ) {
+      const settledNoTokensRecord: NotificationOutboxRecord = {
+        ...current,
+        status: 'DISPATCHED',
+        failureClassification: 'NONE',
+        leaseOwner: null,
+        leaseToken: null,
+        leaseExpiresAt: null,
+        dispatchedAt: nowIso,
+        lastError: null,
+        updatedAt: nowIso,
+      };
+      tx.set(docRef, settledNoTokensRecord, { merge: true });
+      return { settled: true, reason: 'SETTLED_NO_ACTIVE_TOKENS', record: settledNoTokensRecord };
+    }
+
     if (!isValidOutboxTransition(current.status, 'DEAD_LETTER')) {
       return { settled: false, reason: 'NOT_EXHAUSTED', record: current };
     }
@@ -859,8 +902,10 @@ export function supportsMessageTemplateForDispatchType(dispatchType: DispatchEve
 
 /**
  * Returns which channels still require execution on an outbox retry.
- * Channels already SENT, NO_ACTIVE_TOKENS, DISABLED_BY_USER, FAILED_PERMANENT, or
+ * Channels already SENT, DISABLED_BY_USER, FAILED_PERMANENT, or
  * template-unsupported UNCONFIGURED_PROVIDER are NOT retried.
+ * NO_ACTIVE_TOKENS remains retryable while the outbox record itself is retryable (bounded by maxAttempts)
+ * so temporarily unregistered/rotating customer device tokens recover cleanly once registered.
  */
 export function getUnfinishedOutboxChannels(record: Pick<NotificationOutboxRecord, 'pushStatus' | 'smsStatus' | 'emailStatus' | 'dispatchType'>): {
   push: boolean;
@@ -869,7 +914,6 @@ export function getUnfinishedOutboxChannels(record: Pick<NotificationOutboxRecor
 } {
   const pushTerminal = new Set<OutboxPushStatus>([
     'SENT',
-    'NO_ACTIVE_TOKENS',
     'DISABLED_BY_USER',
     'FAILED_PERMANENT',
   ]);
@@ -914,7 +958,9 @@ export interface EvaluatedOutboxOutcome {
  * `notification_dispatch_logs` record to compute safe per-channel & outbox transitions.
  * - Preserves already-SENT channels permanently across unrelated channel failures.
  * - Treats DUPLICATE_IGNORED as completed ONLY when confirmed by persistent record.
- * - Treats NO_ACTIVE_TOKENS & DISABLED_BY_USER as terminal (non-retryable).
+ * - Retries NO_ACTIVE_TOKENS with bounded backoff up to maxAttempts, then settles cleanly to DISPATCHED
+ *   so temporary token registration/rotation races recover while historical events never linger in DEAD_LETTER.
+ * - Treats DISABLED_BY_USER as terminal (non-retryable).
  * - Distinguishes UNCONFIGURED_PROVIDER from FAILED_PERMANENT invalid payloads.
  */
 export function evaluateOutboxAttemptOutcome(params: {
@@ -958,11 +1004,10 @@ export function evaluateOutboxAttemptOutcome(params: {
     return { action: 'ABORT_LEASE_LOST' };
   }
 
-  // 1. Resolve next Push Status (never downgrade SENT, NO_ACTIVE_TOKENS, DISABLED_BY_USER, FAILED_PERMANENT)
+  // 1. Resolve next Push Status (never downgrade SENT, DISABLED_BY_USER, FAILED_PERMANENT)
   let nextPushStatus: OutboxPushStatus = outboxRecord.pushStatus;
   if (
     outboxRecord.pushStatus !== 'SENT' &&
-    outboxRecord.pushStatus !== 'NO_ACTIVE_TOKENS' &&
     outboxRecord.pushStatus !== 'DISABLED_BY_USER' &&
     outboxRecord.pushStatus !== 'FAILED_PERMANENT'
   ) {
@@ -1050,10 +1095,12 @@ export function evaluateOutboxAttemptOutcome(params: {
   const smsConfigRequired = Boolean(channelPolicy?.requireConfiguredSms) && supportsMsgTemplate;
   const emailConfigRequired = Boolean(channelPolicy?.requireConfiguredEmail) && supportsMsgTemplate;
 
+  const maxAttemptsReached = outboxRecord.attemptCount >= outboxRecord.maxAttempts;
+
   const pushDone =
     nextPushStatus === 'SENT' ||
-    nextPushStatus === 'NO_ACTIVE_TOKENS' ||
-    nextPushStatus === 'DISABLED_BY_USER';
+    nextPushStatus === 'DISABLED_BY_USER' ||
+    (nextPushStatus === 'NO_ACTIVE_TOKENS' && maxAttemptsReached);
 
   const hasRetryableChannel =
     Boolean(persistenceError) ||
@@ -1061,6 +1108,7 @@ export function evaluateOutboxAttemptOutcome(params: {
     nextPushStatus === 'FAILED_RETRYABLE' ||
     nextPushStatus === 'PARTIAL' ||
     nextPushStatus === 'UNCONFIGURED_PROVIDER' ||
+    (nextPushStatus === 'NO_ACTIVE_TOKENS' && !maxAttemptsReached) ||
     nextSmsStatus === 'PENDING' ||
     nextSmsStatus === 'FAILED_RETRYABLE' ||
     nextEmailStatus === 'PENDING' ||
@@ -1077,8 +1125,6 @@ export function evaluateOutboxAttemptOutcome(params: {
     nextPushStatus === 'FAILED_PERMANENT' ||
     nextSmsStatus === 'FAILED_PERMANENT' ||
     nextEmailStatus === 'FAILED_PERMANENT';
-
-  const maxAttemptsReached = outboxRecord.attemptCount >= outboxRecord.maxAttempts;
 
   if (!hasRetryableChannel && (pushDone || nextPushStatus === 'FAILED_PERMANENT')) {
     if (nextPushStatus === 'FAILED_PERMANENT' && nextSmsStatus !== 'SENT' && nextEmailStatus !== 'SENT') {
@@ -1114,7 +1160,10 @@ export function evaluateOutboxAttemptOutcome(params: {
     hasMissingConfig && !persistenceError ? 'MISSING_CONFIGURATION' : 'TRANSIENT';
 
   const nextStatus: OutboxStatus = maxAttemptsReached ? 'DEAD_LETTER' : 'FAILED_RETRYABLE';
-  const backoffMs = Math.min(30_000 * Math.pow(2, Math.max(0, outboxRecord.attemptCount - 1)), 3_600_000);
+  const isFirstNoTokenBackoff = nextPushStatus === 'NO_ACTIVE_TOKENS' && outboxRecord.attemptCount <= 1;
+  const backoffMs = isFirstNoTokenBackoff
+    ? 15_000
+    : Math.min(30_000 * Math.pow(2, Math.max(0, outboxRecord.attemptCount - 1)), 3_600_000);
   const nextAttemptAt = new Date(nowMs + backoffMs).toISOString();
 
   return {
@@ -1155,6 +1204,8 @@ export function buildDispatchEventFromOutboxRecord(
     userId: record.userId,
     title: record.payload.title,
     body: record.payload.body,
+    description: record.payload.description,
+    direction: record.payload.direction,
     actionUrl: record.payload.actionUrl,
     amount: record.payload.amount,
     currency: record.payload.currency,

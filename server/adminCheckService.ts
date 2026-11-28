@@ -1044,6 +1044,8 @@ export async function executeServerAdminCheckWithdrawal(
           payload: {
             title: 'Official Check Issued — Monvera',
             body: `An official check withdrawal of $${adminCheckAmtFormatted} from ${safeAdminCheckAccountMasked} has been issued.`,
+            description: `Official check withdrawal from ${safeAdminCheckAccountMasked}`.slice(0, 140),
+            direction: 'DEBIT',
             actionUrl: '/dashboard?view=transactions',
             amount: amountDollars,
             currency: 'USD',

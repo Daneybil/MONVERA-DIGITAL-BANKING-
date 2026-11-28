@@ -292,6 +292,15 @@ export function buildTrustedTransferDispatchEvents(
       : 'Monvera Member';
   const senderName = String(tx.senderName || '').trim() || defaultSenderName;
 
+  const rawTxDescription = sanitizePushText(
+    typeof tx.description === 'string' ? tx.description : '',
+    140
+  );
+  const safeTxDescription =
+    rawTxDescription && rawTxDescription.toLowerCase() !== 'peer transfer'
+      ? rawTxDescription
+      : undefined;
+
   if (recipientUid) {
     const recipientAccountLabel = resolveAuthoritativeAccountMasked(
       options.recipientMetrics,
@@ -305,6 +314,7 @@ export function buildTrustedTransferDispatchEvents(
       referenceNumber,
       eventKey: lifecycleEventKey,
       type: 'MONEY_RECEIVED',
+      direction: 'CREDIT',
       userId: recipientUid,
       recipientName,
       recipientEmail: options.recipientContact?.email,
@@ -312,6 +322,7 @@ export function buildTrustedTransferDispatchEvents(
       amount: committedAmount,
       currency,
       senderName,
+      ...(safeTxDescription ? { description: safeTxDescription } : {}),
       accountMasked: recipientAccountLabel,
     });
   }
@@ -333,6 +344,7 @@ export function buildTrustedTransferDispatchEvents(
         referenceNumber,
         eventKey: lifecycleEventKey,
         type: 'MONEY_SENT',
+        direction: 'DEBIT',
         userId: committedSenderUid,
         recipientName,
         recipientEmail: options.senderContact?.email,
@@ -340,6 +352,7 @@ export function buildTrustedTransferDispatchEvents(
         amount: committedAmount,
         currency,
         senderName,
+        ...(safeTxDescription ? { description: safeTxDescription } : {}),
         accountMasked: senderAccountLabel,
       });
     }
@@ -366,6 +379,8 @@ export interface DispatchNotificationEvent {
   userId: string;
   title?: string;
   body?: string;
+  description?: string;
+  direction?: 'DEBIT' | 'CREDIT' | 'INFO';
   actionUrl?: string;
   recipientName?: string;
   recipientEmail?: string;
@@ -604,6 +619,9 @@ function inferPushEventDirection(
   customTitle: string,
   customBody: string
 ): 'DEBIT' | 'CREDIT' | 'INFO' {
+  if (event.direction === 'DEBIT' || event.direction === 'CREDIT' || event.direction === 'INFO') {
+    return event.direction;
+  }
   if (event.type === 'MONEY_SENT') return 'DEBIT';
   if (event.type === 'MONEY_RECEIVED') return 'CREDIT';
 
@@ -622,9 +640,13 @@ function inferPushEventDirection(
   }
 
   const combined = `${customTitle} ${customBody}`.toLowerCase();
+  if (combined.includes('internal account transfer') || combined.includes('transferred from')) {
+    return 'INFO';
+  }
   if (
     combined.includes('credited back') ||
     combined.includes('credited to') ||
+    combined.includes('liquidity credited') ||
     combined.includes('matured') ||
     combined.includes('disbursed') ||
     combined.includes('deposit') ||
@@ -672,6 +694,7 @@ export function formatSafePushContent(event: DispatchNotificationEvent): {
 
   const customTitle = sanitizePushText(event.title, 120);
   const customBody = sanitizePushText(event.body, 320);
+  const customDescription = sanitizePushText(event.description, 140);
 
   const formattedAmt =
     typeof event.amount === 'number' && Number.isFinite(event.amount)
@@ -729,7 +752,7 @@ export function formatSafePushContent(event: DispatchNotificationEvent): {
   let fallbackBody = formattedAmtWithCurrency
     ? `Account activity of ${formattedAmtWithCurrency} on ${accountLabel}. Ref: ${safeRef}.`
     : `New activity recorded on ${accountLabel}. Ref: ${safeRef}.`;
-  let description = customBody || `Account activity on ${accountLabel}`;
+  let description = customDescription || customBody || `Account activity on ${accountLabel}`;
 
   const LEGACY_GENERIC_TRANSFER_TITLES = new Set([
     'Transfer Sent — Monvera',
@@ -745,42 +768,49 @@ export function formatSafePushContent(event: DispatchNotificationEvent): {
 
   if (event.type === 'MONEY_RECEIVED') {
     const sender = sanitizePushText(event.senderName || 'Monvera Member', 60) || 'Monvera Member';
-    const isDirectDeposit = customTitle === 'Deposit Credited — Monvera';
-    const sourceLabel = isDirectDeposit
-      ? `${sender} (${accountLabel})`
-      : `${sender} (${accountLabel})`;
-    description = `From ${sourceLabel}`;
+    const sourceLabel = `${sender} (${accountLabel})`;
+    const hasCustomDesc =
+      Boolean(customDescription) &&
+      customDescription.toLowerCase() !== 'peer transfer' &&
+      !sourceLabel.toLowerCase().includes(customDescription.toLowerCase());
+    const creditDetail = hasCustomDesc ? `${sourceLabel} — ${customDescription}` : sourceLabel;
+    description = `From ${creditDetail}`;
     fallbackTitle = 'Account Credited';
     fallbackBody = formattedAmtWithCurrency
-      ? `Your account has received ${formattedAmtWithCurrency} from ${sourceLabel}. Ref: ${safeRef}.`
-      : `Your account has received a credit from ${sourceLabel}. Ref: ${safeRef}.`;
+      ? `Your account has received ${formattedAmtWithCurrency} from ${creditDetail}. Ref: ${safeRef}.`
+      : `Your account has received a credit from ${creditDetail}. Ref: ${safeRef}.`;
   } else if (event.type === 'MONEY_SENT') {
     const recipient = sanitizePushText(event.recipientName || 'Recipient', 60) || 'Recipient';
-    const transferDesc = `Transfer to ${recipient} (${accountLabel})`;
+    const baseTransferDesc = `Transfer to ${recipient} (${accountLabel})`;
+    const hasCustomDesc =
+      Boolean(customDescription) &&
+      customDescription.toLowerCase() !== 'peer transfer' &&
+      !baseTransferDesc.toLowerCase().includes(customDescription.toLowerCase());
+    const transferDesc = hasCustomDesc ? `${baseTransferDesc} — ${customDescription}` : baseTransferDesc;
     description = transferDesc;
     fallbackTitle = 'Account Debited';
     fallbackBody = formattedAmtWithCurrency
       ? `Your account has been debited ${formattedAmtWithCurrency} for ${transferDesc}. Ref: ${safeRef}.`
       : `Your account has been debited for ${transferDesc}. Ref: ${safeRef}.`;
   } else if (category === 'SECURITY') {
-    description = customBody || 'Account security update';
+    description = customDescription || customBody || 'Account security update';
     fallbackTitle = 'Security Alert — Monvera';
     fallbackBody = `Important security update on your Monvera profile. Ref: ${safeRef}.`;
   } else if (category === 'INVESTMENT') {
-    description = customBody || `Investment activity (${accountLabel})`;
+    description = customDescription || customBody || `Investment activity (${accountLabel})`;
     fallbackTitle = 'Investment Update — Monvera';
     fallbackBody = formattedAmt
       ? `Investment activity of ${formattedAmt} recorded. Ref: ${safeRef}.`
       : `An update occurred on your Monvera investment portfolio. Ref: ${safeRef}.`;
   } else if (direction === 'DEBIT') {
-    const debitDesc = customBody || `Account transaction (${accountLabel})`;
+    const debitDesc = customDescription || customBody || `Account transaction (${accountLabel})`;
     description = debitDesc;
     fallbackTitle = 'Account Debited';
     fallbackBody = formattedAmtWithCurrency
       ? `Your account has been debited ${formattedAmtWithCurrency} for ${debitDesc}. Ref: ${safeRef}.`
       : `Your account has been debited for ${debitDesc}. Ref: ${safeRef}.`;
   } else if (direction === 'CREDIT') {
-    const creditDesc = customBody || `Account credit (${accountLabel})`;
+    const creditDesc = customDescription || customBody || `Account credit (${accountLabel})`;
     description = creditDesc;
     fallbackTitle = 'Account Credited';
     fallbackBody = formattedAmtWithCurrency
@@ -1176,7 +1206,7 @@ export class ServerNotificationDispatcher {
           patch.createdAt = nowIso;
         }
 
-        if (updates.pushStatus && existing.pushStatus !== 'SENT' && existing.pushStatus !== 'NO_ACTIVE_TOKENS') {
+        if (updates.pushStatus && existing.pushStatus !== 'SENT') {
           patch.pushStatus = updates.pushStatus;
         }
 
@@ -1370,7 +1400,6 @@ export class ServerNotificationDispatcher {
     // Resolve known/terminal push status from outbox or caller before hitting FCM
     const knownOrLivePushStatus = String(liveOutboxData?.pushStatus || callerKnownStatuses?.pushStatus || '');
     const pushKnownTerminal =
-      knownOrLivePushStatus === 'NO_ACTIVE_TOKENS' ||
       knownOrLivePushStatus === 'DISABLED_BY_USER' ||
       knownOrLivePushStatus === 'FAILED_PERMANENT';
 
@@ -1385,9 +1414,6 @@ export class ServerNotificationDispatcher {
       }
     } else if (pushKnownTerminal) {
       pushResult = { attempted: false, delivered: false, status: knownOrLivePushStatus };
-      if (knownOrLivePushStatus === 'NO_ACTIVE_TOKENS' && persistedLog?.pushStatus !== 'NO_ACTIVE_TOKENS') {
-        nextPushSyncStatus = 'NO_ACTIVE_TOKENS';
-      }
     } else if (channelSelection?.push === false) {
       pushResult = {
         attempted: false,
@@ -1777,7 +1803,8 @@ export class ServerNotificationDispatcher {
   private async claimPersistentDispatchLease(
     fs: Firestore,
     event: DispatchNotificationEvent,
-    category: NotificationCategory
+    category: NotificationCategory,
+    allowRetryOnNoTokens: boolean = false
   ): Promise<{
     proceed: boolean;
     skipStatus?: string;
@@ -1827,7 +1854,7 @@ export class ServerNotificationDispatcher {
         return { proceed: false, skipStatus: 'DUPLICATE_IGNORED', alreadyDelivered: [] as string[] };
       }
 
-      if (status === 'NO_ACTIVE_TOKENS') {
+      if (status === 'NO_ACTIVE_TOKENS' && !allowRetryOnNoTokens) {
         return { proceed: false, skipStatus: 'NO_ACTIVE_TOKENS', alreadyDelivered: [] as string[] };
       }
 
@@ -1836,7 +1863,7 @@ export class ServerNotificationDispatcher {
         return { proceed: false, skipStatus: 'DUPLICATE_IN_FLIGHT', alreadyDelivered: [] as string[] };
       }
 
-      // Eligible for retry recovery: FAILED, PARTIAL, or expired CLAIMED lease
+      // Eligible for retry recovery: FAILED, PARTIAL, NO_ACTIVE_TOKENS (under bounded outbox retry), or expired CLAIMED lease
       const prevAttempts = Number(data.attemptCount || 0);
       const deliveredIds = Array.isArray(data.deliveredTokenIds) ? data.deliveredTokenIds.map(String) : [];
 
@@ -1965,7 +1992,7 @@ export class ServerNotificationDispatcher {
     // 1. Claim persistent dispatch lease before hitting FCM
     let lease: Awaited<ReturnType<ServerNotificationDispatcher['claimPersistentDispatchLease']>>;
     try {
-      lease = await this.claimPersistentDispatchLease(fs, event, category);
+      lease = await this.claimPersistentDispatchLease(fs, event, category, Boolean(outboxCtx));
     } catch (leaseErr: any) {
       console.warn('[Push Service] Dispatch lease claim error:', leaseErr?.message || leaseErr);
       if (requirePersistentTracking) {

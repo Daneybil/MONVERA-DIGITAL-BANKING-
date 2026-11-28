@@ -160,10 +160,11 @@ export async function synchronizeSessionPushToken(params: {
   inFlightSyncUidRef: { current: string | null };
   syncFn: (uid: string) => Promise<string | null>;
   isStillActive?: () => boolean;
+  forceRecheck?: boolean;
 }): Promise<boolean> {
-  const { targetUid, syncedPushUidRef, inFlightSyncUidRef, syncFn, isStillActive } = params;
+  const { targetUid, syncedPushUidRef, inFlightSyncUidRef, syncFn, isStillActive, forceRecheck } = params;
   if (!targetUid) return false;
-  if (syncedPushUidRef.current === targetUid) return true;
+  if (!forceRecheck && syncedPushUidRef.current === targetUid) return true;
   if (inFlightSyncUidRef.current === targetUid) return false;
 
   inFlightSyncUidRef.current = targetUid;
@@ -675,13 +676,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     // 6. Silently sync FCM registration token for the session ONLY if browser permission is already granted;
-    // mark syncedPushUidRef exclusively after /api/push/register succeeds so transient failures can retry safely.
+    // mark syncedPushUidRef exclusively after /api/push/register succeeds so transient failures can retry safely,
+    // and re-verify periodically on visibility/online recovery in case the browser rotated the FCM token.
     let isSessionPushActive = true;
-    const triggerSessionPushSync = () => {
+    let lastPushSyncCheckMs = 0;
+    const PUSH_TOKEN_RECHECK_INTERVAL_MS = 15 * 60 * 1000;
+    const triggerSessionPushSync = (forceRecheck: boolean = false) => {
       if (!isSessionPushActive || !targetNotifUid) return;
-      if (syncedPushUidRef.current === targetNotifUid) return;
+      if (!forceRecheck && syncedPushUidRef.current === targetNotifUid) return;
       if (typeof window === 'undefined' || !('Notification' in window) || Notification.permission !== 'granted') return;
 
+      lastPushSyncCheckMs = Date.now();
       synchronizeSessionPushToken({
         targetUid: targetNotifUid,
         syncedPushUidRef,
@@ -690,14 +695,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isStillActive: () =>
           isSessionPushActive &&
           (currentUserRef.current?.id === targetNotifUid || auth.currentUser?.uid === targetNotifUid),
+        forceRecheck,
       }).catch(() => {});
     };
 
-    triggerSessionPushSync();
+    triggerSessionPushSync(false);
 
     const handlePushRetryTrigger = () => {
       if (typeof document !== 'undefined' && document.hidden) return;
-      triggerSessionPushSync();
+      const shouldRecheckRotatedToken =
+        syncedPushUidRef.current === targetNotifUid &&
+        Date.now() - lastPushSyncCheckMs >= PUSH_TOKEN_RECHECK_INTERVAL_MS;
+      triggerSessionPushSync(shouldRecheckRotatedToken);
     };
 
     // 7. Listen to foreground push notifications while tab is open & display visible banner/toast

@@ -938,12 +938,31 @@ export class PushNotificationService {
       }
       this.pendingOsNotifications.delete(key);
       try {
-        await swReg.showNotification(item.title, item.options);
+        await this.showWithSwActionsFallback(swReg, item.title, item.options);
       } catch (err) {
         this.pendingOsNotifications.set(key, item);
         console.warn('[Push] Deferred OS notification retry failed:', err);
         break;
       }
+    }
+  }
+
+  private async showWithSwActionsFallback(
+    swReg: ServiceWorkerRegistration,
+    title: string,
+    options: NotificationOptions
+  ): Promise<void> {
+    try {
+      await swReg.showNotification(title, options);
+    } catch (err) {
+      if ('actions' in options) {
+        const { actions: _ignoredSwActions, ...fallbackOptions } = options as NotificationOptions & {
+          actions?: unknown;
+        };
+        await swReg.showNotification(title, fallbackOptions);
+        return;
+      }
+      throw err;
     }
   }
 
@@ -1172,7 +1191,7 @@ export class PushNotificationService {
     try {
       const swReg = await this.resolveActiveSwRegistrationForDisplay();
       if (swReg && typeof swReg.showNotification === 'function') {
-        await swReg.showNotification(title, mergedOptions);
+        await this.showWithSwActionsFallback(swReg, title, mergedOptions);
         this.pendingOsNotifications.delete(tagKey);
         return true;
       }

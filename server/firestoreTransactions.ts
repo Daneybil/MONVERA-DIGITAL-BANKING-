@@ -868,6 +868,10 @@ export async function executeServerTransfer(
 
         // Transaction read-phase: prepare durable notification outbox batch strictly BEFORE any writes
         const transferEventKey = `${finalTx.id}:COMPLETED`;
+        const sanitizedTransferDesc =
+          typeof description === 'string' && description.trim()
+            ? description.replace(/\b\d{8,}\b/g, '••••').trim().slice(0, 140)
+            : undefined;
         const transferOutboxInputs: CreateOutboxRecordInput[] = [
           {
             userId: senderUid,
@@ -880,6 +884,8 @@ export async function executeServerTransfer(
             nowIso,
             payload: {
               title: 'Transfer Sent — Monvera',
+              direction: 'DEBIT',
+              ...(sanitizedTransferDesc ? { description: sanitizedTransferDesc } : {}),
               actionUrl: '/dashboard?view=transactions',
               amount: transferAmount,
               currency: 'USD',
@@ -899,6 +905,8 @@ export async function executeServerTransfer(
             nowIso,
             payload: {
               title: 'Money Received — Monvera',
+              direction: 'CREDIT',
+              ...(sanitizedTransferDesc ? { description: sanitizedTransferDesc } : {}),
               actionUrl: '/dashboard?view=transactions',
               amount: transferAmount,
               currency: 'USD',
@@ -1580,6 +1588,8 @@ export async function executeServerInternalTransfer(
           payload: {
             title: 'Internal Account Transfer Completed — Monvera',
             body: `$${amtFormatted} transferred from ${safeSourceMasked} to ${safeDestMasked}.`,
+            description: `Transfer from ${safeSourceMasked} to ${safeDestMasked}`.slice(0, 140),
+            direction: 'INFO',
             actionUrl: '/dashboard?view=transactions',
             amount: amountDollars,
             currency: 'USD',
@@ -2035,6 +2045,8 @@ let safeExpiry = rawExpiry || undefined;
           payload: {
             title: 'Withdrawal Initiated — Monvera',
             body: `A pending ${safeSourceLabel} withdrawal of $${safeAmtFormatted} to ${safeDestChannel}${safeLast4Suffix} has been initiated.`,
+            description: `${safeSourceLabel} withdrawal to ${safeDestChannel}${safeLast4Suffix}`.slice(0, 140),
+            direction: 'DEBIT',
             actionUrl: '/dashboard?view=transactions',
             amount: withdrawAmount,
             currency: 'USD',
@@ -2396,6 +2408,8 @@ export async function reverseServerFirestoreWithdrawal(
           payload: {
             title: 'Transaction Was Reversed — Monvera',
             body: `Transaction was reversed. Your withdrawal of $${revAmtFormatted} (${safeRevAccountMasked}) was credited back to your account.`,
+            description: `Withdrawal reversal credited to ${safeRevAccountMasked}`.slice(0, 140),
+            direction: 'CREDIT',
             actionUrl: '/dashboard?view=transactions',
             amount: reverseAmount,
             currency: finalReversedTx.currency || 'USD',
@@ -3332,6 +3346,11 @@ export async function executeServerDeposit(
           nowIso,
           payload: {
             title: 'Deposit Credited — Monvera',
+            direction: 'CREDIT',
+            description: `Deposit to ${targetAccountName}`
+              .replace(/\b\d{8,}\b/g, '••••')
+              .trim()
+              .slice(0, 140),
             actionUrl: '/dashboard?view=transactions',
             amount: depositAmount,
             currency: 'USD',
@@ -3634,6 +3653,15 @@ export async function executeServerAdminTransfer(
           nowIso,
           payload: {
             title: 'Money Received — Monvera',
+            direction: 'CREDIT',
+            ...(typeof cleanDescription === 'string' && cleanDescription.trim()
+              ? {
+                  description: cleanDescription
+                    .replace(/\b\d{8,}\b/g, '••••')
+                    .trim()
+                    .slice(0, 140),
+                }
+              : {}),
             actionUrl: '/dashboard?view=transactions',
             amount: transferAmount,
             currency: 'USD',
@@ -3793,6 +3821,7 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
   let finalTx: Transaction | null = null;
   let finalMetrics: BalanceMetrics | null = null;
   let isDuplicate = false;
+  let outboxWriteResult: WrittenOutboxBatchResult | null = null;
 
   try {
     await adminFirestore.runTransaction(async (transaction) => {
@@ -3933,6 +3962,43 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
         },
       };
 
+      // Transaction read-phase: prepare MONEY_RECEIVED outbox record strictly BEFORE any writes
+      const safeDevAccountMasked = formatSafeOutboxAccountLabel(
+        targetAcc,
+        isSavings ? 'Savings' : 'Checking'
+      );
+      const devAmtFormatted = fundingAmount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      const devFundingOutboxBatch = await prepareNotificationOutboxBatch(transaction, adminFirestore, [
+        {
+          userId: targetUid,
+          transactionId: finalTx.id,
+          referenceNumber: finalTx.referenceNumber,
+          eventKey: `${finalTx.id}:COMPLETED`,
+          lifecycleStage: 'COMPLETED',
+          dispatchType: 'MONEY_RECEIVED',
+          category: 'TRANSACTION',
+          nowIso,
+          payload: {
+            title: 'Account Liquidity Credited — Monvera',
+            body: `+$${devAmtFormatted} USD has been credited to ${safeDevAccountMasked}. Ref: ${finalTx.referenceNumber}.`,
+            description: (reason
+              ? `Treasury liquidity credit: ${String(reason).replace(/\b\d{8,}\b/g, '••••').trim()}`
+              : `Treasury liquidity credit to ${targetType}`
+            ).slice(0, 140),
+            direction: 'CREDIT',
+            actionUrl: '/dashboard?view=transactions',
+            amount: fundingAmount,
+            currency: 'USD',
+            senderName: 'Monvera Developer Sandbox Pool',
+            recipientName: targetDisplayName,
+            accountMasked: safeDevAccountMasked,
+          },
+        },
+      ]);
+
       // Atomic commit: update target account
       transaction.set(
         accRef,
@@ -3944,12 +4010,17 @@ export async function executeServerAdminDevFunding(params: AdminDevFundingParams
         { merge: true }
       );
 
-      // Atomic commit: create transaction ledger document
+      // Atomic commit: create transaction ledger document & durable notification outbox record
       transaction.set(txRef, finalTx, { merge: true });
+      outboxWriteResult = writePreparedNotificationOutboxBatchInTransaction(
+        transaction,
+        devFundingOutboxBatch
+      );
     });
 
     if (finalTx) {
       if (!isDuplicate) {
+        reportOutboxPreparationIssues('executeServerAdminDevFunding', finalTx.id, outboxWriteResult);
         const cleanKey = (finalTx.referenceNumber || finalTx.id).replace(/[^a-zA-Z0-9_-]/g, '');
         persistCustomerNotification({
           id: `notif_dev_fund_${cleanKey}_${targetUid}`,
@@ -4394,6 +4465,11 @@ export async function executeServerLoanDisbursement(
           nowIso: now,
           payload: {
             title: 'Money Received — Monvera',
+            direction: 'CREDIT',
+            description: (loanData.purpose
+              ? `Loan Disbursement: ${String(loanData.purpose).replace(/\b\d{8,}\b/g, '••••').trim()}`
+              : 'Approved Loan Disbursement'
+            ).slice(0, 140),
             actionUrl: '/dashboard?view=loans',
             amount: loanAmount,
             currency: 'USD',
@@ -4779,6 +4855,8 @@ export async function executeServerLoanRepayment(
             body: isFullyPaid
               ? `Your loan repayment of $${repayAmtFormatted} from ${safeRepayAccountMasked} settled your loan in full.`
               : `Your partial loan repayment of $${repayAmtFormatted} from ${safeRepayAccountMasked} was applied. Remaining balance: $${remainingFormatted}.`,
+            description: (isFullyPaid ? 'Loan settled in full' : 'Partial loan repayment').slice(0, 140),
+            direction: 'DEBIT',
             actionUrl: '/dashboard?view=loans',
             amount: actualRepay,
             currency: 'USD',
@@ -5219,6 +5297,8 @@ export async function executeServerInvestmentCreation(
           payload: {
             title: 'Term Investment Activated — Monvera',
             body: `Your ${numDays}-day term investment of $${invPrincipalFormatted} from ${safeInvAccountMasked} has been activated.`,
+            description: `${numDays}-Day Term Investment activated`.slice(0, 140),
+            direction: 'DEBIT',
             actionUrl: '/dashboard?view=investments',
             amount: principal,
             currency: 'USD',
@@ -5539,6 +5619,8 @@ export async function executeServerInvestmentMaturity(
           nowIso,
           payload: {
             title: 'Investment Matured & Settled — Monvera',
+            description: `${inv.termDays}-Day Term Investment Maturity Payout`.slice(0, 140),
+            direction: 'CREDIT',
             actionUrl: '/dashboard?view=investments',
             amount: payoutTotal,
             currency: 'USD',

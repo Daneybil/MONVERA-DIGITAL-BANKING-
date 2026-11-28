@@ -1019,6 +1019,8 @@ export async function executeServerWireCheckWithdrawal(
           payload: {
             title: 'Wire Check Request Submitted — Monvera',
             body: `Your Wire Check withdrawal request for $${wireCheckAmtFormatted} from ${safeWireCheckSourceMasked} was submitted successfully.`,
+            description: `Wire Check withdrawal from ${safeWireCheckSourceMasked}`.slice(0, 140),
+            direction: 'DEBIT',
             actionUrl: '/dashboard?view=transactions',
             amount: amountDollars,
             currency: 'USD',
@@ -1416,6 +1418,8 @@ export async function markWireCheckRequestDeliveredAdmin(
             body: hasPositiveDelivAmt
               ? `Your Wire Check of $${delivAmtFormatted} from ${safeDelivAccountMasked} has been marked as delivered.`
               : `Your Wire Check from ${safeDelivAccountMasked} has been marked as delivered.`,
+            description: 'Wire Check marked delivered'.slice(0, 140),
+            direction: 'INFO',
             actionUrl: '/dashboard?view=transactions',
             ...(hasPositiveDelivAmt ? { amount: authoritativeAmount } : {}),
             currency: String(txData.currency || reqData.currency || 'USD').trim() || 'USD',
