@@ -36,6 +36,7 @@ import { KycBanner } from '../kyc/KycBanner';
 import { KycVerificationModal } from '../kyc/KycVerificationModal';
 import { firestoreSync } from '../../services/firestoreSync';
 import { WelcomeRewardCard } from './WelcomeRewardCard';
+import { readCachedUserBalances } from '../../utils/balancePersistence';
 
 export interface OverviewTransactionClassification {
   isInternalTransfer: boolean;
@@ -153,7 +154,14 @@ export function classifyOverviewTransaction(
 }
 
 export const DashboardOverview: React.FC = () => {
-  const { currentUser, balanceMetrics: liveBalanceMetrics, openModal, setCurrentView, refreshBalance } = useAuth();
+  const {
+    currentUser,
+    balanceMetrics: contextBalanceMetrics,
+    isBalanceCached,
+    openModal,
+    setCurrentView,
+    refreshBalance,
+  } = useAuth();
   const [recentTransactions, setRecentTransactions] = useState<Transaction[]>([]);
   const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
   const [hideBalances, setHideBalances] = useState<boolean>(false);
@@ -164,28 +172,28 @@ export const DashboardOverview: React.FC = () => {
   const effectiveUid = auth.currentUser?.uid || currentUser?.id;
   const refreshBalanceRef = React.useRef(refreshBalance);
   refreshBalanceRef.current = refreshBalance;
-  const hasLiveBalanceRef = React.useRef(Boolean(liveBalanceMetrics));
-  hasLiveBalanceRef.current = Boolean(liveBalanceMetrics);
+  const hasLiveBalanceRef = React.useRef(Boolean(contextBalanceMetrics && !isBalanceCached));
+  hasLiveBalanceRef.current = Boolean(contextBalanceMetrics && !isBalanceCached);
   const prevBalanceSignatureRef = React.useRef<string | null>(null);
 
-  // Authoritative balance metrics: live authoritative balanceMetrics from Firestore.
-  // When live metrics are in-flight or temporarily reconnecting, fallback to verified last-known cache
-  const balanceMetrics: BalanceMetrics = useMemo(() => {
-    if (liveBalanceMetrics) {
-      return liveBalanceMetrics;
+  // Authoritative balance metrics from Firestore, falling back cleanly to last known cached balance during reconnection.
+  const { balanceMetrics, hasDisplayableBalance, isShowingCached } = useMemo(() => {
+    if (contextBalanceMetrics) {
+      return {
+        balanceMetrics: contextBalanceMetrics,
+        hasDisplayableBalance: true,
+        isShowingCached: Boolean(isBalanceCached),
+      };
     }
-    if (effectiveUid && typeof window !== 'undefined') {
-      try {
-        const raw = localStorage.getItem(`monvera_balances_${effectiveUid}`);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed.totalBalance === 'number' && parsed.accounts) {
-            return parsed;
-          }
-        }
-      } catch {}
+    const cachedEntry = effectiveUid ? readCachedUserBalances(effectiveUid) : null;
+    if (cachedEntry) {
+      return {
+        balanceMetrics: cachedEntry.metrics,
+        hasDisplayableBalance: true,
+        isShowingCached: true,
+      };
     }
-    return {
+    const emptyShell: BalanceMetrics = {
       checkingBalance: 0,
       savingsBalance: 0,
       investedBalance: 0,
@@ -229,7 +237,12 @@ export const DashboardOverview: React.FC = () => {
         },
       ],
     };
-  }, [liveBalanceMetrics, effectiveUid, currentUser]);
+    return {
+      balanceMetrics: emptyShell,
+      hasDisplayableBalance: false,
+      isShowingCached: false,
+    };
+  }, [contextBalanceMetrics, isBalanceCached, effectiveUid, currentUser]);
 
   useEffect(() => {
     const currentEffectiveUid = auth.currentUser?.uid || currentUser?.id;
@@ -287,8 +300,8 @@ export const DashboardOverview: React.FC = () => {
   // Refresh recent transactions only when authoritative balances actually change (never on ordinary notifications)
   useEffect(() => {
     const currentEffectiveUid = auth.currentUser?.uid || currentUser?.id;
-    if (!currentEffectiveUid || !liveBalanceMetrics) return;
-    const signature = `${liveBalanceMetrics.checkingBalance}|${liveBalanceMetrics.savingsBalance}|${liveBalanceMetrics.investedBalance}|${liveBalanceMetrics.totalBalance}`;
+    if (!currentEffectiveUid || !contextBalanceMetrics || isBalanceCached) return;
+    const signature = `${contextBalanceMetrics.checkingBalance}|${contextBalanceMetrics.savingsBalance}|${contextBalanceMetrics.investedBalance}|${contextBalanceMetrics.totalBalance}`;
     if (prevBalanceSignatureRef.current === null) {
       prevBalanceSignatureRef.current = signature;
       return;
@@ -305,10 +318,11 @@ export const DashboardOverview: React.FC = () => {
       .catch(() => {});
   }, [
     currentUser?.id,
-    liveBalanceMetrics?.checkingBalance,
-    liveBalanceMetrics?.savingsBalance,
-    liveBalanceMetrics?.investedBalance,
-    liveBalanceMetrics?.totalBalance,
+    isBalanceCached,
+    contextBalanceMetrics?.checkingBalance,
+    contextBalanceMetrics?.savingsBalance,
+    contextBalanceMetrics?.investedBalance,
+    contextBalanceMetrics?.totalBalance,
   ]);
 
   if (!currentUser) {
@@ -408,7 +422,7 @@ export const DashboardOverview: React.FC = () => {
         <div className="absolute bottom-0 left-0 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl pointer-events-none" />
         
         <div className="relative z-10 space-y-8">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-3 text-sm font-mono font-black text-slate-200 uppercase tracking-widest">
               <span>Total Net Worth / Balance</span>
               <button
@@ -419,34 +433,39 @@ export const DashboardOverview: React.FC = () => {
                 {hideBalances ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
             </div>
-            <span className="text-xs sm:text-sm font-mono font-black px-4 py-1.5 rounded-full bg-emerald-950 text-emerald-300 border-2 border-emerald-500 shadow-inner">
-              USD Currency
-            </span>
+            <div className="flex items-center gap-2">
+              {isShowingCached && hasDisplayableBalance && (
+                <span className="text-[11px] font-mono font-black px-3 py-1 rounded-full bg-amber-950/90 text-amber-300 border border-amber-400/70">
+                  Cached — reconnecting
+                </span>
+              )}
+              <span className="text-xs sm:text-sm font-mono font-black px-4 py-1.5 rounded-full bg-emerald-950 text-emerald-300 border-2 border-emerald-500 shadow-inner">
+                USD Currency
+              </span>
+            </div>
           </div>
 
           {/* Primary Large Balance Display */}
           <div className="text-4xl sm:text-6xl lg:text-7xl font-black font-mono tracking-tight text-white select-none drop-shadow-md notranslate" translate="no">
             {hideBalances ? (
               '••••••••••••'
-            ) : balanceMetrics.totalBalance > 0 ? (
+            ) : hasDisplayableBalance ? (
               `$${balanceMetrics.totalBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
-            ) : !liveBalanceMetrics ? (
+            ) : (
               <div className="flex items-center gap-3 py-1">
                 <div className="w-8 h-8 sm:w-10 sm:h-10 border-3 border-emerald-400 border-t-transparent animate-spin rounded-full" />
                 <span className="text-xl sm:text-3xl font-bold font-sans text-slate-300">
                   Synchronizing ledger...
                 </span>
               </div>
-            ) : (
-              `$${balanceMetrics.totalBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`
             )}
           </div>
 
-          {!liveBalanceMetrics && (
-            <div className="mt-3 p-3 rounded-xl bg-amber-400/10 border border-amber-400/30 flex items-center justify-between text-xs text-amber-300">
+          {(!hasDisplayableBalance || isShowingCached) && (
+            <div className="mt-3 p-3 rounded-xl bg-amber-400/10 border border-amber-400/30 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-300">
               <span className="font-semibold">
-                {balanceMetrics.totalBalance > 0
-                  ? 'Displaying verified last-known balances while synchronizing with the authoritative Monvera Core Ledger...'
+                {isShowingCached && hasDisplayableBalance
+                  ? 'Cached — reconnecting: Displaying your last saved balance while reconnecting to the live Monvera ledger.'
                   : 'Retrieving authoritative ledger balances from Monvera Banking Core...'}
               </span>
               <button
@@ -465,7 +484,7 @@ export const DashboardOverview: React.FC = () => {
                 Liquid Operating Balance
               </span>
               <span className="text-2xl sm:text-3xl font-black font-mono text-white block">
-                {hideBalances ? '••••••' : !liveBalanceMetrics ? '••••' : `$${balanceMetrics.availableBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                {hideBalances ? '••••••' : !hasDisplayableBalance ? '••••' : `$${balanceMetrics.availableBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </span>
               <span className="text-xs sm:text-sm text-slate-300 block font-bold">Checking + Savings Accounts</span>
             </div>
@@ -475,7 +494,7 @@ export const DashboardOverview: React.FC = () => {
                 Invested Capital (Locked)
               </span>
               <span className="text-2xl sm:text-3xl font-black font-mono text-emerald-300 block">
-                {hideBalances ? '••••••' : !liveBalanceMetrics ? '••••' : `$${balanceMetrics.investedBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                {hideBalances ? '••••••' : !hasDisplayableBalance ? '••••' : `$${balanceMetrics.investedBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </span>
               <span className="text-xs sm:text-sm text-emerald-200 block font-bold">60-360D Term Sovereign Plans</span>
             </div>
@@ -485,7 +504,7 @@ export const DashboardOverview: React.FC = () => {
                 Total Accrued Interest & Profits
               </span>
               <span className="text-2xl sm:text-3xl font-black font-mono text-amber-300 block">
-                {hideBalances ? '••••••' : !liveBalanceMetrics ? '••••' : `+$${balanceMetrics.accruedEarnings.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
+                {hideBalances ? '••••••' : !hasDisplayableBalance ? '••••' : `+$${balanceMetrics.accruedEarnings.toLocaleString('en-US', { minimumFractionDigits: 2 })}`}
               </span>
               <span className="text-xs sm:text-sm text-amber-200 block font-bold">Earned from 4.50% Daily Yield & Savings</span>
             </div>

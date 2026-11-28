@@ -15,6 +15,13 @@ import {
 import { db, auth } from './firebase';
 import { UserProfile, Transaction, InvestmentPlan, InvestmentTermDays, LoanApplication, CardItem, NotificationItem, NotificationPreferences, ChatMessage } from '../types';
 import type { BalanceMetrics } from './api';
+import {
+  sanitizeAccountNumber,
+  hasAnyPositiveBalance,
+  selectAuthoritativeAccountDocData,
+  normalizeBalanceMetricsFromDoc,
+  createAccountSnapshotCoordinator,
+} from '../utils/balancePersistence';
 
 // Double-investment prevention lock for concurrent clicks/requests
 const inFlightInvestmentLocks = new Set<string>();
@@ -978,110 +985,62 @@ export const firestoreSync = {
 
   /**
    * Fetch permanent user account balances from Firestore: accounts/{userId}
-   * Strictly reads the authoritative account document. Zero loan queries, zero transaction scans.
+   * with verified fallback to legacy accounts/{userAccountNumber} when primary UID ledger is missing or zero.
+   * Strictly reads authoritative account documents. Zero loan queries, zero transaction scans.
    */
-  async getAccountBalances(userId: string, userAccountNumber?: string): Promise<BalanceMetrics | null> {
+  async getAccountBalances(
+    userId: string,
+    userAccountNumber?: string,
+    userEmail?: string
+  ): Promise<BalanceMetrics | null> {
     if (!userId) return null;
     if (!db) return null;
     const path = `accounts/${userId}`;
     try {
       const accRef = doc(db, 'accounts', userId);
       const snap = await getDoc(accRef);
-      let data = snap.exists() ? snap.data() : null;
+      const uidExists = snap.exists();
+      const uidData = uidExists ? snap.data() : null;
 
-      // Resilient check: If accounts/{userId} is missing or has $0 balance, check legacy accounts/{userAccountNumber}
-      const isZeroOrMissing = !data || (Number(data.checkingBalance ?? 0) === 0 && Number(data.totalBalance ?? 0) === 0);
-      if (isZeroOrMissing && userAccountNumber) {
-        const cleanAcc = userAccountNumber.replace(/[-\s]/g, '');
-        if (cleanAcc && cleanAcc !== userId) {
-          try {
-            const legacyRef = doc(db, 'accounts', cleanAcc);
-            const legacySnap = await getDoc(legacyRef);
-            if (legacySnap.exists()) {
-              const legacyData = legacySnap.data();
-              if (Number(legacyData?.checkingBalance ?? 0) > 0 || Number(legacyData?.totalBalance ?? 0) > 0) {
-                data = legacyData;
-              }
-            }
-          } catch {}
+      let legacyExists = false;
+      let legacyData: Record<string, any> | null = null;
+      let legacyTransientError = false;
+      const cleanAcc = sanitizeAccountNumber(userAccountNumber);
+
+      if ((!uidExists || !hasAnyPositiveBalance(uidData)) && cleanAcc && cleanAcc !== userId) {
+        try {
+          const legacyRef = doc(db, 'accounts', cleanAcc);
+          const legacySnap = await getDoc(legacyRef);
+          if (legacySnap.exists()) {
+            legacyExists = true;
+            legacyData = legacySnap.data();
+          }
+        } catch (legacyErr: any) {
+          const code = legacyErr?.code || '';
+          const isPermissionDenied =
+            code === 'permission-denied' || String(legacyErr?.message || '').includes('permission-denied');
+          if (!isPermissionDenied) {
+            legacyTransientError = true;
+          }
         }
       }
 
-      if (data) {
-        const chk = Number(data.checkingBalance ?? 0);
-        const sav = Number(data.savingsBalance ?? data.savings ?? 0);
-        const inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
-        const accrued = Number(data.accruedEarnings ?? 0);
-        const avail = Number(data.availableBalance ?? chk);
-        const total = Number(data.totalBalance ?? (chk + sav + inv + accrued));
-        const loanBal = Number(data.loanBalance ?? 0);
+      if (legacyTransientError && !hasAnyPositiveBalance(uidData)) {
+        return null;
+      }
 
-        const accountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
-          ? data.accounts.map((a: any) => {
-              if (a.type === 'CHECKING') {
-                return { ...a, balance: chk, availableBalance: avail };
-              }
-              if (a.type === 'SAVINGS') {
-                return { ...a, balance: sav, availableBalance: sav };
-              }
-              if (a.type === 'INVESTMENT') {
-                return { ...a, balance: inv, investedBalance: inv };
-              }
-              return a;
-            })
-          : [
-              {
-                id: `acc_chk_${userId}`,
-                userId,
-                type: 'CHECKING',
-                accountNumber: userAccountNumber || '1000000000',
-                routingNumber: '021000021',
-                currency: 'USD',
-                balance: chk,
-                availableBalance: avail,
-                investedBalance: 0,
-                pendingBalance: 0,
-                interestRateAPY: 1.25,
-                status: 'ACTIVE',
-                nickname: 'Monvera Premier Checking',
-              },
-              {
-                id: `acc_sav_${userId}`,
-                userId,
-                type: 'SAVINGS',
-                accountNumber: userAccountNumber ? `10${userAccountNumber.slice(2, -3)}991` : '1000000991',
-                routingNumber: '021000021',
-                currency: 'USD',
-                balance: sav,
-                availableBalance: sav,
-                investedBalance: 0,
-                pendingBalance: 0,
-                interestRateAPY: 4.85,
-                status: 'ACTIVE',
-                nickname: 'Monvera High-Yield Treasury',
-              },
-            ];
+      const selection = selectAuthoritativeAccountDocData({
+        uid: userId,
+        uidExists,
+        uidData,
+        legacyAccNumber: cleanAcc || undefined,
+        legacyExists,
+        legacyData,
+        userEmail,
+      });
 
-        const metrics: BalanceMetrics = {
-          checkingBalance: chk,
-          savingsBalance: sav,
-          investedBalance: inv,
-          accruedEarnings: accrued,
-          totalBalance: total,
-          availableBalance: avail,
-          pendingBalance: Number(data.pendingBalance ?? 0),
-          loanBalance: loanBal,
-          accounts: accountsList,
-        };
-
-        if (data.monthlyIncome !== undefined) {
-          (metrics as any).monthlyIncome = Number(data.monthlyIncome);
-        }
-        if (data.monthlySpending !== undefined) {
-          (metrics as any).monthlySpending = Number(data.monthlySpending);
-        }
-
-        return metrics;
+      if (selection.source !== 'none' && selection.data) {
+        return normalizeBalanceMetricsFromDoc(userId, selection.data, cleanAcc || userAccountNumber);
       }
 
       return null;
@@ -1580,89 +1539,68 @@ export const firestoreSync = {
 
   /**
    * Real-time listener for a user's account balances under accounts/{userId}
+   * and (if applicable) legacy accounts/{userAccountNumber}.
+   * Uses the same authoritative selection rule as getAccountBalances so an empty or zero-valued
+   * accounts/{userId} document never overwrites a valid owned legacy balance.
    */
   subscribeToAccountBalances(
     userId: string,
     userAccountNumber: string | undefined,
-    onUpdate: (metrics: BalanceMetrics) => void
+    onUpdate: (metrics: BalanceMetrics) => void,
+    onError?: (error: unknown) => void,
+    userEmail?: string
   ): () => void {
     if (!userId || !db) return () => {};
     try {
+      const cleanAcc = sanitizeAccountNumber(userAccountNumber);
+      const coordinator = createAccountSnapshotCoordinator({
+        uid: userId,
+        legacyAccNumber: cleanAcc || undefined,
+        userEmail,
+        onUpdate,
+        onError,
+      });
+
       const accRef = doc(db, 'accounts', userId);
-      const unsubscribe = onSnapshot(
+      const unsubUid = onSnapshot(
         accRef,
         (snap) => {
-          if (snap.exists()) {
-            const data = snap.data();
-            const chk = Number(data.checkingBalance ?? 0);
-            const sav = Number(data.savingsBalance ?? data.savings ?? 0);
-            const inv = Number(data.investedBalance ?? data.investmentBalance ?? 0);
-            const accrued = Number(data.accruedEarnings ?? 0);
-            const total = Number(data.totalBalance ?? (chk + sav + inv + accrued));
-            const avail = Number(data.availableBalance ?? chk);
-            const accountsList = (Array.isArray(data.accounts) && data.accounts.length > 0)
-              ? data.accounts.map((a: any) => {
-                  if (a.type === 'CHECKING') return { ...a, balance: chk, availableBalance: avail };
-                  if (a.type === 'SAVINGS') return { ...a, balance: sav, availableBalance: sav };
-                  if (a.type === 'INVESTMENT') return { ...a, balance: inv, investedBalance: inv };
-                  return a;
-                })
-              : [
-                  {
-                    id: `acc_chk_${userId}`,
-                    userId,
-                    type: 'CHECKING',
-                    accountNumber: userAccountNumber || '1000000000',
-                    routingNumber: '021000021',
-                    currency: 'USD',
-                    balance: chk,
-                    availableBalance: avail,
-                    investedBalance: 0,
-                    pendingBalance: 0,
-                    interestRateAPY: 1.25,
-                    status: 'ACTIVE',
-                    nickname: 'Monvera Premier Checking',
-                  },
-                  {
-                    id: `acc_sav_${userId}`,
-                    userId,
-                    type: 'SAVINGS',
-                    accountNumber: userAccountNumber ? `10${userAccountNumber.slice(2, -3)}991` : '1000000991',
-                    routingNumber: '021000021',
-                    currency: 'USD',
-                    balance: sav,
-                    availableBalance: sav,
-                    investedBalance: 0,
-                    pendingBalance: 0,
-                    interestRateAPY: 4.85,
-                    status: 'ACTIVE',
-                    nickname: 'Monvera High-Yield Treasury',
-                  },
-                ];
-
-            const metrics: BalanceMetrics = {
-              checkingBalance: chk,
-              savingsBalance: sav,
-              investedBalance: inv,
-              accruedEarnings: accrued,
-              totalBalance: total,
-              availableBalance: avail,
-              pendingBalance: Number(data.pendingBalance ?? 0),
-              accounts: accountsList,
-            };
-            if (data.monthlyIncome !== undefined) (metrics as any).monthlyIncome = Number(data.monthlyIncome);
-            if (data.monthlySpending !== undefined) (metrics as any).monthlySpending = Number(data.monthlySpending);
-
-            onUpdate(metrics);
-          }
+          coordinator.onUidSnapshot(snap.exists(), snap.exists() ? snap.data() : null);
         },
         (err) => {
           console.warn('[Firestore] Error in account balances realtime listener:', err);
+          coordinator.onUidError(err);
         }
       );
-      return unsubscribe;
+
+      let unsubLegacy: (() => void) | null = null;
+      if (cleanAcc && cleanAcc !== userId) {
+        const legacyRef = doc(db, 'accounts', cleanAcc);
+        unsubLegacy = onSnapshot(
+          legacyRef,
+          (snap) => {
+            coordinator.onLegacySnapshot(snap.exists(), snap.exists() ? snap.data() : null);
+          },
+          (err) => {
+            console.warn('[Firestore] Legacy account balances listener note:', err);
+            coordinator.onLegacyError(err);
+          }
+        );
+      }
+
+      return () => {
+        try {
+          unsubUid();
+        } catch {}
+        if (unsubLegacy) {
+          try {
+            unsubLegacy();
+          } catch {}
+        }
+      };
     } catch (err) {
       console.warn('[Firestore] Error subscribing to account balances:', err);
+      onError?.(err);
       return () => {};
     }
   },

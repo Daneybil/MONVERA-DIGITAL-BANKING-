@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { LinkedBankAccountApplication } from '../../types';
 import { api } from '../../services/api';
 import {
@@ -45,8 +45,21 @@ export const AdminBankVerificationRequestsView: React.FC<AdminBankVerificationRe
   const [isSubmittingAction, setIsSubmittingAction] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const inFlightRef = useRef<boolean>(false);
+  const lastFetchedAtRef = useRef<number>(0);
 
-  const loadRequests = async (silent = false) => {
+  const loadRequests = async (silent = false, fromFocusOrVisibility = false) => {
+    if (silent && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+    if (silent && inFlightRef.current) {
+      return;
+    }
+    if (fromFocusOrVisibility && Date.now() - lastFetchedAtRef.current < 10000) {
+      return;
+    }
+
+    inFlightRef.current = true;
     if (!silent) {
       setIsLoading(true);
     }
@@ -60,10 +73,12 @@ export const AdminBankVerificationRequestsView: React.FC<AdminBankVerificationRe
           res.error || 'Unable to load bank verification requests. Please verify your connection and retry.'
         );
       }
+      lastFetchedAtRef.current = Date.now();
     } catch (err: any) {
       console.error('[AdminBankVerificationRequestsView] Error loading requests:', err);
       setLoadError(err?.message || 'Network error loading bank verification requests.');
     } finally {
+      inFlightRef.current = false;
       if (!silent) {
         setIsLoading(false);
       }
@@ -71,13 +86,13 @@ export const AdminBankVerificationRequestsView: React.FC<AdminBankVerificationRe
   };
 
   useEffect(() => {
-    loadRequests(false);
+    loadRequests(false, false);
     const intervalId = window.setInterval(() => {
-      loadRequests(true);
-    }, 10000);
+      loadRequests(true, false);
+    }, 30000);
     const handleVisibilityOrFocus = () => {
       if (document.visibilityState === 'visible') {
-        loadRequests(true);
+        loadRequests(true, true);
       }
     };
     window.addEventListener('focus', handleVisibilityOrFocus);

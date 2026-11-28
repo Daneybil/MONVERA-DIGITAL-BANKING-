@@ -20,9 +20,15 @@ import {
   Building2,
 } from 'lucide-react';
 
+import { readCachedUserBalances } from '../../utils/balancePersistence';
+
 export const AccountsView: React.FC = () => {
-  const { currentUser, balanceMetrics, openModal, refreshBalance, refreshNotifications } = useAuth();
+  const { currentUser, balanceMetrics: contextBalanceMetrics, isBalanceCached, openModal, refreshBalance, refreshNotifications } = useAuth();
   const [copiedAcc, setCopiedAcc] = useState<string | null>(null);
+
+  const cachedFallback = currentUser?.id ? readCachedUserBalances(currentUser.id)?.metrics || null : null;
+  const balanceMetrics = contextBalanceMetrics || cachedFallback;
+  const isShowingCached = Boolean(isBalanceCached || (!contextBalanceMetrics && cachedFallback));
 
   // Bank Account Applications State
   const [bankAccounts, setBankAccounts] = useState<LinkedBankAccountApplication[]>([]);
@@ -173,6 +179,11 @@ export const AccountsView: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
+          {isShowingCached && (
+            <span className="px-3 py-1.5 text-[11px] font-mono font-bold text-amber-900 bg-amber-100 border border-amber-300 rounded-xl">
+              Cached — reconnecting
+            </span>
+          )}
           <button
             onClick={() => openModal('deposit')}
             className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl shadow-xs transition-colors flex items-center gap-1.5"
@@ -182,6 +193,23 @@ export const AccountsView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {isShowingCached && (
+        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-300 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-950">
+          <div className="flex items-center gap-2 font-semibold">
+            <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
+            <span>
+              <strong>Cached — reconnecting:</strong> Displaying last saved balances while reconnecting to the live Monvera ledger.
+            </span>
+          </div>
+          <button
+            onClick={() => refreshBalance()}
+            className="px-3 py-1 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold transition-colors cursor-pointer"
+          >
+            Retry Sync
+          </button>
+        </div>
+      )}
 
       {/* Account Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">

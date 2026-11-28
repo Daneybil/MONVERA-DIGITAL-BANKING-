@@ -27,6 +27,12 @@ import {
 } from './server/services/notificationOutboxWorker';
 import { persistCustomerNotification, maskAccountNumber, resolveCustomerNotificationContext } from './server/services/notificationStore';
 import { UserProfile, InvestmentTermDays, LoanApplication, AdminSystemOverview } from './src/types';
+import {
+  sanitizeAccountNumber,
+  hasAnyPositiveBalance,
+  selectAuthoritativeAccountDocData,
+  normalizeBalanceMetricsFromDoc,
+} from './src/utils/balancePersistence';
 import { getStripe, isStripeConfigured } from './server/stripe';
 import { requireFirebaseAuth, optionalFirebaseAuth, requireAdminAuth, isCallerAdministrator, getConfiguredAdminEmails, AuthenticatedRequest, createAdminSessionToken, verifyAdminSessionToken } from './server/authMiddleware';
 import { adminAuth, adminFirestore, isFirebaseAdminConfigured, getFirebaseAdminDiagnostics } from './server/firebaseAdmin';
@@ -69,6 +75,7 @@ import {
   getAllCardActivationRequestsAdmin,
   approveCardActivationRequest,
   rejectCardActivationRequest,
+  classifyFirestoreReadError,
 } from './server/firestoreTransactions';
 import { evaluateAndProcessWelcomeReward, getAllWelcomeRewardsAdmin } from './server/welcomeRewardService';
 
@@ -1084,59 +1091,68 @@ export async function handleGetAccountBalance(
   const fs = deps?.firestore || adminFirestore;
   try {
     const accSnap = await fs.collection('accounts').doc(userId).get();
-    if (accSnap.exists) {
-      const ad = accSnap.data()!;
-      const chk = Number(ad.checkingBalance ?? 0);
-      const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
-      const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
-      const accrued = Number(ad.accruedEarnings ?? 0);
-      const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
-      const avail = Number(ad.availableBalance ?? chk);
-      const accountsList = (Array.isArray(ad.accounts) && ad.accounts.length > 0)
-        ? ad.accounts
-        : [
-            {
-              id: `acc_chk_${userId}`,
-              userId,
-              type: 'CHECKING',
-              accountNumber: ad.permanentAccountNumber || '1000000000',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: chk,
-              availableBalance: avail,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 1.25,
-              status: 'ACTIVE',
-              nickname: 'Monvera Premier Checking',
-            },
-            {
-              id: `acc_sav_${userId}`,
-              userId,
-              type: 'SAVINGS',
-              accountNumber: ad.permanentAccountNumber && String(ad.permanentAccountNumber).length >= 7 ? `10${String(ad.permanentAccountNumber).slice(2, -3)}991` : '1000000991',
-              routingNumber: '021000021',
-              currency: 'USD',
-              balance: sav,
-              availableBalance: sav,
-              investedBalance: 0,
-              pendingBalance: 0,
-              interestRateAPY: 4.85,
-              status: 'ACTIVE',
-              nickname: 'Monvera High-Yield Treasury',
-            },
-          ];
+    const uidExists = accSnap.exists;
+    const uidData = uidExists ? accSnap.data()! : null;
 
+    let legacyExists = false;
+    let legacyData: Record<string, any> | null = null;
+    let resolvedAccountNumber = sanitizeAccountNumber(uidData?.permanentAccountNumber);
+    let verifiedEmail: string | undefined;
+
+    if (!uidExists || !hasAnyPositiveBalance(uidData)) {
+      const userSnap = await fs.collection('users').doc(userId).get();
+      const userData = userSnap.exists ? userSnap.data() : null;
+
+      if (userData) {
+        resolvedAccountNumber = sanitizeAccountNumber(userData.permanentAccountNumber || userData.accountNumber);
+        if (typeof userData.email === 'string' && userData.email.trim()) {
+          verifiedEmail = userData.email.trim();
+        }
+      }
+
+      if (resolvedAccountNumber && resolvedAccountNumber !== userId) {
+        const legacySnap = await fs.collection('accounts').doc(resolvedAccountNumber).get();
+        if (legacySnap.exists) {
+          const candidateData = legacySnap.data()!;
+          const explicitlyOwnedByUid =
+            candidateData?.userId === userId ||
+            candidateData?.uid === userId ||
+            candidateData?.ownerUid === userId;
+          // Require verified users/{userId} anchor OR explicit ownership UID on the legacy doc itself
+          if (userSnap.exists || explicitlyOwnedByUid) {
+            legacyExists = true;
+            legacyData = candidateData;
+          }
+        }
+      }
+    }
+
+    const selection = selectAuthoritativeAccountDocData({
+      uid: userId,
+      uidExists,
+      uidData,
+      legacyAccNumber: resolvedAccountNumber || undefined,
+      legacyExists,
+      legacyData,
+      userEmail: verifiedEmail,
+    });
+
+    if (selection.source !== 'none' && selection.data) {
+      const normalized = normalizeBalanceMetricsFromDoc(
+        userId,
+        selection.data,
+        resolvedAccountNumber || undefined
+      );
       return res.json({
-        checkingBalance: chk,
-        savingsBalance: sav,
-        investedBalance: inv,
-        accruedEarnings: accrued,
-        totalBalance: total,
-        availableBalance: avail,
-        pendingBalance: Number(ad.pendingBalance ?? 0),
-        loanBalance: Number(ad.loanBalance ?? 0),
-        accounts: accountsList,
+        checkingBalance: normalized.checkingBalance,
+        savingsBalance: normalized.savingsBalance,
+        investedBalance: normalized.investedBalance,
+        accruedEarnings: normalized.accruedEarnings,
+        totalBalance: normalized.totalBalance,
+        availableBalance: normalized.availableBalance,
+        pendingBalance: normalized.pendingBalance,
+        loanBalance: normalized.loanBalance ?? 0,
+        accounts: normalized.accounts,
       });
     } else {
       return res.status(404).json({
@@ -1145,14 +1161,24 @@ export async function handleGetAccountBalance(
       });
     }
   } catch (e: any) {
-    const errCode = e?.code || e?.status || 'UNKNOWN';
-    const isQuota = errCode === 8 || String(e?.message).includes('RESOURCE_EXHAUSTED') || errCode === 'RESOURCE_EXHAUSTED';
+    const errCode = e?.code ?? e?.status ?? 'UNKNOWN';
+    const errMsg = String(e?.message || '');
+    const isQuota = errCode === 8 || errMsg.includes('RESOURCE_EXHAUSTED') || errCode === 'RESOURCE_EXHAUSTED';
+    const isUnavailable =
+      errCode === 14 ||
+      errCode === 4 ||
+      errCode === 'UNAVAILABLE' ||
+      errCode === 'DEADLINE_EXCEEDED' ||
+      errMsg.includes('UNAVAILABLE') ||
+      errMsg.includes('DEADLINE_EXCEEDED');
     console.error('[/api/accounts/balance error reading Firestore]', e);
-    return res.status(isQuota ? 503 : 500).json({
+    return res.status(isQuota || isUnavailable ? 503 : 500).json({
       error: isQuota
         ? 'Authoritative account balances temporarily unavailable due to upstream Firestore quota limits.'
+        : isUnavailable
+        ? 'Authoritative account balances temporarily unavailable due to database connectivity.'
         : 'Failed to retrieve authoritative account balances from Firestore ledger.',
-      code: isQuota ? 'RESOURCE_EXHAUSTED' : 'FIRESTORE_ERROR',
+      code: isQuota ? 'RESOURCE_EXHAUSTED' : isUnavailable ? 'FIRESTORE_UNAVAILABLE' : 'FIRESTORE_ERROR',
     });
   }
 }
@@ -2217,7 +2243,11 @@ app.get('/api/admin/rewards/welcome', requireAdminAuth, async (req: Authenticate
     return res.json({ success: true, rewards: data.rewards, stats: data.stats });
   } catch (err: any) {
     console.error('[GET /api/admin/rewards/welcome] Error:', err);
-    return res.status(500).json({ error: err?.message || 'Failed to retrieve administrative reward records.' });
+    return res.status(err?.statusCode || 503).json({
+      success: false,
+      errorCode: err?.errorCode || 'DATABASE_READ_ERROR',
+      error: err?.message || 'Database read error: unable to retrieve administrative reward records.',
+    });
   }
 });
 
@@ -2542,7 +2572,11 @@ app.get('/api/admin/bank-accounts', requireAdminAuth, async (_req: Authenticated
     return res.json({ success: true, applications });
   } catch (err: any) {
     console.error('[GET /api/admin/bank-accounts Error]:', err);
-    return res.status(err?.statusCode || 500).json({ error: err?.message || 'Failed to retrieve bank approval requests.' });
+    return res.status(err?.statusCode || 503).json({
+      success: false,
+      errorCode: err?.errorCode || 'DATABASE_READ_ERROR',
+      error: err?.message || 'Database read error: unable to retrieve bank account approval requests.',
+    });
   }
 });
 
@@ -2632,7 +2666,11 @@ app.get('/api/admin/bank-verifications', requireAdminAuth, async (_req: Authenti
     return res.json({ success: true, requests });
   } catch (err: any) {
     console.error('[GET /api/admin/bank-verifications Error]:', err);
-    return res.status(err?.statusCode || 500).json({ error: err?.message || 'Failed to retrieve bank verification requests.' });
+    return res.status(err?.statusCode || 503).json({
+      success: false,
+      errorCode: err?.errorCode || 'DATABASE_READ_ERROR',
+      error: err?.message || 'Database read error: unable to retrieve bank verification requests.',
+    });
   }
 });
 
@@ -2732,7 +2770,11 @@ app.get('/api/admin/card-activations', requireAdminAuth, async (_req: Authentica
     return res.json({ success: true, requests });
   } catch (err: any) {
     console.error('[GET /api/admin/card-activations Error]:', err);
-    return res.status(err?.statusCode || 500).json({ error: err?.message || 'Failed to retrieve card activation requests.' });
+    return res.status(err?.statusCode || 503).json({
+      success: false,
+      errorCode: err?.errorCode || 'DATABASE_READ_ERROR',
+      error: err?.message || 'Database read error: unable to retrieve card activation requests.',
+    });
   }
 });
 
@@ -2965,7 +3007,20 @@ app.get('/api/transactions', requireFirebaseAuth, async (req: AuthenticatedReque
   try {
     const txMap = new Map<string, any>();
 
-    if (isFirebaseAdminConfigured()) {
+    if (!userId && isCallerAdmin) {
+      if (!isFirebaseAdminConfigured()) {
+        return res.status(503).json({
+          success: false,
+          errorCode: 'DATABASE_UNCONFIGURED',
+          error: 'Database service unavailable: unable to retrieve platform transactions.',
+        });
+      }
+      const snap = await adminFirestore.collection('transactions').get();
+      snap.forEach((d) => {
+        const t = d.data();
+        txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
+      });
+    } else if (isFirebaseAdminConfigured()) {
       const txCol = adminFirestore.collection('transactions');
 
       if (userId) {
@@ -2998,12 +3053,6 @@ app.get('/api/transactions', requireFirebaseAuth, async (req: AuthenticatedReque
             });
           }
         }
-      } else if (isCallerAdmin) {
-        const snap = await txCol.get();
-        snap.forEach((d) => {
-          const t = d.data();
-          txMap.set(t.id || d.id, { ...t, id: t.id || d.id });
-        });
       }
     }
 
@@ -3017,8 +3066,16 @@ app.get('/api/transactions', requireFirebaseAuth, async (req: AuthenticatedReque
     }
 
     txs = Array.from(txMap.values());
-  } catch (err) {
+  } catch (err: any) {
     console.error('[/api/transactions Error reading Firestore]', err);
+    if (!userId && isCallerAdmin) {
+      const classified = classifyFirestoreReadError(err);
+      return res.status(classified.statusCode).json({
+        success: false,
+        errorCode: classified.errorCode,
+        error: `Database read error: unable to retrieve platform transactions (${classified.reason}).`,
+      });
+    }
     txs = [...db.transactions];
     if (userId) {
       txs = txs.filter((t) => t.senderUserId === userId || t.recipientUserId === userId || t.userId === userId);
@@ -4152,9 +4209,36 @@ function isFakeAccount(user: { id?: string; email?: string; role?: string }): bo
   return false;
 }
 
-app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+export interface AdminReadEndpointDeps {
+  firestore?: typeof adminFirestore;
+  isFirebaseAdminConfiguredFn?: typeof isFirebaseAdminConfigured;
+}
+
+export async function handleGetAdminOverview(
+  _req: AuthenticatedRequest,
+  res: Response,
+  deps?: AdminReadEndpointDeps
+) {
+  const configured = deps?.isFirebaseAdminConfiguredFn
+    ? deps.isFirebaseAdminConfiguredFn()
+    : isFirebaseAdminConfigured();
+  if (!configured && !deps?.firestore) {
+    return res.status(503).json({
+      success: false,
+      errorCode: 'DATABASE_UNCONFIGURED',
+      error: 'Database service unavailable: unable to retrieve platform overview metrics.',
+    });
+  }
+
+  const fs = deps?.firestore || adminFirestore;
   try {
-    let totalCustomers = 0;
+    const [usersSnap, accountsSnap, txSnap, invSnap] = await Promise.all([
+      fs.collection('users').get(),
+      fs.collection('accounts').get(),
+      fs.collection('transactions').get(),
+      fs.collection('investments').get(),
+    ]);
+
     let activeAccounts = 0;
     let totalPlatformDeposits = 0;
     let totalPlatformWithdrawals = 0;
@@ -4163,86 +4247,66 @@ app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedReques
     let pendingTransactionsCount = 0;
     let failedTransactionsCount = 0;
 
-    if (isFirebaseAdminConfigured()) {
-      const [usersSnap, accountsSnap, txSnap, invSnap] = await Promise.all([
-        adminFirestore.collection('users').get().catch(() => null),
-        adminFirestore.collection('accounts').get().catch(() => null),
-        adminFirestore.collection('transactions').get().catch(() => null),
-        adminFirestore.collection('investments').get().catch(() => null),
-      ]);
-
-      const realUserIds = new Set<string>();
-      if (usersSnap) {
-        usersSnap.forEach((doc) => {
-          const d = doc.data();
-          if (!isFakeAccount({ id: doc.id, ...d })) {
-            realUserIds.add(doc.id);
-          }
-        });
+    const realUserIds = new Set<string>();
+    usersSnap.forEach((doc) => {
+      const d = doc.data() || {};
+      if (!isFakeAccount({ id: doc.id, ...d })) {
+        realUserIds.add(doc.id);
       }
+    });
 
-      totalCustomers = realUserIds.size;
+    const totalCustomers = realUserIds.size;
 
-      if (accountsSnap) {
-        accountsSnap.forEach((doc) => {
-          if (realUserIds.has(doc.id) || !usersSnap) {
-            const ad = doc.data();
-            const chk = Number(ad.checkingBalance ?? 0);
-            const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
-            const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
-            const accrued = Number(ad.accruedEarnings ?? 0);
-            const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
-            totalPlatformDeposits += total;
-            if (Array.isArray(ad.accounts) && ad.accounts.length > 0) {
-              activeAccounts += ad.accounts.filter((a: any) => a.status === 'ACTIVE').length;
-            } else {
-              activeAccounts += 2;
-            }
-          }
-        });
+    accountsSnap.forEach((doc) => {
+      if (realUserIds.has(doc.id)) {
+        const ad = doc.data() || {};
+        const chk = Number(ad.checkingBalance ?? 0);
+        const sav = Number(ad.savingsBalance ?? ad.savings ?? 0);
+        const inv = Number(ad.investedBalance ?? ad.investmentBalance ?? 0);
+        const accrued = Number(ad.accruedEarnings ?? 0);
+        const total = Number(ad.totalBalance ?? (chk + sav + inv + accrued));
+        totalPlatformDeposits += total;
+        if (Array.isArray(ad.accounts) && ad.accounts.length > 0) {
+          activeAccounts += ad.accounts.filter((a: any) => a.status === 'ACTIVE').length;
+        } else {
+          activeAccounts += 2;
+        }
       }
+    });
 
-      if (txSnap) {
-        txSnap.forEach((doc) => {
-          const tx = doc.data();
-          const amt = Number(tx.amount) || 0;
-          const status = (tx.status || 'COMPLETED').toUpperCase();
+    txSnap.forEach((doc) => {
+      const tx = doc.data() || {};
+      const amt = Number(tx.amount) || 0;
+      const status = String(tx.status || 'COMPLETED').toUpperCase();
 
-          if (status === 'PENDING') {
-            pendingTransactionsCount++;
-          } else if (status === 'FAILED' || status === 'DECLINED') {
-            failedTransactionsCount++;
-          } else if (status === 'COMPLETED' || status === 'SETTLED' || status === 'POSTED') {
-            if (tx.type === 'WITHDRAWAL') {
-              totalPlatformWithdrawals += amt;
-            } else if (tx.type === 'TRANSFER' || tx.type === 'INTERNAL_TRANSFER') {
-              totalPlatformTransfers += amt;
-            } else if (tx.type === 'INVESTMENT') {
-              totalPlatformInvestments += amt;
-            }
-          }
-        });
+      if (status === 'PENDING') {
+        pendingTransactionsCount++;
+      } else if (status === 'FAILED' || status === 'DECLINED') {
+        failedTransactionsCount++;
+      } else if (status === 'COMPLETED' || status === 'SETTLED' || status === 'POSTED') {
+        if (tx.type === 'WITHDRAWAL') {
+          totalPlatformWithdrawals += amt;
+        } else if (tx.type === 'TRANSFER' || tx.type === 'INTERNAL_TRANSFER') {
+          totalPlatformTransfers += amt;
+        } else if (tx.type === 'INVESTMENT') {
+          totalPlatformInvestments += amt;
+        }
       }
+    });
 
-      if (invSnap) {
-        invSnap.forEach((doc) => {
-          const inv = doc.data();
-          if (inv && (inv.status === 'ACTIVE' || inv.status === 'ACTIVE_INVESTMENT')) {
-            totalPlatformInvestments += Number(inv.principalAmount || inv.amount || 0);
-          }
-        });
+    invSnap.forEach((doc) => {
+      const inv = doc.data();
+      if (inv && (inv.status === 'ACTIVE' || inv.status === 'ACTIVE_INVESTMENT')) {
+        totalPlatformInvestments += Number(inv.principalAmount || inv.amount || 0);
       }
-    }
+    });
 
-    if (totalCustomers === 0) {
-      return res.json(db.getAdminOverview());
-    }
-
-    if (activeAccounts === 0) {
+    if (totalCustomers > 0 && activeAccounts === 0) {
       activeAccounts = totalCustomers * 2;
     }
 
-    const overview: AdminSystemOverview = {
+    const overview: AdminSystemOverview & { success: boolean } = {
+      success: true,
       totalCustomers,
       activeAccounts,
       totalPlatformDeposits,
@@ -4256,45 +4320,57 @@ app.get('/api/admin/overview', requireAdminAuth, async (req: AuthenticatedReques
       activeNodesCount: 8,
     };
 
-    res.json(overview);
-  } catch (err) {
-    console.error('[GET /api/admin/overview] Error:', err);
-    res.json(db.getAdminOverview());
+    return res.json(overview);
+  } catch (err: any) {
+    console.error('[GET /api/admin/overview] Firestore read failed:', err?.code || '', err?.message || err);
+    const classified = classifyFirestoreReadError(err);
+    return res.status(classified.statusCode).json({
+      success: false,
+      errorCode: classified.errorCode,
+      error: `Database read error: unable to retrieve platform overview metrics (${classified.reason}).`,
+    });
   }
-});
+}
 
-app.get('/api/admin/customers', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
+app.get('/api/admin/overview', requireAdminAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleGetAdminOverview(req, res)
+);
+
+export async function handleGetAdminCustomers(
+  _req: AuthenticatedRequest,
+  res: Response,
+  deps?: AdminReadEndpointDeps
+) {
+  const configured = deps?.isFirebaseAdminConfiguredFn
+    ? deps.isFirebaseAdminConfiguredFn()
+    : isFirebaseAdminConfigured();
+  if (!configured && !deps?.firestore) {
+    return res.status(503).json({
+      success: false,
+      errorCode: 'DATABASE_UNCONFIGURED',
+      error: 'Database service unavailable: unable to retrieve customer directory.',
+    });
+  }
+
+  const fs = deps?.firestore || adminFirestore;
   try {
-    const firestoreUsers: any[] = [];
+    const [usersSnap, accountsSnap] = await Promise.all([
+      fs.collection('users').get(),
+      fs.collection('accounts').get(),
+    ]);
+
     const accountsMap = new Map<string, any>();
+    accountsSnap.forEach((doc) => {
+      accountsMap.set(doc.id, doc.data());
+    });
 
-    if (isFirebaseAdminConfigured()) {
-      const [usersSnap, accountsSnap] = await Promise.all([
-        adminFirestore.collection('users').get().catch((err) => {
-          console.warn('[GET /api/admin/customers] Error fetching users from Firestore:', err?.message || err);
-          return null;
-        }),
-        adminFirestore.collection('accounts').get().catch((err) => {
-          console.warn('[GET /api/admin/customers] Error fetching accounts from Firestore:', err?.message || err);
-          return null;
-        }),
-      ]);
-
-      if (accountsSnap) {
-        accountsSnap.forEach((doc) => {
-          accountsMap.set(doc.id, doc.data());
-        });
+    const firestoreUsers: any[] = [];
+    usersSnap.forEach((doc) => {
+      const d = doc.data() || {};
+      if (!isFakeAccount({ id: doc.id, ...d })) {
+        firestoreUsers.push({ id: doc.id, ...d });
       }
-
-      if (usersSnap) {
-        usersSnap.forEach((doc) => {
-          const d = doc.data();
-          if (!isFakeAccount({ id: doc.id, ...d })) {
-            firestoreUsers.push({ id: doc.id, ...d });
-          }
-        });
-      }
-    }
+    });
 
     const userMap = new Map<string, any>();
 
@@ -4335,31 +4411,22 @@ app.get('/api/admin/customers', requireAdminAuth, async (req: AuthenticatedReque
       }
     }
 
-    // Fallback to non-fake users in db.users if Firestore returned nothing (e.g. dev mode without Firestore)
-    if (userMap.size === 0) {
-      Array.from(db.users.values())
-        .filter((u) => !isFakeAccount(u))
-        .forEach((u) => {
-          userMap.set(u.id, {
-            ...u,
-            balanceMetrics: db.getUserBalanceMetrics(u.id),
-          });
-        });
-    }
-
     const customers = Array.from(userMap.values());
-    res.json({ customers });
+    return res.json({ success: true, customers });
   } catch (err: any) {
-    console.error('[GET /api/admin/customers] Error fetching customers:', err);
-    const customers = Array.from(db.users.values())
-      .filter((u) => !isFakeAccount(u))
-      .map((u) => ({
-        ...u,
-        balanceMetrics: db.getUserBalanceMetrics(u.id),
-      }));
-    res.json({ customers });
+    console.error('[GET /api/admin/customers] Firestore read failed:', err?.code || '', err?.message || err);
+    const classified = classifyFirestoreReadError(err);
+    return res.status(classified.statusCode).json({
+      success: false,
+      errorCode: classified.errorCode,
+      error: `Database read error: unable to retrieve customer directory (${classified.reason}).`,
+    });
   }
-});
+}
+
+app.get('/api/admin/customers', requireAdminAuth, (req: AuthenticatedRequest, res: Response) =>
+  handleGetAdminCustomers(req, res)
+);
 
 app.post('/api/admin/customers/:id/toggle-status', requireAdminAuth, async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
@@ -5374,7 +5441,6 @@ app.get('/api/admin/checks', requireAdminAuth, async (req: AuthenticatedRequest,
   if (!sessionCheck.valid) {
     return res.status(401).json({
       success: false,
-      checks: [],
       errorCode: 'ADMIN_SESSION_INVALID',
       error: `UNAUTHORIZED: ${sessionCheck.reason || 'Administrator session is invalid or expired.'}`,
     });
@@ -5385,17 +5451,18 @@ app.get('/api/admin/checks', requireAdminAuth, async (req: AuthenticatedRequest,
     if (!result.success) {
       return res.status(503).json({
         success: false,
-        checks: [],
-        error: result.error || 'Unable to retrieve issued checks.',
+        errorCode: 'DATABASE_READ_ERROR',
+        error: result.error || 'Database read error: unable to retrieve issued checks.',
       });
     }
     return res.json({ success: true, checks: result.checks });
   } catch (err: any) {
     console.error('[GET /api/admin/checks] Error:', err);
-    return res.status(500).json({
+    const classified = classifyFirestoreReadError(err);
+    return res.status(classified.statusCode).json({
       success: false,
-      checks: [],
-      error: err?.message || 'Failed to list issued checks.',
+      errorCode: classified.errorCode,
+      error: err?.message || `Database read error: unable to retrieve issued checks (${classified.reason}).`,
     });
   }
 });
@@ -5474,7 +5541,6 @@ app.get('/api/admin/wire-checks', requireAdminAuth, async (req: AuthenticatedReq
   if (!sessionCheck.valid) {
     return res.status(401).json({
       success: false,
-      requests: [],
       errorCode: 'ADMIN_SESSION_INVALID',
       error: `UNAUTHORIZED: ${sessionCheck.reason || 'Administrator session is invalid or expired.'}`,
     });
@@ -5485,17 +5551,18 @@ app.get('/api/admin/wire-checks', requireAdminAuth, async (req: AuthenticatedReq
     if (!result.success) {
       return res.status(503).json({
         success: false,
-        requests: [],
-        error: result.error || 'Unable to retrieve Wire Check requests.',
+        errorCode: 'DATABASE_READ_ERROR',
+        error: result.error || 'Database read error: unable to retrieve Wire Check requests.',
       });
     }
     return res.json({ success: true, requests: result.requests });
   } catch (err: any) {
     console.error('[GET /api/admin/wire-checks] Error:', err);
-    return res.status(500).json({
+    const classified = classifyFirestoreReadError(err);
+    return res.status(classified.statusCode).json({
       success: false,
-      requests: [],
-      error: err?.message || 'Failed to list Wire Check requests.',
+      errorCode: classified.errorCode,
+      error: err?.message || `Database read error: unable to retrieve Wire Check requests (${classified.reason}).`,
     });
   }
 });
@@ -5586,6 +5653,13 @@ app.get('/api/loans', requireFirebaseAuth, async (req: AuthenticatedRequest, res
         }
       });
     } else if (isCallerAdmin) {
+      if (!isFirebaseAdminConfigured()) {
+        return res.status(503).json({
+          success: false,
+          errorCode: 'DATABASE_UNCONFIGURED',
+          error: 'Database service unavailable: unable to retrieve loan records.',
+        });
+      }
       // Full loan listings only for authorized administrators
       const fsSnap = await adminFirestore.collection('loans').get();
       fsSnap.forEach((doc) => {
@@ -5604,10 +5678,17 @@ app.get('/api/loans', requireFirebaseAuth, async (req: AuthenticatedRequest, res
       (a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
 
-    return res.json({ loans: loanList });
+    return res.json({ success: true, loans: loanList });
   } catch (err: any) {
     console.error('[/api/loans Error]', err);
-    return res.status(500).json({ error: 'Failed to retrieve loan records.' });
+    const classified = classifyFirestoreReadError(err);
+    return res.status(isCallerAdmin && !targetUserId ? classified.statusCode : 500).json({
+      success: false,
+      errorCode: classified.errorCode,
+      error: isCallerAdmin && !targetUserId
+        ? `Database read error: unable to retrieve loan records (${classified.reason}).`
+        : 'Failed to retrieve loan records.',
+    });
   }
 });
 

@@ -32,6 +32,11 @@ import {
 } from '../utils/pushNotificationPayload';
 import { UserProfile, NotificationItem } from '../types';
 import { api, BalanceMetrics, clearAdminSessionToken } from '../services/api';
+import {
+  hasAnyPositiveBalance,
+  readCachedUserBalances,
+  writeCachedUserBalances,
+} from '../utils/balancePersistence';
 
 export type { MultiFactorResolver, MultiFactorInfo, TotpSecret };
 
@@ -62,6 +67,9 @@ export type AppView =
 interface AuthContextType {
   currentUser: UserProfile | null;
   balanceMetrics: BalanceMetrics | null;
+  isBalanceCached: boolean;
+  balanceSyncError: string | null;
+  balanceLastSyncedAt: string | null;
   isLoading: boolean;
   availableUsers: UserProfile[];
   currentView: AppView;
@@ -249,6 +257,9 @@ const checkIsAdminPath = (): boolean => {
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [balanceMetrics, setBalanceMetrics] = useState<BalanceMetrics | null>(null);
+  const [isBalanceCached, setIsBalanceCached] = useState<boolean>(false);
+  const [balanceSyncError, setBalanceSyncError] = useState<string | null>(null);
+  const [balanceLastSyncedAt, setBalanceLastSyncedAt] = useState<string | null>(null);
   const [availableUsers, setAvailableUsers] = useState<UserProfile[]>([]);
   const [currentView, setCurrentViewState] = useState<AppView>(() => {
     return checkIsAdminPath() ? 'admin' : 'home';
@@ -258,6 +269,47 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [lastUpdateTimestamp, setLastUpdateTimestamp] = useState<number>(Date.now());
   const [activeModal, setActiveModal] = useState<'deposit' | 'send' | 'receive' | 'withdraw' | 'invest' | 'auth_prompt' | 'auth_login' | 'auth_register' | null>(null);
   const [foregroundPushNotifications, setForegroundPushNotifications] = useState<NormalizedPushNotification[]>([]);
+
+  const balanceMetricsRef = React.useRef<BalanceMetrics | null>(balanceMetrics);
+  balanceMetricsRef.current = balanceMetrics;
+  const balanceOwnerUidRef = React.useRef<string | null>(null);
+  const isBalanceCachedRef = React.useRef<boolean>(isBalanceCached);
+  isBalanceCachedRef.current = isBalanceCached;
+
+  const applyLiveBalanceMetrics = useCallback((uid: string, metrics: BalanceMetrics) => {
+    balanceOwnerUidRef.current = uid;
+    const syncedAt = new Date().toISOString();
+    setBalanceMetrics(metrics);
+    setIsBalanceCached(false);
+    setBalanceSyncError(null);
+    setBalanceLastSyncedAt(syncedAt);
+    writeCachedUserBalances(uid, metrics, undefined, syncedAt);
+  }, []);
+
+  const hydrateCachedBalanceIfNeeded = useCallback((uid: string, errorMessage?: string | null) => {
+    if (!uid) return;
+    const cachedEntry = readCachedUserBalances(uid);
+    if (!balanceMetricsRef.current || balanceOwnerUidRef.current !== uid) {
+      if (cachedEntry) {
+        balanceOwnerUidRef.current = uid;
+        setBalanceMetrics(cachedEntry.metrics);
+        setIsBalanceCached(true);
+        if (cachedEntry.cachedAt) {
+          setBalanceLastSyncedAt(cachedEntry.cachedAt);
+        }
+      } else if (balanceOwnerUidRef.current !== uid) {
+        balanceOwnerUidRef.current = null;
+        setBalanceMetrics(null);
+        setIsBalanceCached(false);
+      }
+    } else if (errorMessage) {
+      setIsBalanceCached(true);
+    }
+
+    if (errorMessage !== undefined) {
+      setBalanceSyncError(errorMessage);
+    }
+  }, []);
 
   const setCurrentView = useCallback((view: AppView) => {
     const targetView = (view === 'security' as any) ? 'profile' : view;
@@ -406,24 +458,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const promise = (async () => {
       try {
-        // 1. Retrieve verified balances directly from permanent Firestore ledger: accounts/{effectiveUid}
-        const fsMetrics = await firestoreSync.getAccountBalances(effectiveUid, activeUser?.permanentAccountNumber);
+        // 1. Retrieve verified balances directly from permanent Firestore ledger (with verified legacy fallback)
+        const fsMetrics = await firestoreSync.getAccountBalances(
+          effectiveUid,
+          activeUser?.permanentAccountNumber,
+          activeUser?.email
+        );
         if (fsMetrics) {
-          setBalanceMetrics(fsMetrics);
-          cacheUserBalances(effectiveUid, fsMetrics);
+          applyLiveBalanceMetrics(effectiveUid, fsMetrics);
           return;
         }
 
-        // 2. Fetch backend metrics if Firestore client is initializing
+        // 2. Fetch backend metrics if Firestore client is initializing or rate-limited
         const metrics = await api.getBalanceMetrics(effectiveUid, activeUser?.permanentAccountNumber);
         if (metrics) {
-          setBalanceMetrics(metrics);
-          cacheUserBalances(effectiveUid, metrics);
+          applyLiveBalanceMetrics(effectiveUid, metrics);
           return;
         }
+
+        // 3. Both reads failed/returned null: preserve last known cached balance and mark as cached
+        hydrateCachedBalanceIfNeeded(
+          effectiveUid,
+          'Temporarily unable to refresh live balance — displaying cached balance while reconnecting.'
+        );
       } catch (err) {
         console.error('Failed to refresh balance:', err);
-        // On error or RESOURCE_EXHAUSTED: NEVER zero out balance! Preserve existing balanceMetrics.
+        // On error or RESOURCE_EXHAUSTED: NEVER zero out balance! Preserve existing/cached balanceMetrics.
+        hydrateCachedBalanceIfNeeded(
+          effectiveUid,
+          'Temporarily unable to refresh live balance — displaying cached balance while reconnecting.'
+        );
       } finally {
         setTimeout(() => {
           inflightBalancePromiseRef.current = null;
@@ -433,7 +497,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     inflightBalancePromiseRef.current = promise;
     return promise;
-  }, [currentUser?.id, currentUser?.permanentAccountNumber]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
 
   const refreshNotifications = useCallback(async () => {
     const activeUser = currentUserRef.current;
@@ -547,15 +611,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return false;
     };
 
-    // 1. Real-time Firestore account balance listener under accounts/{effectiveUid}
+    // 1. Real-time Firestore account balance listener under accounts/{effectiveUid} (+ verified legacy fallback)
     const unsubBalance = firestoreSync.subscribeToAccountBalances(
       effectiveUid,
       currentUserRef.current?.permanentAccountNumber,
       (newMetrics) => {
-        setBalanceMetrics(newMetrics);
-        cacheUserBalances(effectiveUid, newMetrics);
+        applyLiveBalanceMetrics(effectiveUid, newMetrics);
         setLastUpdateTimestamp(Date.now());
-      }
+      },
+      () => {
+        hydrateCachedBalanceIfNeeded(
+          effectiveUid,
+          'Live balance stream interrupted — showing cached balance while reconnecting.'
+        );
+      },
+      currentUserRef.current?.email
     );
 
     // 2. Real-time Firestore profile listener under users/{effectiveUid} for instant KYC status reflection & frozen enforcement
@@ -794,8 +864,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!detail || !activeUser?.id) return;
       if (isTargetUser(detail)) {
         if (detail.balanceMetrics) {
-          setBalanceMetrics(detail.balanceMetrics);
-          cacheUserBalances(activeUser.id, detail.balanceMetrics);
+          applyLiveBalanceMetrics(activeUser.id, detail.balanceMetrics);
           setLastUpdateTimestamp(Date.now());
         } else {
           refreshBalanceRef.current();
@@ -829,8 +898,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (!data || !activeUser?.id) return;
         if (isTargetUser(data)) {
           if (data.balanceMetrics) {
-            setBalanceMetrics(data.balanceMetrics);
-            cacheUserBalances(activeUser.id, data.balanceMetrics);
+            applyLiveBalanceMetrics(activeUser.id, data.balanceMetrics);
             setLastUpdateTimestamp(Date.now());
           } else {
             refreshBalanceRef.current();
@@ -849,11 +917,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       };
     } catch {}
 
+    const handleOnlineRecovery = () => {
+      handlePushRetryTrigger();
+      if (isBalanceCachedRef.current || !balanceMetricsRef.current) {
+        refreshBalanceRef.current();
+      }
+    };
+
     window.addEventListener('monvera_kyc_status_updated', handleKycStatusUpdated);
     window.addEventListener('monvera_balance_updated', handleBalanceUpdated);
     window.addEventListener('monvera_notification_created', handleNotificationCreated);
     window.addEventListener('storage', handleStorageEvent);
-    window.addEventListener('online', handlePushRetryTrigger);
+    window.addEventListener('online', handleOnlineRecovery);
     document.addEventListener('visibilitychange', handlePushRetryTrigger);
 
     return () => {
@@ -873,10 +948,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.removeEventListener('monvera_balance_updated', handleBalanceUpdated);
       window.removeEventListener('monvera_notification_created', handleNotificationCreated);
       window.removeEventListener('storage', handleStorageEvent);
-      window.removeEventListener('online', handlePushRetryTrigger);
+      window.removeEventListener('online', handleOnlineRecovery);
       document.removeEventListener('visibilitychange', handlePushRetryTrigger);
     };
-  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email]);
+  }, [currentUser?.id, currentUser?.permanentAccountNumber, currentUser?.email, applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
+
+  // Automatic background reconnect when displaying a cached balance due to temporary DB failure
+  useEffect(() => {
+    if (!currentUser?.id || !isBalanceCached) return;
+    const retryInterval = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        refreshBalanceRef.current();
+      }
+    }, 15000);
+    return () => clearInterval(retryInterval);
+  }, [currentUser?.id, isBalanceCached]);
 
   const getPersistedAvatar = (userId: string, defaultAvatar?: string) => {
     try {
@@ -889,24 +975,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const cacheUserBalances = (userId: string, metrics: BalanceMetrics) => {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage || !userId || !metrics) return;
-      localStorage.setItem(`monvera_balances_${userId}`, JSON.stringify(metrics));
-    } catch {}
+    writeCachedUserBalances(userId, metrics);
   };
 
   const getCachedUserBalances = (userId: string): BalanceMetrics | null => {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage || !userId) return null;
-      const raw = localStorage.getItem(`monvera_balances_${userId}`);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.accounts) && parsed.accounts.length > 0) {
-          return parsed;
-        }
-      }
-    } catch {}
-    return null;
+    return readCachedUserBalances(userId)?.metrics || null;
   };
 
   const cacheUserInDirectory = (user: UserProfile) => {
@@ -932,11 +1005,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const switchUser = useCallback(async (userId: string) => {
     setIsLoading(true);
     try {
-      // 1. Immediately hydrate cached balances to eliminate any 00 flicker
-      const cachedBalances = getCachedUserBalances(userId);
-      if (cachedBalances) {
-        setBalanceMetrics(cachedBalances);
-      }
+      // 1. Immediately hydrate cached balances with explicit cached flag while live read runs
+      hydrateCachedBalanceIfNeeded(userId);
 
       // Check if user exists in Firestore
       let userProfile = await firestoreSync.getUserProfile(userId);
@@ -953,16 +1023,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setCurrentUser(resolvedUser);
         cacheUserInDirectory(resolvedUser);
 
-        // Fetch verified balance metrics from Firestore ledger first
-        const fsMetrics = await firestoreSync.getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber);
+        // Fetch verified balance metrics from Firestore ledger first, then authenticated REST balance endpoint
+        const fsMetrics = await firestoreSync.getAccountBalances(
+          resolvedUser.id,
+          resolvedUser.permanentAccountNumber,
+          resolvedUser.email
+        );
         if (fsMetrics) {
-          setBalanceMetrics(fsMetrics);
-          cacheUserBalances(resolvedUser.id, fsMetrics);
+          applyLiveBalanceMetrics(resolvedUser.id, fsMetrics);
         } else {
-          const res = await api.getCurrentUser(resolvedUser.id);
-          if (res.balanceMetrics) {
-            setBalanceMetrics(res.balanceMetrics);
-            cacheUserBalances(resolvedUser.id, res.balanceMetrics);
+          const apiMetrics = await api.getBalanceMetrics(resolvedUser.id, resolvedUser.permanentAccountNumber);
+          if (apiMetrics) {
+            applyLiveBalanceMetrics(resolvedUser.id, apiMetrics);
+          } else {
+            hydrateCachedBalanceIfNeeded(
+              resolvedUser.id,
+              'Temporarily unable to verify live ledger — showing cached balance if available.'
+            );
           }
         }
         const notifRes = await api.getNotifications(resolvedUser.id);
@@ -970,10 +1047,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } catch (err) {
       console.error('Error switching user:', err);
+      hydrateCachedBalanceIfNeeded(
+        userId,
+        'Temporarily unable to verify live ledger — showing cached balance if available.'
+      );
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
 
   // Firebase Auth State Listener & Initial Setup
   useEffect(() => {
@@ -994,6 +1075,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         try {
           console.log('[Auth] Authenticated Firebase user detected:', firebaseUser.uid);
+
+          // Immediately hydrate any cached balance labeled as Cached — reconnecting before async network reads settle
+          if (isMounted) {
+            hydrateCachedBalanceIfNeeded(firebaseUser.uid);
+          }
 
           // Fetch authoritative Firestore user profile and account balances concurrently
           const [fsUserProfile, initialFsMetrics] = await Promise.all([
@@ -1076,23 +1162,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             };
 
             let fsMetrics = initialFsMetrics;
-            const isZeroOrMissing =
-              !fsMetrics ||
-              (Number(fsMetrics.checkingBalance ?? 0) === 0 && Number(fsMetrics.totalBalance ?? 0) === 0);
+            const isZeroOrMissing = !fsMetrics || !hasAnyPositiveBalance(fsMetrics);
             if (isZeroOrMissing && resolvedUser.permanentAccountNumber && resolvedUser.permanentAccountNumber !== '0000000000') {
               fsMetrics = await firestoreSync
-                .getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber)
+                .getAccountBalances(resolvedUser.id, resolvedUser.permanentAccountNumber, resolvedUser.email)
                 .catch(() => fsMetrics);
             }
 
             if (fsMetrics && isMounted) {
-              setBalanceMetrics(fsMetrics);
-              cacheUserBalances(resolvedUser.id, fsMetrics);
+              applyLiveBalanceMetrics(resolvedUser.id, fsMetrics);
             } else if (isMounted) {
-              const metricsRes = await api.getCurrentUser(resolvedUser.id);
-              if (metricsRes.balanceMetrics && isMounted) {
-                setBalanceMetrics(metricsRes.balanceMetrics);
-                cacheUserBalances(resolvedUser.id, metricsRes.balanceMetrics);
+              const apiMetrics = await api
+                .getBalanceMetrics(resolvedUser.id, resolvedUser.permanentAccountNumber)
+                .catch(() => null);
+              if (apiMetrics && isMounted) {
+                applyLiveBalanceMetrics(resolvedUser.id, apiMetrics);
+              } else if (isMounted) {
+                hydrateCachedBalanceIfNeeded(
+                  resolvedUser.id,
+                  'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.'
+                );
               }
             }
 
@@ -1133,15 +1222,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
         } catch (err) {
           console.error('[Auth] Error fetching user profile on auth change:', err);
+          if (isMounted && firebaseUser?.uid) {
+            hydrateCachedBalanceIfNeeded(
+              firebaseUser.uid,
+              'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.'
+            );
+          }
         }
       } else {
         // No authenticated session
         checkedReversalsUidRef.current = null;
         syncedPushUidRef.current = null;
         inFlightPushSyncUidRef.current = null;
+        balanceOwnerUidRef.current = null;
         if (isMounted) {
           setCurrentUser(null);
           setBalanceMetrics(null);
+          setIsBalanceCached(false);
+          setBalanceSyncError(null);
+          setBalanceLastSyncedAt(null);
           setNotifications([]);
           setForegroundPushNotifications([]);
 
@@ -1165,7 +1264,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isMounted = false;
       unsubscribe();
     };
-  }, [fetchUsers]);
+  }, [fetchUsers, applyLiveBalanceMetrics, hydrateCachedBalanceIfNeeded]);
 
   /**
    * Internal session hydrator that completes profile synchronization,
@@ -1183,6 +1282,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Mark UID as actively hydrating to prevent duplicate queries from onAuthStateChanged
     isHydratingSessionRef.current = uid;
+    // Immediately hydrate any cached balance (clearly marked cached until live balance resolves)
+    hydrateCachedBalanceIfNeeded(uid);
 
     try {
       // 1. Fetch User Profile (users/{uid}) and Account Balances (accounts/{uid}) concurrently in a single RTT
@@ -1280,19 +1381,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // 2. Resolve authoritative account balances (only run legacy accountNumber/API fallback if parallel primary read returned missing/zero)
       let finalMetricsToSet = initialFsMetrics;
-      const isZeroOrMissing =
-        !finalMetricsToSet ||
-        (Number(finalMetricsToSet.checkingBalance ?? 0) === 0 && Number(finalMetricsToSet.totalBalance ?? 0) === 0);
+      const isZeroOrMissing = !finalMetricsToSet || !hasAnyPositiveBalance(finalMetricsToSet);
 
       if (isZeroOrMissing && finalUser.permanentAccountNumber && finalUser.permanentAccountNumber !== '0000000000') {
-        const legacyMetrics = await firestoreSync.getAccountBalances(uid, finalUser.permanentAccountNumber).catch(() => null);
-        if (legacyMetrics && (Number(legacyMetrics.checkingBalance ?? 0) > 0 || Number(legacyMetrics.totalBalance ?? 0) > 0)) {
+        const legacyMetrics = await firestoreSync
+          .getAccountBalances(uid, finalUser.permanentAccountNumber, finalUser.email)
+          .catch(() => null);
+        if (legacyMetrics && (!finalMetricsToSet || hasAnyPositiveBalance(legacyMetrics))) {
           finalMetricsToSet = legacyMetrics;
         }
       }
 
       if (!finalMetricsToSet) {
-        // Resilient fallback to backend API if Firestore accounts doc is initializing
+        // Resilient fallback to authenticated backend API if Firestore accounts doc is unavailable/initializing
         try {
           const backendMetrics = await api.getBalanceMetrics(uid, finalUser.permanentAccountNumber);
           if (backendMetrics && (typeof backendMetrics.checkingBalance === 'number' || typeof backendMetrics.totalBalance === 'number')) {
@@ -1304,9 +1405,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       if (finalMetricsToSet) {
-        cacheUserBalances(uid, finalMetricsToSet);
-        setBalanceMetrics(finalMetricsToSet);
+        applyLiveBalanceMetrics(uid, finalMetricsToSet);
       } else {
+        hydrateCachedBalanceIfNeeded(
+          uid,
+          'Temporarily unable to retrieve live ledger balance — displaying cached balance if available.'
+        );
         console.warn(`[Auth] Authoritative account ledger document accounts/${uid} was not found. Financial records preserved.`);
       }
 
@@ -1911,10 +2015,14 @@ const unenrollTotpMfa = async (): Promise<{
     clearAdminSessionToken();
     clearPendingNotificationNavTarget();
     pendingUrlDeepLinkRef.current = null;
+    balanceOwnerUidRef.current = null;
     setForegroundPushNotifications([]);
     setNotifications([]);
     setCurrentUser(null);
     setBalanceMetrics(null);
+    setIsBalanceCached(false);
+    setBalanceSyncError(null);
+    setBalanceLastSyncedAt(null);
     setCurrentView('home');
   };
 
@@ -2043,7 +2151,9 @@ const unenrollTotpMfa = async (): Promise<{
 
       setCurrentUser(finalUser);
       cacheUserInDirectory(finalUser);
-      if (finalMetrics) setBalanceMetrics(finalMetrics);
+      if (finalMetrics) {
+        applyLiveBalanceMetrics(uid, finalMetrics);
+      }
       await fetchUsers();
       await refreshNotifications();
 
@@ -2313,6 +2423,9 @@ const unenrollTotpMfa = async (): Promise<{
       value={{
         currentUser,
         balanceMetrics,
+        isBalanceCached,
+        balanceSyncError,
+        balanceLastSyncedAt,
         isLoading,
         availableUsers,
         currentView,

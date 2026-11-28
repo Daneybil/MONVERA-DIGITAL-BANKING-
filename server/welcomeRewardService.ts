@@ -795,35 +795,58 @@ function syncRewardToMemoryDb(record: WelcomeRewardInfo) {
 export async function getAllWelcomeRewardsAdmin(): Promise<{ rewards: WelcomeRewardInfo[]; stats: any }> {
   const result: WelcomeRewardInfo[] = [];
 
-  if (isFirebaseAdminConfigured()) {
-    try {
-      // 1. First fetch all records from welcome_rewards collection
-      const rSnap = await adminFirestore.collection('welcome_rewards').get();
-      const loadedUserIds = new Set<string>();
+  if (!isFirebaseAdminConfigured()) {
+    throw Object.assign(
+      new Error('Database service unavailable: cannot retrieve administrative reward records.'),
+      { statusCode: 503, errorCode: 'DATABASE_UNCONFIGURED' }
+    );
+  }
 
-      rSnap.docs.forEach((d) => {
-        const item = d.data() as WelcomeRewardInfo;
-        result.push(item);
-        loadedUserIds.add(item.userId);
-      });
+  try {
+    // 1. First fetch all records from welcome_rewards collection
+    const rSnap = await adminFirestore.collection('welcome_rewards').get();
+    const loadedUserIds = new Set<string>();
 
-      // 2. Also ensure all registered customers have an evaluated entry
-      const usersSnap = await adminFirestore.collection('users').get();
-      for (const uDoc of usersSnap.docs) {
-        const u = uDoc.data();
-        if (u.role === 'admin' || u.role === 'super_admin') continue;
-        if (!loadedUserIds.has(uDoc.id)) {
-          // Evaluate on the fly
-          try {
-            const ev = await evaluateAndProcessWelcomeReward(uDoc.id);
-            result.push(ev);
-            loadedUserIds.add(uDoc.id);
-          } catch {}
-        }
+    rSnap.docs.forEach((d) => {
+      const item = d.data() as WelcomeRewardInfo;
+      result.push(item);
+      loadedUserIds.add(item.userId);
+    });
+
+    // 2. Also ensure all registered customers have an evaluated entry
+    const usersSnap = await adminFirestore.collection('users').get();
+    for (const uDoc of usersSnap.docs) {
+      const u = uDoc.data();
+      if (u.role === 'admin' || u.role === 'super_admin') continue;
+      if (!loadedUserIds.has(uDoc.id)) {
+        // Evaluate on the fly
+        try {
+          const ev = await evaluateAndProcessWelcomeReward(uDoc.id);
+          result.push(ev);
+          loadedUserIds.add(uDoc.id);
+        } catch {}
       }
-    } catch (err) {
-      console.error('[getAllWelcomeRewardsAdmin] Firestore query error:', err);
     }
+  } catch (err: any) {
+    console.error('[getAllWelcomeRewardsAdmin] Firestore query error:', err?.code || '', err?.message || err);
+    const codeStr = String(err?.code ?? '').toUpperCase();
+    const msgLower = String(err?.message || '').toLowerCase();
+    const isQuota = err?.code === 8 || codeStr === 'RESOURCE_EXHAUSTED' || msgLower.includes('quota exceeded') || msgLower.includes('resource_exhausted');
+    const isPerm = err?.code === 7 || err?.code === 16 || codeStr === 'PERMISSION_DENIED' || codeStr === 'UNAUTHENTICATED';
+    const errorCode = isQuota
+      ? 'FIRESTORE_QUOTA_EXCEEDED'
+      : isPerm
+        ? 'FIRESTORE_PERMISSION_DENIED'
+        : 'DATABASE_READ_ERROR';
+    const reason = isQuota
+      ? 'Firestore read quota exceeded'
+      : isPerm
+        ? 'database authorization or permission denied'
+        : 'unexpected database read failure';
+    throw Object.assign(
+      new Error(`Database read error: unable to retrieve administrative reward records (${reason}).`),
+      { statusCode: 503, errorCode }
+    );
   }
 
   // Fallback / merge with memory store

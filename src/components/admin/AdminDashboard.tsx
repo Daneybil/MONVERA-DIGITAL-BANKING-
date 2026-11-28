@@ -361,6 +361,10 @@ export const AdminDashboard: React.FC = () => {
   const [cardActivationsLoadError, setCardActivationsLoadError] = useState<string | null>(null);
   const [bankAppsLoadError, setBankAppsLoadError] = useState<string | null>(null);
   const [bankVerificationsLoadError, setBankVerificationsLoadError] = useState<string | null>(null);
+  const [overviewLoadError, setOverviewLoadError] = useState<string | null>(null);
+  const [customersLoadError, setCustomersLoadError] = useState<string | null>(null);
+  const [transactionsLoadError, setTransactionsLoadError] = useState<string | null>(null);
+  const [loansLoadError, setLoansLoadError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
   const [firebaseUid, setFirebaseUid] = useState<string | null>(() => auth?.currentUser?.uid || null);
@@ -372,6 +376,8 @@ export const AdminDashboard: React.FC = () => {
   const [verifyAttempt, setVerifyAttempt] = useState<number>(0);
   const verifiedUidRef = useRef<string | null>(null);
   const lastCheckedKeyRef = useRef<string | null>(null);
+  const badgePollInFlightRef = useRef<boolean>(false);
+  const lastBadgeSyncAtRef = useRef<number>(0);
 
   // Reactively track Firebase Auth user UID across sign-in, reload, and sign-out
   useEffect(() => {
@@ -686,13 +692,29 @@ export const AdminDashboard: React.FC = () => {
 
   const loadAllAdminData = async () => {
     setIsLoading(true);
+    lastBadgeSyncAtRef.current = Date.now();
     try {
       const [overviewRes, custRes, txRes, logsRes, loansRes, cardActRes, bankAppsRes, bankVerifsRes] = await Promise.all([
-        api.getAdminOverview().catch(() => null),
-        api.getAdminCustomers().catch(() => ({ customers: [] })),
-        api.getTransactions().catch(() => ({ transactions: [] })),
+        api.getAdminOverview().catch((err: any) => ({
+          success: false as const,
+          error: err?.message || 'Network error retrieving platform overview metrics.',
+        })),
+        api.getAdminCustomers().catch((err: any) => ({
+          success: false,
+          customers: undefined,
+          error: err?.message || 'Network error retrieving customer directory.',
+        })),
+        api.getTransactions().catch((err: any) => ({
+          success: false,
+          transactions: [],
+          error: err?.message || 'Network error retrieving platform transactions.',
+        })),
         api.getAdminAuditLogs().catch(() => ({ auditLogs: [] })),
-        api.getLoans().catch(() => ({ loans: [] })),
+        api.getLoans().catch((err: any) => ({
+          success: false,
+          loans: [],
+          error: err?.message || 'Network error retrieving loan records.',
+        })),
         api.getAdminCardActivationRequests().catch((err: any) => ({
           success: false,
           requests: [],
@@ -710,10 +732,21 @@ export const AdminDashboard: React.FC = () => {
         })),
       ]);
 
-      const serverCustomers = custRes?.customers || [];
-      const merged = mergeCustomers([], serverCustomers, currentUser);
-      setCustomers(merged);
-      if (loansRes?.loans) setAdminLoans(loansRes.loans);
+      let mergedCustomers: (UserProfile & { balanceMetrics?: any })[] = customers;
+      if (custRes?.success && Array.isArray(custRes.customers)) {
+        mergedCustomers = mergeCustomers([], custRes.customers, currentUser);
+        setCustomers(mergedCustomers);
+        setCustomersLoadError(null);
+      } else {
+        setCustomersLoadError(custRes?.error || 'Unable to load customer directory from database.');
+      }
+
+      if (loansRes?.success !== false && Array.isArray(loansRes?.loans)) {
+        setAdminLoans(loansRes.loans);
+        setLoansLoadError(null);
+      } else {
+        setLoansLoadError(loansRes?.error || 'Unable to load loan records from database.');
+      }
 
       if (cardActRes?.success && Array.isArray(cardActRes.requests)) {
         const pendingActivations = cardActRes.requests.filter((r) => r.status === 'PENDING').length;
@@ -755,33 +788,40 @@ export const AdminDashboard: React.FC = () => {
         setBankVerificationsLoadError(bankVerifsRes?.error || 'Unable to load bank verification requests.');
       }
 
-      const totalUserDeposits = merged.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0);
-
-      if (overviewRes) {
+      if (overviewRes && overviewRes.success) {
+        const hasAuthoritativeCustomers = Boolean(custRes?.success && Array.isArray(custRes.customers));
+        const totalUserDeposits = hasAuthoritativeCustomers
+          ? mergedCustomers.reduce((acc, c) => acc + (c.balanceMetrics?.totalBalance || 0), 0)
+          : 0;
         setMetrics({
           ...overviewRes,
-          totalCustomers: merged.length > 0 ? merged.length : overviewRes.totalCustomers,
-          activeAccounts: merged.length > 0 ? merged.length * 2 : overviewRes.activeAccounts,
-          totalPlatformDeposits: totalUserDeposits > 0 ? totalUserDeposits : overviewRes.totalPlatformDeposits,
+          totalCustomers: hasAuthoritativeCustomers && mergedCustomers.length > 0
+            ? mergedCustomers.length
+            : overviewRes.totalCustomers,
+          activeAccounts: hasAuthoritativeCustomers && mergedCustomers.length > 0
+            ? (overviewRes.activeAccounts || mergedCustomers.length * 2)
+            : overviewRes.activeAccounts,
+          totalPlatformDeposits: hasAuthoritativeCustomers && totalUserDeposits > 0
+            ? totalUserDeposits
+            : overviewRes.totalPlatformDeposits,
         });
+        setOverviewLoadError(null);
       } else {
-        setMetrics({
-          totalCustomers: merged.length,
-          activeAccounts: merged.length * 2,
-          totalPlatformDeposits: totalUserDeposits,
-          totalPlatformWithdrawals: 0,
-          totalPlatformTransfers: 0,
-          totalPlatformInvestments: 0,
-          pendingTransactionsCount: 0,
-          failedTransactionsCount: 0,
-          devFundingPoolBalance: 1000000000,
-          systemReserveRatio: 100,
-          activeNodesCount: 8,
-        });
+        setOverviewLoadError(
+          (overviewRes && !overviewRes.success ? overviewRes.error : null) ||
+          'Unable to load platform overview metrics from database.'
+        );
       }
 
-      if (txRes?.transactions) setTransactions(txRes.transactions);
+      if (txRes?.success !== false && Array.isArray(txRes?.transactions)) {
+        setTransactions(txRes.transactions);
+        setTransactionsLoadError(null);
+      } else {
+        setTransactionsLoadError(txRes?.error || 'Unable to load platform transactions from database.');
+      }
+
       if (logsRes?.auditLogs) setAuditLogs(logsRes.auditLogs);
+      lastBadgeSyncAtRef.current = Date.now();
       setLastRefreshed(new Date());
     } catch (err) {
       console.error('Failed to load admin data:', err);
@@ -854,8 +894,20 @@ export const AdminDashboard: React.FC = () => {
       }
     });
 
-    // Background polling every 10s (and on tab visibility/focus) to keep bank & card badges current
-    const refreshApprovalBadges = async () => {
+    // Background polling every 30s (and throttled on tab visibility/focus) to keep bank & card badges current
+    const refreshApprovalBadges = async (isTriggeredByFocus = false) => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      if (badgePollInFlightRef.current) {
+        return;
+      }
+      const now = Date.now();
+      if (isTriggeredByFocus && now - lastBadgeSyncAtRef.current < 10000) {
+        return;
+      }
+
+      badgePollInFlightRef.current = true;
       try {
         const [cardActRes, bankAppsRes, bankVerifsRes] = await Promise.all([
           api.getAdminCardActivationRequests().catch((err: any) => ({
@@ -913,17 +965,20 @@ export const AdminDashboard: React.FC = () => {
         } else {
           setBankVerificationsLoadError(bankVerifsRes?.error || 'Unable to load bank verification requests.');
         }
+        lastBadgeSyncAtRef.current = Date.now();
       } catch (err: any) {
         console.warn('[AdminDashboard] Badge polling error:', err);
+      } finally {
+        badgePollInFlightRef.current = false;
       }
     };
 
     const badgePollInterval = window.setInterval(() => {
-      refreshApprovalBadges();
-    }, 10000);
+      refreshApprovalBadges(false);
+    }, 30000);
     const handleVisibilityOrFocus = () => {
       if (document.visibilityState === 'visible') {
-        refreshApprovalBadges();
+        refreshApprovalBadges(true);
       }
     };
     if (typeof window !== 'undefined') {
@@ -1554,7 +1609,13 @@ export const AdminDashboard: React.FC = () => {
           </div>
         </div>
 
-        {(bankAppsLoadError || bankVerificationsLoadError || cardActivationsLoadError) && (
+        {(bankAppsLoadError ||
+          bankVerificationsLoadError ||
+          cardActivationsLoadError ||
+          overviewLoadError ||
+          customersLoadError ||
+          transactionsLoadError ||
+          loansLoadError) && (
           <div className="mb-5 p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
             <div className="flex items-start gap-2.5 text-xs font-bold">
               <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
@@ -1562,6 +1623,10 @@ export const AdminDashboard: React.FC = () => {
                 {bankAppsLoadError && <div>Bank Requests Sync Error: {bankAppsLoadError}</div>}
                 {bankVerificationsLoadError && <div>Bank Verifications Sync Error: {bankVerificationsLoadError}</div>}
                 {cardActivationsLoadError && <div>Card Activations Sync Error: {cardActivationsLoadError}</div>}
+                {overviewLoadError && <div>Platform Overview Sync Error: {overviewLoadError}</div>}
+                {customersLoadError && <div>Customers Directory Sync Error: {customersLoadError}</div>}
+                {transactionsLoadError && <div>Transactions Sync Error: {transactionsLoadError}</div>}
+                {loansLoadError && <div>Loans Sync Error: {loansLoadError}</div>}
               </div>
             </div>
             <button

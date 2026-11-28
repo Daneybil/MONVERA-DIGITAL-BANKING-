@@ -26,6 +26,7 @@ import { db, auth } from './firebase';
 import { collection, query, where, getDocs, doc, getDoc, setDoc, deleteField } from 'firebase/firestore';
 import { firestoreSync } from './firestoreSync';
 import { notificationDispatcher } from './notificationDispatcher';
+import { hasAnyPositiveBalance } from '../utils/balancePersistence';
 
 const API_BASE_URL = ((import.meta as any).env?.VITE_API_URL || '').replace(/\/+$/, '');
 
@@ -1168,11 +1169,18 @@ export const api = {
   },
 
   async getBalanceMetrics(userId: string, userAccountNumber?: string): Promise<BalanceMetrics | null> {
+    let zeroFirestoreFallback: BalanceMetrics | null = null;
+
     // 1. Check permanent Firestore record / immutable ledger first for highest durability
     try {
       const firestoreMetrics = await firestoreSync.getAccountBalances(userId, userAccountNumber);
       if (firestoreMetrics && firestoreMetrics.accounts && firestoreMetrics.accounts.length > 0) {
-        return firestoreMetrics;
+        if (hasAnyPositiveBalance(firestoreMetrics) || userAccountNumber) {
+          return firestoreMetrics;
+        }
+        // Client didn't have userAccountNumber to check legacy accounts/{permanentAccountNumber};
+        // consult /api/accounts/balance which verifies users/{userId} and checks legacy fallback safely.
+        zeroFirestoreFallback = firestoreMetrics;
       }
     } catch {
       // Continue to API check
@@ -1228,9 +1236,9 @@ export const api = {
       // Backend unavailable
     }
 
-    // 3. DO NOT fabricate 0 balance metrics when upstream is rate-limited or temporarily unavailable.
-    // Return null to allow caller to preserve the last known authoritative balance.
-    return null;
+    // 3. Only return genuine $0 if accounts/{userId} was directly verified without upstream error;
+    // NEVER fabricate 0 balance metrics when upstream is rate-limited or temporarily unavailable.
+    return zeroFirestoreFallback;
   },
 
   async lookupRecipient(
@@ -1757,9 +1765,10 @@ export const api = {
     flow?: string;
     startDate?: string;
     endDate?: string;
-  }): Promise<{ transactions: Transaction[] }> {
+  }): Promise<{ transactions: Transaction[]; success?: boolean; error?: string; errorCode?: string }> {
     let apiTxs: Transaction[] = [];
     let backendSuccess = false;
+    let adminBackendFailure: { error: string; errorCode?: string } | null = null;
 
     try {
       const query = new URLSearchParams();
@@ -1773,33 +1782,49 @@ export const api = {
 
       const headers = await getAuthHeaders();
       const res = await fetch(`/api/transactions?${query.toString()}`, { headers });
-      if (res.ok) {
-        const data = await parseJsonResponse<{ transactions: Transaction[] }>(res, { transactions: [] });
-        if (data && Array.isArray(data.transactions)) {
-          apiTxs = data.transactions;
-          backendSuccess = true;
-        }
+      const data = await parseJsonResponse<{
+        transactions?: Transaction[];
+        success?: boolean;
+        error?: string;
+        errorCode?: string;
+      }>(res, { success: false });
+
+      if (res.ok && data && Array.isArray(data.transactions)) {
+        apiTxs = data.transactions;
+        backendSuccess = true;
+      } else if (!params?.userId) {
+        adminBackendFailure = {
+          error: data?.error || `Database read error: unable to retrieve platform transactions (HTTP ${res.status}).`,
+          errorCode: data?.errorCode,
+        };
       }
-    } catch {
-      // Backend unavailable
+    } catch (err: any) {
+      if (!params?.userId) {
+        adminBackendFailure = {
+          error: formatApiNetworkError(err, 'retrieve platform transactions'),
+        };
+      }
     }
 
     // Authoritative return from server API without redundant client Firestore query
     if (backendSuccess) {
-      return { transactions: apiTxs };
+      return { success: true, transactions: apiTxs };
     }
 
-    // Resilient fallback to Firestore only if backend network request genuinely failed
+    // For admin platform-wide reads, report the backend database/network failure rather than masking with []
+    if (!params?.userId && adminBackendFailure) {
+      return {
+        success: false,
+        transactions: [],
+        error: adminBackendFailure.error,
+        errorCode: adminBackendFailure.errorCode,
+      };
+    }
+
+    // Resilient fallback to Firestore only if backend network request genuinely failed (customer-scoped queries)
     if (params?.userId) {
       try {
         const firestoreTxs = await firestoreSync.getTransactionsForUser(params.userId);
-        return { transactions: firestoreTxs };
-      } catch {
-        // Firestore query notice
-      }
-    } else {
-      try {
-        const firestoreTxs = await firestoreSync.getAllTransactions();
         return { transactions: firestoreTxs };
       } catch {
         // Firestore query notice
@@ -2539,47 +2564,76 @@ export const api = {
     return promise;
   },
 
-  async getAdminOverview(): Promise<AdminSystemOverview> {
+  async getAdminOverview(): Promise<
+    (AdminSystemOverview & { success: true; error?: undefined; errorCode?: undefined }) |
+    { success: false; error: string; errorCode?: string }
+  > {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetchWithSameOriginFallback('/api/admin/overview', { headers });
-      return await parseJsonResponse(res, {
-        totalCustomers: 4,
-        activeAccounts: 12,
-        totalPlatformDeposits: 0,
-        totalPlatformWithdrawals: 0,
-        totalPlatformTransfers: 0,
-        totalPlatformInvestments: 0,
-        pendingTransactionsCount: 0,
-        failedTransactionsCount: 0,
-        devFundingPoolBalance: 1000000000,
-        systemReserveRatio: 100,
-        activeNodesCount: 8,
+      const res = await fetchWithFreshAuthRetry('/api/admin/overview', getAuthHeaders);
+      const parsed = await parseJsonResponse<
+        Partial<AdminSystemOverview> & { success?: boolean; error?: string; errorCode?: string }
+      >(res, {
+        success: false,
+        error: 'Database read error: unable to retrieve platform overview metrics.',
       });
-    } catch {
+
+      if (!res.ok || parsed.success === false) {
+        return {
+          success: false,
+          errorCode: parsed.errorCode,
+          error: parsed.error || `Database read error: unable to retrieve platform overview metrics (HTTP ${res.status}).`,
+        };
+      }
+
       return {
-        totalCustomers: 4,
-        activeAccounts: 12,
-        totalPlatformDeposits: 0,
-        totalPlatformWithdrawals: 0,
-        totalPlatformTransfers: 0,
-        totalPlatformInvestments: 0,
-        pendingTransactionsCount: 0,
-        failedTransactionsCount: 0,
-        devFundingPoolBalance: 1000000000,
-        systemReserveRatio: 100,
-        activeNodesCount: 8,
+        ...(parsed as AdminSystemOverview),
+        success: true,
+      };
+    } catch (err: any) {
+      console.error('[getAdminOverview] Network error:', err);
+      return {
+        success: false,
+        error: formatApiNetworkError(err, 'retrieve platform overview metrics'),
       };
     }
   },
 
-  async getAdminCustomers(): Promise<{ customers: (UserProfile & { balanceMetrics: BalanceMetrics })[] }> {
+  async getAdminCustomers(): Promise<{
+    success: boolean;
+    customers?: (UserProfile & { balanceMetrics: BalanceMetrics })[];
+    error?: string;
+    errorCode?: string;
+  }> {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetchWithSameOriginFallback('/api/admin/customers', { headers });
-      return await parseJsonResponse(res, { customers: [] });
-    } catch {
-      return { customers: [] };
+      const res = await fetchWithFreshAuthRetry('/api/admin/customers', getAuthHeaders);
+      const parsed = await parseJsonResponse<{
+        success?: boolean;
+        customers?: (UserProfile & { balanceMetrics: BalanceMetrics })[];
+        error?: string;
+        errorCode?: string;
+      }>(res, {
+        success: false,
+        error: 'Database read error: unable to retrieve customer directory.',
+      });
+
+      if (!res.ok || parsed.success === false || !Array.isArray(parsed.customers)) {
+        return {
+          success: false,
+          errorCode: parsed.errorCode,
+          error: parsed.error || `Database read error: unable to retrieve customer directory (HTTP ${res.status}).`,
+        };
+      }
+
+      return {
+        success: true,
+        customers: parsed.customers,
+      };
+    } catch (err: any) {
+      console.error('[getAdminCustomers] Network error:', err);
+      return {
+        success: false,
+        error: formatApiNetworkError(err, 'retrieve customer directory'),
+      };
     }
   },
 
@@ -3250,7 +3304,7 @@ export const api = {
     userId?: string,
     userAccountNumber?: string,
     userEmail?: string
-  ): Promise<{ loans: LoanApplication[] }> {
+  ): Promise<{ loans: LoanApplication[]; success?: boolean; error?: string; errorCode?: string }> {
     try {
       const authHeaders = await getAuthHeaders();
       const queryParams = new URLSearchParams();
@@ -3259,8 +3313,13 @@ export const api = {
       if (userEmail) queryParams.set('email', userEmail);
       const url = `/api/loans${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
       const res = await fetch(url, { headers: authHeaders });
-      const data = await parseJsonResponse<{ loans: LoanApplication[] }>(res, { loans: [] });
-      
+      const data = await parseJsonResponse<{
+        success?: boolean;
+        loans?: LoanApplication[];
+        error?: string;
+        errorCode?: string;
+      }>(res, { success: false });
+
       // When queried for a specific user, ensure strict scoping to that user's UID
       if (userId) {
         if (res.ok) {
@@ -3277,26 +3336,31 @@ export const api = {
         };
       } else {
         // Full loan listings only for authorized administrators (validated by backend /api/loans)
-        if (res.ok) {
+        if (res.ok && data.success !== false && Array.isArray(data.loans)) {
           return {
-            loans: (data.loans || []).sort(
+            success: true,
+            loans: data.loans.sort(
               (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
             ),
           };
         }
-        const fsLoans = await firestoreSync.getAllLoans().catch(() => []);
         return {
-          loans: fsLoans.sort(
-            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          ),
+          success: false,
+          loans: [],
+          errorCode: data?.errorCode,
+          error: data?.error || `Database read error: unable to retrieve loan records (HTTP ${res.status}).`,
         };
       }
-    } catch {
+    } catch (err: any) {
       if (userId) {
         const fsLoans = await firestoreSync.getLoansForUser(userId, userAccountNumber, userEmail).catch(() => []);
         return { loans: fsLoans };
       }
-      return { loans: [] };
+      return {
+        success: false,
+        loans: [],
+        error: formatApiNetworkError(err, 'retrieve loan records'),
+      };
     }
   },
 
@@ -3773,22 +3837,33 @@ export const api = {
     rewards?: WelcomeRewardInfo[];
     stats?: any;
     error?: string;
+    errorCode?: string;
   }> {
     try {
-      const headers = await getAuthHeaders();
-      const res = await fetch(getApiEndpoint('/api/admin/rewards/welcome'), {
-        headers,
-      });
-      const data = await parseJsonResponse<{ success: boolean; rewards?: WelcomeRewardInfo[]; stats?: any; error?: string }>(res, {
+      const res = await fetchWithFreshAuthRetry('/api/admin/rewards/welcome', getAuthHeaders);
+      const data = await parseJsonResponse<{
+        success: boolean;
+        rewards?: WelcomeRewardInfo[];
+        stats?: any;
+        error?: string;
+        errorCode?: string;
+      }>(res, {
         success: false,
-        error: 'Failed to retrieve administrative welcome rewards',
+        error: 'Database read error: unable to retrieve administrative reward records.',
       });
+      if (!res.ok || data.success === false) {
+        return {
+          success: false,
+          errorCode: data.errorCode,
+          error: data.error || `Database read error: unable to retrieve administrative reward records (HTTP ${res.status}).`,
+        };
+      }
       return data;
     } catch (err: any) {
       console.error('[getAdminWelcomeRewards] Network error:', err);
       return {
         success: false,
-        error: err?.message || 'Network error retrieving admin welcome rewards.',
+        error: formatApiNetworkError(err, 'retrieve administrative reward records'),
       };
     }
   },
@@ -3942,6 +4017,7 @@ export const api = {
     success: boolean;
     applications?: LinkedBankAccountApplication[];
     error?: string;
+    errorCode?: string;
   }> {
     try {
       const res = await fetchWithFreshAuthRetry('/api/admin/bank-accounts', getAuthHeaders);
@@ -3949,6 +4025,7 @@ export const api = {
         success: boolean;
         applications?: LinkedBankAccountApplication[];
         error?: string;
+        errorCode?: string;
       }>(res, {
         success: false,
         error: 'Failed to retrieve bank approval requests',
@@ -3957,6 +4034,7 @@ export const api = {
       if (!res.ok || !parsed.success) {
         return {
           success: false,
+          errorCode: parsed.errorCode,
           error: parsed.error || `Failed to retrieve bank approval requests (HTTP ${res.status})`,
         };
       }
@@ -4186,6 +4264,7 @@ export const api = {
     success: boolean;
     requests?: LinkedBankAccountApplication[];
     error?: string;
+    errorCode?: string;
   }> {
     try {
       const res = await fetchWithFreshAuthRetry('/api/admin/bank-verifications', getAuthHeaders);
@@ -4193,6 +4272,7 @@ export const api = {
         success: boolean;
         requests?: LinkedBankAccountApplication[];
         error?: string;
+        errorCode?: string;
       }>(res, {
         success: false,
         error: 'Failed to retrieve bank verification requests',
@@ -4201,6 +4281,7 @@ export const api = {
       if (!res.ok || !parsed.success) {
         return {
           success: false,
+          errorCode: parsed.errorCode,
           error: parsed.error || `Failed to retrieve bank verification requests (HTTP ${res.status})`,
         };
       }
@@ -4480,6 +4561,7 @@ export const api = {
     success: boolean;
     requests?: CardActivationRequest[];
     error?: string;
+    errorCode?: string;
   }> {
     try {
       const res = await fetchWithFreshAuthRetry('/api/admin/card-activations', getAuthHeaders);
@@ -4487,6 +4569,7 @@ export const api = {
         success: boolean;
         requests?: CardActivationRequest[];
         error?: string;
+        errorCode?: string;
       }>(res, {
         success: false,
         error: 'Failed to retrieve card activation requests.',
@@ -4495,6 +4578,7 @@ export const api = {
       if (!res.ok || !parsed.success) {
         return {
           success: false,
+          errorCode: parsed.errorCode,
           error: parsed.error || `Failed to retrieve card activation requests (HTTP ${res.status}).`,
         };
       }

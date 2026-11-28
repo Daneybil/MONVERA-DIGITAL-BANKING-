@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CardActivationRequest, CardActivationStatus } from '../../types';
 import { api } from '../../services/api';
 import {
@@ -39,8 +39,21 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
   const [isSubmittingAction, setIsSubmittingAction] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const inFlightRef = useRef<boolean>(false);
+  const lastFetchedAtRef = useRef<number>(0);
 
-  const loadRequests = async (silent = false) => {
+  const loadRequests = async (silent = false, fromFocusOrVisibility = false) => {
+    if (silent && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+    if (silent && inFlightRef.current) {
+      return;
+    }
+    if (fromFocusOrVisibility && Date.now() - lastFetchedAtRef.current < 10000) {
+      return;
+    }
+
+    inFlightRef.current = true;
     if (!silent) {
       setIsLoading(true);
     }
@@ -55,10 +68,12 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
       } else {
         setLoadError(res.error || 'Unable to load card activation requests. Please verify your connection and try again.');
       }
+      lastFetchedAtRef.current = Date.now();
     } catch (err: any) {
       console.error('[AdminCardActivationsView] Error loading requests:', err);
       setLoadError(err?.message || 'Unexpected error loading card activation requests.');
     } finally {
+      inFlightRef.current = false;
       if (!silent) {
         setIsLoading(false);
       }
@@ -66,13 +81,13 @@ export const AdminCardActivationsView: React.FC<AdminCardActivationsViewProps> =
   };
 
   useEffect(() => {
-    loadRequests(false);
+    loadRequests(false, false);
     const intervalId = window.setInterval(() => {
-      loadRequests(true);
-    }, 10000);
+      loadRequests(true, false);
+    }, 30000);
     const handleVisibilityOrFocus = () => {
       if (document.visibilityState === 'visible') {
-        loadRequests(true);
+        loadRequests(true, true);
       }
     };
     window.addEventListener('focus', handleVisibilityOrFocus);

@@ -31,6 +31,260 @@ export interface ServerTransactionDeps {
   isAdminConfigured?: () => boolean;
 }
 
+export type ClassifiedFirestoreErrorCode =
+  | 'DATABASE_UNCONFIGURED'
+  | 'FIRESTORE_QUOTA_EXCEEDED'
+  | 'FIRESTORE_PERMISSION_DENIED'
+  | 'FIRESTORE_UNAVAILABLE'
+  | 'FIRESTORE_INDEX_REQUIRED'
+  | 'DATABASE_READ_ERROR';
+
+export interface ClassifiedFirestoreReadError {
+  errorCode: ClassifiedFirestoreErrorCode;
+  firestoreCode: string;
+  reason: string;
+  retryable: boolean;
+  statusCode: number;
+}
+
+export function classifyFirestoreReadError(err: any): ClassifiedFirestoreReadError {
+  const rawCode = err?.code;
+  const codeStr = typeof rawCode === 'string' ? rawCode.toUpperCase() : String(rawCode ?? '');
+  const msg = String(err?.message || err || '');
+  const lowerMsg = msg.toLowerCase();
+
+  if (
+    lowerMsg.includes('firebase admin sdk is not configured') ||
+    lowerMsg.includes('firestore is unavailable') ||
+    lowerMsg.includes('database service unavailable')
+  ) {
+    return {
+      errorCode: 'DATABASE_UNCONFIGURED',
+      firestoreCode: codeStr || 'UNCONFIGURED',
+      reason: 'Firebase Admin database service is not configured',
+      retryable: false,
+      statusCode: 503,
+    };
+  }
+
+  if (
+    rawCode === 8 ||
+    codeStr === 'RESOURCE_EXHAUSTED' ||
+    codeStr === '8' ||
+    lowerMsg.includes('resource_exhausted') ||
+    lowerMsg.includes('quota exceeded')
+  ) {
+    return {
+      errorCode: 'FIRESTORE_QUOTA_EXCEEDED',
+      firestoreCode: 'RESOURCE_EXHAUSTED',
+      reason: 'Firestore read quota exceeded',
+      retryable: false,
+      statusCode: 503,
+    };
+  }
+
+  if (
+    rawCode === 7 ||
+    rawCode === 16 ||
+    codeStr === 'PERMISSION_DENIED' ||
+    codeStr === 'UNAUTHENTICATED' ||
+    codeStr === '7' ||
+    codeStr === '16' ||
+    lowerMsg.includes('permission_denied') ||
+    lowerMsg.includes('missing or insufficient permissions') ||
+    lowerMsg.includes('unauthenticated')
+  ) {
+    return {
+      errorCode: 'FIRESTORE_PERMISSION_DENIED',
+      firestoreCode: rawCode === 16 || codeStr === 'UNAUTHENTICATED' ? 'UNAUTHENTICATED' : 'PERMISSION_DENIED',
+      reason: 'database authorization or permission denied',
+      retryable: false,
+      statusCode: 503,
+    };
+  }
+
+  if (
+    rawCode === 9 ||
+    codeStr === 'FAILED_PRECONDITION' ||
+    codeStr === '9' ||
+    lowerMsg.includes('failed_precondition') ||
+    lowerMsg.includes('requires an index')
+  ) {
+    return {
+      errorCode: 'FIRESTORE_INDEX_REQUIRED',
+      firestoreCode: 'FAILED_PRECONDITION',
+      reason: 'required Firestore precondition or index missing',
+      retryable: false,
+      statusCode: 503,
+    };
+  }
+
+  if (
+    rawCode === 4 ||
+    rawCode === 10 ||
+    rawCode === 13 ||
+    rawCode === 14 ||
+    codeStr === 'DEADLINE_EXCEEDED' ||
+    codeStr === 'UNAVAILABLE' ||
+    codeStr === 'ABORTED' ||
+    codeStr === 'INTERNAL' ||
+    codeStr === '4' ||
+    codeStr === '10' ||
+    codeStr === '13' ||
+    codeStr === '14' ||
+    lowerMsg.includes('deadline_exceeded') ||
+    lowerMsg.includes('unavailable') ||
+    lowerMsg.includes('etimedout') ||
+    lowerMsg.includes('econnreset') ||
+    lowerMsg.includes('econnrefused') ||
+    lowerMsg.includes('socket hang up')
+  ) {
+    return {
+      errorCode: 'FIRESTORE_UNAVAILABLE',
+      firestoreCode: codeStr || 'UNAVAILABLE',
+      reason: 'Firestore service temporarily unavailable or timed out',
+      retryable: true,
+      statusCode: 503,
+    };
+  }
+
+  return {
+    errorCode: 'DATABASE_READ_ERROR',
+    firestoreCode: codeStr || 'UNKNOWN',
+    reason: 'unexpected database read failure',
+    retryable: false,
+    statusCode: 503,
+  };
+}
+
+function toTimestampMs(value: unknown): number {
+  if (!value) return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (typeof value === 'object') {
+    const obj = value as { toDate?: () => Date; _seconds?: number; seconds?: number };
+    if (typeof obj.toDate === 'function') {
+      try {
+        const ms = obj.toDate().getTime();
+        return Number.isFinite(ms) ? ms : 0;
+      } catch {
+        return 0;
+      }
+    }
+    if (typeof obj._seconds === 'number') return obj._seconds * 1000;
+    if (typeof obj.seconds === 'number') return obj.seconds * 1000;
+  }
+  const parsed = new Date(String(value)).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+const ADMIN_QUEUE_COALESCE_TTL_MS = 2500;
+
+interface AdminQueueReadBucket {
+  bankAppsInflight?: Promise<LinkedBankAccountApplication[]>;
+  bankAppsRecent?: { data: LinkedBankAccountApplication[]; fetchedAt: number };
+  cardActInflight?: Promise<CardActivationRequest[]>;
+  cardActRecent?: { data: CardActivationRequest[]; fetchedAt: number };
+}
+
+const adminQueueReadBuckets = new WeakMap<object, AdminQueueReadBucket>();
+
+function getAdminQueueReadBucket(fs: Firestore): AdminQueueReadBucket {
+  let bucket = adminQueueReadBuckets.get(fs as unknown as object);
+  if (!bucket) {
+    bucket = {};
+    adminQueueReadBuckets.set(fs as unknown as object, bucket);
+  }
+  return bucket;
+}
+
+export function invalidateAdminQueueReadCache(
+  target: 'bank_account_applications' | 'card_activation_requests' | 'all' = 'all',
+  fs?: Firestore
+): void {
+  const resolvedFs = fs || (isFirebaseAdminConfigured() ? adminFirestore : null);
+  if (!resolvedFs) return;
+  const bucket = adminQueueReadBuckets.get(resolvedFs as unknown as object);
+  if (!bucket) return;
+  if (target === 'bank_account_applications' || target === 'all') {
+    bucket.bankAppsRecent = undefined;
+    bucket.bankAppsInflight = undefined;
+  }
+  if (target === 'card_activation_requests' || target === 'all') {
+    bucket.cardActRecent = undefined;
+    bucket.cardActInflight = undefined;
+  }
+}
+
+async function readWithTransientRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise<T> {
+  let lastErr: any;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+      const classified = classifyFirestoreReadError(err);
+      if (!classified.retryable || attempt >= maxRetries) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+function buildClassifiedAdminReadError(subject: string, err: any): Error {
+  const classified = classifyFirestoreReadError(err);
+  return Object.assign(
+    new Error(`Database read error: unable to retrieve ${subject} (${classified.reason}).`),
+    {
+      statusCode: classified.statusCode,
+      errorCode: classified.errorCode,
+      firestoreCode: classified.firestoreCode,
+    }
+  );
+}
+
+async function readAllBankAccountApplicationsShared(
+  fs: Firestore
+): Promise<LinkedBankAccountApplication[]> {
+  const bucket = getAdminQueueReadBucket(fs);
+  const now = Date.now();
+  if (bucket.bankAppsRecent && now - bucket.bankAppsRecent.fetchedAt < ADMIN_QUEUE_COALESCE_TTL_MS) {
+    return bucket.bankAppsRecent.data.map((item) => ({ ...item }));
+  }
+  if (bucket.bankAppsInflight) {
+    const shared = await bucket.bankAppsInflight;
+    return shared.map((item) => ({ ...item }));
+  }
+
+  const inflight = (async () => {
+    const snap = await readWithTransientRetry(() =>
+      fs.collection('bank_account_applications').get()
+    );
+    const list = snap.docs.map((doc) => ({
+      ...((doc.data() || {}) as LinkedBankAccountApplication),
+      id: doc.id,
+    }));
+    list.sort((a, b) => toTimestampMs(b.submittedAt) - toTimestampMs(a.submittedAt));
+    bucket.bankAppsRecent = { data: list, fetchedAt: Date.now() };
+    return list;
+  })();
+
+  bucket.bankAppsInflight = inflight;
+  try {
+    const result = await inflight;
+    return result.map((item) => ({ ...item }));
+  } finally {
+    if (bucket.bankAppsInflight === inflight) {
+      bucket.bankAppsInflight = undefined;
+    }
+  }
+}
+
 function reportOutboxPreparationIssues(
   context: string,
   txId: string,
@@ -6386,6 +6640,7 @@ export async function submitBankAccountApplication(params: SubmitBankAccountPara
 
     // Update runtime cache only after permanent Firestore persistence succeeds
     db.bankAccountApplications.set(appId, application);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     // Persistent notification for bank linking submission
     await persistCustomerNotification({
@@ -6449,25 +6704,23 @@ export async function getCustomerBankAccountApplications(userId: string): Promis
   }
 }
 
-export async function getAllBankAccountApplicationsAdmin(): Promise<LinkedBankAccountApplication[]> {
-  if (!isFirebaseAdminConfigured()) {
+export async function getAllBankAccountApplicationsAdmin(
+  deps?: ServerTransactionDeps
+): Promise<LinkedBankAccountApplication[]> {
+  const configured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+  if (!configured && !deps?.firestore) {
     throw Object.assign(
       new Error('Database service unavailable: cannot retrieve bank account approval requests.'),
-      { statusCode: 503 }
+      { statusCode: 503, errorCode: 'DATABASE_UNCONFIGURED' }
     );
   }
 
+  const fs = deps?.firestore || adminFirestore;
   try {
-    const snap = await adminFirestore.collection('bank_account_applications').get();
-    const list = snap.docs.map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }));
-    list.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
-    return list;
+    return await readAllBankAccountApplicationsShared(fs);
   } catch (fsErr: any) {
-    console.error('[getAllBankAccountApplicationsAdmin] Firestore read failed:', fsErr?.message || fsErr);
-    throw Object.assign(
-      new Error('Database read error: unable to retrieve bank account approval requests.'),
-      { statusCode: 503 }
-    );
+    console.error('[getAllBankAccountApplicationsAdmin] Firestore read failed:', fsErr?.code || '', fsErr?.message || fsErr);
+    throw buildClassifiedAdminReadError('bank account approval requests', fsErr);
   }
 }
 
@@ -6548,6 +6801,7 @@ export async function approveBankAccountApplication(
 
     // Update runtime cache only after Firestore write succeeds
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     // Record Admin Audit Log
     const auditId = `aud_${Date.now()}_approve_bank_${Math.random().toString(36).substring(2, 6)}`;
@@ -6659,6 +6913,7 @@ export async function rejectBankAccountApplication(
 
     // Update runtime cache only after Firestore write succeeds
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     // Record Admin Audit Log
     const auditId = `aud_${Date.now()}_reject_bank_${Math.random().toString(36).substring(2, 6)}`;
@@ -6765,6 +7020,7 @@ export async function cancelBankAccountApplication(
     }
 
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     await persistCustomerNotification({
       id: `notif_bnk_can_${applicationId}`,
@@ -6867,6 +7123,7 @@ export async function adminCancelBankAccount(
 
     const updatedApp = txResult.application;
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     const auditId = `aud_${Date.now()}_cancel_bank_${Math.random().toString(36).substring(2, 6)}`;
     const auditEntry = {
@@ -6918,39 +7175,38 @@ export async function adminCancelBankAccount(
   }
 }
 
-export async function getBankVerificationRequestsAdmin(): Promise<LinkedBankAccountApplication[]> {
-  if (!isFirebaseAdminConfigured()) {
+export async function getBankVerificationRequestsAdmin(
+  deps?: ServerTransactionDeps
+): Promise<LinkedBankAccountApplication[]> {
+  const configured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+  if (!configured && !deps?.firestore) {
     throw Object.assign(
       new Error('Database service unavailable: cannot retrieve bank verification requests.'),
-      { statusCode: 503 }
+      { statusCode: 503, errorCode: 'DATABASE_UNCONFIGURED' }
     );
   }
 
+  const fs = deps?.firestore || adminFirestore;
   try {
-    const snap = await adminFirestore.collection('bank_account_applications').get();
-    const list = snap.docs
-      .map((doc) => ({ ...(doc.data() as LinkedBankAccountApplication), id: doc.id }))
-      .filter((app) => {
-        if (app.status === 'cancelled' || app.activationStatus === 'CANCELLED') {
-          return false;
-        }
-        const submittedRef = String(app.verificationReference || app.verificationCode || '').trim();
-        const hasSubmittedRef = Boolean(submittedRef || app.verificationCodeStatus);
-        const hasValidStage1 = app.status === 'approved' || app.status === 'activated' || app.activationStatus === 'ACTIVATED';
-        return hasValidStage1 && hasSubmittedRef;
-      });
+    const allApplications = await readAllBankAccountApplicationsShared(fs);
+    const list = allApplications.filter((app) => {
+      if (app.status === 'cancelled' || app.activationStatus === 'CANCELLED') {
+        return false;
+      }
+      const submittedRef = String(app.verificationReference || app.verificationCode || '').trim();
+      const hasSubmittedRef = Boolean(submittedRef || app.verificationCodeStatus);
+      const hasValidStage1 = app.status === 'approved' || app.status === 'activated' || app.activationStatus === 'ACTIVATED';
+      return hasValidStage1 && hasSubmittedRef;
+    });
     list.sort(
       (a, b) =>
-        (new Date(b.verificationSubmittedAt || b.submittedAt || 0).getTime() || 0) -
-        (new Date(a.verificationSubmittedAt || a.submittedAt || 0).getTime() || 0)
+        toTimestampMs(b.verificationSubmittedAt || b.submittedAt) -
+        toTimestampMs(a.verificationSubmittedAt || a.submittedAt)
     );
     return list;
   } catch (fsErr: any) {
-    console.error('[getBankVerificationRequestsAdmin] Firestore read failed:', fsErr?.message || fsErr);
-    throw Object.assign(
-      new Error('Database read error: unable to retrieve bank verification requests.'),
-      { statusCode: 503 }
-    );
+    console.error('[getBankVerificationRequestsAdmin] Firestore read failed:', fsErr?.code || '', fsErr?.message || fsErr);
+    throw buildClassifiedAdminReadError('bank verification requests', fsErr);
   }
 }
 
@@ -7052,6 +7308,7 @@ export async function completeBankVerification(
 
     const updatedApp = txResult.application;
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     const auditId = `aud_${Date.now()}_sub_bank_vrf_${Math.random().toString(36).substring(2, 6)}`;
     const auditEntry = {
@@ -7208,6 +7465,7 @@ export async function approveBankVerificationCode(
 
     const { application: updatedApp, submittedRef } = txResult;
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     const auditId = `aud_${Date.now()}_approve_bank_vrf_${Math.random().toString(36).substring(2, 6)}`;
     const auditEntry = {
@@ -7359,6 +7617,7 @@ export async function rejectBankVerificationCode(
 
     const { application: updatedApp } = txResult;
     db.bankAccountApplications.set(applicationId, updatedApp);
+    invalidateAdminQueueReadCache('bank_account_applications');
 
     const auditId = `aud_${Date.now()}_reject_bank_vrf_${Math.random().toString(36).substring(2, 6)}`;
     const auditEntry = {
@@ -7566,6 +7825,7 @@ export async function submitCardActivationRequest(params: SubmitCardActivationPa
 
     // Update runtime cache only after Firestore persistence succeeds
     db.cardActivationRequests.set(requestId, newRequest);
+    invalidateAdminQueueReadCache('card_activation_requests');
 
     // Create deterministic notification for customer
     await persistCustomerNotification({
@@ -7641,25 +7901,55 @@ export async function getCustomerCardActivationStatus(userId: string): Promise<{
   }
 }
 
-export async function getAllCardActivationRequestsAdmin(): Promise<CardActivationRequest[]> {
-  if (!isFirebaseAdminConfigured()) {
+export async function getAllCardActivationRequestsAdmin(
+  deps?: ServerTransactionDeps
+): Promise<CardActivationRequest[]> {
+  const configured = deps?.isAdminConfigured ? deps.isAdminConfigured() : isFirebaseAdminConfigured();
+  if (!configured && !deps?.firestore) {
     throw Object.assign(
       new Error('Database service unavailable: cannot retrieve card activation requests.'),
-      { statusCode: 503 }
+      { statusCode: 503, errorCode: 'DATABASE_UNCONFIGURED' }
     );
   }
 
+  const fs = deps?.firestore || adminFirestore;
+  const bucket = getAdminQueueReadBucket(fs);
+
   try {
-    const snap = await adminFirestore.collection('card_activation_requests').get();
-    const list = snap.docs.map((doc) => ({ ...(doc.data() as CardActivationRequest), id: doc.id }));
-    list.sort((a, b) => (new Date(b.submittedAt || 0).getTime() || 0) - (new Date(a.submittedAt || 0).getTime() || 0));
-    return list;
+    const now = Date.now();
+    if (bucket.cardActRecent && now - bucket.cardActRecent.fetchedAt < ADMIN_QUEUE_COALESCE_TTL_MS) {
+      return bucket.cardActRecent.data.map((item) => ({ ...item }));
+    }
+    if (bucket.cardActInflight) {
+      const shared = await bucket.cardActInflight;
+      return shared.map((item) => ({ ...item }));
+    }
+
+    const inflight = (async () => {
+      const snap = await readWithTransientRetry(() =>
+        fs.collection('card_activation_requests').get()
+      );
+      const list = snap.docs.map((doc) => ({
+        ...((doc.data() || {}) as CardActivationRequest),
+        id: doc.id,
+      }));
+      list.sort((a, b) => toTimestampMs(b.submittedAt) - toTimestampMs(a.submittedAt));
+      bucket.cardActRecent = { data: list, fetchedAt: Date.now() };
+      return list;
+    })();
+
+    bucket.cardActInflight = inflight;
+    try {
+      const result = await inflight;
+      return result.map((item) => ({ ...item }));
+    } finally {
+      if (bucket.cardActInflight === inflight) {
+        bucket.cardActInflight = undefined;
+      }
+    }
   } catch (fsErr: any) {
-    console.error('[getAllCardActivationRequestsAdmin] Firestore read failed:', fsErr?.message || fsErr);
-    throw Object.assign(
-      new Error('Database read error: unable to retrieve card activation requests.'),
-      { statusCode: 503 }
-    );
+    console.error('[getAllCardActivationRequestsAdmin] Firestore read failed:', fsErr?.code || '', fsErr?.message || fsErr);
+    throw buildClassifiedAdminReadError('card activation requests', fsErr);
   }
 }
 
@@ -7733,6 +8023,7 @@ export async function approveCardActivationRequest(
 
     // Update in memory only after Firestore write succeeds
     db.cardActivationRequests.set(requestId, updatedReq);
+    invalidateAdminQueueReadCache('card_activation_requests');
 
     // Record Admin Audit Log
     const auditId = `aud_${Date.now()}_approve_card_act_${Math.random().toString(36).substring(2, 6)}`;
@@ -7854,6 +8145,7 @@ export async function rejectCardActivationRequest(
 
     // Update in memory only after Firestore write succeeds
     db.cardActivationRequests.set(requestId, updatedReq);
+    invalidateAdminQueueReadCache('card_activation_requests');
 
     // Record Admin Audit Log
     const auditId = `aud_${Date.now()}_reject_card_act_${Math.random().toString(36).substring(2, 6)}`;

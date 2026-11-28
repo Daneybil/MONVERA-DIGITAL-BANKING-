@@ -26,6 +26,7 @@ export const AdminRewardsView: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'PAID' | 'IN_PROGRESS' | 'QUALIFIED'>('ALL');
   const [copiedRef, setCopiedRef] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const fetchAdminRewards = async () => {
     setLoading(true);
@@ -34,9 +35,13 @@ export const AdminRewardsView: React.FC = () => {
       if (res.success && res.rewards) {
         setRewards(res.rewards);
         setStats(res.stats);
+        setLoadError(null);
+      } else {
+        setLoadError(res.error || 'Database read error: unable to retrieve administrative reward records.');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('[AdminRewardsView] Error loading rewards:', err);
+      setLoadError(err?.message || 'Network error retrieving administrative reward records.');
     } finally {
       setLoading(false);
     }
@@ -107,6 +112,22 @@ export const AdminRewardsView: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {loadError && (
+        <div className="p-4 rounded-2xl bg-rose-50 border-2 border-rose-300 text-rose-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-start gap-2.5 text-xs font-bold">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <div>Welcome Rewards Sync Error: {loadError}</div>
+          </div>
+          <button
+            type="button"
+            onClick={fetchAdminRewards}
+            className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-colors cursor-pointer self-start sm:self-auto shrink-0"
+          >
+            Retry Sync
+          </button>
+        </div>
+      )}
 
       {/* Program Statistics Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
